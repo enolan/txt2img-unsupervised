@@ -1,0 +1,56 @@
+"""
+Generate some test data for testing the Jax implementation of the autoencoder.
+"""
+import PIL
+import numpy as np
+import torch
+import sys
+from pathlib import Path
+import argparse
+from omegaconf import OmegaConf
+
+from ldm.models.autoencoder import VQModel
+
+# Parse the arguments
+parser = argparse.ArgumentParser()
+parser.add_argument("img", type=str)
+parser.add_argument("ckpt", type=str)
+parser.add_argument("cfg", type=str)
+args = parser.parse_args()
+
+img_path = Path(args.img).absolute()
+out_dir = img_path.parent
+
+# Load the image
+img = PIL.Image.open(img_path)
+w, h = img.size
+assert w == 256 and h == 256
+assert img.mode == "RGB"
+
+img = np.array(img, dtype=np.float32) / 127.5 - 1.0
+img = torch.tensor(img).unsqueeze(0).permute(0, 3, 1, 2)
+
+# Load the config
+cfg = OmegaConf.load(args.cfg)
+
+# Load the model
+model = VQModel(**cfg["model"]["params"])
+model.init_from_ckpt(args.ckpt)
+
+# Encode the image
+z = model.encode(img)
+codes = z[2][2].numpy()
+
+# Save the encoded representation
+codes_path = img_path.with_suffix(".codes.npy")
+print(f"Saving codes to {codes_path}")
+np.save(codes_path, codes)
+latents_path = img_path.with_suffix(".latents.npy")
+print(f"Saving latents to {latents_path}")
+np.save(latents_path, z[0].detach().numpy())
+
+# Save embedded codes
+embedded_codes = model.quantize.get_codebook_entry(z[2][2], None).detach().numpy()
+embedded_codes_path = img_path.with_suffix(".embedded_codes.npy")
+print(f"Saving embedded codes to {embedded_codes_path}")
+np.save(embedded_codes_path, embedded_codes)
