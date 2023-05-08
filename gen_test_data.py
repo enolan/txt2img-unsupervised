@@ -43,14 +43,14 @@ codes = z[2][2].numpy()
 
 # Save the encoded representation
 codes_path = img_path.with_suffix(".codes.npy")
-print(f"Saving codes to {codes_path}")
+print(f"Saving codes to {codes_path}, shape {codes.shape}")
 np.save(codes_path, codes)
 latents_path = img_path.with_suffix(".latents.npy")
-print(f"Saving latents to {latents_path}")
+print(f"Saving latents to {latents_path}, shape {z[0].shape}")
 np.save(latents_path, z[0].detach().numpy())
 
 # Save embedded codes
 embedded_codes = model.quantize.get_codebook_entry(z[2][2], None).detach().numpy()
 embedded_codes_path = img_path.with_suffix(".embedded_codes.npy")
-print(f"Saving embedded codes to {embedded_codes_path}")
+print(f"Saving embedded codes to {embedded_codes_path}, shape {embedded_codes.shape}")
 np.save(embedded_codes_path, embedded_codes)
