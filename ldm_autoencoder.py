@@ -14,7 +14,7 @@ class LDMAutoencoder(nn.Module):
     def setup(self):
         self.embedding = nn.Embed(num_embeddings=self.cfg['n_embed'], dtype=jnp.float32, features=self.cfg['embed_dim'])
 
-    def dec(self, x):
+    def embed(self, x):
         return self.embedding(x)
     
     @staticmethod
@@ -33,7 +33,7 @@ def _test_embedding(name):
 
     golden_embedded_codes = jnp.load(path_prefix.with_suffix(".embedded_codes.npy"))
 
-    computed_embedded_codes = mdl.apply(params, x=codes, method=mdl.dec)
+    computed_embedded_codes = mdl.apply(params, x=codes, method=mdl.embed)
     assert golden_embedded_codes.shape == computed_embedded_codes.shape
     np.testing.assert_array_equal(golden_embedded_codes, computed_embedded_codes)
 
