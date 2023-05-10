@@ -19,11 +19,13 @@ class LDMAutoencoder(nn.Module):
     
     @staticmethod
     def params_from_torch(state_dict):
+        """Load the parameters from a torch checkpoint."""
         state_dict = state_dict['state_dict']
         return {'params': {'embedding': {'embedding': state_dict['quantize.embedding.weight']}}}
 
 
 def _test_embedding(name):
+    """Test that the embedding matches the one from the original implementation."""
     src_dir = Path(__file__).parent
     path_prefix = src_dir / f"test-images/{name}"
     cfg = OmegaConf.load(src_dir / "vendor/latent-diffusion/models/first_stage_models/vq-f4/config.yaml")
