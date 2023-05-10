@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 import argparse
 from omegaconf import OmegaConf
+from einops import rearrange
 
 from ldm.models.autoencoder import VQModel
 
@@ -50,7 +51,18 @@ print(f"Saving latents to {latents_path}, shape {z[0].shape}")
 np.save(latents_path, z[0].detach().numpy())
 
 # Save embedded codes
-embedded_codes = model.quantize.get_codebook_entry(z[2][2], None).detach().numpy()
+embedded_codes = model.quantize.get_codebook_entry(z[2][2], [1, 64, 64, 3])
+embedded_codes_np = embedded_codes.squeeze(0).detach().numpy()
 embedded_codes_path = img_path.with_suffix(".embedded_codes.npy")
-print(f"Saving embedded codes to {embedded_codes_path}, shape {embedded_codes.shape}")
-np.save(embedded_codes_path, embedded_codes)
+print(
+    f"Saving embedded codes to {embedded_codes_path}, shape {embedded_codes_np.shape}"
+)
+np.save(embedded_codes_path, embedded_codes_np)
+
+# Save convolved embedded codes
+convolved_embedded_codes = model.post_quant_conv(embedded_codes).detach().numpy().squeeze(0)
+convolved_embedded_codes_path = img_path.with_suffix(".convolved_embedded_codes.npy")
+print(
+    f"Saving convolved embedded codes to {convolved_embedded_codes_path}, shape {convolved_embedded_codes.shape}"
+)
+np.save(convolved_embedded_codes_path, convolved_embedded_codes)
