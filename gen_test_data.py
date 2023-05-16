@@ -60,9 +60,19 @@ print(
 np.save(embedded_codes_path, embedded_codes_np)
 
 # Save convolved embedded codes
-convolved_embedded_codes = model.post_quant_conv(embedded_codes).detach().numpy().squeeze(0)
+convolved_embedded_codes = model.post_quant_conv(embedded_codes).detach()
+convolved_embedded_codes_np = convolved_embedded_codes.numpy().squeeze(0)
 convolved_embedded_codes_path = img_path.with_suffix(".convolved_embedded_codes.npy")
 print(
-    f"Saving convolved embedded codes to {convolved_embedded_codes_path}, shape {convolved_embedded_codes.shape}"
+    f"Saving convolved embedded codes to {convolved_embedded_codes_path}, shape {convolved_embedded_codes_np.shape}"
 )
-np.save(convolved_embedded_codes_path, convolved_embedded_codes)
+np.save(convolved_embedded_codes_path, convolved_embedded_codes_np)
+
+# Save hidden representation after 1st convolution in decoder
+post_conv_hidden = model.decoder.conv_in(convolved_embedded_codes)
+post_conv_hidden_np = post_conv_hidden.detach().numpy().squeeze(0)
+post_conv_hidden_path = img_path.with_suffix(".post_conv_hidden.npy")
+print(
+    f"Saving post conv hidden to {post_conv_hidden_path}, shape {post_conv_hidden_np.shape}"
+)
+np.save(post_conv_hidden_path, post_conv_hidden_np)

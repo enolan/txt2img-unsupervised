@@ -23,6 +23,7 @@ class LDMAutoencoder(nn.Module):
         self.post_quant_conv = nn.Conv(
             features=self.cfg["ddconfig"]["z_channels"], kernel_size=[1]
         )
+        self.decoder = LDMDecoder(cfg=self.cfg["ddconfig"])
 
     def embed(self, x, shape=None):
         """Embed the codes, reshaping them to (height, width), where height and width are
@@ -34,6 +35,10 @@ class LDMAutoencoder(nn.Module):
 
     def conv_embeds(self, x):
         return self.post_quant_conv(x)
+
+    def _dec_conv_in(self, x):
+        """Run the first convolutional layer in the decoder. For testing."""
+        return self.decoder.conv_in(x)
 
     @staticmethod
     def params_from_torch(state_dict):
@@ -50,9 +55,32 @@ class LDMAutoencoder(nn.Module):
                     ),
                     "bias": state_dict["post_quant_conv.bias"],
                 },
+                "decoder": {
+                    "conv_in": {
+                        "kernel": rearrange(
+                            state_dict["decoder.conv_in.weight"],
+                            "outC inC kH kW -> kH kW inC outC",
+                        ),
+                        "bias": state_dict["decoder.conv_in.bias"],
+                    }
+                },
             }
         }
         return jax.tree_map(jnp.array, params)
+
+
+class LDMDecoder(nn.Module):
+    """Flax Reimplentation of the decoder from the latent diffusion repo."""
+
+    cfg: dict
+
+    def setup(self):
+        # channels used in decoder
+        block_in = self.cfg["ch"] * self.cfg["ch_mult"][-1]
+
+        # convolutional layer applied first
+        # torch code pads with zeros, what does flax pad with? Tests pass so I guess it's fine.
+        self.conv_in = nn.Conv(features=block_in, kernel_size=[3, 3], padding=1)
 
 
 def _setup_comparison_test(name):
@@ -106,6 +134,26 @@ def _test_post_quant_conv(name):
     )
 
 
+def _test_dec_conv_in(name):
+    """Test that the first convolutional layer in the decoder matches the pytorch implementation."""
+    src_dir, path_prefix, mdl, params = _setup_comparison_test(name)
+    convolved_embedded_codes = jnp.load(
+        path_prefix.with_suffix(".convolved_embedded_codes.npy")
+    )
+    assert convolved_embedded_codes.shape == (3, 64, 64)
+    golden_conv_in = jnp.load(path_prefix.with_suffix(".post_conv_hidden.npy"))
+    assert golden_conv_in.shape == (512, 64, 64)
+    computed_conv_in = mdl.apply(
+        params,
+        x=rearrange(convolved_embedded_codes, "c h w -> h w c"),
+        method=mdl._dec_conv_in,
+    )
+    assert computed_conv_in.shape == (64, 64, 512)
+    np.testing.assert_allclose(
+        computed_conv_in, rearrange(golden_conv_in, "c h w -> h w c")
+    )
+
+
 def test_embedding_me():
     _test_embedding("devil me")
 
@@ -120,3 +168,11 @@ def test_post_quant_conv_me():
 
 def test_post_quant_conv_painting():
     _test_post_quant_conv("painty lady")
+
+
+def test_dec_conv_in_me():
+    _test_dec_conv_in("devil me")
+
+
+def test_dec_conv_in_painting():
+    _test_dec_conv_in("painty lady")
