@@ -117,5 +117,6 @@ def test_embedding_painting():
 def test_post_quant_conv_me():
     _test_post_quant_conv("devil me")
 
+
 def test_post_quant_conv_painting():
     _test_post_quant_conv("painty lady")
