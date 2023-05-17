@@ -33,7 +33,7 @@ class LDMAutoencoder(nn.Module):
             x = x.reshape(shape)
         return self.embedding(x)
 
-    def conv_embeds(self, x):
+    def _conv_embeds(self, x):
         return self.post_quant_conv(x)
 
     def _dec_conv_in(self, x):
@@ -124,7 +124,7 @@ def _test_post_quant_conv(name):
     assert not (np.array_equal(embedded_codes, golden_convolved_embedded_codes))
 
     computed_convolved_embedded_codes = mdl.apply(
-        params, x=rearrange(embedded_codes, "c h w -> h w c"), method=mdl.conv_embeds
+        params, x=rearrange(embedded_codes, "c h w -> h w c"), method=mdl._conv_embeds
     )
     assert computed_convolved_embedded_codes.shape == (64, 64, 3)
     np.testing.assert_allclose(
