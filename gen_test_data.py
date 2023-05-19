@@ -76,3 +76,12 @@ print(
     f"Saving post conv hidden to {post_conv_hidden_path}, shape {post_conv_hidden_np.shape}"
 )
 np.save(post_conv_hidden_path, post_conv_hidden_np)
+
+# Save hidden representation after 1st resnet block in decoder
+post_resnet_1_hidden = model.decoder.mid.block_1(post_conv_hidden, None)
+post_resnet_1_hidden_np = post_resnet_1_hidden.detach().numpy().squeeze(0)
+post_resnet_1_hidden_path = img_path.with_suffix(".post_resnet_1_hidden.npy")
+print(
+    f"Saving post resnet 1 hidden to {post_resnet_1_hidden_path}, shape {post_resnet_1_hidden_np.shape}"
+)
+np.save(post_resnet_1_hidden_path, post_resnet_1_hidden_np)

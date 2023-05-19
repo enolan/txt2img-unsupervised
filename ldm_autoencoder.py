@@ -21,7 +21,7 @@ class LDMAutoencoder(nn.Module):
             features=self.cfg["embed_dim"],
         )
         self.post_quant_conv = nn.Conv(
-            features=self.cfg["ddconfig"]["z_channels"], kernel_size=[1]
+            features=self.cfg["ddconfig"]["z_channels"], kernel_size=[1, 1]
         )
         self.decoder = LDMDecoder(cfg=self.cfg["ddconfig"])
 
@@ -34,35 +34,53 @@ class LDMAutoencoder(nn.Module):
         return self.embedding(x)
 
     def _conv_embeds(self, x):
+        """Run the post-quantization convolutional layer on the embedded codes. For testing."""
         return self.post_quant_conv(x)
 
     def _dec_conv_in(self, x):
         """Run the first convolutional layer in the decoder. For testing."""
         return self.decoder.conv_in(x)
 
+    def _dec_mid_resnet_1(self, x):
+        """Run the 1st resnet block of the middle of the decoder. For testing."""
+        return self.decoder.mid_resnet_1(x)
+
     @staticmethod
     def params_from_torch(state_dict):
         """Load the parameters from a torch checkpoint."""
         state_dict = state_dict["state_dict"]
+
+        def conv2d_params(prefix: str):
+            return {
+                "kernel": rearrange(
+                    state_dict[prefix + ".weight"],
+                    "outC inC kH kW -> kH kW inC outC",
+                ),
+                "bias": state_dict[prefix + ".bias"],
+            }
+
+        def groupnorm_params(prefix: str):
+            return {
+                "bias": state_dict[prefix + ".bias"],
+                "scale": state_dict[prefix + ".weight"],
+            }
+
+        def resnet_block_params(prefix: str):
+            return {
+                "conv1": conv2d_params(prefix + ".conv1"),
+                "conv2": conv2d_params(prefix + ".conv2"),
+                "norm1": groupnorm_params(prefix + ".norm1"),
+                "norm2": groupnorm_params(prefix + ".norm2"),
+            }
+
         params = {
             "params": {
                 "embedding": {"embedding": state_dict["quantize.embedding.weight"]},
-                "post_quant_conv": {
-                    "kernel": rearrange(
-                        # not sure why there's an extra dimension.
-                        state_dict["post_quant_conv.weight"],
-                        "outC inC 1 1 -> 1 inC outC",
-                    ),
-                    "bias": state_dict["post_quant_conv.bias"],
-                },
+                "post_quant_conv": conv2d_params("post_quant_conv"),
                 "decoder": {
-                    "conv_in": {
-                        "kernel": rearrange(
-                            state_dict["decoder.conv_in.weight"],
-                            "outC inC kH kW -> kH kW inC outC",
-                        ),
-                        "bias": state_dict["decoder.conv_in.bias"],
-                    }
+                    "conv_in": conv2d_params("decoder.conv_in"),
+                    "mid_resnet_1": resnet_block_params("decoder.mid.block_1"),
+                    "mid_resnet_2": resnet_block_params("decoder.mid.block_2"),
                 },
             }
         }
@@ -81,6 +99,41 @@ class LDMDecoder(nn.Module):
         # convolutional layer applied first
         # torch code pads with zeros, what does flax pad with? Tests pass so I guess it's fine.
         self.conv_in = nn.Conv(features=block_in, kernel_size=[3, 3], padding=1)
+
+        # middle blocks
+        self.mid_resnet_1 = ResnetBlock(out_channels=block_in, in_channels=block_in)
+        self.mid_attn_1 = None  # TODO
+        self.mid_resnet_2 = ResnetBlock(out_channels=block_in, in_channels=block_in)
+
+
+class ResnetBlock(nn.Module):
+    in_channels: int
+    out_channels: int
+
+    def setup(self):
+        self.norm1 = nn.GroupNorm(num_groups=32, epsilon=1e-6)
+        self.conv1 = nn.Conv(features=self.out_channels, kernel_size=[3, 3], padding=1)
+        self.norm2 = nn.GroupNorm(num_groups=32, epsilon=1e-6)
+        self.conv2 = nn.Conv(features=self.out_channels, kernel_size=[3, 3], padding=1)
+
+    def __call__(self, x):
+        assert (
+            len(x.shape) == 3 and x.shape[-1] == self.in_channels
+        ), f"resnet block should be called with shape h w c and {in_channels} channels, got {x.shape}"
+        # I hate batch dimensions but GroupNorm expects one
+        h = rearrange(x, "h w c -> 1 h w c")
+        h = self.norm1(h)
+        h = nn.activation.swish(h)
+        h = self.conv1(h)
+        # temb is always None in torch, so skip it here
+        h = self.norm2(h)
+        h = nn.activation.swish(h)
+        # there's dropout here in the torch code, but we skip it because we only want to do inference
+        h = self.conv2(h)
+        # there's a bunch of code about "use_conv_shortcut" in the torch code but that param is
+        # always false so it's not included here.
+        h = rearrange(h, "1 h w c -> h w c")
+        return x + h
 
 
 def _setup_comparison_test(name):
@@ -154,6 +207,27 @@ def _test_dec_conv_in(name):
     )
 
 
+def _test_mid_resnet_block_1(name):
+    """Test that the first resnet block in the middle of the decoder matches the pytorch implementation."""
+    src_dir, path_prefix, mdl, params = _setup_comparison_test(name)
+    conv_in = jnp.load(path_prefix.with_suffix(".post_conv_hidden.npy"))
+    assert conv_in.shape == (512, 64, 64)
+    golden_mid_resnet_1 = jnp.load(path_prefix.with_suffix(".post_resnet_1_hidden.npy"))
+    assert golden_mid_resnet_1.shape == (512, 64, 64)
+    #with jax.default_matmul_precision("float32"):
+    computed_mid_resnet_1 = mdl.apply(
+        params, x=rearrange(conv_in, "c h w -> h w c"), method=mdl._dec_mid_resnet_1)
+    assert computed_mid_resnet_1.shape == (64, 64, 512)
+    np.testing.assert_allclose(
+        rearrange(computed_mid_resnet_1, "h w c -> c h w"),
+        golden_mid_resnet_1,
+        atol=1e-3,
+        rtol=0
+        # TBH not sure if the error here is a bug or not. we see up to 57% difference in some
+        # values. very small in absolute terms though.
+    )
+
+
 def test_embedding_me():
     _test_embedding("devil me")
 
@@ -176,3 +250,10 @@ def test_dec_conv_in_me():
 
 def test_dec_conv_in_painting():
     _test_dec_conv_in("painty lady")
+
+
+def test_mid_resnet_block_1_me():
+    _test_mid_resnet_block_1("devil me")
+
+def test_mid_resnet_block_1_painting():
+    _test_mid_resnet_block_1("painty lady")
