@@ -214,9 +214,9 @@ def _test_mid_resnet_block_1(name):
     assert conv_in.shape == (512, 64, 64)
     golden_mid_resnet_1 = jnp.load(path_prefix.with_suffix(".post_resnet_1_hidden.npy"))
     assert golden_mid_resnet_1.shape == (512, 64, 64)
-    #with jax.default_matmul_precision("float32"):
     computed_mid_resnet_1 = mdl.apply(
-        params, x=rearrange(conv_in, "c h w -> h w c"), method=mdl._dec_mid_resnet_1)
+        params, x=rearrange(conv_in, "c h w -> h w c"), method=mdl._dec_mid_resnet_1
+    )
     assert computed_mid_resnet_1.shape == (64, 64, 512)
     np.testing.assert_allclose(
         rearrange(computed_mid_resnet_1, "h w c -> c h w"),
@@ -254,6 +254,7 @@ def test_dec_conv_in_painting():
 
 def test_mid_resnet_block_1_me():
     _test_mid_resnet_block_1("devil me")
+
 
 def test_mid_resnet_block_1_painting():
     _test_mid_resnet_block_1("painty lady")
