@@ -111,18 +111,16 @@ class ResnetBlock(nn.Module):
     out_channels: int
 
     def setup(self):
-        self.norm1 = nn.GroupNorm(num_groups=32, epsilon=1e-6)
+        self.norm1 = BatchlessGroupNorm(num_groups=32, epsilon=1e-6)
         self.conv1 = nn.Conv(features=self.out_channels, kernel_size=[3, 3], padding=1)
-        self.norm2 = nn.GroupNorm(num_groups=32, epsilon=1e-6)
+        self.norm2 = BatchlessGroupNorm(num_groups=32, epsilon=1e-6)
         self.conv2 = nn.Conv(features=self.out_channels, kernel_size=[3, 3], padding=1)
 
     def __call__(self, x):
         assert (
             len(x.shape) == 3 and x.shape[-1] == self.in_channels
         ), f"resnet block should be called with shape h w c and {in_channels} channels, got {x.shape}"
-        # I hate batch dimensions but GroupNorm expects one
-        h = rearrange(x, "h w c -> 1 h w c")
-        h = self.norm1(h)
+        h = self.norm1(x)
         h = nn.activation.swish(h)
         h = self.conv1(h)
         # temb is always None in torch, so skip it here
@@ -132,8 +130,16 @@ class ResnetBlock(nn.Module):
         h = self.conv2(h)
         # there's a bunch of code about "use_conv_shortcut" in the torch code but that param is
         # always false so it's not included here.
-        h = rearrange(h, "1 h w c -> h w c")
         return x + h
+
+
+class BatchlessGroupNorm(nn.GroupNorm):
+    """Version of GroupNorm that doesn't require a batch dimension."""
+
+    def __call__(self, x):
+        input = rearrange(x, "... -> 1 ...")
+        res = super().__call__(input)
+        return rearrange(res, "1 ... -> ...")
 
 
 def _setup_comparison_test(name):
