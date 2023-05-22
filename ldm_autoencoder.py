@@ -1,5 +1,7 @@
 import jax
 import jax.numpy as jnp
+import flax.core.frozen_dict as frozen_dict
+from flax.core.frozen_dict import FrozenDict
 import flax.linen as nn
 import numpy as np
 import torch
@@ -55,7 +57,7 @@ class LDMAutoencoder(nn.Module):
         return self.decoder._mid(x)
 
     @staticmethod
-    def params_from_torch(state_dict: dict[str, Any]) -> dict[str, Any]:
+    def params_from_torch(state_dict: dict[str, Any]) -> FrozenDict[str, Any]:
         """Load the parameters from a torch checkpoint."""
         state_dict = state_dict["state_dict"]
 
@@ -103,7 +105,7 @@ class LDMAutoencoder(nn.Module):
                 },
             }
         }
-        return jax.tree_map(jnp.array, params)  # type:ignore[no-any-return]
+        return frozen_dict.freeze(jax.tree_map(jnp.array, params))
 
 
 class LDMDecoder(nn.Module):
@@ -226,7 +228,7 @@ class BatchlessGroupNorm(nn.GroupNorm):
 
 def _setup_comparison_test(
     name: str,
-) -> Tuple[Path, Path, LDMAutoencoder, dict[str, Any]]:
+) -> Tuple[Path, Path, LDMAutoencoder, FrozenDict[str, Any]]:
     """Load stuff to compare Flax & Torch behavior."""
     src_dir = Path(__file__).parent
     path_prefix = src_dir / f"test-images/{name}"
