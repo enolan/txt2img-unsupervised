@@ -50,6 +50,10 @@ class LDMAutoencoder(nn.Module):
         """Run the attention block in the middle of the decoder. For testing."""
         return self.decoder.mid_attn_1(x)
 
+    def _dec_mid_full(self, x: jax.Array) -> jax.Array:
+        """Run the entire set of middle blocks in the decoder. For testing."""
+        return self.decoder._mid(x)
+
     @staticmethod
     def params_from_torch(state_dict: dict[str, Any]) -> dict[str, Any]:
         """Load the parameters from a torch checkpoint."""
@@ -125,6 +129,13 @@ class LDMDecoder(nn.Module):
         self.mid_resnet_2: ResnetBlock = ResnetBlock(
             out_channels=block_in, in_channels=block_in
         )
+
+    def _mid(self, x: jax.Array) -> jax.Array:
+        """Run the middle blocks."""
+        h = self.mid_resnet_1(x)
+        h = self.mid_attn_1(h)
+        h = self.mid_resnet_2(h)
+        return h
 
 
 class ResnetBlock(nn.Module):
@@ -327,6 +338,27 @@ def _test_mid_attn_block_1(name: str) -> None:
     )
 
 
+def _test_mid_full(name: str) -> None:
+    """Test that the full mid block in the decoder matches the pytorch implementation."""
+    src_dir, path_prefix, mdl, params = _setup_comparison_test(name)
+    post_conv_hidden = jnp.load(path_prefix.with_suffix(".post_conv_hidden.npy"))
+    assert post_conv_hidden.shape == (512, 64, 64)
+    golden_mid_full = jnp.load(path_prefix.with_suffix(".post_mid_hidden.npy"))
+    assert golden_mid_full.shape == (512, 64, 64)
+    computed_mid_full: jax.Array = mdl.apply(
+        params,
+        x=rearrange(post_conv_hidden, "c h w -> h w c"),
+        method=mdl._dec_mid_full,
+    )  # type: ignore[assignment]
+    assert computed_mid_full.shape == (64, 64, 512)
+    np.testing.assert_allclose(
+        rearrange(computed_mid_full, "h w c -> c h w"),
+        golden_mid_full,
+        atol=1e-3,
+        rtol=0,
+    )
+
+
 def test_embedding_me() -> None:
     _test_embedding("devil me")
 
@@ -365,3 +397,11 @@ def test_mid_attn_block_1_me() -> None:
 
 def test_mid_attn_block_1_painting() -> None:
     _test_mid_attn_block_1("painty lady")
+
+
+def test_mid_full_me() -> None:
+    _test_mid_full("devil me")
+
+
+def test_mid_full_painting() -> None:
+    _test_mid_full("painty lady")

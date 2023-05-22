@@ -94,3 +94,14 @@ print(
     f"Saving post attn hidden to {post_attn_hidden_path}, shape {post_attn_hidden_np.shape}"
 )
 np.save(post_attn_hidden_path, post_attn_hidden_np)
+
+# Save hidden representation after mid blocks
+post_mid_hidden = model.decoder.mid.block_2(
+    model.decoder.mid.attn_1(model.decoder.mid.block_1(post_conv_hidden, None)), None
+)
+post_mid_hidden_np = post_mid_hidden.detach().numpy().squeeze(0)
+post_mid_hidden_path = img_path.with_suffix(".post_mid_hidden.npy")
+print(
+    f"Saving post mid hidden to {post_mid_hidden_path}, shape {post_mid_hidden_np.shape}"
+)
+np.save(post_mid_hidden_path, post_mid_hidden_np)
