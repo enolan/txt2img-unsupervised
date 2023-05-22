@@ -112,7 +112,8 @@ class LDMDecoder(nn.Module):
     cfg: dict[str, Any]
 
     def setup(self) -> None:
-        # channels used in decoder
+        # channels used in first stage of decoder. number of channels decreases as resolution
+        # increases in the decoder.
         block_in: int = self.cfg["ch"] * self.cfg["ch_mult"][-1]
 
         # convolutional layer applied first
