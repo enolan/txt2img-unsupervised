@@ -6,55 +6,56 @@ import torch
 from einops import rearrange
 from omegaconf import OmegaConf
 from pathlib import Path
+from typing import Any, Optional, Tuple
 
 
 class LDMAutoencoder(nn.Module):
-    """Flax Reimplentation of the quantized autoencoder from the latent diffusion repo.
+    """Flax Reimplementation of the quantized autoencoder from the latent diffusion repo.
     Only intended to work with the f4 model."""
 
-    cfg: dict
+    cfg: dict[str, Any]
 
-    def setup(self):
-        self.embedding = nn.Embed(
+    def setup(self) -> None:
+        self.embedding: nn.Embed = nn.Embed(
             num_embeddings=self.cfg["n_embed"],
             dtype=jnp.float32,
             features=self.cfg["embed_dim"],
         )
-        self.post_quant_conv = nn.Conv(
+        self.post_quant_conv: nn.Conv = nn.Conv(
             features=self.cfg["ddconfig"]["z_channels"], kernel_size=[1, 1]
         )
-        self.decoder = LDMDecoder(cfg=self.cfg["ddconfig"])
+        self.decoder: LDMDecoder = LDMDecoder(cfg=self.cfg["ddconfig"])
 
-    def embed(self, x, shape=None):
+    def embed(self, x: jax.Array, shape: Optional[tuple[int, int]] = None) -> jax.Array:
         """Embed the codes, reshaping them to (height, width), where height and width are
         the height and width of the compressed representation. You must pass the shape parameter
         for decoding to work."""
         if shape is not None:
             x = x.reshape(shape)
-        return self.embedding(x)
+        return self.embedding(x)  # type:ignore[no-any-return]
 
-    def _conv_embeds(self, x):
+    def _conv_embeds(self, x: jax.Array) -> jax.Array:
         """Run the post-quantization convolutional layer on the embedded codes. For testing."""
-        return self.post_quant_conv(x)
+        return self.post_quant_conv(x)  # type:ignore[no-any-return]
 
-    def _dec_conv_in(self, x):
+    def _dec_conv_in(self, x: jax.Array) -> jax.Array:
         """Run the first convolutional layer in the decoder. For testing."""
-        return self.decoder.conv_in(x)
+        return self.decoder.conv_in(x)  # type:ignore[no-any-return]
 
-    def _dec_mid_resnet_1(self, x):
+    def _dec_mid_resnet_1(self, x: jax.Array) -> jax.Array:
         """Run the 1st resnet block of the middle of the decoder. For testing."""
         return self.decoder.mid_resnet_1(x)
 
-    def _dec_mid_attn(self, x):
+    def _dec_mid_attn(self, x: jax.Array) -> jax.Array:
         """Run the attention block in the middle of the decoder. For testing."""
         return self.decoder.mid_attn_1(x)
 
     @staticmethod
-    def params_from_torch(state_dict):
+    def params_from_torch(state_dict: dict[str, Any]) -> dict[str, Any]:
         """Load the parameters from a torch checkpoint."""
         state_dict = state_dict["state_dict"]
 
-        def conv2d_params(prefix: str):
+        def conv2d_params(prefix: str) -> dict[str, Any]:
             return {
                 "kernel": rearrange(
                     state_dict[prefix + ".weight"],
@@ -63,13 +64,13 @@ class LDMAutoencoder(nn.Module):
                 "bias": state_dict[prefix + ".bias"],
             }
 
-        def groupnorm_params(prefix: str):
+        def groupnorm_params(prefix: str) -> dict[str, Any]:
             return {
                 "bias": state_dict[prefix + ".bias"],
                 "scale": state_dict[prefix + ".weight"],
             }
 
-        def resnet_block_params(prefix: str):
+        def resnet_block_params(prefix: str) -> dict[str, Any]:
             return {
                 "conv1": conv2d_params(prefix + ".conv1"),
                 "conv2": conv2d_params(prefix + ".conv2"),
@@ -77,7 +78,7 @@ class LDMAutoencoder(nn.Module):
                 "norm2": groupnorm_params(prefix + ".norm2"),
             }
 
-        def attn_block_params(prefix: str):
+        def attn_block_params(prefix: str) -> dict[str, Any]:
             return {
                 "norm": groupnorm_params(prefix + ".norm"),
                 "q": conv2d_params(prefix + ".q"),
@@ -98,48 +99,59 @@ class LDMAutoencoder(nn.Module):
                 },
             }
         }
-        return jax.tree_map(jnp.array, params)
+        return jax.tree_map(jnp.array, params)  # type:ignore[no-any-return]
 
 
 class LDMDecoder(nn.Module):
-    """Flax Reimplentation of the decoder from the latent diffusion repo."""
+    """Flax Reimplementation of the decoder from the latent diffusion repo."""
 
-    cfg: dict
+    cfg: dict[str, Any]
 
-    def setup(self):
+    def setup(self) -> None:
         # channels used in decoder
-        block_in = self.cfg["ch"] * self.cfg["ch_mult"][-1]
+        block_in: int = self.cfg["ch"] * self.cfg["ch_mult"][-1]
 
         # convolutional layer applied first
         # torch code pads with zeros, what does flax pad with? Tests pass so I guess it's fine.
-        self.conv_in = nn.Conv(features=block_in, kernel_size=[3, 3], padding=1)
+        self.conv_in: nn.Conv = nn.Conv(
+            features=block_in, kernel_size=[3, 3], padding=1
+        )
 
         # middle blocks
-        self.mid_resnet_1 = ResnetBlock(out_channels=block_in, in_channels=block_in)
-        self.mid_attn_1 = AttnBlock(in_channels=block_in)
-        self.mid_resnet_2 = ResnetBlock(out_channels=block_in, in_channels=block_in)
+        self.mid_resnet_1: ResnetBlock = ResnetBlock(
+            out_channels=block_in, in_channels=block_in
+        )
+        self.mid_attn_1: AttnBlock = AttnBlock(in_channels=block_in)
+        self.mid_resnet_2: ResnetBlock = ResnetBlock(
+            out_channels=block_in, in_channels=block_in
+        )
 
 
 class ResnetBlock(nn.Module):
     in_channels: int
     out_channels: int
 
-    def setup(self):
-        self.norm1 = BatchlessGroupNorm(num_groups=32, epsilon=1e-6)
-        self.conv1 = nn.Conv(features=self.out_channels, kernel_size=[3, 3], padding=1)
-        self.norm2 = BatchlessGroupNorm(num_groups=32, epsilon=1e-6)
-        self.conv2 = nn.Conv(features=self.out_channels, kernel_size=[3, 3], padding=1)
+    def setup(self) -> None:
+        self.norm1: BatchlessGroupNorm = BatchlessGroupNorm(num_groups=32, epsilon=1e-6)
+        self.conv1: nn.Conv = nn.Conv(
+            features=self.out_channels, kernel_size=[3, 3], padding=1
+        )
+        self.norm2: BatchlessGroupNorm = BatchlessGroupNorm(num_groups=32, epsilon=1e-6)
+        self.conv2: nn.Conv = nn.Conv(
+            features=self.out_channels, kernel_size=[3, 3], padding=1
+        )
 
-    def __call__(self, x):
+    def __call__(self, x: jax.Array) -> jax.Array:
         assert (
             len(x.shape) == 3 and x.shape[-1] == self.in_channels
-        ), f"resnet block should be called with shape h w c and {in_channels} channels, got {x.shape}"
+        ), f"resnet block should be called with shape h w c and {self.in_channels} channels, got {x.shape}"
         h = self.norm1(x)
-        h = nn.activation.swish(h)
+        # no idea why mypy thinks nn.activation doesn't export swish
+        h = nn.activation.swish(h)  # type:ignore[attr-defined]
         h = self.conv1(h)
         # temb is always None in torch, so skip it here
         h = self.norm2(h)
-        h = nn.activation.swish(h)
+        h = nn.activation.swish(h)  # type:ignore[attr-defined]
         # there's dropout here in the torch code, but we skip it because we only want to do inference
         h = self.conv2(h)
         # there's a bunch of code about "use_conv_shortcut" in the torch code but that param is
@@ -154,16 +166,22 @@ class AttnBlock(nn.Module):
 
     in_channels: int
 
-    def setup(self):
-        self.norm = BatchlessGroupNorm(num_groups=32, epsilon=1e-6)
-        self.q = nn.Conv(features=self.in_channels, kernel_size=[1, 1], padding=0)
-        self.k = nn.Conv(features=self.in_channels, kernel_size=[1, 1], padding=0)
-        self.v = nn.Conv(features=self.in_channels, kernel_size=[1, 1], padding=0)
-        self.proj_out = nn.Conv(
+    def setup(self) -> None:
+        self.norm: BatchlessGroupNorm = BatchlessGroupNorm(num_groups=32, epsilon=1e-6)
+        self.q: nn.Conv = nn.Conv(
+            features=self.in_channels, kernel_size=[1, 1], padding=0
+        )
+        self.k: nn.Conv = nn.Conv(
+            features=self.in_channels, kernel_size=[1, 1], padding=0
+        )
+        self.v: nn.Conv = nn.Conv(
+            features=self.in_channels, kernel_size=[1, 1], padding=0
+        )
+        self.proj_out: nn.Conv = nn.Conv(
             features=self.in_channels, kernel_size=[1, 1], padding=0
         )
 
-    def __call__(self, x):
+    def __call__(self, x: jax.Array) -> jax.Array:
         assert len(x.shape) == 3 and x.shape[-1] == self.in_channels
         height, width, _channels = x.shape
         h = self.norm(x)
@@ -188,27 +206,29 @@ class AttnBlock(nn.Module):
 class BatchlessGroupNorm(nn.GroupNorm):
     """Version of GroupNorm that doesn't require a batch dimension."""
 
-    def __call__(self, x):
+    def __call__(self, x: jax.Array) -> jax.Array:
         input = rearrange(x, "... -> 1 ...")
-        res = super().__call__(input)
-        return rearrange(res, "1 ... -> ...")
+        res = super().__call__(input)  # type:ignore[no-untyped-call]
+        return rearrange(res, "1 ... -> ...")  # type:ignore[no-any-return]
 
 
-def _setup_comparison_test(name):
+def _setup_comparison_test(
+    name: str,
+) -> Tuple[Path, Path, LDMAutoencoder, dict[str, Any]]:
     """Load stuff to compare Flax & Torch behavior."""
     src_dir = Path(__file__).parent
     path_prefix = src_dir / f"test-images/{name}"
     cfg = OmegaConf.load(
         src_dir / "vendor/latent-diffusion/models/first_stage_models/vq-f4/config.yaml"
     )
-    mdl = LDMAutoencoder(cfg=cfg["model"]["params"])
+    mdl = LDMAutoencoder(cfg=cfg["model"]["params"])  # type: ignore[index]
     params = LDMAutoencoder.params_from_torch(
         torch.load(src_dir / "vq-f4.ckpt", map_location="cpu")
     )
     return src_dir, path_prefix, mdl, params
 
 
-def _test_embedding(name):
+def _test_embedding(name: str) -> None:
     """Test that the embedding matches the one from the original implementation."""
     src_dir, path_prefix, mdl, params = _setup_comparison_test(name)
     codes = jnp.load(path_prefix.with_suffix(".codes.npy"))
@@ -222,21 +242,21 @@ def _test_embedding(name):
     np.testing.assert_array_equal(golden_embedded_codes, computed_embedded_codes)
 
 
-def _test_post_quant_conv(name):
+def _test_post_quant_conv(name: str) -> None:
     """Test that the post-quantization convolution matches the one from the original implementation."""
     src_dir, path_prefix, mdl, params = _setup_comparison_test(name)
-    embedded_codes = jnp.load(path_prefix.with_suffix(".embedded_codes.npy"))
+    embedded_codes: jax.Array = jnp.load(path_prefix.with_suffix(".embedded_codes.npy"))
     assert embedded_codes.shape == (3, 64, 64)
 
-    golden_convolved_embedded_codes = jnp.load(
+    golden_convolved_embedded_codes: jax.Array = jnp.load(
         path_prefix.with_suffix(".convolved_embedded_codes.npy")
     )
     assert golden_convolved_embedded_codes.shape == (3, 64, 64)
     assert not (np.array_equal(embedded_codes, golden_convolved_embedded_codes))
 
-    computed_convolved_embedded_codes = mdl.apply(
+    computed_convolved_embedded_codes: jax.Array = mdl.apply(
         params, x=rearrange(embedded_codes, "c h w -> h w c"), method=mdl._conv_embeds
-    )
+    )  # type: ignore[assignment]
     assert computed_convolved_embedded_codes.shape == (64, 64, 3)
     np.testing.assert_allclose(
         rearrange(golden_convolved_embedded_codes, "c h w -> h w c"),
@@ -245,7 +265,7 @@ def _test_post_quant_conv(name):
     )
 
 
-def _test_dec_conv_in(name):
+def _test_dec_conv_in(name: str) -> None:
     """Test that the first convolutional layer in the decoder matches the pytorch implementation."""
     src_dir, path_prefix, mdl, params = _setup_comparison_test(name)
     convolved_embedded_codes = jnp.load(
@@ -254,27 +274,27 @@ def _test_dec_conv_in(name):
     assert convolved_embedded_codes.shape == (3, 64, 64)
     golden_conv_in = jnp.load(path_prefix.with_suffix(".post_conv_hidden.npy"))
     assert golden_conv_in.shape == (512, 64, 64)
-    computed_conv_in = mdl.apply(
+    computed_conv_in: jax.Array = mdl.apply(
         params,
         x=rearrange(convolved_embedded_codes, "c h w -> h w c"),
         method=mdl._dec_conv_in,
-    )
+    )  # type: ignore[assignment]
     assert computed_conv_in.shape == (64, 64, 512)
     np.testing.assert_allclose(
         computed_conv_in, rearrange(golden_conv_in, "c h w -> h w c")
     )
 
 
-def _test_mid_resnet_block_1(name):
+def _test_mid_resnet_block_1(name: str) -> None:
     """Test that the first resnet block in the middle of the decoder matches the pytorch implementation."""
     src_dir, path_prefix, mdl, params = _setup_comparison_test(name)
     conv_in = jnp.load(path_prefix.with_suffix(".post_conv_hidden.npy"))
     assert conv_in.shape == (512, 64, 64)
     golden_mid_resnet_1 = jnp.load(path_prefix.with_suffix(".post_resnet_1_hidden.npy"))
     assert golden_mid_resnet_1.shape == (512, 64, 64)
-    computed_mid_resnet_1 = mdl.apply(
+    computed_mid_resnet_1: jax.Array = mdl.apply(
         params, x=rearrange(conv_in, "c h w -> h w c"), method=mdl._dec_mid_resnet_1
-    )
+    )  # type: ignore[assignment]
     assert computed_mid_resnet_1.shape == (64, 64, 512)
     np.testing.assert_allclose(
         rearrange(computed_mid_resnet_1, "h w c -> c h w"),
@@ -286,18 +306,18 @@ def _test_mid_resnet_block_1(name):
     )
 
 
-def _test_mid_attn_block_1(name):
+def _test_mid_attn_block_1(name: str) -> None:
     """Test that the attention block in the decoder matches the pytorch implementation."""
     src_dir, path_prefix, mdl, params = _setup_comparison_test(name)
     post_resnet1_hidden = jnp.load(path_prefix.with_suffix(".post_resnet_1_hidden.npy"))
     assert post_resnet1_hidden.shape == (512, 64, 64)
     golden_mid_attn_1 = jnp.load(path_prefix.with_suffix(".post_attn_hidden.npy"))
     assert golden_mid_attn_1.shape == (512, 64, 64)
-    computed_mid_attn_1 = mdl.apply(
+    computed_mid_attn_1: jax.Array = mdl.apply(
         params,
         x=rearrange(post_resnet1_hidden, "c h w -> h w c"),
         method=mdl._dec_mid_attn,
-    )
+    )  # type: ignore[assignment]
     assert computed_mid_attn_1.shape == (64, 64, 512)
     np.testing.assert_allclose(
         rearrange(computed_mid_attn_1, "h w c -> c h w"),
@@ -307,41 +327,41 @@ def _test_mid_attn_block_1(name):
     )
 
 
-def test_embedding_me():
+def test_embedding_me() -> None:
     _test_embedding("devil me")
 
 
-def test_embedding_painting():
+def test_embedding_painting() -> None:
     _test_embedding("painty lady")
 
 
-def test_post_quant_conv_me():
+def test_post_quant_conv_me() -> None:
     _test_post_quant_conv("devil me")
 
 
-def test_post_quant_conv_painting():
+def test_post_quant_conv_painting() -> None:
     _test_post_quant_conv("painty lady")
 
 
-def test_dec_conv_in_me():
+def test_dec_conv_in_me() -> None:
     _test_dec_conv_in("devil me")
 
 
-def test_dec_conv_in_painting():
+def test_dec_conv_in_painting() -> None:
     _test_dec_conv_in("painty lady")
 
 
-def test_mid_resnet_block_1_me():
+def test_mid_resnet_block_1_me() -> None:
     _test_mid_resnet_block_1("devil me")
 
 
-def test_mid_resnet_block_1_painting():
+def test_mid_resnet_block_1_painting() -> None:
     _test_mid_resnet_block_1("painty lady")
 
 
-def test_mid_attn_block_1_me():
+def test_mid_attn_block_1_me() -> None:
     _test_mid_attn_block_1("devil me")
 
 
-def test_mid_attn_block_1_painting():
+def test_mid_attn_block_1_painting() -> None:
     _test_mid_attn_block_1("painty lady")
