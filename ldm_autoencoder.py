@@ -45,6 +45,10 @@ class LDMAutoencoder(nn.Module):
         """Run the 1st resnet block of the middle of the decoder. For testing."""
         return self.decoder.mid_resnet_1(x)
 
+    def _dec_mid_attn(self, x):
+        """Run the attention block in the middle of the decoder. For testing."""
+        return self.decoder.mid_attn_1(x)
+
     @staticmethod
     def params_from_torch(state_dict):
         """Load the parameters from a torch checkpoint."""
@@ -73,6 +77,15 @@ class LDMAutoencoder(nn.Module):
                 "norm2": groupnorm_params(prefix + ".norm2"),
             }
 
+        def attn_block_params(prefix: str):
+            return {
+                "norm": groupnorm_params(prefix + ".norm"),
+                "q": conv2d_params(prefix + ".q"),
+                "k": conv2d_params(prefix + ".k"),
+                "v": conv2d_params(prefix + ".v"),
+                "proj_out": conv2d_params(prefix + ".proj_out"),
+            }
+
         params = {
             "params": {
                 "embedding": {"embedding": state_dict["quantize.embedding.weight"]},
@@ -81,6 +94,7 @@ class LDMAutoencoder(nn.Module):
                     "conv_in": conv2d_params("decoder.conv_in"),
                     "mid_resnet_1": resnet_block_params("decoder.mid.block_1"),
                     "mid_resnet_2": resnet_block_params("decoder.mid.block_2"),
+                    "mid_attn_1": attn_block_params("decoder.mid.attn_1"),
                 },
             }
         }
@@ -102,7 +116,7 @@ class LDMDecoder(nn.Module):
 
         # middle blocks
         self.mid_resnet_1 = ResnetBlock(out_channels=block_in, in_channels=block_in)
-        self.mid_attn_1 = None  # TODO
+        self.mid_attn_1 = AttnBlock(in_channels=block_in)
         self.mid_resnet_2 = ResnetBlock(out_channels=block_in, in_channels=block_in)
 
 
@@ -130,6 +144,44 @@ class ResnetBlock(nn.Module):
         h = self.conv2(h)
         # there's a bunch of code about "use_conv_shortcut" in the torch code but that param is
         # always false so it's not included here.
+        return x + h
+
+
+class AttnBlock(nn.Module):
+    """Self attention block. I could use Flax's self attention code but it seems easier to ensure
+    the implementation is the same if I just reimplement the latent diffusion Torch code.
+    """
+
+    in_channels: int
+
+    def setup(self):
+        self.norm = BatchlessGroupNorm(num_groups=32, epsilon=1e-6)
+        self.q = nn.Conv(features=self.in_channels, kernel_size=[1, 1], padding=0)
+        self.k = nn.Conv(features=self.in_channels, kernel_size=[1, 1], padding=0)
+        self.v = nn.Conv(features=self.in_channels, kernel_size=[1, 1], padding=0)
+        self.proj_out = nn.Conv(
+            features=self.in_channels, kernel_size=[1, 1], padding=0
+        )
+
+    def __call__(self, x):
+        assert len(x.shape) == 3 and x.shape[-1] == self.in_channels
+        height, width, _channels = x.shape
+        h = self.norm(x)
+
+        q = self.q(h)
+        k = self.k(h)
+        v = self.v(h)
+
+        q = rearrange(q, "h w c -> (h w) c")
+        k = rearrange(k, "h w c -> (h w) c")
+        v = rearrange(v, "h w c -> (h w) c")
+
+        attn = jax.nn.softmax((q @ k.T) * self.in_channels ** (-0.5))
+
+        h = attn @ v
+
+        h = rearrange(h, "(h w) c -> h w c", h=height, w=width)
+        h = self.proj_out(h)
         return x + h
 
 
@@ -234,6 +286,27 @@ def _test_mid_resnet_block_1(name):
     )
 
 
+def _test_mid_attn_block_1(name):
+    """Test that the attention block in the decoder matches the pytorch implementation."""
+    src_dir, path_prefix, mdl, params = _setup_comparison_test(name)
+    post_resnet1_hidden = jnp.load(path_prefix.with_suffix(".post_resnet_1_hidden.npy"))
+    assert post_resnet1_hidden.shape == (512, 64, 64)
+    golden_mid_attn_1 = jnp.load(path_prefix.with_suffix(".post_attn_hidden.npy"))
+    assert golden_mid_attn_1.shape == (512, 64, 64)
+    computed_mid_attn_1 = mdl.apply(
+        params,
+        x=rearrange(post_resnet1_hidden, "c h w -> h w c"),
+        method=mdl._dec_mid_attn,
+    )
+    assert computed_mid_attn_1.shape == (64, 64, 512)
+    np.testing.assert_allclose(
+        rearrange(computed_mid_attn_1, "h w c -> c h w"),
+        golden_mid_attn_1,
+        atol=1e-4,
+        rtol=0,
+    )
+
+
 def test_embedding_me():
     _test_embedding("devil me")
 
@@ -264,3 +337,11 @@ def test_mid_resnet_block_1_me():
 
 def test_mid_resnet_block_1_painting():
     _test_mid_resnet_block_1("painty lady")
+
+
+def test_mid_attn_block_1_me():
+    _test_mid_attn_block_1("devil me")
+
+
+def test_mid_attn_block_1_painting():
+    _test_mid_attn_block_1("painty lady")

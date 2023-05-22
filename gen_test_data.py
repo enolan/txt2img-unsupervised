@@ -85,3 +85,12 @@ print(
     f"Saving post resnet 1 hidden to {post_resnet_1_hidden_path}, shape {post_resnet_1_hidden_np.shape}"
 )
 np.save(post_resnet_1_hidden_path, post_resnet_1_hidden_np)
+
+# Save hidden representation after attention block in decoder
+post_attn_hidden = model.decoder.mid.attn_1(post_resnet_1_hidden)
+post_attn_hidden_np = post_attn_hidden.detach().numpy().squeeze(0)
+post_attn_hidden_path = img_path.with_suffix(".post_attn_hidden.npy")
+print(
+    f"Saving post attn hidden to {post_attn_hidden_path}, shape {post_attn_hidden_np.shape}"
+)
+np.save(post_attn_hidden_path, post_attn_hidden_np)
