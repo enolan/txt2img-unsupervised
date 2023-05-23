@@ -105,3 +105,12 @@ print(
     f"Saving post mid hidden to {post_mid_hidden_path}, shape {post_mid_hidden_np.shape}"
 )
 np.save(post_mid_hidden_path, post_mid_hidden_np)
+
+# Save hidden representation after upsampling
+post_up_hidden = model.decoder.upsample(post_mid_hidden)
+post_up_hidden_np = post_up_hidden.detach().numpy().squeeze(0)
+post_up_hidden_path = img_path.with_suffix(".post_upsample_hidden.npy")
+print(
+    f"Saving post up hidden to {post_up_hidden_path}, shape {post_up_hidden_np.shape}"
+)
+np.save(post_up_hidden_path, post_up_hidden_np)

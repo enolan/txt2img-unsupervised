@@ -1,4 +1,5 @@
 import jax
+import jax.image
 import jax.numpy as jnp
 import flax.core.frozen_dict as frozen_dict
 from flax.core.frozen_dict import FrozenDict
@@ -56,8 +57,14 @@ class LDMAutoencoder(nn.Module):
         """Run the entire set of middle blocks in the decoder. For testing."""
         return self.decoder._mid(x)
 
+    def _dec_upsample(self, x: jax.Array) -> jax.Array:
+        """Run the upsampling blocks in the decoder. For testing."""
+        return self.decoder.upsample_blocks(x)  # type:ignore[no-any-return]
+
     @staticmethod
-    def params_from_torch(state_dict: dict[str, Any]) -> FrozenDict[str, Any]:
+    def params_from_torch(
+        state_dict: dict[str, Any], cfg: dict[str, Any]
+    ) -> FrozenDict[str, Any]:
         """Load the parameters from a torch checkpoint."""
         state_dict = state_dict["state_dict"]
 
@@ -77,12 +84,15 @@ class LDMAutoencoder(nn.Module):
             }
 
         def resnet_block_params(prefix: str) -> dict[str, Any]:
-            return {
+            ret = {
                 "conv1": conv2d_params(prefix + ".conv1"),
                 "conv2": conv2d_params(prefix + ".conv2"),
                 "norm1": groupnorm_params(prefix + ".norm1"),
                 "norm2": groupnorm_params(prefix + ".norm2"),
             }
+            if prefix + ".nin_shortcut.weight" in state_dict:
+                ret["nin_shortcut"] = conv2d_params(prefix + ".nin_shortcut")
+            return ret
 
         def attn_block_params(prefix: str) -> dict[str, Any]:
             return {
@@ -93,6 +103,26 @@ class LDMAutoencoder(nn.Module):
                 "proj_out": conv2d_params(prefix + ".proj_out"),
             }
 
+        def upsample_block_params(prefix: str) -> dict[str, Any]:
+            ret: dict[str, Any] = {"rn_blocks": {}}
+            for i in range(cfg["ddconfig"]["num_res_blocks"] + 1):
+                ret["rn_blocks"][f"layers_{i}"] = resnet_block_params(
+                    f"{prefix}.block.{i}"
+                )
+            if prefix + ".upsample.conv.weight" in state_dict:
+                ret["upconv"] = conv2d_params(prefix + ".upsample.conv")
+            return ret
+
+        def upsample_blocks_params(prefix: str) -> dict[str, Any]:
+            ret = {}
+            num_resolutions = len(cfg["ddconfig"]["ch_mult"])
+            for i in range(num_resolutions):
+                # torch layers are in reverse order
+                ret[f"layers_{i}"] = upsample_block_params(
+                    f"{prefix}.{num_resolutions - 1 - i}"
+                )
+            return ret
+
         params = {
             "params": {
                 "embedding": {"embedding": state_dict["quantize.embedding.weight"]},
@@ -102,6 +132,7 @@ class LDMAutoencoder(nn.Module):
                     "mid_resnet_1": resnet_block_params("decoder.mid.block_1"),
                     "mid_resnet_2": resnet_block_params("decoder.mid.block_2"),
                     "mid_attn_1": attn_block_params("decoder.mid.attn_1"),
+                    "upsample_blocks": upsample_blocks_params("decoder.up"),
                 },
             }
         }
@@ -133,11 +164,84 @@ class LDMDecoder(nn.Module):
             out_channels=block_in, in_channels=block_in
         )
 
+        # upsampling blocks
+        upsample_blocks: list[UpsamplingBlock] = []
+        channels = block_in
+        for i_level in reversed(range(len(self.cfg["ch_mult"]))):
+            out_channels = self.cfg["ch"] * self.cfg["ch_mult"][i_level]
+            print(
+                f"i_level {i_level} input channels {channels} output channels {out_channels}"
+            )
+            upsample_blocks.append(
+                UpsamplingBlock(
+                    in_channels=channels,
+                    out_channels=self.cfg["ch"] * self.cfg["ch_mult"][i_level],
+                    do_upsample=i_level != 0,
+                    num_res_blocks=self.cfg["num_res_blocks"],
+                )
+            )
+            channels = out_channels
+        self.upsample_blocks: nn.Sequential = nn.Sequential(upsample_blocks)
+
     def _mid(self, x: jax.Array) -> jax.Array:
         """Run the middle blocks."""
         h = self.mid_resnet_1(x)
         h = self.mid_attn_1(h)
         h = self.mid_resnet_2(h)
+        return h
+
+
+class UpsamplingBlock(nn.Module):
+    """One block of the decoder's upsampler. On each block but the last we double the resolution."""
+
+    in_channels: int
+    out_channels: int
+    num_res_blocks: int
+    # whether to do the actual nearest neighbor upsampling. False on the last
+    # block, True otherwise.
+    do_upsample: bool
+
+    def setup(self) -> None:
+        # In the torch code attention blocks can be used as well. The vq-f4 model uses no attention
+        # blocks, so we don't bother implementing attention blocks.
+        # the number of resnet blocks is the number in the config file plus one. WTFFFFFFFFFFF
+        rn_blocks: list[ResnetBlock] = []
+        rn_blocks.append(
+            ResnetBlock(in_channels=self.in_channels, out_channels=self.out_channels)
+        )
+        rn_blocks.extend(
+            [
+                ResnetBlock(
+                    in_channels=self.out_channels, out_channels=self.out_channels
+                )
+                for _ in range(self.num_res_blocks)
+            ]
+        )
+        self.rn_blocks = nn.Sequential(rn_blocks)
+
+        if self.do_upsample:
+            # Whether there's a convolutional layer here is also optional, but always true in vq-f4.
+            self.upconv: Optional[nn.Conv] = nn.Conv(
+                features=self.out_channels, kernel_size=[3, 3], padding=1
+            )
+        else:
+            self.upconv = None
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        assert (
+            len(x.shape) == 3
+            and x.shape[0] == x.shape[1]
+            and x.shape[2] == self.in_channels
+        )
+        h: jax.Array = self.rn_blocks(x)
+        if self.upconv is not None:
+            out_res = x.shape[1] * 2
+            h = jax.image.resize(
+                h,
+                shape=[out_res, out_res, self.out_channels],
+                method=jax.image.ResizeMethod.NEAREST,
+            )
+            h = self.upconv(h)
         return h
 
 
@@ -154,6 +258,12 @@ class ResnetBlock(nn.Module):
         self.conv2: nn.Conv = nn.Conv(
             features=self.out_channels, kernel_size=[3, 3], padding=1
         )
+        if self.in_channels != self.out_channels:
+            self.nin_shortcut: Optional[nn.Conv] = nn.Conv(
+                features=self.out_channels, kernel_size=[1, 1], padding=0
+            )
+        else:
+            self.nin_shortcut = None
 
     def __call__(self, x: jax.Array) -> jax.Array:
         assert (
@@ -170,6 +280,8 @@ class ResnetBlock(nn.Module):
         h = self.conv2(h)
         # there's a bunch of code about "use_conv_shortcut" in the torch code but that param is
         # always false so it's not included here.
+        if self.nin_shortcut is not None:
+            x = self.nin_shortcut(x)
         return x + h
 
 
@@ -235,9 +347,11 @@ def _setup_comparison_test(
     cfg = OmegaConf.load(
         src_dir / "vendor/latent-diffusion/models/first_stage_models/vq-f4/config.yaml"
     )
-    mdl = LDMAutoencoder(cfg=cfg["model"]["params"])  # type: ignore[index]
+    cfg = cfg["model"]["params"]  # type:ignore[index]
+    mdl = LDMAutoencoder(cfg=cfg)  # type:ignore[arg-type]
     params = LDMAutoencoder.params_from_torch(
-        torch.load(src_dir / "vq-f4.ckpt", map_location="cpu")
+        torch.load(src_dir / "vq-f4.ckpt", map_location="cpu"),
+        cfg,  # type:ignore[arg-type]
     )
     return src_dir, path_prefix, mdl, params
 
@@ -362,6 +476,27 @@ def _test_mid_full(name: str) -> None:
     )
 
 
+def _test_upsample(name: str) -> None:
+    """Test that the upsampling block in the decoder matches the pytorch implementation."""
+    src_dir, path_prefix, mdl, params = _setup_comparison_test(name)
+    post_mid_hidden = jnp.load(path_prefix.with_suffix(".post_mid_hidden.npy"))
+    assert post_mid_hidden.shape == (512, 64, 64)
+    golden_upsample = jnp.load(path_prefix.with_suffix(".post_upsample_hidden.npy"))
+    assert golden_upsample.shape == (128, 256, 256)
+    computed_upsample: jax.Array = mdl.apply(
+        params,
+        x=rearrange(post_mid_hidden, "c h w -> h w c"),
+        method=mdl._dec_upsample,
+    )  # type: ignore[assignment]
+    assert computed_upsample.shape == (256, 256, 128)
+    np.testing.assert_allclose(
+        rearrange(computed_upsample, "h w c -> c h w"),
+        golden_upsample,
+        atol=2e-2,  # I am getting less and less comfortable with these tolerances :/
+        rtol=0,
+    )
+
+
 def test_embedding_me() -> None:
     _test_embedding("devil me")
 
@@ -408,3 +543,11 @@ def test_mid_full_me() -> None:
 
 def test_mid_full_painting() -> None:
     _test_mid_full("painty lady")
+
+
+def test_upsample_me() -> None:
+    _test_upsample("devil me")
+
+
+def test_upsample_painting() -> None:
+    _test_upsample("painty lady")

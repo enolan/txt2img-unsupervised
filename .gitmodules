@@ -3,7 +3,7 @@
 	url = https://github.com/borisdayma/clip-jax.git
 [submodule "vendor/latent-diffusion"]
 	path = vendor/latent-diffusion
-	url = https://github.com/CompVis/latent-diffusion.git
+	url = https://github.com/enolan/latent-diffusion.git
 [submodule "vendor/taming-transformers"]
 	path = vendor/taming-transformers
 	url = https://github.com/CompVis/taming-transformers.git
