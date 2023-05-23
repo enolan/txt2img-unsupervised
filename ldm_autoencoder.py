@@ -37,6 +37,16 @@ class LDMAutoencoder(nn.Module):
             x = x.reshape(shape)
         return self.embedding(x)  # type:ignore[no-any-return]
 
+    def decode(self, x: jax.Array) -> jax.Array:
+        """Decode from the int codes."""
+        assert x.dtype == jnp.int64 or x.dtype == jnp.int32
+        assert len(x.shape) == 1
+        h = self.embed(x, shape=(64, 64))
+        assert h.shape == (64, 64, 3)
+        h = self.post_quant_conv(h)
+        assert h.shape == (64, 64, 3)
+        return self.decoder(h)
+
     def _conv_embeds(self, x: jax.Array) -> jax.Array:
         """Run the post-quantization convolutional layer on the embedded codes. For testing."""
         return self.post_quant_conv(x)  # type:ignore[no-any-return]
@@ -133,6 +143,8 @@ class LDMAutoencoder(nn.Module):
                     "mid_resnet_2": resnet_block_params("decoder.mid.block_2"),
                     "mid_attn_1": attn_block_params("decoder.mid.attn_1"),
                     "upsample_blocks": upsample_blocks_params("decoder.up"),
+                    "norm_out": groupnorm_params("decoder.norm_out"),
+                    "conv_out": conv2d_params("decoder.conv_out"),
                 },
             }
         }
@@ -183,12 +195,31 @@ class LDMDecoder(nn.Module):
             channels = out_channels
         self.upsample_blocks: nn.Sequential = nn.Sequential(upsample_blocks)
 
+        # output phase
+        self.norm_out = BatchlessGroupNorm(num_groups=32, epsilon=1e-6)
+        self.conv_out = nn.Conv(
+            features=self.cfg["out_ch"], kernel_size=[3, 3], padding=1
+        )
+
     def _mid(self, x: jax.Array) -> jax.Array:
         """Run the middle blocks."""
         h = self.mid_resnet_1(x)
         h = self.mid_attn_1(h)
         h = self.mid_resnet_2(h)
         return h
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        """Run the decoder."""
+        assert len(x.shape) == 3, f"expected h w c array, got {x.shape}"
+        height, width, c = x.shape
+        assert height == width
+        h = self.conv_in(x)
+        h = self._mid(h)
+        h = self.upsample_blocks(h)
+        h = self.norm_out(h)
+        h = nn.activation.swish(h)  # type: ignore[attr-defined]
+        h = self.conv_out(h)
+        return h  # type: ignore[no-any-return]
 
 
 class UpsamplingBlock(nn.Module):
@@ -497,6 +528,29 @@ def _test_upsample(name: str) -> None:
     )
 
 
+def _test_full_decode(name: str) -> None:
+    """Test full decoding pipeline from int codes."""
+    src_dir, path_prefix, mdl, params = _setup_comparison_test(name)
+    codes = jnp.load(path_prefix.with_suffix(".codes.npy"))
+    assert codes.shape == (4096,) and (
+        codes.dtype == jnp.int64 or codes.dtype == jnp.int32
+    )
+    golden_full_decode = jnp.load(path_prefix.with_suffix(".full_decode.npy"))
+    assert golden_full_decode.shape == (3, 256, 256)
+    computed_full_decode: jax.Array = mdl.apply(
+        params,
+        x=codes,
+        method=mdl.decode,
+    )  # type: ignore[assignment]
+    assert computed_full_decode.shape == (256, 256, 3)
+    np.testing.assert_allclose(
+        rearrange(computed_full_decode, "h w c -> c h w"),
+        golden_full_decode,
+        atol=1e-5,
+        rtol=0,
+    )
+
+
 def test_embedding_me() -> None:
     _test_embedding("devil me")
 
@@ -551,3 +605,11 @@ def test_upsample_me() -> None:
 
 def test_upsample_painting() -> None:
     _test_upsample("painty lady")
+
+
+def test_full_decode_me() -> None:
+    _test_full_decode("devil me")
+
+
+def test_full_decode_painting() -> None:
+    _test_full_decode("painty lady")

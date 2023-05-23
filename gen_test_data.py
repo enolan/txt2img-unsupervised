@@ -114,3 +114,10 @@ print(
     f"Saving post up hidden to {post_up_hidden_path}, shape {post_up_hidden_np.shape}"
 )
 np.save(post_up_hidden_path, post_up_hidden_np)
+
+# Save decoded image
+full_decode = model.decode(model.quantize.get_codebook_entry(z[2][2], [1, 64, 64, 3]))
+full_decode_np = full_decode.detach().numpy().squeeze(0)
+full_decode_path = img_path.with_suffix(".full_decode.npy")
+print(f"Saving full decode to {full_decode_path}, shape {full_decode_np.shape}")
+np.save(full_decode_path, full_decode_np)
