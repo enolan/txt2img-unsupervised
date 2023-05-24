@@ -47,8 +47,9 @@ codes_path = img_path.with_suffix(".codes.npy")
 print(f"Saving codes to {codes_path}, shape {codes.shape}")
 np.save(codes_path, codes)
 latents_path = img_path.with_suffix(".latents.npy")
-print(f"Saving latents to {latents_path}, shape {z[0].shape}")
-np.save(latents_path, z[0].detach().numpy())
+latents = z[0][0]
+print(f"Saving latents to {latents_path}, shape {latents.shape}")
+np.save(latents_path, latents.detach().numpy())
 
 # Save embedded codes
 embedded_codes = model.quantize.get_codebook_entry(z[2][2], [1, 64, 64, 3])

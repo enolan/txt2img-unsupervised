@@ -5,6 +5,7 @@ import flax.core.frozen_dict as frozen_dict
 from flax.core.frozen_dict import FrozenDict
 import flax.linen as nn
 import numpy as np
+import PIL
 import torch
 from einops import rearrange
 from omegaconf import OmegaConf
@@ -27,7 +28,9 @@ class LDMAutoencoder(nn.Module):
         self.post_quant_conv: nn.Conv = nn.Conv(
             features=self.cfg["ddconfig"]["z_channels"], kernel_size=[1, 1]
         )
+        self.quant_conv = nn.Conv(features=self.cfg["embed_dim"], kernel_size=[1, 1])
         self.decoder: LDMDecoder = LDMDecoder(cfg=self.cfg["ddconfig"])
+        self.encoder: LDMEncoder = LDMEncoder(cfg=self.cfg["ddconfig"])
 
     def embed(self, x: jax.Array, shape: Optional[tuple[int, int]] = None) -> jax.Array:
         """Embed the codes, reshaping them to (height, width), where height and width are
@@ -46,6 +49,14 @@ class LDMAutoencoder(nn.Module):
         h = self.post_quant_conv(h)
         assert h.shape == (64, 64, 3)
         return self.decoder(h)
+
+    def _encode_to_latents(self, x: jax.Array) -> jax.Array:
+        """Encode to the latents, without quantization."""
+        assert x.shape == (256, 256, 3)
+        h: jax.Array = self.encoder(x)
+        h = self.quant_conv(h)
+        assert h.shape == (64, 64, 3)
+        return h
 
     def _conv_embeds(self, x: jax.Array) -> jax.Array:
         """Run the post-quantization convolutional layer on the embedded codes. For testing."""
@@ -133,10 +144,27 @@ class LDMAutoencoder(nn.Module):
                 )
             return ret
 
+        def downsample_block_params(prefix: str) -> dict[str, Any]:
+            ret: dict[str, Any] = {"rn_blocks": {}}
+            for i in range(cfg["ddconfig"]["num_res_blocks"]):
+                ret["rn_blocks"][f"layers_{i}"] = resnet_block_params(
+                    f"{prefix}.block.{i}"
+                )
+            if prefix + ".downsample.conv.weight" in state_dict:
+                ret["downconv"] = conv2d_params(prefix + ".downsample.conv")
+            return ret
+
+        def downsample_blocks_params(prefix: str) -> dict[str, Any]:
+            ret = {}
+            for i in range(len(cfg["ddconfig"]["ch_mult"])):
+                ret[f"layers_{i}"] = downsample_block_params(f"{prefix}.{i}")
+            return ret
+
         params = {
             "params": {
                 "embedding": {"embedding": state_dict["quantize.embedding.weight"]},
                 "post_quant_conv": conv2d_params("post_quant_conv"),
+                "quant_conv": conv2d_params("quant_conv"),
                 "decoder": {
                     "conv_in": conv2d_params("decoder.conv_in"),
                     "mid_resnet_1": resnet_block_params("decoder.mid.block_1"),
@@ -145,6 +173,15 @@ class LDMAutoencoder(nn.Module):
                     "upsample_blocks": upsample_blocks_params("decoder.up"),
                     "norm_out": groupnorm_params("decoder.norm_out"),
                     "conv_out": conv2d_params("decoder.conv_out"),
+                },
+                "encoder": {
+                    "conv_in": conv2d_params("encoder.conv_in"),
+                    "conv_out": conv2d_params("encoder.conv_out"),
+                    "downsample_blocks": downsample_blocks_params("encoder.down"),
+                    "mid_resnet_1": resnet_block_params("encoder.mid.block_1"),
+                    "mid_resnet_2": resnet_block_params("encoder.mid.block_2"),
+                    "mid_attn_1": attn_block_params("encoder.mid.attn_1"),
+                    "norm_out": groupnorm_params("encoder.norm_out"),
                 },
             }
         }
@@ -273,6 +310,103 @@ class UpsamplingBlock(nn.Module):
                 method=jax.image.ResizeMethod.NEAREST,
             )
             h = self.upconv(h)
+        return h
+
+
+class LDMEncoder(nn.Module):
+    """Flax reimplementation of the LDM encoder."""
+
+    cfg: dict[str, Any]
+
+    def setup(self) -> None:
+        ch = self.cfg["ch"]
+
+        self.conv_in = nn.Conv(features=ch, kernel_size=[3, 3], padding=1)
+
+        ch_mult = self.cfg["ch_mult"]
+        in_ch_mult = [1] + ch_mult
+
+        self.downsample_blocks = nn.Sequential(
+            [
+                DownsamplingBlock(
+                    in_channels=ch * in_ch_mult[i_level],
+                    out_channels=ch * ch_mult[i_level],
+                    do_downsample=i_level != len(ch_mult) - 1,
+                    num_res_blocks=self.cfg["num_res_blocks"],
+                )
+                for i_level in range(len(ch_mult))
+            ]
+        )
+
+        channels = ch * ch_mult[-1]
+        self.mid_resnet_1 = ResnetBlock(in_channels=channels, out_channels=channels)
+        self.mid_attn_1 = AttnBlock(in_channels=channels)
+        self.mid_resnet_2 = ResnetBlock(in_channels=channels, out_channels=channels)
+
+        self.norm_out = BatchlessGroupNorm(num_groups=32, epsilon=1e-6)
+        self.conv_out = nn.Conv(
+            features=self.cfg["z_channels"], kernel_size=[3, 3], padding=1
+        )
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        assert (
+            len(x.shape) == 3 and x.shape[0] == x.shape[1]
+        ), f"expected h w c array, got {x.shape}"
+        height, width, c = x.shape
+        h = self.conv_in(x)
+        h = self.downsample_blocks(h)
+        h = self.mid_resnet_1(h)
+        h = self.mid_attn_1(h)
+        h = self.mid_resnet_2(h)
+        h = self.norm_out(h)
+        h = nn.activation.swish(h)  # type: ignore[attr-defined]
+        h = self.conv_out(h)
+        return h  # type: ignore[no-any-return]
+
+
+class DownsamplingBlock(nn.Module):
+    """Downsampling block of the LDM encoder. On each block but the last we halve the resolution."""
+
+    in_channels: int
+    out_channels: int
+    num_res_blocks: int
+    do_downsample: bool
+
+    def setup(self) -> None:
+        rn_blocks = [
+            ResnetBlock(in_channels=self.in_channels, out_channels=self.out_channels)
+        ]
+        rn_blocks.extend(
+            [
+                ResnetBlock(
+                    in_channels=self.out_channels, out_channels=self.out_channels
+                )
+                for i in range(self.num_res_blocks - 1)
+            ]
+        )
+        self.rn_blocks = nn.Sequential(rn_blocks)
+
+        if self.do_downsample:
+            self.downconv: Optional[nn.Conv] = nn.Conv(
+                features=self.out_channels,
+                kernel_size=[3, 3],
+                padding=[(0, 1), (0, 1)],
+                strides=2,
+            )
+        else:
+            self.downconv = None
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        assert (
+            len(x.shape) == 3
+            and x.shape[0] == x.shape[1]
+            and x.shape[2] == self.in_channels
+        )
+        h: jax.Array = self.rn_blocks(x)
+        if self.downconv is not None:
+            h = self.downconv(h)
+            assert h.shape[0] == x.shape[0] // 2
+            assert h.shape[1] == x.shape[1] // 2
         return h
 
 
@@ -551,6 +685,25 @@ def _test_full_decode(name: str) -> None:
     )
 
 
+def _test_encode_to_latents(name: str) -> None:
+    """Test encoding pipeline from image to latents."""
+    src_dir, path_prefix, mdl, params = _setup_comparison_test(name)
+    img: jax.Array = jnp.array(PIL.Image.open(path_prefix.with_suffix(".png")))
+    assert img.shape == (256, 256, 3)
+    img = img.astype(jnp.float32) / 127.5 - 1
+    golden_latents = jnp.load(path_prefix.with_suffix(".latents.npy"))
+    assert golden_latents.shape == (3, 64, 64)
+    computed_latents: jax.Array = mdl.apply(
+        params,
+        x=img,
+        method=mdl._encode_to_latents,
+    )
+    assert computed_latents.shape == (64, 64, 3)
+    np.testing.assert_allclose(
+        rearrange(computed_latents, "h w c -> c h w"), golden_latents
+    )
+
+
 def test_embedding_me() -> None:
     _test_embedding("devil me")
 
@@ -613,3 +766,11 @@ def test_full_decode_me() -> None:
 
 def test_full_decode_painting() -> None:
     _test_full_decode("painty lady")
+
+
+def test_encode_to_latents_me() -> None:
+    _test_encode_to_latents("devil me")
+
+
+def test_encode_to_latents_painting() -> None:
+    _test_encode_to_latents("painty lady")
