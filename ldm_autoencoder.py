@@ -41,14 +41,15 @@ class LDMAutoencoder(nn.Module):
             x = x.reshape(shape)
         return self.embedding(x)  # type:ignore[no-any-return]
 
-    def decode(self, x: jax.Array) -> jax.Array:
-        """Decode from the int codes."""
+    def decode(self, x: jax.Array, shape: tuple[int, int]) -> jax.Array:
+        """Decode from the int codes. Shape is the shape of the compressed representation, i.e.
+        (height / 4, width / 4)."""
         assert x.dtype == jnp.int64 or x.dtype == jnp.int32
         assert len(x.shape) == 1
-        h = self.embed(x, shape=(64, 64))
-        assert h.shape == (64, 64, 3)
+        h = self.embed(x, shape=shape)
+        assert h.shape == shape + (3,)
         h = self.post_quant_conv(h)
-        assert h.shape == (64, 64, 3)
+        assert h.shape == shape + (3,)
         return self.decoder(h)
 
     def encode(self, x: jax.Array) -> jax.Array:
@@ -59,10 +60,10 @@ class LDMAutoencoder(nn.Module):
 
     def _encode_to_latents(self, x: jax.Array) -> jax.Array:
         """Encode to the latents, without quantization."""
-        assert x.shape == (256, 256, 3)
+        assert len(x.shape) == 3 and x.shape[2] == 3
         h: jax.Array = self.encoder(x)
         h = self.quant_conv(h)
-        assert h.shape == (64, 64, 3)
+        assert h.shape == (x.shape[0] // 4, x.shape[1] // 4, 3)
         return h
 
     def _quantize(self, x: jax.Array) -> jax.Array:
@@ -694,6 +695,7 @@ def _test_full_decode(name: str) -> None:
     computed_full_decode: jax.Array = mdl.apply(
         params,
         x=codes,
+        shape=(64, 64),
         method=mdl.decode,
     )  # type: ignore[assignment]
     assert computed_full_decode.shape == (256, 256, 3)
