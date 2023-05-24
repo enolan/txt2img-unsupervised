@@ -1,17 +1,17 @@
-import jax
-import jax.image
-import jax.numpy as jnp
-import flax.core.frozen_dict as frozen_dict
-from flax.core.frozen_dict import FrozenDict
-import flax.linen as nn
-import numpy as np
-import PIL
-import torch
-import pytest
 from einops import rearrange, reduce
+from flax.core.frozen_dict import FrozenDict
 from omegaconf import OmegaConf
 from pathlib import Path
 from typing import Any, Optional, Tuple
+import flax.core.frozen_dict as frozen_dict
+import flax.linen as nn
+import jax
+import jax.image
+import jax.numpy as jnp
+import numpy as np
+import PIL
+import pytest
+import torch
 
 
 class LDMAutoencoder(nn.Module):
