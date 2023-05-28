@@ -2,9 +2,10 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import optax  # type: ignore[import]
+from copy import copy
 from dataclasses import dataclass
 from flax.core.frozen_dict import FrozenDict
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 
 class ImageModel(nn.Module):
@@ -13,7 +14,7 @@ class ImageModel(nn.Module):
     d_model: int
     num_heads: int
     ff_dim: int
-    dropout: float
+    dropout: Optional[float]
     n_layers: int
     seq_len: int
 
@@ -46,6 +47,29 @@ class ImageModel(nn.Module):
             h = tl(h, mask=mask)
         return self.logits_decoder(h)  # type: ignore[no-any-return]
 
+    def sample(self, top_p: float = 0.95) -> jax.Array:
+        """Sample a single image from the model."""
+        image = jnp.zeros((self.seq_len,), dtype=jnp.int32)
+        for i in range(self.seq_len):
+            logits = self(image)[i]
+            probs = jax.nn.softmax(logits)
+            sorted_probs, sorted_indices = (
+                jnp.sort(probs)[::-1],
+                jnp.argsort(probs)[::-1],
+            )
+            cumulative_probs = jnp.cumsum(sorted_probs)
+            mask = cumulative_probs <= top_p
+            filtered_probs, filtered_indices = sorted_probs[mask], sorted_indices[mask]
+            if not jnp.any(mask):
+                # This shouldn't happen, but if it does, just take the most probable
+                # token.
+                image = image.at[i].set(sorted_indices[0])
+            else:
+                rng = self.make_rng("sampling")
+                tok = sorted_indices[jax.random.categorical(rng, filtered_probs)]
+                image = image.at[i].set(tok)
+        return image
+
 
 class TransformerLayer(nn.Module):
     """A single transformer layer."""
@@ -53,7 +77,7 @@ class TransformerLayer(nn.Module):
     d_model: int
     num_heads: int
     ff_dim: int
-    dropout: float
+    dropout: Optional[float]
 
     def setup(self) -> None:
         self.mha = nn.SelfAttention(
@@ -69,7 +93,10 @@ class TransformerLayer(nn.Module):
         self.linear_1 = nn.Dense(features=self.ff_dim)
         self.linear_2 = nn.Dense(features=self.d_model)
         self.layer_norm_2 = nn.LayerNorm()
-        self.dropout_layer = nn.Dropout(self.dropout, deterministic=False)
+        if self.dropout is not None:
+            self.dropout_layer = nn.Dropout(self.dropout, deterministic=False)
+        else:
+            self.dropout_layer = nn.Dropout(rate=0, deterministic=True)
 
     def __call__(self, embeds: jax.Array, mask: jax.Array) -> jax.Array:
         out_block_1 = self.layer_norm_1(self.mha(embeds, mask=mask))
@@ -114,7 +141,7 @@ class ModelConfig:
     d_model: int
     num_heads: int
     ff_dim: int
-    dropout: float
+    dropout: Optional[float]
     n_layers: int
     seq_len: int
 
@@ -133,7 +160,7 @@ def train_loop_simple(
         rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
         image=jnp.zeros((gpt_1_config.seq_len,), dtype=jnp.int32),
     )
-    opt = optax.adam(learning_rate=1e-4)
+    opt = optax.adam(learning_rate=3e-4)
     opt_state = opt.init(params)
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
 
@@ -149,7 +176,7 @@ def train_loop_simple(
         new_params: FrozenDict[str, Any] = optax.apply_updates(params, updates)
         return new_params, opt_state, rng2, loss
 
-    opt_step = jax.jit(opt_step, donate_argnums=(0, 1, 2, 3))
+    opt_step = jax.jit(opt_step, donate_argnums=(0, 1, 2))
 
     dropout_rng = jax.random.PRNGKey(0)
     for i in range(iters):
@@ -166,6 +193,13 @@ def test_learn_zeros() -> None:
     data = jnp.zeros((16, gpt_1_config.seq_len), dtype=jnp.int32)
     loss, params = train_loop_simple(data, mdl, 10)
     assert loss < 1e-10
+    cfg = copy(gpt_1_config)
+    cfg.dropout = None
+    mdl = ImageModel(**cfg.__dict__)
+    sample = mdl.apply(
+        params, rngs={"sampling": jax.random.PRNGKey(0)}, method=ImageModel.sample
+    )
+    assert jnp.all(sample == 0)
 
 
 def test_learn_ranges() -> None:
@@ -174,3 +208,16 @@ def test_learn_ranges() -> None:
     data = jnp.arange(16 * gpt_1_config.seq_len).reshape((16, gpt_1_config.seq_len))
     loss, params = train_loop_simple(data, mdl, 300)
     assert loss < 0.6
+    cfg = copy(gpt_1_config)
+    cfg.dropout = None
+    mdl = ImageModel(**cfg.__dict__)
+    sample: jax.Array = mdl.apply(  # type: ignore[assignment]
+        params,
+        rngs={"sampling": jax.random.PRNGKey(69_420)},
+        method=ImageModel.sample,
+        top_p=0.95,
+    )
+    print(f"sample: {sample}")
+    # TODO when sampling isn't hideously slow, generate enough samples to check that each
+    # possibility is generated at least once
+    assert any([jnp.array_equal(sample, data[i]) for i in range(16)])
