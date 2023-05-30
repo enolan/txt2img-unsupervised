@@ -1,11 +1,14 @@
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax  # type: ignore[import]
 from copy import copy
 from dataclasses import dataclass
 from flax.core.frozen_dict import FrozenDict
+from functools import partial
 from typing import Any, Optional, Tuple
+from tqdm import trange
 
 
 class ImageModel(nn.Module):
@@ -47,28 +50,104 @@ class ImageModel(nn.Module):
             h = tl(h, mask=mask)
         return self.logits_decoder(h)  # type: ignore[no-any-return]
 
-    def sample(self, top_p: float = 0.95) -> jax.Array:
-        """Sample a single image from the model."""
-        image = jnp.zeros((self.seq_len,), dtype=jnp.int32)
-        for i in range(self.seq_len):
-            logits = self(image)[i]
-            probs = jax.nn.softmax(logits)
-            sorted_probs, sorted_indices = (
-                jnp.sort(probs)[::-1],
-                jnp.argsort(probs)[::-1],
-            )
-            cumulative_probs = jnp.cumsum(sorted_probs)
-            mask = cumulative_probs <= top_p
-            filtered_probs, filtered_indices = sorted_probs[mask], sorted_indices[mask]
-            if not jnp.any(mask):
-                # This shouldn't happen, but if it does, just take the most probable
-                # token.
-                image = image.at[i].set(sorted_indices[0])
-            else:
-                rng = self.make_rng("sampling")
-                tok = sorted_indices[jax.random.categorical(rng, filtered_probs)]
-                image = image.at[i].set(tok)
-        return image
+
+@partial(jax.jit, static_argnums=(0,))
+def sample(
+    mdl: ImageModel,
+    params: FrozenDict[str, Any],
+    rng: jax.random.KeyArray,
+    top_p: float = 0.95,
+) -> jax.Array:
+    """Sample a single image from the model. Returns an array of codes to be passed to the
+    LDM decoder."""
+
+    # This needs to be outside the linen module because the fori_loop combinator doesn't work
+    # inside them.
+    def loop_iter(
+        i: int, acc: Tuple[jax.Array, jax.random.KeyArray]
+    ) -> Tuple[jax.Array, jax.random.KeyArray]:
+        image, rng = acc
+        logits: jax.Array = mdl.apply(params, image=image)[i]  # type: ignore[assignment]
+        assert logits.shape == (8192,)
+        filtered_logits = _filter_top_p(logits, top_p)
+        rng2, rng3 = jax.random.split(rng, 2)
+        tok = jax.random.categorical(rng2, filtered_logits)
+        image = image.at[i].set(tok)
+        return (image, rng3)
+
+    image, _ = jax.lax.fori_loop(  # type: ignore[no-untyped-call]
+        0,
+        mdl.seq_len,
+        loop_iter,
+        (jnp.zeros((mdl.seq_len,), dtype=jnp.int32), rng),
+    )
+    return image  # type: ignore[no-any-return]
+
+
+def _filter_top_p(logits: jax.Array, top_p: float) -> jax.Array:
+    """Filter an array of logits to include the smallest subset of possibilities that has
+    proability mass at least p i.e. top p/nucleus sampling. Returns the filtered array.
+    """
+    probs = jax.nn.softmax(logits)
+    sorted_probs, sorted_indices = (
+        jnp.sort(probs)[::-1],
+        jnp.argsort(probs)[::-1],
+    )
+    cumulative_probs = jnp.cumsum(sorted_probs)
+    # collect the minimal set of possibilites with probability <= top_p
+    mask = cumulative_probs <= top_p
+    # Find the index of the first possibility that has cumulative probability >= top_p
+    # this might be the last element we found above or might be the one after it.
+    # we could do only the argmax and set the mask with a range but that's not JIT-able so we do
+    # this.
+    last_idx = jnp.argmax(cumulative_probs >= top_p)
+    mask = mask.at[last_idx].set(True)
+
+    # permute the mask back to the original order
+    mask = mask[sorted_indices.argsort()]
+
+    filtered_logits = jnp.where(mask, logits, -np.inf)
+    return filtered_logits
+
+
+def test_filter_top_p_10() -> None:
+    """Test that filter_top_p is the identity function when top_p = 1.0."""
+    logits = jnp.arange(10)
+    filtered_logits = _filter_top_p(logits, 1.0)
+    assert jnp.allclose(
+        filtered_logits, logits
+    ), "filter_top_p doesn't match the identity function when top_p = 1.0"
+
+
+def test_filter_top_p_05() -> None:
+    """Test that filter_top_p removes low-probability elements when top_p = 0.5."""
+    probabilities = jnp.array([0.35, 0.35, 0.1, 0.1, 0.1])
+    assert jnp.isclose(jnp.sum(probabilities), 1.0)
+    logits = jnp.log(probabilities)
+    filtered_logits = _filter_top_p(logits, 0.5)
+    np.testing.assert_allclose(
+        np.array(jax.nn.softmax(filtered_logits)), np.array([0.5, 0.5, 0, 0, 0])
+    )
+
+
+def test_filter_top_p_out_of_order() -> None:
+    """Test that filter_top_p removes low-probability elements when inputs do not start sorted."""
+    probabilities = np.repeat(1000.0, 7)
+    big_indices = np.array([3, 5])
+    medium_indices = np.array([2, 4])
+    small_indices = np.array([0, 1, 6])
+    probabilities[big_indices] = 0.25
+    probabilities[medium_indices] = 0.2
+    probabilities[small_indices] = 0.1 / 3.0
+    np.testing.assert_allclose(np.sum(probabilities), 1.0)
+
+    logits = jnp.log(probabilities)
+    filtered_logits = _filter_top_p(logits, 0.75)
+    filtered_probabilities = np.array(jax.nn.softmax(filtered_logits))
+
+    np.testing.assert_allclose(filtered_probabilities[small_indices], 0.0)
+    np.testing.assert_allclose(filtered_probabilities[medium_indices], 0.2 / 0.9)
+    np.testing.assert_allclose(filtered_probabilities[big_indices], 0.25 / 0.9)
 
 
 class TransformerLayer(nn.Module):
@@ -160,7 +239,7 @@ def train_loop_simple(
         rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
         image=jnp.zeros((gpt_1_config.seq_len,), dtype=jnp.int32),
     )
-    opt = optax.adam(learning_rate=3e-4)
+    opt = optax.adam(learning_rate=optax.linear_onecycle_schedule(iters, 1e-3))
     opt_state = opt.init(params)
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
 
@@ -196,28 +275,36 @@ def test_learn_zeros() -> None:
     cfg = copy(gpt_1_config)
     cfg.dropout = None
     mdl = ImageModel(**cfg.__dict__)
-    sample = mdl.apply(
-        params, rngs={"sampling": jax.random.PRNGKey(0)}, method=ImageModel.sample
-    )
-    assert jnp.all(sample == 0)
+    sampled_arr = sample(mdl, params, jax.random.PRNGKey(0))
+    assert jnp.all(sampled_arr == 0)
 
 
 def test_learn_ranges() -> None:
     """Test whether the model can learn to predict a range of integers."""
     mdl = ImageModel(**gpt_1_config.__dict__)
     data = jnp.arange(16 * gpt_1_config.seq_len).reshape((16, gpt_1_config.seq_len))
-    loss, params = train_loop_simple(data, mdl, 300)
+    # It's annoying how many iterations we need to get to minimal loss on such a trivial dataset
+    loss, params = train_loop_simple(data, mdl, 500)
     assert loss < 0.6
     cfg = copy(gpt_1_config)
     cfg.dropout = None
     mdl = ImageModel(**cfg.__dict__)
-    sample: jax.Array = mdl.apply(  # type: ignore[assignment]
-        params,
-        rngs={"sampling": jax.random.PRNGKey(69_420)},
-        method=ImageModel.sample,
-        top_p=0.95,
-    )
-    print(f"sample: {sample}")
-    # TODO when sampling isn't hideously slow, generate enough samples to check that each
-    # possibility is generated at least once
-    assert any([jnp.array_equal(sample, data[i]) for i in range(16)])
+    sample_jv = jax.jit(jax.vmap(lambda rng: sample(mdl, params, rng, top_p=0.99)))
+    print("Generating samples...")
+    total_samples = 256
+    samples_per_batch = 64
+    assert total_samples % samples_per_batch == 0
+    sample_batches = []
+    rng = jax.random.PRNGKey(0)
+    for _ in trange(total_samples // samples_per_batch):
+        rng, rng2 = jax.random.split(rng)
+        sample_batches.append(sample_jv(jax.random.split(rng2, samples_per_batch)))
+    sampled_arr: jax.Array = jnp.concatenate(sample_batches, axis=0)
+    print(f"Generated samples, shape: {sampled_arr.shape}")
+    counts = dict([(i, 0) for i in range(16)])
+    for i, s in enumerate(sampled_arr):
+        assert s[0] % 256 == 0
+        np.testing.assert_equal(np.array(s), np.array(s[0] + np.arange(256)))
+        counts[int(s[0] // 256)] += 1
+    print(f"counts: {counts}")
+    assert all([c > 0 for c in counts.values()])
