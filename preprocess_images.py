@@ -7,9 +7,11 @@ import jax
 import jax.numpy as jnp
 import PIL
 import torch
+from concurrent import futures
 from ldm_autoencoder import LDMAutoencoder
 from omegaconf import OmegaConf
 from pathlib import Path
+from tqdm import tqdm
 
 parser = argparse.ArgumentParser()
 parser.add_argument("in_dir", type=str)
@@ -55,6 +57,19 @@ def norm_scale_and_crop(img):
     ]
     return img
 
+def load_img(img_path: Path):
+    """Load a single image."""
+    img = PIL.Image.open(img_path)
+    img.load()
+    return img
+
+def load_imgs(img_paths: list[Path]):
+    """Load a list of images from a list of paths in parallel."""
+    print(f"Loading {len(img_paths)} images in parallel...")
+    with futures.ProcessPoolExecutor(max_workers=16) as pool:
+        imgs = pool.map(load_img, img_paths)
+    print("Loaded")
+    return list(imgs)
 
 # Process the images in chunks
 print("Processing...")
@@ -67,27 +82,30 @@ encode_vec = jax.jit(
 )
 
 img_paths_iter = in_path.iterdir()
-while True:
-    img_paths = list(itertools.islice(img_paths_iter, args.batch_size))
-    if not img_paths:
-        break
-    imgs_jax_list = []
-    imgs_paths = []
-    for img_pil, img_path in [(PIL.Image.open(p), p) for p in img_paths]:
-        w, h = img_pil.size
-        if w >= 64 and h >= 64 and img_pil.mode == "RGB":
-            imgs_jax_list.append(norm_scale_and_crop(jnp.array(img_pil)))
-            imgs_paths.append(img_path)
-        else:
-            print(
-                f"skipping image {img_path} with dimensions {w}x{h} and format {img_pil.mode}"
-            )
-    print(f"loaded, normed, scaled, and cropped {len(imgs_jax_list)} images")
-    imgs_jax_arr = jnp.stack(imgs_jax_list)
-    print(f"stacked into shape {imgs_jax_arr.shape}")
-    imgs_encoded = encode_vec(imgs_jax_arr)
-    print(f"encoded into shape {imgs_encoded.shape}")
-    for encoded_img, img_path in zip(imgs_encoded, imgs_paths):
-        out_file_path = out_path / img_path.name
-        jnp.save(out_file_path, encoded_img)
-        print(f"saved encoded image to {out_file_path}")
+with tqdm(total=len(list(in_path.iterdir()))) as pbar:
+    while True:
+        img_paths = list(itertools.islice(img_paths_iter, args.batch_size))
+        if not img_paths:
+            break
+        imgs_jax_list = []
+        imgs_paths = []
+        imgs_pil = load_imgs(img_paths)
+        for img_pil, img_path in zip(imgs_pil, img_paths):
+            w, h = img_pil.size
+            if w >= 64 and h >= 64 and img_pil.mode == "RGB":
+                imgs_jax_list.append(norm_scale_and_crop(jnp.array(img_pil)))
+                imgs_paths.append(img_path)
+            else:
+                print(
+                    f"skipping image {img_path} with dimensions {w}x{h} and format {img_pil.mode}"
+                )
+        print(f"loaded, normed, scaled, and cropped {len(imgs_jax_list)} images")
+        imgs_jax_arr = jnp.stack(imgs_jax_list)
+        print(f"stacked into shape {imgs_jax_arr.shape}")
+        imgs_encoded = encode_vec(imgs_jax_arr)
+        print(f"encoded into shape {imgs_encoded.shape}")
+        for encoded_img, img_path in zip(imgs_encoded, imgs_paths):
+            out_file_path = out_path / img_path.name
+            jnp.save(out_file_path, encoded_img)
+            print(f"saved encoded image to {out_file_path}")
+        pbar.update(len(imgs_encoded))
