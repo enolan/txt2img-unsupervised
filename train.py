@@ -120,6 +120,8 @@ checkpoint_manager = orbax.checkpoint.CheckpointManager(
     checkpoint_dir, orbax.checkpoint.PyTreeCheckpointer(), options=checkpoint_options
 )
 
+last_checkpoint_time = datetime.datetime.now()
+
 rng = jax.random.PRNGKey(1337)
 for epoch in trange(wandb.config.epochs):
     rng, rng2 = jax.random.split(rng)
@@ -135,6 +137,14 @@ for epoch in trange(wandb.config.epochs):
             wandb.log({"global_step": global_step, "train/loss": loss})
             pbar.update()
             pbar.set_postfix(loss=f"{loss:.4f}")
+            # Save checkpoint every 10 minutes
+            if (datetime.datetime.now() - last_checkpoint_time) > datetime.timedelta(
+                minutes=10
+            ):
+                print("Saving checkpoint...", end="", flush=True)
+                checkpoint_manager.save(global_step, my_train_state)
+                last_checkpoint_time = datetime.datetime.now()
+                print(" DONE")
     # Evaluate on test set
     losses = []
     for i_batch in range(test_imgs.shape[0] // args.batch_size):
@@ -147,5 +157,5 @@ for epoch in trange(wandb.config.epochs):
         end="",
         flush=True,
     )
-    checkpoint_manager.save(epoch, my_train_state)
+    checkpoint_manager.save(global_step, my_train_state)
     print(" DONE")
