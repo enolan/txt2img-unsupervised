@@ -23,12 +23,15 @@ parser.add_argument("test_dir", type=Path)
 parser.add_argument("batch_size", type=int)
 parser.add_argument("epochs", type=int)
 parser.add_argument("--lr", type=float, default=1e-4)
-parser.add_argument("--triangle_schedule", type=lambda x: bool(strtobool(x)), default=True)
+parser.add_argument(
+    "--triangle_schedule", type=lambda x: bool(strtobool(x)), default=True
+)
 args, _unknown = parser.parse_known_args()
 
 wandb.init()
-global_step: int = 0 # gradients computed so far
+global_step: int = 0  # gradients computed so far
 wandb.define_metric("*", step_metric="global_step")
+
 
 # Load the dataset
 def load_dir(path: Path) -> jax.Array:
@@ -60,12 +63,21 @@ params = mdl.init(
 def triangle_schedule(max_lr: float, total_steps: int) -> optax.Schedule:
     """Simple linear trianguar learning rate schedule. Best schedule found in Cramming paper.
     https://arxiv.org/abs/2212.14034"""
-    sched_up = optax.linear_schedule(init_value=0, end_value=max_lr, transition_steps=total_steps // 2)
-    sched_down = optax.linear_schedule(init_value=max_lr, end_value=0, transition_steps=total_steps // 2)
+    sched_up = optax.linear_schedule(
+        init_value=0, end_value=max_lr, transition_steps=total_steps // 2
+    )
+    sched_down = optax.linear_schedule(
+        init_value=max_lr, end_value=0, transition_steps=total_steps // 2
+    )
     return optax.join_schedules([sched_up, sched_down], [total_steps // 2])
 
+
 if wandb.config.triangle_schedule:
-    opt = optax.adam(learning_rate=triangle_schedule(wandb.config.lr, wandb.config.epochs * len(train_imgs)))
+    opt = optax.adam(
+        learning_rate=triangle_schedule(
+            wandb.config.lr, wandb.config.epochs * len(train_imgs)
+        )
+    )
 else:
     opt = optax.adam(learning_rate=wandb.config.lr)
 
@@ -97,7 +109,7 @@ my_train_state: TrainState = TrainState.create(  # type:ignore[no-untyped-call]
     apply_fn=mdl.apply, params=params, tx=opt, rng=jax.random.PRNGKey(1337)
 )
 
-run_id = wandb.run.id
+run_id = wandb.run.id  # type:ignore[union-attr]
 
 checkpoint_dir = Path(f"checkpoints/{run_id}")
 checkpoint_dir.mkdir(parents=True, exist_ok=True)
