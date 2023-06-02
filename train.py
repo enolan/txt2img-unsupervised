@@ -26,6 +26,7 @@ parser.add_argument("--lr", type=float, default=1e-4)
 parser.add_argument(
     "--triangle_schedule", type=lambda x: bool(strtobool(x)), default=True
 )
+parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
 args, _unknown = parser.parse_known_args()
 
 wandb.init()
@@ -53,6 +54,8 @@ wandb_config = {}
 wandb_config.update(vars(args))
 wandb_config.update(cfg.__dict__)
 wandb.config.update(wandb_config)
+wandb.define_metric("test/loss", summary="last")
+wandb.define_metric("train/loss", summary="last")
 
 params = mdl.init(
     rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
@@ -80,7 +83,7 @@ if wandb.config.triangle_schedule:
     )
 else:
     opt = optax.adam(learning_rate=wandb.config.lr)
-
+opt = optax.MultiSteps(opt, every_k_schedule=wandb.config.gradient_accumulation_steps)
 loss_grad_fn = jax.value_and_grad(transformer_model.loss_batch, argnums=1)
 loss_fn = jax.jit(
     lambda params, rng, batch: transformer_model.loss_batch(mdl, params, rng, batch)
