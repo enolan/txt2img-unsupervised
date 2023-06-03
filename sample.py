@@ -21,8 +21,25 @@ parser.add_argument("autoencoder_cfg", type=Path)
 parser.add_argument("--n", type=int, default=1)
 parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--top-p", type=float, default=0.9)
+parser.add_argument("--make-grids", action="store_true")
 parser.add_argument("out_dir", type=Path)
 args = parser.parse_args()
+
+# check if grids are possible, and if so how many to make of what dimensions. We make 1 or 2 square
+# grids.
+if args.make_grids:
+
+    def can_make_grid(n: int) -> bool:
+        return (n**0.5) % 1 == 0
+
+    if can_make_grid(args.n):
+        grid_imgs = [list(range(args.n))]
+    elif args.n / 2 % 1 == 0 and can_make_grid(args.n / 2):
+        grid_imgs = [list(range(args.n // 2)), list(range(args.n // 2, args.n))]
+    else:
+        print(f"Can't make grids out of {args.n} images")
+        exit(1)
+
 
 print("Loading transformer model...")
 checkpointer = orbax.checkpoint.PyTreeCheckpointer()
@@ -57,9 +74,25 @@ args.out_dir.mkdir(exist_ok=True)
 decode_j = jax.jit(
     lambda codes: ae_mdl.apply(ae_params, method=ae_mdl.decode, x=codes, shape=(16, 16))
 )
+
+print("Saving images...")
+imgs = []
 for i in trange(args.n):
     img = decode_j(encoded_imgs[i])
     img = jnp.clip(-1, img, 1)
     img = ((img + 1) * 127.5).astype(jnp.uint8)
     img = PIL.Image.fromarray(np.array(img))
     img.save(args.out_dir / f"{i:04d}.png")
+    imgs.append(img)
+
+if args.make_grids:
+    print(f"Making {len(grid_imgs)} grids...")
+    for i, grid in enumerate(grid_imgs):
+        side_len = int(len(grid) ** 0.5)
+        side_len_px = 64 * side_len + 4 * (side_len - 1)  # 4 px padding between images
+        grid_img = PIL.Image.new("RGB", (side_len_px, side_len_px), (255, 255, 255))
+        for y_img in range(side_len):
+            for x_img in range(side_len):
+                img = imgs[grid[y_img * side_len + x_img]]
+                grid_img.paste(img, (x_img * 68, y_img * 68))
+        grid_img.save(args.out_dir / f"grid_{i:04d}.png")
