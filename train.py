@@ -145,10 +145,10 @@ for epoch in trange(wandb.config.epochs):
             if (datetime.datetime.now() - last_checkpoint_time) > datetime.timedelta(
                 minutes=10
             ):
-                print("Saving checkpoint...", end="", flush=True)
+                tqdm.write("Saving checkpoint...", end="")
                 checkpoint_manager.save(global_step, my_train_state)
                 last_checkpoint_time = datetime.datetime.now()
-                print(" DONE")
+                tqdm.write(" DONE")
     # Evaluate on test set
     losses = []
     for i_batch in range(test_imgs.shape[0] // args.batch_size):
@@ -156,10 +156,9 @@ for epoch in trange(wandb.config.epochs):
         losses.append(loss_fn(my_train_state.params, rng, batch))
     test_loss = jnp.mean(jnp.stack(losses))
     wandb.log({"global_step": global_step, "test/loss": test_loss})
-    print(
+    tqdm.write(
         f"Epoch {epoch} done, train loss: {loss:.4f}, test loss {test_loss:.4f} saving...",
         end="",
-        flush=True,
     )
     checkpoint_manager.save(global_step, my_train_state)
-    print(" DONE")
+    tqdm.write(" DONE")
