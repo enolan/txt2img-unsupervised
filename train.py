@@ -98,14 +98,15 @@ class TrainState(train_state.TrainState):  # type:ignore[no-untyped-call]
 def train_step(
     state: TrainState,
     batch: jax.Array,
-) -> Tuple[TrainState, jax.Array]:
+) -> Tuple[TrainState, jax.Array, jax.Array]:
     """Compute a single optimization step."""
     rng, rng2 = jax.random.split(state.rng)
     loss, grads = loss_grad_fn(mdl, state.params, rng, batch)
     new_state = state.apply_gradients(
         grads=grads, rng=rng2
     )  # type:ignore[no-untyped-call]
-    return new_state, loss
+    norm = optax.global_norm(grads)
+    return new_state, loss, norm
 
 
 my_train_state: TrainState = TrainState.create(  # type:ignore[no-untyped-call]
@@ -135,9 +136,9 @@ for epoch in trange(wandb.config.epochs):
             batch = train_imgs[
                 i_batch * args.batch_size : (i_batch + 1) * args.batch_size
             ]
-            my_train_state, loss = train_step(my_train_state, batch)
+            my_train_state, loss, norm = train_step(my_train_state, batch)
             global_step += 1
-            wandb.log({"global_step": global_step, "train/loss": loss})
+            wandb.log({"global_step": global_step, "train/loss": loss, "grad_global_norm": norm})
             pbar.update()
             pbar.set_postfix(loss=f"{loss:.4f}")
             # Save checkpoint every 10 minutes
