@@ -1,5 +1,6 @@
 """Sample from the model"""
 import argparse
+import dacite
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -12,7 +13,7 @@ from omegaconf import OmegaConf
 from pathlib import Path
 from random import randint
 from tqdm import tqdm, trange
-from transformer_model import ImageModel, gpt_1_config, sample
+from transformer_model import ImageModel, ModelConfig, gpt_1_config, sample
 
 parser = argparse.ArgumentParser()
 parser.add_argument("transformer_checkpoint_dir", type=Path)
@@ -34,7 +35,7 @@ if args.make_grids:
 
     if can_make_grid(args.n):
         grid_imgs = [list(range(args.n))]
-    elif args.n / 2 % 1 == 0 and can_make_grid(args.n / 2):
+    elif args.n % 2 == 0 and can_make_grid(args.n / 2):
         grid_imgs = [list(range(args.n // 2)), list(range(args.n // 2, args.n))]
     else:
         print(f"Can't make grids out of {args.n} images")
@@ -44,10 +45,26 @@ if args.make_grids:
 print("Loading transformer model...")
 checkpointer = orbax.checkpoint.PyTreeCheckpointer()
 restored = checkpointer.restore(args.transformer_checkpoint_dir)
-cfg = copy(gpt_1_config)
+
+
+def conv_cfg_type(x):
+    # Convert from numpy ndarrays to built-in types
+    if type(x) == np.ndarray:
+        assert x.shape == (), f"Expected scalar, got {x.shape}"
+        if x.dtype == np.int_:
+            return int(x)
+        elif x.dtype == np.float_:
+            return float(x)
+        elif x.dtype == np.bool_:
+            return bool(x)
+
+
+cfg = dacite.from_dict(
+    data_class=ModelConfig, data=jax.tree_map(conv_cfg_type, restored["metadata"])
+)
 cfg.dropout = None
 im_mdl = ImageModel(**cfg.__dict__)
-im_params = restored["params"]
+im_params = restored["state"]["params"]
 
 # Set up random seed
 if args.seed is not None:

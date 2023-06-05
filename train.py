@@ -126,6 +126,13 @@ checkpoint_manager = orbax.checkpoint.CheckpointManager(
 
 last_checkpoint_time = datetime.datetime.now()
 
+
+def save_checkpoint() -> None:
+    checkpoint_manager.save(
+        global_step, {"state": my_train_state, "metadata": wandb_config}
+    )
+
+
 rng = jax.random.PRNGKey(1337)
 for epoch in trange(wandb.config.epochs):
     rng, rng2 = jax.random.split(rng)
@@ -138,7 +145,13 @@ for epoch in trange(wandb.config.epochs):
             ]
             my_train_state, loss, norm = train_step(my_train_state, batch)
             global_step += 1
-            wandb.log({"global_step": global_step, "train/loss": loss, "grad_global_norm": norm})
+            wandb.log(
+                {
+                    "global_step": global_step,
+                    "train/loss": loss,
+                    "grad_global_norm": norm,
+                }
+            )
             pbar.update()
             pbar.set_postfix(loss=f"{loss:.4f}")
             # Save checkpoint every 10 minutes
@@ -146,7 +159,7 @@ for epoch in trange(wandb.config.epochs):
                 minutes=10
             ):
                 tqdm.write("Saving checkpoint...", end="")
-                checkpoint_manager.save(global_step, my_train_state)
+                save_checkpoint()
                 last_checkpoint_time = datetime.datetime.now()
                 tqdm.write(" DONE")
     # Evaluate on test set
@@ -160,5 +173,5 @@ for epoch in trange(wandb.config.epochs):
         f"Epoch {epoch} done, train loss: {loss:.4f}, test loss {test_loss:.4f} saving...",
         end="",
     )
-    checkpoint_manager.save(global_step, my_train_state)
+    save_checkpoint()
     tqdm.write(" DONE")

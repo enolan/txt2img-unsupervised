@@ -21,6 +21,7 @@ pytorch-lightning = "^2.0.2"
 wandb = "^0.15.3"
 imageio-ffmpeg = "^0.4.8"
 warcat = "^2.2.5"
+dacite = "^1.8.1"
 
 [tool.poetry.group.dev.dependencies]
 ipython = "^8.14.0"
