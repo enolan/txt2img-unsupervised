@@ -5,13 +5,14 @@ import argparse
 import itertools
 import jax
 import jax.numpy as jnp
-import PIL
+import PIL.Image
 import torch
 from concurrent import futures
 from ldm_autoencoder import LDMAutoencoder
 from omegaconf import OmegaConf
 from pathlib import Path
 from tqdm import tqdm
+from typing import Optional
 
 parser = argparse.ArgumentParser()
 parser.add_argument("in_dir", type=str)
@@ -57,26 +58,52 @@ def norm_scale_and_crop(img):
     ]
     return img
 
-def load_img(img_path: Path):
-    """Load a single image."""
+
+def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
+    """Load/crop/scale a single image."""
     img = PIL.Image.open(img_path)
+    w, h = img.size
+    if w < 64 or h < 64 or img.mode != "RGB":
+        print(f"Skipping {img_path}, size {w}x{h}, mode {img.mode}")
+        return None
+    else:
+        if w > h:
+            px_to_remove = w - h
+            img = img.resize(
+                (64, 64),
+                PIL.Image.BICUBIC,
+                (px_to_remove // 2, 0, w - px_to_remove // 2, h),
+            )
+        elif h > w:
+            px_to_remove = h - w
+            img = img.resize(
+                (64, 64),
+                PIL.Image.BICUBIC,
+                (0, px_to_remove // 2, w, h - px_to_remove // 2),
+            )
+        else:
+            img = img.resize((64, 64), PIL.Image.BICUBIC)
     img.load()
     return img
 
-def load_imgs(img_paths: list[Path]):
-    """Load a list of images from a list of paths in parallel."""
+
+def load_imgs(img_paths: list[Path]) -> list[Optional[PIL.Image.Image]]:
+    """Load, crop, and scale a list of images, from a list of paths in parallel."""
     print(f"Loading {len(img_paths)} images in parallel...")
-    with futures.ProcessPoolExecutor(max_workers=16) as pool:
+    with futures.ThreadPoolExecutor(max_workers=16) as pool:
         imgs = pool.map(load_img, img_paths)
     print("Loaded")
     return list(imgs)
+
 
 # Process the images in chunks
 print("Processing...")
 encode_vec = jax.jit(
     jax.vmap(
         lambda img: autoencoder_mdl.apply(
-            autoencoder_params, method=autoencoder_mdl.encode, x=img
+            autoencoder_params,
+            method=autoencoder_mdl.encode,
+            x=(img.astype(jnp.float32) / 127.5 - 1.0),
         )
     )
 )
@@ -91,14 +118,9 @@ with tqdm(total=len(list(in_path.iterdir()))) as pbar:
         imgs_paths = []
         imgs_pil = load_imgs(img_paths)
         for img_pil, img_path in zip(imgs_pil, img_paths):
-            w, h = img_pil.size
-            if w >= 64 and h >= 64 and img_pil.mode == "RGB":
-                imgs_jax_list.append(norm_scale_and_crop(jnp.array(img_pil)))
+            if img_pil is not None:
+                imgs_jax_list.append(jnp.array(img_pil))
                 imgs_paths.append(img_path)
-            else:
-                print(
-                    f"skipping image {img_path} with dimensions {w}x{h} and format {img_pil.mode}"
-                )
         print(f"loaded, normed, scaled, and cropped {len(imgs_jax_list)} images")
         imgs_jax_arr = jnp.stack(imgs_jax_list)
         print(f"stacked into shape {imgs_jax_arr.shape}")

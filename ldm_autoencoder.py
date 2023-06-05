@@ -55,6 +55,7 @@ class LDMAutoencoder(nn.Module):
     def encode(self, x: jax.Array) -> jax.Array:
         """Encode from the image to the int codes."""
         assert len(x.shape) == 3 and x.shape[2] == 3
+        assert x.dtype == jnp.float32
         h = self._encode_to_latents(x)
         return self._quantize(h)
 
