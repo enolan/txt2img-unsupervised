@@ -38,27 +38,6 @@ out_path = Path(args.out_dir)
 out_path.mkdir(exist_ok=True)
 
 
-@jax.jit
-def norm_scale_and_crop(img):
-    h, w, c = img.shape
-    assert c == 3, f"image has {c} channels, expected 3"
-    # Normalize the image
-    img = img.astype(jnp.float32) / 127.5 - 1.0
-    # Scale the image so the short axis is 64 pixels
-    if h < w:
-        img = jax.image.resize(img, (64, 64 * w // h, 3), "cubic")
-    else:
-        img = jax.image.resize(img, (64 * h // w, 64, 3), "cubic")
-    assert img.shape[0] >= 64 and img.shape[1] >= 64
-    # Center crop the image
-    img = img[
-        (img.shape[0] - 64) // 2 : (img.shape[0] + 64) // 2,
-        (img.shape[1] - 64) // 2 : (img.shape[1] + 64) // 2,
-        :,
-    ]
-    return img
-
-
 def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
     """Load/crop/scale a single image."""
     img = PIL.Image.open(img_path)
