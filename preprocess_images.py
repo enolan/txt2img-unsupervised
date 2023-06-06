@@ -2,6 +2,7 @@
 Given a source of images, scale them, crop them, and encode them with LDM encoder.
 """
 import argparse
+import gc
 import itertools
 import jax
 import jax.numpy as jnp
@@ -63,21 +64,19 @@ def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
             )
         else:
             img = img.resize((64, 64), PIL.Image.BICUBIC)
-    img.load()
     return img
 
+pool = futures.ThreadPoolExecutor(max_workers=16)
 
 def load_imgs(img_paths: list[Path]) -> list[Optional[PIL.Image.Image]]:
     """Load, crop, and scale a list of images, from a list of paths in parallel."""
-    tqdm.write(f"Loading {len(img_paths)} images in parallel...")
-    with futures.ThreadPoolExecutor(max_workers=16) as pool:
-        imgs = pool.map(load_img, img_paths)
-    tqdm.write("Loaded")
-    return list(imgs)
+    tqdm.write(f"Loading {len(img_paths)} images in parallel...", end="")
+    imgs = pool.map(load_img, img_paths)
+    imgs = list(imgs)
+    tqdm.write(" Loaded")
+    return imgs
 
 
-# Process the images in chunks
-print("Processing...")
 encode_vec = jax.jit(
     jax.vmap(
         lambda img: autoencoder_mdl.apply(
@@ -88,30 +87,49 @@ encode_vec = jax.jit(
     )
 )
 
-for in_path in tqdm(args.in_dirs, desc="dirs"):
-    tqdm.write(f"Processing {in_path}")
-    img_paths_iter = in_path.iterdir()
-    with tqdm(total=len(list(in_path.iterdir())), desc="images") as pbar:
-        while True:
-            img_paths = list(itertools.islice(img_paths_iter, args.batch_size))
-            if not img_paths:
+print("Collecting image paths...", flush=True, end="")
+img_paths = [list(in_path.iterdir()) for in_path in args.in_dirs]
+img_paths = list(itertools.chain(*img_paths))
+print(f" {len(img_paths)} images found.")
+img_paths_iter = iter(img_paths)
+
+# We load images with PIL in batch_size chunks, but not every image is valid, so we accumulate
+# the PIL images until we have batch_size of them, then convert them to jax arrays and encode.
+# This saves recompiling encode_vec for every different shape of input array.
+print("Processing images...")
+batch_img_paths = []
+batch_pil_imgs = []
+with tqdm(total=len(img_paths), desc="images") as pbar:
+    while True:
+        while len(batch_img_paths) < args.batch_size:
+            paths_to_load = list(itertools.islice(img_paths_iter, args.batch_size))
+            tqdm.write(f"Attempting load of {len(paths_to_load)} images")
+            if not paths_to_load:
                 break
-            imgs_jax_list = []
-            imgs_paths = []
-            imgs_pil = load_imgs(img_paths)
-            for img_pil, img_path in zip(imgs_pil, img_paths):
-                if img_pil is not None:
-                    imgs_jax_list.append(jnp.array(img_pil))
-                    imgs_paths.append(img_path)
-            tqdm.write(f"loaded, normed, scaled, and cropped {len(imgs_jax_list)} images")
-            imgs_jax_arr = jnp.stack(imgs_jax_list)
-            tqdm.write(f"stacked into shape {imgs_jax_arr.shape}")
-            imgs_encoded = encode_vec(imgs_jax_arr)
-            tqdm.write(f"encoded into shape {imgs_encoded.shape}")
-            saved = 0
-            for encoded_img, img_path in zip(imgs_encoded, imgs_paths):
-                out_file_path = out_path / img_path.name
-                jnp.save(out_file_path, encoded_img)
-                saved += 1
-            tqdm.write(f"saved {saved} images")
-            pbar.update(len(imgs_encoded))
+            pil_imgs = load_imgs(paths_to_load)
+            for img, path in zip(pil_imgs, paths_to_load):
+                if img is not None:
+                    batch_img_paths.append(path)
+                    batch_pil_imgs.append(img)
+                else:
+                    pbar.update(1)
+        if not batch_img_paths:
+            break
+        tqdm.write(f"{len(batch_pil_imgs)} loaded/scaled/cropped images ready for encoding")
+        this_batch_imgs = batch_pil_imgs[:args.batch_size]
+        this_batch_paths = batch_img_paths[:args.batch_size]
+        batch_pil_imgs = batch_pil_imgs[args.batch_size:]
+        batch_img_paths = batch_img_paths[args.batch_size:]
+        tqdm.write(f"encoding {len(this_batch_imgs)} images this batch")
+        imgs_jax_arr = jnp.stack([jnp.array(img) for img in this_batch_imgs])
+        imgs_encoded = encode_vec(imgs_jax_arr)
+        saved = 0
+        for encoded_img, img_path in zip(imgs_encoded, this_batch_paths):
+            out_file_path = out_path / img_path.name
+            jnp.save(out_file_path, encoded_img)
+            saved += 1
+        tqdm.write(f"saved {saved} images")
+        pbar.update(len(imgs_encoded))
+        gc.collect()
+
+pool.shutdown()
