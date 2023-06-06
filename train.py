@@ -3,6 +3,7 @@ import argparse
 import datetime
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax  # type:ignore[import]
 import orbax.checkpoint  # type:ignore[import]
 import random
@@ -47,8 +48,8 @@ wandb.define_metric("*", step_metric="global_step")
 def load_dir(path: Path) -> jax.Array:
     imgs = []
     for img_path in path.iterdir():
-        imgs.append(jnp.load(img_path))
-    return jnp.stack(imgs)
+        imgs.append(np.load(img_path))
+    return np.stack(imgs)
 
 
 train_imgs = load_dir(args.train_dir)
@@ -94,7 +95,9 @@ if wandb.config.triangle_schedule:
 else:
     opt = optax.adam(learning_rate=wandb.config.lr)
 
-opt = optax.MultiSteps(opt, every_k_schedule=wandb.config.gradient_accumulation_steps)
+assert wandb.config.gradient_accumulation_steps > 0
+if wandb.config.gradient_accumulation_steps > 1:
+    opt = optax.MultiSteps(opt, every_k_schedule=wandb.config.gradient_accumulation_steps)
 if wandb.config.gradient_clipping is not None:
     clip = optax.clip_by_global_norm(wandb.config.gradient_clipping)
 else:
@@ -150,9 +153,10 @@ def save_checkpoint() -> None:
 
 
 rng = jax.random.PRNGKey(1337)
+rng_np = np.random.default_rng(1337)
 for epoch in trange(wandb.config.epochs):
     rng, rng2 = jax.random.split(rng)
-    train_imgs = jax.random.permutation(rng2, train_imgs, axis=0)
+    rng_np.shuffle(train_imgs)
     batches = train_imgs.shape[0] // args.batch_size
     with tqdm(total=batches, leave=False) as pbar:
         for i_batch in range(train_imgs.shape[0] // args.batch_size):
