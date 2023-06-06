@@ -15,11 +15,11 @@ from tqdm import tqdm
 from typing import Optional
 
 parser = argparse.ArgumentParser()
-parser.add_argument("in_dir", type=str)
-parser.add_argument("out_dir", type=str)
-parser.add_argument("batch_size", type=int)
-parser.add_argument("ckpt", type=str)
-parser.add_argument("autoencoder_cfg", type=str)
+parser.add_argument("--out_dir", type=str)
+parser.add_argument("--batch_size", type=int)
+parser.add_argument("--ckpt", type=str)
+parser.add_argument("--autoencoder_cfg", type=str)
+parser.add_argument("in_dirs", type=Path, nargs="+")
 
 args = parser.parse_args()
 
@@ -32,8 +32,9 @@ autoencoder_params = autoencoder_mdl.params_from_torch(
 )
 
 
-in_path = Path(args.in_dir)
-assert in_path.is_dir()
+for in_dir in args.in_dirs:
+    assert in_dir.is_dir(), f"{in_dir} is not a directory"
+
 out_path = Path(args.out_dir)
 out_path.mkdir(exist_ok=True)
 
@@ -43,7 +44,7 @@ def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
     img = PIL.Image.open(img_path)
     w, h = img.size
     if w < 64 or h < 64 or img.mode != "RGB":
-        print(f"Skipping {img_path}, size {w}x{h}, mode {img.mode}")
+        tqdm.write(f"Skipping {img_path}, size {w}x{h}, mode {img.mode}")
         return None
     else:
         if w > h:
@@ -68,10 +69,10 @@ def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
 
 def load_imgs(img_paths: list[Path]) -> list[Optional[PIL.Image.Image]]:
     """Load, crop, and scale a list of images, from a list of paths in parallel."""
-    print(f"Loading {len(img_paths)} images in parallel...")
+    tqdm.write(f"Loading {len(img_paths)} images in parallel...")
     with futures.ThreadPoolExecutor(max_workers=16) as pool:
         imgs = pool.map(load_img, img_paths)
-    print("Loaded")
+    tqdm.write("Loaded")
     return list(imgs)
 
 
@@ -87,26 +88,30 @@ encode_vec = jax.jit(
     )
 )
 
-img_paths_iter = in_path.iterdir()
-with tqdm(total=len(list(in_path.iterdir()))) as pbar:
-    while True:
-        img_paths = list(itertools.islice(img_paths_iter, args.batch_size))
-        if not img_paths:
-            break
-        imgs_jax_list = []
-        imgs_paths = []
-        imgs_pil = load_imgs(img_paths)
-        for img_pil, img_path in zip(imgs_pil, img_paths):
-            if img_pil is not None:
-                imgs_jax_list.append(jnp.array(img_pil))
-                imgs_paths.append(img_path)
-        print(f"loaded, normed, scaled, and cropped {len(imgs_jax_list)} images")
-        imgs_jax_arr = jnp.stack(imgs_jax_list)
-        print(f"stacked into shape {imgs_jax_arr.shape}")
-        imgs_encoded = encode_vec(imgs_jax_arr)
-        print(f"encoded into shape {imgs_encoded.shape}")
-        for encoded_img, img_path in zip(imgs_encoded, imgs_paths):
-            out_file_path = out_path / img_path.name
-            jnp.save(out_file_path, encoded_img)
-            print(f"saved encoded image to {out_file_path}")
-        pbar.update(len(imgs_encoded))
+for in_path in tqdm(args.in_dirs, desc="dirs"):
+    tqdm.write(f"Processing {in_path}")
+    img_paths_iter = in_path.iterdir()
+    with tqdm(total=len(list(in_path.iterdir())), desc="images") as pbar:
+        while True:
+            img_paths = list(itertools.islice(img_paths_iter, args.batch_size))
+            if not img_paths:
+                break
+            imgs_jax_list = []
+            imgs_paths = []
+            imgs_pil = load_imgs(img_paths)
+            for img_pil, img_path in zip(imgs_pil, img_paths):
+                if img_pil is not None:
+                    imgs_jax_list.append(jnp.array(img_pil))
+                    imgs_paths.append(img_path)
+            tqdm.write(f"loaded, normed, scaled, and cropped {len(imgs_jax_list)} images")
+            imgs_jax_arr = jnp.stack(imgs_jax_list)
+            tqdm.write(f"stacked into shape {imgs_jax_arr.shape}")
+            imgs_encoded = encode_vec(imgs_jax_arr)
+            tqdm.write(f"encoded into shape {imgs_encoded.shape}")
+            saved = 0
+            for encoded_img, img_path in zip(imgs_encoded, imgs_paths):
+                out_file_path = out_path / img_path.name
+                jnp.save(out_file_path, encoded_img)
+                saved += 1
+            tqdm.write(f"saved {saved} images")
+            pbar.update(len(imgs_encoded))
