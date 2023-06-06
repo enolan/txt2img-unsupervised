@@ -20,6 +20,7 @@ class ImageModel(nn.Module):
     dropout: Optional[float]
     n_layers: int
     seq_len: int
+    use_biases: bool
 
     def setup(self) -> None:
         self.in_embed = nn.Embed(num_embeddings=8192, features=self.d_model)
@@ -32,10 +33,11 @@ class ImageModel(nn.Module):
                 num_heads=self.num_heads,
                 ff_dim=self.ff_dim,
                 dropout=self.dropout,
+                use_biases=self.use_biases,
             )
             for _ in range(self.n_layers)
         ]
-        self.logits_decoder = nn.Dense(features=8192)
+        self.logits_decoder = nn.Dense(features=8192, use_bias=self.use_biases)
 
     def __call__(self, image: jax.Array) -> jax.Array:
         """Run the model, returning log probabilities. Input should be padded to seq_len."""
@@ -157,6 +159,7 @@ class TransformerLayer(nn.Module):
     num_heads: int
     ff_dim: int
     dropout: Optional[float]
+    use_biases: bool
 
     def setup(self) -> None:
         self.mha = nn.SelfAttention(
@@ -167,10 +170,11 @@ class TransformerLayer(nn.Module):
             # from Attention is All You Need.
             dropout_rate=0,
             deterministic=False,
+            use_bias=self.use_biases,
         )
         self.layer_norm_1 = nn.LayerNorm()
-        self.linear_1 = nn.Dense(features=self.ff_dim)
-        self.linear_2 = nn.Dense(features=self.d_model)
+        self.linear_1 = nn.Dense(features=self.ff_dim, use_bias=self.use_biases)
+        self.linear_2 = nn.Dense(features=self.d_model, use_bias=self.use_biases)
         self.layer_norm_2 = nn.LayerNorm()
         if self.dropout is not None:
             self.dropout_layer = nn.Dropout(self.dropout, deterministic=False)
@@ -223,11 +227,12 @@ class ModelConfig:
     dropout: Optional[float]
     n_layers: int
     seq_len: int
+    use_biases: bool
 
 
 # Parameters taken from GPT-1, except seq_len is 256 instead of 1024
 gpt_1_config = ModelConfig(
-    d_model=768, num_heads=12, ff_dim=3072, dropout=0.1, n_layers=12, seq_len=256
+    d_model=768, num_heads=12, ff_dim=3072, dropout=0.1, n_layers=12, seq_len=256, use_biases=True
 )
 
 

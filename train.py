@@ -17,6 +17,13 @@ from pathlib import Path
 from tqdm import tqdm, trange
 from typing import Any, Tuple
 
+# TODO next sweep:
+# - learning rate
+# - gradient accumulation
+# - gradient clipping
+# - biases
+# - alt activation functions
+
 parser = argparse.ArgumentParser()
 parser.add_argument("train_dir", type=Path)
 parser.add_argument("test_dir", type=Path)
@@ -27,6 +34,8 @@ parser.add_argument(
     "--triangle_schedule", type=lambda x: bool(strtobool(x)), default=True
 )
 parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)), default=True)
+parser.add_argument("--gradient-clipping", type=float, default=None)
 args, _unknown = parser.parse_known_args()
 
 wandb.init()
@@ -48,6 +57,7 @@ print(f"Train set {train_imgs.shape}, test set {test_imgs.shape}")
 
 # Setup the model
 cfg = transformer_model.gpt_1_config
+cfg.use_biases = args.use_biases
 mdl = transformer_model.ImageModel(**cfg.__dict__)
 
 wandb_config = {}
@@ -83,7 +93,13 @@ if wandb.config.triangle_schedule:
     )
 else:
     opt = optax.adam(learning_rate=wandb.config.lr)
+
 opt = optax.MultiSteps(opt, every_k_schedule=wandb.config.gradient_accumulation_steps)
+if wandb.config.gradient_clipping is not None:
+    clip = optax.clip_by_global_norm(wandb.config.gradient_clipping)
+else:
+    clip = optax.identity()
+opt = optax.chain(clip, opt)
 loss_grad_fn = jax.value_and_grad(transformer_model.loss_batch, argnums=1)
 loss_fn = jax.jit(
     lambda params, rng, batch: transformer_model.loss_batch(mdl, params, rng, batch)
