@@ -42,7 +42,12 @@ out_path.mkdir(exist_ok=True)
 
 def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
     """Load/crop/scale a single image."""
-    img = PIL.Image.open(img_path)
+    try:
+        img = PIL.Image.open(img_path)
+        img.load()
+    except (PIL.UnidentifiedImageError, OSError) as e:
+        tqdm.write(f"Skipping {img_path}, PIL can't open it due to {e}")
+        return None
     w, h = img.size
     if w < 64 or h < 64 or img.mode != "RGB":
         tqdm.write(f"Skipping {img_path}, size {w}x{h}, mode {img.mode}")
@@ -66,7 +71,7 @@ def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
             img = img.resize((64, 64), PIL.Image.BICUBIC)
     return img
 
-pool = futures.ThreadPoolExecutor(max_workers=16)
+pool = futures.ThreadPoolExecutor(max_workers=32)
 
 def load_imgs(img_paths: list[Path]) -> list[Optional[PIL.Image.Image]]:
     """Load, crop, and scale a list of images, from a list of paths in parallel."""
