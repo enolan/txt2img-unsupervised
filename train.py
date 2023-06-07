@@ -14,6 +14,7 @@ from distutils.util import strtobool
 from flax.core.frozen_dict import FrozenDict
 from flax.training import train_state
 from functools import partial
+from jax.experimental import mesh_utils
 from pathlib import Path
 from tqdm import tqdm, trange
 from typing import Any, Tuple
@@ -55,6 +56,9 @@ def load_dir(path: Path) -> jax.Array:
 train_imgs = load_dir(args.train_dir)
 test_imgs = load_dir(args.test_dir)
 print(f"Train set {train_imgs.shape}, test set {test_imgs.shape}")
+
+# Make the RNG partitionable across devices
+jax.config.update("jax_threefry_partitionable", True)
 
 # Setup the model
 cfg = transformer_model.gpt_1_config
@@ -130,6 +134,15 @@ def train_step(
     return new_state, loss, norm
 
 
+# Set up sharding
+devices = jax.device_count()
+print(
+    f"Sharding batches of {args.batch_size} across {devices} devices, {args.batch_size / devices} per device"
+)
+assert args.batch_size % devices == 0
+sharding = jax.sharding.PositionalSharding(mesh_utils.create_device_mesh((devices, 1)))
+params = jax.device_put(params, sharding.replicate())
+
 my_train_state: TrainState = TrainState.create(  # type:ignore[no-untyped-call]
     apply_fn=mdl.apply, params=params, tx=opt, rng=jax.random.PRNGKey(1337)
 )
@@ -162,9 +175,10 @@ for epoch in trange(wandb.config.epochs):
     batches = train_imgs.shape[0] // args.batch_size
     with tqdm(total=batches, leave=False) as pbar:
         for i_batch in range(train_imgs.shape[0] // args.batch_size):
-            batch = train_imgs[
-                i_batch * args.batch_size : (i_batch + 1) * args.batch_size
-            ]
+            batch = jax.device_put(
+                train_imgs[i_batch * args.batch_size : (i_batch + 1) * args.batch_size],
+                sharding,
+            )
             my_train_state, loss, norm = train_step(my_train_state, batch)
             global_step += 1
             wandb.log(
@@ -187,7 +201,10 @@ for epoch in trange(wandb.config.epochs):
     # Evaluate on test set
     losses = []
     for i_batch in range(test_imgs.shape[0] // args.batch_size):
-        batch = test_imgs[i_batch * args.batch_size : (i_batch + 1) * args.batch_size]
+        batch = jax.device_put(
+            test_imgs[i_batch * args.batch_size : (i_batch + 1) * args.batch_size],
+            sharding,
+        )
         losses.append(loss_fn(my_train_state.params, rng, batch))
     test_loss = jnp.mean(jnp.stack(losses))
     wandb.log({"global_step": global_step, "test/loss": test_loss})
