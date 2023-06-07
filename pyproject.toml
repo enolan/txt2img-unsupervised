@@ -35,6 +35,7 @@ optional = true
 
 [tool.poetry.group.cuda.dependencies]
 jaxlib = {url = "https://storage.googleapis.com/jax-releases/cuda11/jaxlib-0.4.11+cuda11.cudnn86-cp311-cp311-manylinux2014_x86_64.whl"}
+jax = {extras = ["cuda"], version = "^0.4.11"}
 
 [build-system]
 requires = ["poetry-core"]

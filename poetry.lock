@@ -950,6 +950,7 @@ files = [
 ]
 
 [package.dependencies]
+jaxlib = {version = "0.4.11+cuda11.cudnn86", optional = true, markers = "extra == \"cuda\""}
 ml_dtypes = ">=0.1.0"
 numpy = ">=1.21"
 opt_einsum = "*"
@@ -2651,4 +2652,4 @@ multidict = ">=4.0"
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.11"
-content-hash = "f5e632e3d69151aa98480ce1de1ecd94b52587ac6886d646ab5429c9f7a8242b"
+content-hash = "d491baedb0dcda4c3b765d9186829aa2ecba2568b3fec1fb00c1a3538fd0f89c"
