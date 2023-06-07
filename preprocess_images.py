@@ -71,7 +71,9 @@ def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
             img = img.resize((64, 64), PIL.Image.BICUBIC)
     return img
 
+
 pool = futures.ThreadPoolExecutor(max_workers=32)
+
 
 def load_imgs(img_paths: list[Path]) -> list[Optional[PIL.Image.Image]]:
     """Load, crop, and scale a list of images, from a list of paths in parallel."""
@@ -120,11 +122,13 @@ with tqdm(total=len(img_paths), desc="images") as pbar:
                     pbar.update(1)
         if not batch_img_paths:
             break
-        tqdm.write(f"{len(batch_pil_imgs)} loaded/scaled/cropped images ready for encoding")
-        this_batch_imgs = batch_pil_imgs[:args.batch_size]
-        this_batch_paths = batch_img_paths[:args.batch_size]
-        batch_pil_imgs = batch_pil_imgs[args.batch_size:]
-        batch_img_paths = batch_img_paths[args.batch_size:]
+        tqdm.write(
+            f"{len(batch_pil_imgs)} loaded/scaled/cropped images ready for encoding"
+        )
+        this_batch_imgs = batch_pil_imgs[: args.batch_size]
+        this_batch_paths = batch_img_paths[: args.batch_size]
+        batch_pil_imgs = batch_pil_imgs[args.batch_size :]
+        batch_img_paths = batch_img_paths[args.batch_size :]
         tqdm.write(f"encoding {len(this_batch_imgs)} images this batch")
         imgs_jax_arr = jnp.stack([jnp.array(img) for img in this_batch_imgs])
         imgs_encoded = encode_vec(imgs_jax_arr)

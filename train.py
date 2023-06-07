@@ -97,7 +97,9 @@ else:
 
 assert wandb.config.gradient_accumulation_steps > 0
 if wandb.config.gradient_accumulation_steps > 1:
-    opt = optax.MultiSteps(opt, every_k_schedule=wandb.config.gradient_accumulation_steps)
+    opt = optax.MultiSteps(
+        opt, every_k_schedule=wandb.config.gradient_accumulation_steps
+    )
 if wandb.config.gradient_clipping is not None:
     clip = optax.clip_by_global_norm(wandb.config.gradient_clipping)
 else:
