@@ -44,7 +44,8 @@ if args.make_grids:
 
 print("Loading transformer model...")
 checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-restored = checkpointer.restore(args.transformer_checkpoint_dir)
+# Orbax chokes on relative paths for some godforsaken reason
+restored = checkpointer.restore(args.transformer_checkpoint_dir.absolute())
 
 
 def conv_cfg_type(x):
