@@ -62,7 +62,7 @@ def download_warc(id: str, dest_dir: Path) -> Path:
     named after the id. Returns the path to the compressed warc, which will be in dest_dir.
     """
     ia.download(id, formats="Web ARChive ZST", destdir=str(dest_dir))
-    zsts = list(dest_dir.glob("*.zst"))
+    zsts = list(dest_dir.glob("*/*.zst"))
     assert len(zsts) == 1, f"Expected one zst file, found {len(zsts)}"
     out_path = dest_dir / zsts[0].name
     zsts[0].rename(out_path)
@@ -167,6 +167,7 @@ def extract_from_dir(in_path: Path, out_path: Path) -> Tuple[list[Path], list[Pa
 def hash_dir(path: Path, conn: sqlite3.Connection, warc: str) -> None:
     """Hash the files in a directory and add them to the db."""
     toinsert = []
+    tqdm.write(f"Hashing files in {path} for warc {warc}")
     for img_path in tqdm(list(path.iterdir()), desc="hashing"):
         hash_state = hashlib.blake2b()
         with open(img_path, "rb") as f:
@@ -249,7 +250,7 @@ class SQLiteConnectionPool:
 
     def get_conn(self) -> sqlite3.Connection:
         if not hasattr(self.local, "conn"):
-            self.local.conn = sqlite3.connect(self.db_name)
+            self.local.conn = sqlite3.connect(self.db_name, timeout=60)
             self.local.conn.execute("PRAGMA FOREIGN_KEYS = ON")
         return self.local.conn  # type: ignore[no-any-return]
 
@@ -274,7 +275,7 @@ def process_warc(
     extract_from_dir(warc_extracted_dir / "i.imgur.com", orig_images_dir)
 
     tqdm.write(f"Hashing original images from {warc}...")
-    hash_dir(orig_images_dir, conn, warc.stem)
+    hash_dir(orig_images_dir, conn, warc_id)
 
     tqdm.write(f"Deduplicating original images from {warc}...")
     deduped_dir = workdir / "deduped"
@@ -319,9 +320,9 @@ def dl_and_process_warc(
         ).fetchone()[0]
         assert processed == 0, f"Warc {id} has already been processed"
     tqdm.write(f"Downloading {id}...")
-    warc_dir = download_warc(id, workdir)
-    warc = list(warc_dir.glob("*.warc.zst"))[0]
-    return process_warc(warc, id, workdir, pool)
+    warc_path = download_warc(id, workdir)
+    tqdm.write(f"Downloaded {id} to {warc_path}")
+    return process_warc(warc_path, id, workdir, pool)
 
 
 def process_warcs_threaded(
