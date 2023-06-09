@@ -45,7 +45,7 @@ def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
     try:
         img = PIL.Image.open(img_path)
         img.load()
-    except (PIL.UnidentifiedImageError, OSError) as e:
+    except (PIL.UnidentifiedImageError, OSError, ValueError) as e:
         tqdm.write(f"Skipping {img_path}, PIL can't open it due to {e}")
         return None
     w, h = img.size
@@ -72,7 +72,7 @@ def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
     return img
 
 
-pool = futures.ThreadPoolExecutor(max_workers=32)
+pool = futures.ThreadPoolExecutor(max_workers=64)
 
 
 def load_imgs(img_paths: list[Path]) -> list[Optional[PIL.Image.Image]]:
@@ -106,7 +106,7 @@ img_paths_iter = iter(img_paths)
 print("Processing images...")
 batch_img_paths = []
 batch_pil_imgs = []
-with tqdm(total=len(img_paths), desc="images") as pbar:
+with tqdm(total=len(img_paths), desc="images", smoothing=0.10) as pbar:
     while True:
         while len(batch_img_paths) < args.batch_size:
             paths_to_load = list(itertools.islice(img_paths_iter, args.batch_size))
