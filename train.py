@@ -174,7 +174,7 @@ for epoch in trange(wandb.config.epochs):
     train_imgs = train_imgs.shuffle(generator=rng_np)
     batches = train_imgs.shape[0] // args.batch_size
     with tqdm(total=batches, leave=False, desc="train batches") as pbar:
-        for batch in train_imgs.iter(batch_size=args.batch_size, skip_last_batch=True):
+        for batch in train_imgs.iter(batch_size=args.batch_size, drop_last_batch=True):
             batch = jax.device_put(batch["encoded_img"], sharding)
             my_train_state, loss, norm = train_step(my_train_state, batch)
             global_step += 1
