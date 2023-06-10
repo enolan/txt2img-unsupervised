@@ -10,6 +10,7 @@ import random
 import string
 import transformer_model
 import wandb
+from datasets import Dataset
 from distutils.util import strtobool
 from flax.core.frozen_dict import FrozenDict
 from flax.training import train_state
@@ -27,8 +28,8 @@ from typing import Any, Tuple
 # - alt activation functions
 
 parser = argparse.ArgumentParser()
-parser.add_argument("train_dir", type=Path)
-parser.add_argument("test_dir", type=Path)
+parser.add_argument("train_pq", type=Path)
+parser.add_argument("test_pq", type=Path)
 parser.add_argument("batch_size", type=int)
 parser.add_argument("epochs", type=int)
 parser.add_argument("--lr", type=float, default=1e-4)
@@ -46,15 +47,14 @@ wandb.define_metric("*", step_metric="global_step")
 
 
 # Load the dataset
-def load_dir(path: Path) -> jax.Array:
-    imgs = []
-    for img_path in path.iterdir():
-        imgs.append(np.load(img_path))
-    return np.stack(imgs)
+def load_dataset(p: Path) -> Dataset:
+    ds = Dataset.from_parquet(str(p))
+    ds.set_format("numpy")
+    return ds
 
 
-train_imgs = load_dir(args.train_dir)
-test_imgs = load_dir(args.test_dir)
+train_imgs = load_dataset(args.train_pq)
+test_imgs = load_dataset(args.test_pq)
 print(f"Train set {train_imgs.shape}, test set {test_imgs.shape}")
 
 # Make the RNG partitionable across devices
@@ -171,14 +171,11 @@ rng = jax.random.PRNGKey(1337)
 rng_np = np.random.default_rng(1337)
 for epoch in trange(wandb.config.epochs):
     rng, rng2 = jax.random.split(rng)
-    rng_np.shuffle(train_imgs)
+    train_imgs = train_imgs.shuffle(generator=rng_np)
     batches = train_imgs.shape[0] // args.batch_size
-    with tqdm(total=batches, leave=False) as pbar:
-        for i_batch in range(train_imgs.shape[0] // args.batch_size):
-            batch = jax.device_put(
-                train_imgs[i_batch * args.batch_size : (i_batch + 1) * args.batch_size],
-                sharding,
-            )
+    with tqdm(total=batches, leave=False, desc="train batches") as pbar:
+        for batch in train_imgs.iter(batch_size=args.batch_size, skip_last_batch=True):
+            batch = jax.device_put(batch["encoded_img"], sharding)
             my_train_state, loss, norm = train_step(my_train_state, batch)
             global_step += 1
             wandb.log(
@@ -200,12 +197,14 @@ for epoch in trange(wandb.config.epochs):
                 tqdm.write(" DONE")
     # Evaluate on test set
     losses = []
-    for i_batch in range(test_imgs.shape[0] // args.batch_size):
-        batch = jax.device_put(
-            test_imgs[i_batch * args.batch_size : (i_batch + 1) * args.batch_size],
-            sharding,
-        )
-        losses.append(loss_fn(my_train_state.params, rng, batch))
+    for batch in tqdm(
+        test_imgs.iter(batch_size=args.batch_size),
+        total=len(test_imgs) // args.batch_size,
+        desc="test batches",
+    ):
+        rng, rng2 = jax.random.split(rng)
+        batch = jax.device_put(batch["encoded_img"], sharding)
+        losses.append(loss_fn(my_train_state.params, rng2, batch))
     test_loss = jnp.mean(jnp.stack(losses))
     wandb.log({"global_step": global_step, "test/loss": test_loss})
     tqdm.write(

@@ -6,7 +6,12 @@ import gc
 import itertools
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pandas as pd
 import PIL.Image
+import pyarrow as pa
+import pyarrow.parquet as pq
+import random
 import torch
 from concurrent import futures
 from ldm_autoencoder import LDMAutoencoder
@@ -16,7 +21,7 @@ from tqdm import tqdm
 from typing import Optional
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--out_dir", type=str)
+parser.add_argument("--out_path", type=Path)
 parser.add_argument("--batch_size", type=int)
 parser.add_argument("--ckpt", type=str)
 parser.add_argument("--autoencoder_cfg", type=str)
@@ -35,9 +40,6 @@ autoencoder_params = autoencoder_mdl.params_from_torch(
 
 for in_dir in args.in_dirs:
     assert in_dir.is_dir(), f"{in_dir} is not a directory"
-
-out_path = Path(args.out_dir)
-out_path.mkdir(exist_ok=True)
 
 
 def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
@@ -98,7 +100,11 @@ print("Collecting image paths...", flush=True, end="")
 img_paths = [list(in_path.iterdir()) for in_path in args.in_dirs]
 img_paths = list(itertools.chain(*img_paths))
 print(f" {len(img_paths)} images found.")
+random.shuffle(img_paths)  # Makes progress bar ETA more accurate
 img_paths_iter = iter(img_paths)
+
+# List of DataFrames
+dfs = []
 
 # We load images with PIL in batch_size chunks, but not every image is valid, so we accumulate
 # the PIL images until we have batch_size of them, then convert them to jax arrays and encode.
@@ -106,7 +112,7 @@ img_paths_iter = iter(img_paths)
 print("Processing images...")
 batch_img_paths = []
 batch_pil_imgs = []
-with tqdm(total=len(img_paths), desc="images", smoothing=0.10) as pbar:
+with tqdm(total=len(img_paths), desc="images", smoothing=0.15) as pbar:
     while True:
         while len(batch_img_paths) < args.batch_size:
             paths_to_load = list(itertools.islice(img_paths_iter, args.batch_size))
@@ -133,12 +139,25 @@ with tqdm(total=len(img_paths), desc="images", smoothing=0.10) as pbar:
         imgs_jax_arr = jnp.stack([jnp.array(img) for img in this_batch_imgs])
         imgs_encoded = encode_vec(imgs_jax_arr)
         saved = 0
+        new_examples = []
         for encoded_img, img_path in zip(imgs_encoded, this_batch_paths):
-            out_file_path = out_path / img_path.name
-            jnp.save(out_file_path, encoded_img)
+            new_examples.append(
+                {
+                    "name": img_path.name,
+                    "encoded_img": np.array(encoded_img).astype(np.int32),
+                }
+            )
             saved += 1
-        tqdm.write(f"saved {saved} images")
+        # At some point this will need to stream output to disk rather than keeping everything in
+        # RAM, but that's a problem for Future Echo.
+        dfs.append(pd.DataFrame(new_examples))
+        tqdm.write(f"encoded {saved} images")
         pbar.update(len(imgs_encoded))
-        gc.collect()
+
+print("Concatenating dataframes...")
+df = pd.concat(dfs, ignore_index=True)
+
+print("Writing dataset to disk...")
+pq.write_table(pa.Table.from_pandas(df), args.out_path)
 
 pool.shutdown()
