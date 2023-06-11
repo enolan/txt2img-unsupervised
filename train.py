@@ -257,9 +257,7 @@ last_checkpoint_time = datetime.datetime.now()
 
 
 def save_checkpoint() -> None:
-    checkpoint_manager.save(
-        global_step, {"state": my_train_state, "cfg": cfg}
-    )
+    checkpoint_manager.save(global_step, {"state": my_train_state, "cfg": cfg})
 
 
 rng = jax.random.PRNGKey(1337)
