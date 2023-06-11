@@ -47,7 +47,9 @@ parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)), default=T
 parser.add_argument("--gradient-clipping", type=float, default=None)
 parser.add_argument("--ae-cfg", type=Path, required=True)
 parser.add_argument("--ae-ckpt", type=Path, required=True)
+parser.add_argument("--activations-dtype", type=str, default="float32")
 args, _unknown = parser.parse_known_args()
+
 
 wandb.init()
 global_step: int = 0  # gradients computed so far
@@ -68,17 +70,25 @@ print(f"Train set {train_imgs.shape}, test set {test_imgs.shape}")
 # Make the RNG partitionable across devices
 jax.config.update("jax_threefry_partitionable", True)
 
-# Setup the model
 cfg = transformer_model.gpt_1_config
-cfg.use_biases = args.use_biases
-mdl = transformer_model.ImageModel(**cfg.__dict__)
 
 wandb_config = {}
-wandb_config.update(vars(args))
 wandb_config.update(cfg.__dict__)
+wandb_config.update(vars(args))
 wandb.config.update(wandb_config)
 wandb.define_metric("test/loss", summary="last")
 wandb.define_metric("train/loss", summary="last")
+
+
+# Setup the model
+cfg.use_biases = wandb.config.use_biases
+if wandb.config.activations_dtype == "float32":
+    cfg.activations_dtype = jnp.float32
+elif wandb.config.activations_dtype == "bfloat16":
+    cfg.activations_dtype = jnp.bfloat16
+else:
+    raise ValueError("Invalid activations_dtype")
+mdl = transformer_model.ImageModel(**cfg.__dict__)
 
 params = mdl.init(
     rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},

@@ -21,11 +21,12 @@ class ImageModel(nn.Module):
     n_layers: int
     seq_len: int
     use_biases: bool
+    activations_dtype: jnp.dtype
 
     def setup(self) -> None:
-        self.in_embed = nn.Embed(num_embeddings=8192, features=self.d_model)
+        self.in_embed = nn.Embed(num_embeddings=8192, features=self.d_model, dtype=self.activations_dtype)
         self.positional_encoding = nn.Embed(
-            num_embeddings=self.seq_len, features=self.d_model
+            num_embeddings=self.seq_len, features=self.d_model, dtype=self.activations_dtype
         )
         self.transformer_layers = [
             TransformerLayer(
@@ -34,10 +35,11 @@ class ImageModel(nn.Module):
                 ff_dim=self.ff_dim,
                 dropout=self.dropout,
                 use_biases=self.use_biases,
+                activations_dtype=self.activations_dtype,
             )
             for _ in range(self.n_layers)
         ]
-        self.logits_decoder = nn.Dense(features=8192, use_bias=self.use_biases)
+        self.logits_decoder = nn.Dense(features=8192, use_bias=self.use_biases, dtype=self.activations_dtype)
 
     def __call__(self, image: jax.Array) -> jax.Array:
         """Run the model, returning log probabilities. Input should be padded to seq_len."""
@@ -47,7 +49,7 @@ class ImageModel(nn.Module):
         # Have to shift the input right so causality isn't violated
         embeds = jnp.concatenate([jnp.zeros((1, self.d_model)), embeds[:-1]], axis=0)
         h: jax.Array = embeds + self.positional_encoding(jnp.arange(self.seq_len))
-        mask = nn.attention.make_causal_mask(image)
+        mask = nn.attention.make_causal_mask(image, dtype=self.activations_dtype)
         for tl in self.transformer_layers:
             h = tl(h, mask=mask)
         return self.logits_decoder(h)  # type: ignore[no-any-return]
@@ -160,6 +162,7 @@ class TransformerLayer(nn.Module):
     ff_dim: int
     dropout: Optional[float]
     use_biases: bool
+    activations_dtype: jnp.dtype
 
     def setup(self) -> None:
         self.mha = nn.SelfAttention(
@@ -171,11 +174,12 @@ class TransformerLayer(nn.Module):
             dropout_rate=0,
             deterministic=False,
             use_bias=self.use_biases,
+            dtype=self.activations_dtype,
         )
-        self.layer_norm_1 = nn.LayerNorm()
-        self.linear_1 = nn.Dense(features=self.ff_dim, use_bias=self.use_biases)
-        self.linear_2 = nn.Dense(features=self.d_model, use_bias=self.use_biases)
-        self.layer_norm_2 = nn.LayerNorm()
+        self.layer_norm_1 = nn.LayerNorm(dtype=self.activations_dtype)
+        self.linear_1 = nn.Dense(features=self.ff_dim, use_bias=self.use_biases, dtype=self.activations_dtype)
+        self.linear_2 = nn.Dense(features=self.d_model, use_bias=self.use_biases, dtype=self.activations_dtype)
+        self.layer_norm_2 = nn.LayerNorm(dtype=self.activations_dtype)
         if self.dropout is not None:
             self.dropout_layer = nn.Dropout(self.dropout, deterministic=False)
         else:
@@ -228,6 +232,7 @@ class ModelConfig:
     n_layers: int
     seq_len: int
     use_biases: bool
+    activations_dtype: jnp.dtype = jnp.float32
 
 
 # Parameters taken from GPT-1, except seq_len is 256 instead of 1024
