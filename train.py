@@ -245,7 +245,7 @@ last_checkpoint_time = datetime.datetime.now()
 
 def save_checkpoint() -> None:
     checkpoint_manager.save(
-        global_step, {"state": my_train_state, "metadata": wandb_config}
+        global_step, {"state": my_train_state, "cfg": cfg}
     )
 
 
