@@ -240,9 +240,6 @@ class LDMDecoder(nn.Module):
         channels = block_in
         for i_level in reversed(range(len(self.cfg["ch_mult"]))):
             out_channels = self.cfg["ch"] * self.cfg["ch_mult"][i_level]
-            print(
-                f"i_level {i_level} input channels {channels} output channels {out_channels}"
-            )
             upsample_blocks.append(
                 UpsamplingBlock(
                     in_channels=channels,

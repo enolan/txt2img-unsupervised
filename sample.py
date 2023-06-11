@@ -74,11 +74,10 @@ else:
     seed = randint(0, 2**32 - 1)
 rng = jax.random.PRNGKey(seed)
 
+sample_v = jax.vmap(lambda rng: sample(im_mdl, im_params, rng, args.top_p))
+
 print("Sampling encoded images from the transformer model...")
-encoded_imgs = []
-for _ in trange(args.n):
-    rng, rng_sample = jax.random.split(rng)
-    encoded_imgs.append(sample(im_mdl, im_params, rng_sample, args.top_p))
+encoded_imgs = sample_v(jax.random.split(rng, args.n))
 
 print("Loading autoencoder model...")
 ae_cfg = OmegaConf.load(args.autoencoder_cfg)["model"]["params"]  # type:ignore[index]

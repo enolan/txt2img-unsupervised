@@ -6,16 +6,21 @@ import jax.numpy as jnp
 import numpy as np
 import optax  # type:ignore[import]
 import orbax.checkpoint  # type:ignore[import]
+import PIL.Image
 import random
 import string
+import torch
 import transformer_model
 import wandb
+from copy import copy
 from datasets import Dataset
 from distutils.util import strtobool
 from flax.core.frozen_dict import FrozenDict
 from flax.training import train_state
 from functools import partial
 from jax.experimental import mesh_utils
+from ldm_autoencoder import LDMAutoencoder
+from omegaconf import OmegaConf
 from pathlib import Path
 from tqdm import tqdm, trange
 from typing import Any, Tuple
@@ -39,6 +44,9 @@ parser.add_argument(
 parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
 parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)), default=True)
 parser.add_argument("--gradient-clipping", type=float, default=None)
+parser.add_argument("--ae-cfg", type=Path, required=True)
+parser.add_argument("--ae-ckpt", type=Path, required=True)
+parser.add_argument("--top-p", type=float, default=0.8, help="p in top-p sampling, for eval images on W&B")
 args, _unknown = parser.parse_known_args()
 
 wandb.init()
@@ -119,6 +127,55 @@ class TrainState(train_state.TrainState):  # type:ignore[no-untyped-call]
     rng: jax.random.KeyArray  # type:ignore[misc]
 
 
+# Set up for sampling:
+sample_mdl = copy(mdl)
+sample_mdl.dropout = 0.0
+
+sample_jv = jax.jit(
+    jax.vmap(
+        lambda params, rng: transformer_model.sample(
+            sample_mdl, params, rng, args.top_p
+        ),
+        in_axes=(None, 0),
+    )
+)
+
+
+ae_cfg = OmegaConf.load(args.ae_cfg)["model"]["params"]
+ae_mdl = LDMAutoencoder(ae_cfg)
+# don't keep these on the GPU when we're not using them
+ae_params_torch = torch.load(args.ae_ckpt, map_location="cpu")
+
+decode_jv = jax.jit(
+    jax.vmap(
+        (
+            lambda ae_params, codes: ae_mdl.apply(
+                ae_params, method=ae_mdl.decode, x=codes, shape=(16, 16)
+            )
+        ),
+        in_axes=(None, 0),
+    )
+)
+
+
+def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
+    """Sample from the model and log to wandb."""
+    rngs = jax.device_put(jax.random.split(ts.rng, args.batch_size), sharding)
+    samples = sample_jv(ts.params, rngs)
+    ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
+    decoded = decode_jv(ae_params, samples)
+    decoded = jnp.clip(-1.0, decoded, 1.0)
+    decoded = (decoded + 1.0) * 127.5
+    decoded = np.array(decoded.astype(jnp.uint8))
+    imgs = [
+        wandb.Image(
+            PIL.Image.fromarray(img), caption=f"sample w/ top-p = {args.top_p:.02f}"
+        )
+        for img in decoded
+    ]
+    wandb.log({"samples": imgs, "global_step": global_step})
+
+
 @partial(jax.jit, donate_argnums=(0,))
 def train_step(
     state: TrainState,
@@ -170,7 +227,6 @@ def save_checkpoint() -> None:
 rng = jax.random.PRNGKey(1337)
 rng_np = np.random.default_rng(1337)
 for epoch in trange(wandb.config.epochs):
-    rng, rng2 = jax.random.split(rng)
     train_imgs = train_imgs.shuffle(generator=rng_np)
     batches = train_imgs.shape[0] // args.batch_size
     with tqdm(total=batches, leave=False, desc="train batches") as pbar:
@@ -212,4 +268,7 @@ for epoch in trange(wandb.config.epochs):
         end="",
     )
     save_checkpoint()
+    tqdm.write(" DONE")
+    tqdm.write("Sampling...", end="")
+    sample_and_log(my_train_state, global_step, sharding)
     tqdm.write(" DONE")
