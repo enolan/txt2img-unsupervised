@@ -177,9 +177,14 @@ def sample_and_log(ts: TrainState, global_step: int) -> None:
         # Round something down so it's a multiple of a and b
         less = min(a, b)
         more = max(a, b)
-        while x % less != 0 or x % more != 0:
+        while True:
+            if x % less != 0:
+                x -= x % less
+            if x % more != 0:
+                x -= x % more
+            if x % less == 0 and x % more == 0:
+                break
             assert x > 0
-            x -= less
         return x
 
     imgs_to_sample = min(80, args.batch_size)
