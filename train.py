@@ -172,11 +172,24 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
     """Sample from the model and log to wandb."""
     # Sample with different top_p values
     top_ps = [0.2, 0.6, 0.8, 0.9, 0.95]
-    imgs_to_sample = min(64, args.batch_size)
-    imgs_to_sample = imgs_to_sample - imgs_to_sample % len(top_ps)
+
+    def round_down_to_multiples(x, a, b):
+        # Round something down so it's a multiple of a and b
+        less = min(a, b)
+        more = max(a, b)
+        while x % less != 0 or x % more != 0:
+            assert x > 0
+            x -= less
+        return x
+
+    imgs_to_sample = min(80, args.batch_size)
+    imgs_to_sample = round_down_to_multiples(
+        imgs_to_sample, len(top_ps), jax.device_count()
+    )
     img_top_ps = jnp.concatenate(
         [jnp.repeat(p, imgs_to_sample // len(top_ps)) for p in top_ps]
     )
+    assert len(img_top_ps) % jax.device_count() == 0
     img_top_ps = jax.device_put(img_top_ps, sharding)
 
     rngs = jax.device_put(jax.random.split(ts.rng, imgs_to_sample), sharding)
