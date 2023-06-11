@@ -168,7 +168,7 @@ decode_jv = jax.jit(
 )
 
 
-def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
+def sample_and_log(ts: TrainState, global_step: int) -> None:
     """Sample from the model and log to wandb."""
     # Sample with different top_p values
     top_ps = [0.2, 0.6, 0.8, 0.9, 0.95]
@@ -190,9 +190,16 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
         [jnp.repeat(p, imgs_to_sample // len(top_ps)) for p in top_ps]
     )
     assert len(img_top_ps) % jax.device_count() == 0
-    img_top_ps = jax.device_put(img_top_ps, sharding)
+    # Can't use the sharding for examples here because it has two dimensions and we need one.
+    p_sharding = jax.sharding.PositionalSharding(
+        mesh_utils.create_device_mesh((jax.device_count(),))
+    )
+    img_top_ps = jax.device_put(img_top_ps, p_sharding)
 
-    rngs = jax.device_put(jax.random.split(ts.rng, imgs_to_sample), sharding)
+    rng_sharding = jax.sharding.PositionalSharding(
+        mesh_utils.create_device_mesh((jax.device_count(), 1))
+    )
+    rngs = jax.device_put(jax.random.split(ts.rng, imgs_to_sample), rng_sharding)
 
     samples = sample_jv(ts.params, rngs, img_top_ps)
 
@@ -306,5 +313,5 @@ for epoch in trange(wandb.config.epochs):
     save_checkpoint()
     tqdm.write(" DONE")
     tqdm.write("Sampling...", end="")
-    sample_and_log(my_train_state, global_step, sharding)
+    sample_and_log(my_train_state, global_step)
     tqdm.write(" DONE")
