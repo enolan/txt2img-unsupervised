@@ -27,8 +27,10 @@ echo "Installing Poetry & poet-plugin"
 pip install poetry
 pip install poet-plugin
 
-echo "cloning git repo"
+echo "Cloning git repo"
 git clone https://github.com/enolan/txt2img-unsupervised.git ~/txt2img-unsupervised
+cd ~/txt2img-unsupervised
+git submodule update --init
 
 echo "Installing txt2img dependencies"
 cd ~/txt2img-unsupervised || exit 1
@@ -46,5 +48,10 @@ rclone copy \
     --fast-list --size-only --multi-thread-streams 16 --include '*.tar' --include '*.tar.zst' \
     --include '*.parquet' -P \
     r2:txt2img-unsupervised-dataset/preprocessed/ ~/datasets/preprocessed/
+
+echo "Downloading VQGAN"
+wget https://ommer-lab.com/files/latent-diffusion/vq-f4.zip -O ~/vq-f4.zip
+unzip ~/vq-f4.zip -d ~/vq-f4
+mv ~/vq-f4/model.ckpt ~/txt2img-unsupervised/vq-f4.ckpt
 
 echo "Done. Now relogin, and don't forget to start tmux."
