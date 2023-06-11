@@ -15,6 +15,7 @@ import wandb
 from copy import copy
 from datasets import Dataset
 from distutils.util import strtobool
+from einops import rearrange
 from flax.core.frozen_dict import FrozenDict
 from flax.training import train_state
 from functools import partial
@@ -46,7 +47,6 @@ parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)), default=T
 parser.add_argument("--gradient-clipping", type=float, default=None)
 parser.add_argument("--ae-cfg", type=Path, required=True)
 parser.add_argument("--ae-ckpt", type=Path, required=True)
-parser.add_argument("--top-p", type=float, default=0.8, help="p in top-p sampling, for eval images on W&B")
 args, _unknown = parser.parse_known_args()
 
 wandb.init()
@@ -133,10 +133,10 @@ sample_mdl.dropout = 0.0
 
 sample_jv = jax.jit(
     jax.vmap(
-        lambda params, rng: transformer_model.sample(
-            sample_mdl, params, rng, args.top_p
+        lambda params, rng, top_p: transformer_model.sample(
+            sample_mdl, params, rng, top_p
         ),
-        in_axes=(None, 0),
+        in_axes=(None, 0, 0),
     )
 )
 
@@ -160,20 +160,35 @@ decode_jv = jax.jit(
 
 def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
     """Sample from the model and log to wandb."""
-    rngs = jax.device_put(jax.random.split(ts.rng, args.batch_size), sharding)
-    samples = sample_jv(ts.params, rngs)
+    # Sample with different top_p values
+    top_ps = [0.2, 0.6, 0.8, 0.9, 0.95]
+    imgs_to_sample = min(64, args.batch_size)
+    imgs_to_sample = imgs_to_sample - imgs_to_sample % len(top_ps)
+    img_top_ps = jnp.concatenate(
+        [jnp.repeat(p, imgs_to_sample // len(top_ps)) for p in top_ps]
+    )
+    img_top_ps = jax.device_put(img_top_ps, sharding)
+
+    rngs = jax.device_put(jax.random.split(ts.rng, imgs_to_sample), sharding)
+
+    samples = sample_jv(ts.params, rngs, img_top_ps)
+
     ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
+
     decoded = decode_jv(ae_params, samples)
     decoded = jnp.clip(-1.0, decoded, 1.0)
     decoded = (decoded + 1.0) * 127.5
     decoded = np.array(decoded.astype(jnp.uint8))
-    imgs = [
-        wandb.Image(
-            PIL.Image.fromarray(img), caption=f"sample w/ top-p = {args.top_p:.02f}"
-        )
-        for img in decoded
-    ]
-    wandb.log({"samples": imgs, "global_step": global_step})
+
+    decoded_grouped = rearrange(decoded, "(p n) h w c -> p n h w c", p=len(top_ps))
+    to_log = {
+        f"samples/top-p-{p:.02f}": [
+            wandb.Image(PIL.Image.fromarray(np.array(img))) for img in imgs
+        ]
+        for p, imgs in zip(top_ps, decoded_grouped)
+    }
+    to_log["global_step"] = global_step
+    wandb.log(to_log)
 
 
 @partial(jax.jit, donate_argnums=(0,))
