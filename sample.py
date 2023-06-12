@@ -43,29 +43,20 @@ if args.make_grids:
 
 
 print("Loading transformer model...")
-checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-# Orbax chokes on relative paths for some godforsaken reason
-restored = checkpointer.restore(args.transformer_checkpoint_dir.absolute())
-
-
-def conv_cfg_type(x):
-    # Convert from numpy ndarrays to built-in types
-    if type(x) == np.ndarray:
-        assert x.shape == (), f"Expected scalar, got {x.shape}"
-        if x.dtype == np.int_:
-            return int(x)
-        elif x.dtype == np.float_:
-            return float(x)
-        elif x.dtype == np.bool_:
-            return bool(x)
-
-
-cfg = dacite.from_dict(
-    data_class=ModelConfig, data=jax.tree_map(conv_cfg_type, restored["metadata"])
+checkpoint_mngr = orbax.checkpoint.CheckpointManager(
+    # Orbax chokes on relative paths for some godforsaken reason
+    args.transformer_checkpoint_dir.absolute(),
+    orbax.checkpoint.Checkpointer(orbax.checkpoint.PyTreeCheckpointer()),
 )
-cfg.dropout = None
-im_mdl = ImageModel(**cfg.__dict__)
-im_params = restored["state"]["params"]
+print(
+    f"Loading step {checkpoint_mngr.latest_step()} from {args.transformer_checkpoint_dir}"
+)
+restored = checkpoint_mngr.restore(checkpoint_mngr.latest_step())
+
+model_cfg = ModelConfig.from_json_dict(checkpoint_mngr.metadata()["model_cfg"])
+model_cfg.dropout = None
+im_mdl = ImageModel(**model_cfg.__dict__)
+im_params = restored["params"]
 
 # Set up random seed
 if args.seed is not None:

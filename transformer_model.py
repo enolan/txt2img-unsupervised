@@ -3,8 +3,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax  # type: ignore[import]
+from config import ModelConfig
 from copy import copy
 from dataclasses import dataclass
+from flax import struct
 from flax.core.frozen_dict import FrozenDict
 from functools import partial
 from typing import Any, Optional, Tuple
@@ -219,20 +221,6 @@ def loss_batch(
             model, params, jax.random.split(dropout_rng, batch.shape[0]), batch
         )
     )
-
-
-@dataclass
-class ModelConfig:
-    """Configuration for the transformer models."""
-
-    d_model: int
-    num_heads: int
-    ff_dim: int
-    dropout: Optional[float]
-    n_layers: int
-    seq_len: int
-    use_biases: bool
-    activations_dtype: jnp.dtype = jnp.float32
 
 
 # Parameters taken from GPT-1, except seq_len is 256 instead of 1024

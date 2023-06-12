@@ -1,17 +1,18 @@
 """Train the image model."""
 import argparse
+import config
 import datetime
 import jax
 import jax.numpy as jnp
+import json
 import numpy as np
 import optax  # type:ignore[import]
 import orbax.checkpoint  # type:ignore[import]
 import PIL.Image
-import random
-import string
 import torch
 import transformer_model
 import wandb
+from config import ModelConfig, TrainingConfig
 from copy import copy
 from datasets import Dataset
 from distutils.util import strtobool
@@ -34,20 +35,22 @@ from typing import Any, Tuple
 # - alt activation functions
 
 parser = argparse.ArgumentParser()
-parser.add_argument("train_pq", type=Path)
-parser.add_argument("test_pq", type=Path)
-parser.add_argument("batch_size", type=int)
-parser.add_argument("epochs", type=int)
-parser.add_argument("--lr", type=float, default=1e-4)
+parser.add_argument("--train-pq", type=Path, required=True)
+parser.add_argument("--test-pq", type=Path, required=True)
+parser.add_argument("--model-config", type=Path, required=True)
+parser.add_argument("--training-config", type=Path, required=True)
+parser.add_argument("--batch-size", type=int)
+parser.add_argument("--epochs", type=int)
+parser.add_argument("--learning-rate", type=float, default=1e-4)
 parser.add_argument(
-    "--triangle_schedule", type=lambda x: bool(strtobool(x)), default=True
+    "--triangle-schedule", type=lambda x: bool(strtobool(x)), default=True
 )
-parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)), default=True)
+parser.add_argument("--gradient-accumulation-steps", type=int)
+parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--gradient-clipping", type=float, default=None)
 parser.add_argument("--ae-cfg", type=Path, required=True)
 parser.add_argument("--ae-ckpt", type=Path, required=True)
-parser.add_argument("--activations-dtype", type=str, default="float32")
+parser.add_argument("--activations-dtype", type=str)
 args, _unknown = parser.parse_known_args()
 
 
@@ -70,29 +73,36 @@ print(f"Train set {train_imgs.shape}, test set {test_imgs.shape}")
 # Make the RNG partitionable across devices
 jax.config.update("jax_threefry_partitionable", True)
 
-cfg = transformer_model.gpt_1_config
+# Load the model configuration
+with open(args.model_config) as f:
+    model_cfg = ModelConfig.from_json_dict(json.load(f))
+config.merge_attrs(model_cfg, args)
 
-wandb_config = {}
-wandb_config.update(cfg.__dict__)
-wandb_config.update(vars(args))
-wandb.config.update(wandb_config)
+with open(args.training_config) as f:
+    training_cfg = TrainingConfig.from_json_dict(json.load(f))
+config.merge_attrs(training_cfg, args)
+
+wandb.config.update(model_cfg.to_json_dict())
+wandb.config.update(training_cfg.to_json_dict())
+model_cfg = ModelConfig.from_json_dict(wandb.config.as_dict())
+training_cfg = TrainingConfig.from_json_dict(wandb.config.as_dict())
+print(f"Model config post-wandb: {json.dumps(model_cfg.to_json_dict(), indent=2)}")
+print(
+    f"Training config post-wandb: {json.dumps(training_cfg.to_json_dict(), indent=2)}"
+)
+
 wandb.define_metric("test/loss", summary="last")
 wandb.define_metric("train/loss", summary="last")
 
+# Get possibly sweep-controlled parameters from wandb
+model_cfg = ModelConfig.from_json_dict(wandb.config.as_dict())
+training_cfg = TrainingConfig.from_json_dict(wandb.config.as_dict())
 
-# Setup the model
-cfg.use_biases = wandb.config.use_biases
-if wandb.config.activations_dtype == "float32":
-    cfg.activations_dtype = jnp.float32
-elif wandb.config.activations_dtype == "bfloat16":
-    cfg.activations_dtype = jnp.bfloat16
-else:
-    raise ValueError("Invalid activations_dtype")
-mdl = transformer_model.ImageModel(**cfg.__dict__)
+mdl = transformer_model.ImageModel(**model_cfg.__dict__)
 
 params = mdl.init(
     rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
-    image=jnp.zeros((cfg.seq_len,), dtype=jnp.int32),
+    image=jnp.zeros((model_cfg.seq_len,), dtype=jnp.int32),
 )
 
 
@@ -108,22 +118,22 @@ def triangle_schedule(max_lr: float, total_steps: int) -> optax.Schedule:
     return optax.join_schedules([sched_up, sched_down], [total_steps // 2])
 
 
-if wandb.config.triangle_schedule:
+if training_cfg.triangle_schedule:
     opt = optax.adam(
         learning_rate=triangle_schedule(
-            wandb.config.lr, wandb.config.epochs * len(train_imgs)
+            training_cfg.learning_rate, training_cfg.epochs * len(train_imgs)
         )
     )
 else:
-    opt = optax.adam(learning_rate=wandb.config.lr)
+    opt = optax.adam(learning_rate=training_cfg.learning_rate)
 
-assert wandb.config.gradient_accumulation_steps > 0
-if wandb.config.gradient_accumulation_steps > 1:
+assert training_cfg.gradient_accumulation_steps > 0
+if training_cfg.gradient_accumulation_steps > 1:
     opt = optax.MultiSteps(
-        opt, every_k_schedule=wandb.config.gradient_accumulation_steps
+        opt, every_k_schedule=training_cfg.gradient_accumulation_steps
     )
-if wandb.config.gradient_clipping is not None:
-    clip = optax.clip_by_global_norm(wandb.config.gradient_clipping)
+if training_cfg.gradient_clipping is not None:
+    clip = optax.clip_by_global_norm(training_cfg.gradient_clipping)
 else:
     clip = optax.identity()
 opt = optax.chain(clip, opt)
@@ -187,7 +197,7 @@ def sample_and_log(ts: TrainState, global_step: int) -> None:
             assert x > 0
         return x
 
-    imgs_to_sample = min(80, args.batch_size)
+    imgs_to_sample = min(80, training_cfg.batch_size)
     imgs_to_sample = round_down_to_multiples(
         imgs_to_sample, len(top_ps), jax.device_count()
     )
@@ -244,9 +254,9 @@ def train_step(
 # Set up sharding
 devices = jax.device_count()
 print(
-    f"Sharding batches of {args.batch_size} across {devices} devices, {args.batch_size / devices} per device"
+    f"Sharding batches of {training_cfg.batch_size} across {devices} devices, {training_cfg.batch_size / devices} per device"
 )
-assert args.batch_size % devices == 0
+assert training_cfg.batch_size % devices == 0
 sharding = jax.sharding.PositionalSharding(mesh_utils.create_device_mesh((devices, 1)))
 params = jax.device_put(params, sharding.replicate())
 
@@ -262,23 +272,32 @@ checkpoint_options = orbax.checkpoint.CheckpointManagerOptions(
     max_to_keep=3, keep_time_interval=datetime.timedelta(hours=1)
 )
 checkpoint_manager = orbax.checkpoint.CheckpointManager(
-    checkpoint_dir, orbax.checkpoint.PyTreeCheckpointer(), options=checkpoint_options
+    checkpoint_dir,
+    orbax.checkpoint.Checkpointer(orbax.checkpoint.PyTreeCheckpointHandler()),
+    options=checkpoint_options,
+    metadata={
+        "model_cfg": model_cfg.to_json_dict(),
+        "training_cfg": training_cfg.to_json_dict(),
+        "run_id": run_id,
+    },
 )
 
 last_checkpoint_time = datetime.datetime.now()
 
 
 def save_checkpoint() -> None:
-    checkpoint_manager.save(global_step, {"state": my_train_state, "cfg": cfg})
+    checkpoint_manager.save(global_step, my_train_state)
 
 
 rng = jax.random.PRNGKey(1337)
 rng_np = np.random.default_rng(1337)
-for epoch in trange(wandb.config.epochs):
+for epoch in trange(training_cfg.epochs):
     train_imgs = train_imgs.shuffle(generator=rng_np)
-    batches = train_imgs.shape[0] // args.batch_size
+    batches = train_imgs.shape[0] // training_cfg.batch_size
     with tqdm(total=batches, leave=False, desc="train batches") as pbar:
-        for batch in train_imgs.iter(batch_size=args.batch_size, drop_last_batch=True):
+        for batch in train_imgs.iter(
+            batch_size=training_cfg.batch_size, drop_last_batch=True
+        ):
             batch = jax.device_put(batch["encoded_img"], sharding)
             my_train_state, loss, norm = train_step(my_train_state, batch)
             global_step += 1
@@ -302,8 +321,8 @@ for epoch in trange(wandb.config.epochs):
     # Evaluate on test set
     losses = []
     for batch in tqdm(
-        test_imgs.iter(batch_size=args.batch_size),
-        total=len(test_imgs) // args.batch_size,
+        test_imgs.iter(batch_size=training_cfg.batch_size, drop_last_batch=False),
+        total=len(test_imgs) // training_cfg.batch_size,
         desc="test batches",
     ):
         rng, rng2 = jax.random.split(rng)
