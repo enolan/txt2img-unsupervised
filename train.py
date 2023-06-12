@@ -35,6 +35,15 @@ from typing import Any, Tuple
 # - alt activation functions
 
 parser = argparse.ArgumentParser()
+def parse_dtype(dtype_str):
+    dtype_mapping = {
+        'float32': jnp.float32,
+        'float16': jnp.float16,
+        'bfloat16': jnp.bfloat16
+    }
+    if dtype_str not in dtype_mapping:
+        raise argparse.ArgumentTypeError(f"Invalid activations dtype: {dtype_str}")
+    return dtype_mapping[dtype_str]
 parser.add_argument("--train-pq", type=Path, required=True)
 parser.add_argument("--test-pq", type=Path, required=True)
 parser.add_argument("--model-config", type=Path, required=True)
@@ -50,7 +59,7 @@ parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--gradient-clipping", type=float, default=None)
 parser.add_argument("--ae-cfg", type=Path, required=True)
 parser.add_argument("--ae-ckpt", type=Path, required=True)
-parser.add_argument("--activations-dtype", type=str)
+parser.add_argument("--activations-dtype", type=parse_dtype)
 args, _unknown = parser.parse_known_args()
 
 
