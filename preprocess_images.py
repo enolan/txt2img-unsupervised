@@ -172,8 +172,22 @@ for in_dir, out_path in tqdm(zip(in_dirs, out_paths), total=len(in_dirs)):
                     return batch
 
     with tqdm(total=len(img_paths), desc=str(in_dir)) as pbar:
-        encoded_batches = []
+        encoded_batches_j = []
+        encoded_batches_np = []
         encoded_paths = []
+
+        def flush_batches(jax_list, numpy_list, force=False):
+            # Flush from jax to numpy when there is more than 256MiB of data on GPU. Movement from
+            # GPU->CPU is expensive, so we want to do it infrequently, but often enogh that we don't
+            # exhaust GPU memory.
+            batch_size_bytes = (
+                args.batch_size * 256 * 4
+            )  # TODO this will change with higher res
+            if force or len(jax_list) * batch_size_bytes > 256 * 1024 * 1204:
+                tqdm.write(f"Flushing {len(jax_list)} batches to CPU memory")
+                numpy_list.extend([np.array(batch_j) for batch_j in jax_list])
+                jax_list.clear()
+
         while True:
             batch = fetch_batch(args.batch_size, pbar)
             if not batch:
@@ -188,13 +202,15 @@ for in_dir, out_path in tqdm(zip(in_dirs, out_paths), total=len(in_dirs)):
                 batch_j = jnp.stack([jnp.array(img) for path, img in batch])
                 tqdm.write(f"Batch shape: {batch_j.shape}")
                 encoded = encode_vec(batch_j)
-                encoded_batches.append(np.array(encoded))
+                encoded_batches_j.append(encoded)
                 encoded_paths.extend([path for path, img in batch])
+                flush_batches(encoded_batches_j, encoded_batches_np)
                 pbar.update(len(batch))
+        flush_batches(encoded_batches_j, encoded_batches_np, force=True)
         tqdm.write("Done encoding, joining path queuer...")
         path_queuer.join()
         tqdm.write("Writing parquet...")
-        encoded_imgs = np.concatenate(encoded_batches)
+        encoded_imgs = np.concatenate(encoded_batches_np)
         pd_rows = [
             {"encoded_img": encoded, "name": str(path)}
             for encoded, path in zip(encoded_imgs, encoded_paths)
