@@ -93,6 +93,8 @@ config.merge_attrs(training_cfg, args)
 
 wandb.config.update(model_cfg.to_json_dict())
 wandb.config.update(training_cfg.to_json_dict())
+
+# Get possibly sweep-controlled parameters from wandb
 model_cfg = ModelConfig.from_json_dict(wandb.config.as_dict())
 training_cfg = TrainingConfig.from_json_dict(wandb.config.as_dict())
 print(f"Model config post-wandb: {json.dumps(model_cfg.to_json_dict(), indent=2)}")
@@ -102,10 +104,6 @@ print(
 
 wandb.define_metric("test/loss", summary="last")
 wandb.define_metric("train/loss", summary="last")
-
-# Get possibly sweep-controlled parameters from wandb
-model_cfg = ModelConfig.from_json_dict(wandb.config.as_dict())
-training_cfg = TrainingConfig.from_json_dict(wandb.config.as_dict())
 
 mdl = transformer_model.ImageModel(**model_cfg.__dict__)
 
