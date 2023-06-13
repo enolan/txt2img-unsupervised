@@ -3,6 +3,7 @@ import concurrent.futures
 import hashlib
 import imageio_ffmpeg  # type: ignore[import]
 import internetarchive as ia
+import os
 import random
 import re
 import shutil
@@ -57,17 +58,26 @@ def fetch_warc_names(conn: sqlite3.Connection) -> None:
         )
 
 
+def warc_id_to_url(id: str) -> str:
+    """Convert a warc id to a url."""
+    files = list(ia.get_files(id))
+    warcs = [f for f in files if f.format == "Web ARChive ZST"]
+    assert len(warcs) == 1, f"Expected one warc, found {len(warcs)}"
+    return warcs[0].url
+
+
 def download_warc(id: str, dest_dir: Path) -> Path:
-    """Download a warc from the internet archive. This will make a new directory under dest_dir
+    """Download a warc from the internet archive. This will make a new file under dest_dir
     named after the id. Returns the path to the compressed warc, which will be in dest_dir.
     """
-    ia.download(id, formats="Web ARChive ZST", destdir=str(dest_dir))
-    zsts = list(dest_dir.glob("*/*.zst"))
-    assert len(zsts) == 1, f"Expected one zst file, found {len(zsts)}"
-    out_path = dest_dir / zsts[0].name
-    zsts[0].rename(out_path)
-    shutil.rmtree(dest_dir / id)
-    return out_path
+    warc_url = warc_id_to_url(id)
+    subprocess.run(
+        ["aria2c", "-s", "16", "-x", "16", warc_url], check=True, cwd=dest_dir
+    )
+    filename_prefix = re.match(r"archiveteam_(imgur_.*)", id).group(1)
+    warc_path = list(dest_dir.glob(f"{filename_prefix}*.warc.zst"))
+    assert len(warc_path) == 1, f"Expected one warc, found {len(warc_path)}"
+    return warc_path[0]
 
 
 def decompress_and_extract_warc(compressed_warc_path: Path, dest_dir: Path) -> None:
@@ -77,6 +87,7 @@ def decompress_and_extract_warc(compressed_warc_path: Path, dest_dir: Path) -> N
     with tempfile.NamedTemporaryFile(dir=dest_dir, delete=False) as f:
         subprocess.run(["zstdwarccat", compressed_warc_path], stdout=f)
         decompressed_warc_path = Path(f.name)
+    compressed_warc_path.unlink()
     # Extract the warc
     subprocess.run(
         [
@@ -220,11 +231,16 @@ def make_video_stills(
     them. Moves the original video files to vid_dest_path and puts the generated stills in
     still_dest_path. Leaves other files where they are."""
     vid_paths = list(src_path.glob("*.mp4")) + list(src_path.glob("*.gif"))
-    for vid_path in tqdm(vid_paths, desc="video stills"):
+    # With a tmpfs, this is CPU bound, so we do it in parallel
+
+    def make_video_still(vid_path: Path) -> None:
         out_path = still_dest_path / (vid_path.name + ".png")
         # Select a random frame
         try:
             frames = imageio_ffmpeg.count_frames_and_secs(vid_path)[0]
+            if frames == 0:
+                tqdm.write(f"Skipping {vid_path} because it has no frames")
+                return
             frame_to_save = random.randint(0, frames - 1)
             gen = imageio_ffmpeg.read_frames(vid_path)
             metadata = gen.__next__()
@@ -240,6 +256,15 @@ def make_video_stills(
             # sure why. Maybe the frame counts reported are inaccurate?
             tqdm.write(f"Couldn't process {vid_path} with ffmpeg: {e}")
         vid_path.rename(vid_dest_path / vid_path.name)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+        with tqdm(total=len(vid_paths), desc="video stills") as pbar:
+            futs = [
+                executor.submit(make_video_still, vid_path) for vid_path in vid_paths
+            ]
+            for fut in concurrent.futures.as_completed(futs):
+                fut.result()
+                pbar.update(1)
 
 
 # Thread-safe connection pool
@@ -325,48 +350,44 @@ def dl_and_process_warc(
     return process_warc(warc_path, id, workdir, pool)
 
 
-def process_warcs_threaded(
+def process_warcs(
     pool: SQLiteConnectionPool,
     warcs: list[Union[Path, str]],
     workdir: Path,
     outdir: Path,
-    max_workers: int = 16,
 ) -> None:
-    """Process a list of warcs in parallel. warcs should be a list of either Path objects or IA ids."""
+    """Process a list of warcs sequentially. warcs should be a list of either Path objects or IA ids."""
     assert outdir.exists(), f"Output directory {outdir} doesn't exist"
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {}
-        for warc in warcs:
-            warc_type = type(warc)
-            if type(warc) is str:
-                ia_id: str = warc
-            elif issubclass(warc_type, Path):
-                # MyPy's narrowing is broken here
-                ia_id = ia_id_from_warc_filename(warc.name)  # type: ignore[union-attr]
-            else:
-                assert False, f"Invalid type for warc {warc}"
-            sub_workdir = workdir / ia_id
-            sub_workdir.mkdir()
-            if warc_type is str:
-                tqdm.write(f"Queueing {ia_id} for download and processing")
-                futures[
-                    executor.submit(dl_and_process_warc, ia_id, sub_workdir, pool)
-                ] = ia_id
-            elif issubclass(warc_type, Path):
-                tqdm.write(f"Queueing {warc} for processing")
-                futures[
-                    executor.submit(process_warc, warc, ia_id, sub_workdir, pool)  # type: ignore[arg-type]
-                ] = ia_id
-        for future in tqdm(
-            concurrent.futures.as_completed(futures), total=len(futures), desc="warcs"
-        ):
-            deduped_dir, video_stills_dir, videos_dir = future.result()
-            # Move the results to the output directory
-            this_outdir = outdir / futures[future]
-            this_outdir.mkdir()
-            shutil.move(deduped_dir, this_outdir / "deduped")
-            shutil.move(video_stills_dir, this_outdir / "video_stills")
-            shutil.move(videos_dir, this_outdir / "videos")
+    for warc in tqdm(warcs, desc="warcs"):
+        warc_type = type(warc)
+        if type(warc) is str:
+            ia_id: str = warc
+        elif issubclass(warc_type, Path):
+            # MyPy's narrowing is broken here
+            ia_id = ia_id_from_warc_filename(warc.name)  # type: ignore[union-attr]
+        else:
+            assert False, f"Invalid type for warc {warc}"
+        conn = pool.get_conn()
+        already_processed = conn.execute(
+            "SELECT COUNT(*) FROM warcs WHERE id = ? and processed = 1", (ia_id,)
+        ).fetchone()[0]
+        assert already_processed == 0, f"Warc {ia_id} has already been processed"
+        sub_workdir = workdir / ia_id
+        sub_workdir.mkdir()
+        if warc_type is str:
+            tqdm.write(f"Downloading and processing {ia_id}")
+            res = dl_and_process_warc(ia_id, sub_workdir, pool)
+        elif issubclass(warc_type, Path):
+            tqdm.write(f"Processing {warc}")
+            res = process_warc(warc, ia_id, sub_workdir, pool)  # type: ignore[arg-type]
+        deduped_dir, video_stills_dir, videos_dir = res
+        # Move the results to the output directory
+        this_outdir = outdir / ia_id
+        this_outdir.mkdir()
+        shutil.move(deduped_dir, this_outdir / "deduped")
+        shutil.move(video_stills_dir, this_outdir / "video_stills")
+        shutil.move(videos_dir, this_outdir / "videos")
+        shutil.rmtree(sub_workdir)
 
 
 def get_random_warc_ids(conn: sqlite3.Connection, n: int) -> list[str]:
