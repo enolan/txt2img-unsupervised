@@ -8,7 +8,7 @@ echo "TXT2IMG-UNSUPERVISED: Installing apt dependencies"
 apt-get update
 apt-get install build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
         libsqlite3-dev curl libncursesw5-dev xz-utils tk-dev libxml2-dev \
-        libxmlsec1-dev libffi-dev liblzma-dev rclone magic-wormhole zstd jq -y
+        libxmlsec1-dev libffi-dev liblzma-dev rclone magic-wormhole zstd jq atop -y
 
 echo "TXT2IMG-UNSUPERVISED: Fetching user setup script"
 curl -H "Metadata-Flavor: Google" \
