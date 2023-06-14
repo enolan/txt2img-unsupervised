@@ -9,6 +9,7 @@ import random
 import torch
 import transformer_model
 from copy import copy
+from einops import rearrange, repeat
 from ldm_autoencoder import LDMAutoencoder
 from omegaconf import OmegaConf
 from pathlib import Path
