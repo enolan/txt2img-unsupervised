@@ -41,6 +41,53 @@ autoencoder_params = autoencoder_mdl.params_from_torch(
     torch.load(args.ckpt, map_location="cpu"), autoencoder_cfg
 )
 
+# Pipelined data processing. We want as much as possible to keep data flowing at all times, and to
+# ensure the GPU is doing even batch sizes. We have several queues.
+# - one queue for each directory, containing image paths
+# - one queue for each directory, containing PIL images
+# A single thread writes paths to the directory path queues, filling each in (random) order. A pool
+# of threads reads from those queues, also in order, and loads the images. Those threads pass
+# scaled/cropped PIL images to the image queue corresponding with the right directory. Then the
+# main thread collects images from these queues (in order) and feeds them to the GPU for encoding
+# It may collect images from multiple queues and put them in the same batch, but all images from a
+# given directory go into one parquet file.
+
+encode_vec = jax.jit(
+    jax.vmap(
+        lambda img: autoencoder_mdl.apply(
+            autoencoder_params,
+            method=autoencoder_mdl.encode,
+            x=(img.astype(jnp.float32) / 127.5 - 1.0),
+        )
+    )
+)
+
+in_dirs = copy(args.in_dirs)
+random.shuffle(in_dirs)  # Makes progress bar ETA more accurate
+
+out_paths = []
+for in_dir in in_dirs:
+    assert in_dir.is_dir(), f"{in_dir} is not a directory"
+    out_path = in_dir.parent.parent / f"{in_dir.parent}-{in_dir.name}.parquet"
+    assert not out_path.exists(), f"{out_path} already exists"
+    out_paths.append(out_path)
+
+paths_queues = [CQueue(maxsize=args.batch_size * 4) for _ in in_dirs]
+
+
+def paths_queuer_main(dirs: list[Path]):
+    # Queue all the paths for each directory in turn, closing the queues as they're finished.
+    for i, dir in enumerate(dirs):
+        tqdm.write(f"Queueing paths for {dir} #{i}...")
+        CloseableQueue.enqueue(list(dir.iterdir()), paths_queues[i])
+        tqdm.write(f"Done queueing paths for {dir} #{i}")
+
+
+paths_queuer = Thread(
+    target=paths_queuer_main, args=(in_dirs,), name="Paths queuer", daemon=True
+)
+paths_queuer.start()
+
 
 def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
     """Load/crop/scale a single image."""
@@ -75,147 +122,182 @@ def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
     return img
 
 
-encode_vec = jax.jit(
-    jax.vmap(
-        lambda img: autoencoder_mdl.apply(
-            autoencoder_params,
-            method=autoencoder_mdl.encode,
-            x=(img.astype(jnp.float32) / 127.5 - 1.0),
-        )
-    )
-)
+imgs_queues = [CQueue(maxsize=args.batch_size * 4) for _ in in_dirs]
 
-in_dirs = copy(args.in_dirs)
-random.shuffle(in_dirs)  # Makes progress bar ETA more accurate
+# Thread pool for loading/scaling/cropping images
 
-out_paths = []
-for in_dir in in_dirs:
-    assert in_dir.is_dir(), f"{in_dir} is not a directory"
-    out_path = in_dir.parent / f"{in_dir.name}.parquet"
-    assert not out_path.exists(), f"{out_path} already exists"
-    out_paths.append(out_path)
+# How many threads are working on each directory
+pil_thread_counts = [0 for _ in in_dirs]
+pil_thread_counts_locks = [Lock() for _ in in_dirs]
 
-for in_dir, out_path in tqdm(zip(in_dirs, out_paths), total=len(in_dirs)):
-    # Pipelined data processing:
-    # - enqueue image paths (single thread)
-    # - dequeue image paths, load images, enqueue PIL images (many threads)
-    # - dequeue PIL images, encode with autoencoder, write to parquet when done (main thread)
 
-    # Queue for image paths
-    paths_queue = CQueue(maxsize=args.batch_size * 4)
-    # Queue for PIL images
-    imgs_queue = CQueue(maxsize=args.batch_size * 4)
-
-    tqdm.write("Collecting image paths...")
-    img_paths = list(in_dir.iterdir())
-    tqdm.write(f" {len(img_paths)} images found.")
-    random.shuffle(img_paths)  # Makes progress bar ETA more accurate
-
-    # Enqueue image paths asynchonously
-    path_queuer = Thread(
-        target=lambda: CloseableQueue.enqueue(img_paths, paths_queue),
-        name="Path enqueuer",
-    )
-    path_queuer.start()
-
-    # Thread pool for loading/scaling/cropping images
-    pil_threads = {}
-    pil_threads_lock = Lock()
-
-    def pil_thread_fn(thread_num: int):
-        try:
+def pil_thread_fn(thread_num: int):
+    try:
+        for i, q in enumerate(paths_queues):
+            with pil_thread_counts_locks[i]:
+                pil_thread_counts[i] += 1
+                tqdm.write(
+                    f"PIL thread {thread_num} starting on {in_dirs[i]} (#{i}) ({pil_thread_counts[i]} total)"
+                )
             while True:
                 try:
-                    img_path = paths_queue.get()
+                    img_path = q.get()
                 except CloseableQueue.Closed:
-                    with pil_threads_lock:
-                        del pil_threads[thread_num]
+                    with pil_thread_counts_locks[i]:
+                        pil_thread_counts[i] -= 1
                         tqdm.write(
-                            f"PIL thread {thread_num} exiting, paths queue closed ({len(pil_threads)} left)"
+                            f"PIL thread {thread_num} done with dir {i}, paths queue closed ({pil_thread_counts[i]} left)"
                         )
-                        if not pil_threads:
+                        if pil_thread_counts[i] == 0:
                             # There are no more paths to process
                             tqdm.write(
-                                f"Last PIL thread ({thread_num}) exiting, closing imgs queue"
+                                f"Last PIL thread ({thread_num}) working on {in_dirs[i]} (#{i}) done, closing corresponding images queue"
                             )
-                            imgs_queue.close()
+                            imgs_queues[i].close()
                     break
                 img = load_img(img_path)
-                imgs_queue.put((img_path, img))
-        except Exception as e:
+                imgs_queues[i].put((img, img_path))
+    except Exception as e:
+        # This hangs the process, since the PIL thread won't get closed.
+        tqdm.write(
+            f"XXX\nXXX\nXXX\nPIL thread {thread_num} crashed due to {e}\nXXX\nXXX\nXXX"
+        )
+
+
+pil_threads = {}
+
+pil_threads_num = 32
+
+for i in range(pil_threads_num):
+    t = Thread(target=pil_thread_fn, args=(i,), name=f"PIL thread {i}")
+    pil_threads[i] = t
+    t.start()
+
+
+def flush_batches(jax_list, numpy_list, force=False):
+    # Flush from jax to numpy when there is more than 256MiB of data on GPU. Movement from
+    # GPU->CPU is expensive, so we want to do it infrequently, but often enogh that we don't
+    # exhaust GPU memory.
+    # TODO this will change with higher res
+    bytes_per_enc_img = 256 * 4
+    batch_bytes = [len(j) * bytes_per_enc_img for j in jax_list]
+    if force or sum(batch_bytes) > 256 * 1024 * 1204:
+        tqdm.write(f"Flushing {len(jax_list)} encoded batches to CPU memory")
+        numpy_list.extend([np.array(batch_j) for batch_j in jax_list])
+        jax_list.clear()
+
+
+# What image queue we're currently pulling from
+img_queue_idx = 0
+# Directories that need to be written out to parquet files
+dirs_to_write = []
+# Encoded images ready to be written out, indexed by dir (JAX and NumPy)
+encoded_batches_j = {0: []}
+encoded_batches_np = {0: []}
+# The paths of the images that have been encoded
+encoded_imgs_paths = {0: []}
+
+with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
+    with tqdm(desc="files") as files_pbar:
+        while True:
+            # Collect a batch of PIL images
+            batch = []
+            # Each element of this is a pair of a dir index and the index of the first image in the
+            # batch from that dir
+            batch_dir_indices = []
+            while len(batch) < args.batch_size:
+                try:
+                    img, img_path = imgs_queues[img_queue_idx].get()
+                    if img is not None:
+                        batch.append(img)
+                        encoded_imgs_paths[img_queue_idx].append(img_path)
+                        if (
+                            batch_dir_indices == []
+                            or batch_dir_indices[-1][0] != img_queue_idx
+                        ):
+                            batch_dir_indices.append((img_queue_idx, len(batch) - 1))
+                    else:
+                        # This image was skipped
+                        files_pbar.update(1)
+                except CloseableQueue.Closed:
+                    # This queue is closed, move on to the next one
+                    tqdm.write(f"Image queue {img_queue_idx} closed, moving on")
+                    # We're ready to write the parquet file for this directory as soon as any
+                    # remaining data in batches is processed.
+                    dirs_to_write.append(img_queue_idx)
+                    if img_queue_idx == len(imgs_queues) - 1:
+                        # We've reached the end of the queues
+                        tqdm.write("All image queues closed, we're almost done")
+                        break
+                    else:
+                        img_queue_idx += 1
+                        encoded_batches_j[img_queue_idx] = []
+                        encoded_batches_np[img_queue_idx] = []
+                        encoded_imgs_paths[img_queue_idx] = []
+                        tqdm.write(
+                            f"Moving to image queue {img_queue_idx} ({in_dirs[img_queue_idx]})"
+                        )
             tqdm.write(
-                f"XXX\nXXX\nXXX\nPIL thread {thread_num} crashed due to {e}\nXXX\nXXX\nXXX"
+                f"Got batch of {len(batch)} images, queue sizes {[q.qsize() for q in imgs_queues]}"
             )
 
-    for i in range(os.cpu_count() * 2):
-        t = Thread(target=pil_thread_fn, args=(i,), name=f"PIL thread {i}")
-        pil_threads[i] = t
-        t.start()
-
-    # Read PIL images from queue, encode, and write to parquet
-
-    def fetch_batch(n: int, pbar) -> list[PIL.Image.Image]:
-        """Grab a batch of n items from the queue, or less if the queue is closed."""
-        batch = []
-        while True:
-            if len(batch) >= n:
-                return batch
-            else:
-                try:
-                    path, pil_img = imgs_queue.get()
-                    if pil_img is not None:
-                        batch.append((path, pil_img))
-                    else:
-                        # If the image was unreadable/unusable, it counts as done
-                        pbar.update(1)
-                except CloseableQueue.Closed:
-                    return batch
-
-    with tqdm(total=len(img_paths), desc=str(in_dir)) as pbar:
-        encoded_batches_j = []
-        encoded_batches_np = []
-        encoded_paths = []
-
-        def flush_batches(jax_list, numpy_list, force=False):
-            # Flush from jax to numpy when there is more than 256MiB of data on GPU. Movement from
-            # GPU->CPU is expensive, so we want to do it infrequently, but often enogh that we don't
-            # exhaust GPU memory.
-            batch_size_bytes = (
-                args.batch_size * 256 * 4
-            )  # TODO this will change with higher res
-            if force or len(jax_list) * batch_size_bytes > 256 * 1024 * 1204:
-                tqdm.write(f"Flushing {len(jax_list)} batches to CPU memory")
-                numpy_list.extend([np.array(batch_j) for batch_j in jax_list])
-                jax_list.clear()
-
-        while True:
-            batch = fetch_batch(args.batch_size, pbar)
-            if not batch:
-                tqdm.write("Images queue done!")
-                for thread in pil_threads.values():
-                    thread.join()
-                break
-            else:
-                tqdm.write(
-                    f"Got batch of {len(batch)} images, (qsize now {imgs_queue.qsize()}) encoding..."
-                )
-                batch_j = jnp.stack([jnp.array(img) for path, img in batch])
-                tqdm.write(f"Batch shape: {batch_j.shape}")
+            if len(batch) > 0:
+                # Encode the batch
+                batch_j = jnp.stack([jnp.array(img) for img in batch])
                 encoded = encode_vec(batch_j)
-                encoded_batches_j.append(encoded)
-                encoded_paths.extend([path for path, img in batch])
-                flush_batches(encoded_batches_j, encoded_batches_np)
-                pbar.update(len(batch))
-        flush_batches(encoded_batches_j, encoded_batches_np, force=True)
-        tqdm.write("Done encoding, joining path queuer...")
-        path_queuer.join()
-        tqdm.write("Writing parquet...")
-        encoded_imgs = np.concatenate(encoded_batches_np)
-        pd_rows = [
-            {"encoded_img": encoded, "name": str(path)}
-            for encoded, path in zip(encoded_imgs, encoded_paths)
-        ]
-        df = pd.DataFrame(pd_rows)
-        tqdm.write(f"Writing {len(df)} rows to {out_path}, cols {df.columns}")
-        pq.write_table(pa.Table.from_pandas(df), out_path)
-        tqdm.write("Done writing parquet!")
+                # Add the parts of the batch to the appropriate lists
+                for i in range(len(batch_dir_indices)):
+                    dir_idx, batch_start = batch_dir_indices[i]
+                    if i == len(batch_dir_indices) - 1:
+                        batch_end = len(batch)
+                    else:
+                        batch_end = batch_dir_indices[i + 1][1]
+                    encoded_batches_j[dir_idx].append(encoded[batch_start:batch_end])
+                    tqdm.write(
+                        f"Assigning images {batch_start}:{batch_end} to dir {dir_idx}"
+                    )
+                files_pbar.update(len(batch))
+
+                # Flush batches to CPU memory if necessary
+                for i in encoded_batches_j.keys():
+                    # Hmm this enforces a *per-directory* limit, not a global limit :/
+                    flush_batches(encoded_batches_j[i], encoded_batches_np[i])
+
+                # Finalize directories that are done, writing the encoded images to parquet files.
+                for i in dirs_to_write:
+                    flush_batches(
+                        encoded_batches_j[i], encoded_batches_np[i], force=True
+                    )
+                    if len(encoded_batches_np[i]) == 0:
+                        tqdm.write(
+                            f"Skipping directory {i} because it has no encoded images"
+                        )
+                    else:
+                        encoded_imgs = np.concatenate(encoded_batches_np[i])
+                        assert len(encoded_imgs) == len(
+                            encoded_imgs_paths[i]
+                        ), f"{len(encoded_imgs)} encoded images but {len(encoded_imgs_paths[i])} paths"
+                        tqdm.write(
+                            f"Writing {len(encoded_imgs)} encoded images to {out_paths[i]}"
+                        )
+                        pd_rows = [
+                            {"encoded_img": img, "name": path.name}
+                            for img, path in zip(encoded_imgs, encoded_imgs_paths[i])
+                        ]
+                        df = pd.DataFrame(pd_rows)
+                        tqdm.write(
+                            f"Writing {len(df)} rows to {out_paths[i]}, cols {df.columns}"
+                        )
+                        pq.write_table(pa.Table.from_pandas(df), out_paths[i])
+                        tqdm.write(f"Done writing {out_paths[i]}")
+                    del encoded_batches_np[i]
+                    del encoded_batches_j[i]
+                    del encoded_imgs_paths[i]
+                    dirs_pbar.update(1)
+                dirs_to_write.clear()
+            else:
+                # We've reached the end of the queues
+                tqdm.write("All done :) Joining PIL threads")
+                for t in pil_threads.values():
+                    t.join()
+                break

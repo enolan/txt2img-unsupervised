@@ -35,17 +35,20 @@ from typing import Any, Tuple
 # - alt activation functions
 
 parser = argparse.ArgumentParser()
+
+
 def parse_dtype(dtype_str):
     dtype_mapping = {
-        'float32': jnp.float32,
-        'float16': jnp.float16,
-        'bfloat16': jnp.bfloat16
+        "float32": jnp.float32,
+        "float16": jnp.float16,
+        "bfloat16": jnp.bfloat16,
     }
     if dtype_str not in dtype_mapping:
         raise argparse.ArgumentTypeError(f"Invalid activations dtype: {dtype_str}")
     return dtype_mapping[dtype_str]
-parser.add_argument("--train-pq", type=Path, required=True)
-parser.add_argument("--test-pq", type=Path, required=True)
+
+
+parser.add_argument("--pq-dir", type=Path, required=True)
 parser.add_argument("--model-config", type=Path, required=True)
 parser.add_argument("--training-config", type=Path, required=True)
 parser.add_argument("--batch-size", type=int)
@@ -69,14 +72,12 @@ wandb.define_metric("*", step_metric="global_step")
 
 
 # Load the dataset
-def load_dataset(p: Path) -> Dataset:
-    ds = Dataset.from_parquet(str(p))
-    ds.set_format("numpy")
-    return ds
-
-
-train_imgs = load_dataset(args.train_pq)
-test_imgs = load_dataset(args.test_pq)
+dset_paths = list(args.pq_dir.glob("**/*.parquet"))
+dset_all = Dataset.from_parquet([str(path) for path in dset_paths])
+dset_all.set_format("numpy")
+dset_split = dset_all.train_test_split(test_size=0.01, seed=19900515)
+train_imgs = dset_split["train"]
+test_imgs = dset_split["test"]
 print(f"Train set {train_imgs.shape}, test set {test_imgs.shape}")
 
 # Make the RNG partitionable across devices
