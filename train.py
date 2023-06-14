@@ -277,7 +277,7 @@ run_id = wandb.run.id  # type:ignore[union-attr]
 checkpoint_dir = Path(f"checkpoints/{run_id}")
 checkpoint_dir.mkdir(parents=True, exist_ok=True)
 checkpoint_options = orbax.checkpoint.CheckpointManagerOptions(
-    max_to_keep=3, keep_time_interval=datetime.timedelta(hours=1)
+    max_to_keep=3, keep_time_interval=datetime.timedelta(hours=6)
 )
 checkpoint_manager = orbax.checkpoint.CheckpointManager(
     checkpoint_dir,
