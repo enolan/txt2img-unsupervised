@@ -1,6 +1,3 @@
-[submodule "vendor/clip-jax"]
-	path = vendor/clip-jax
-	url = https://github.com/borisdayma/clip-jax.git
 [submodule "vendor/latent-diffusion"]
 	path = vendor/latent-diffusion
 	url = https://github.com/enolan/latent-diffusion.git
