@@ -54,4 +54,9 @@ wget https://ommer-lab.com/files/latent-diffusion/vq-f4.zip -O ~/vq-f4.zip
 unzip ~/vq-f4.zip -d ~/vq-f4
 mv ~/vq-f4/model.ckpt ~/txt2img-unsupervised/vq-f4.ckpt
 
+echo "Adding tmux nicety"
+cat > ~/.tmux.conf << EOF
+set-option -g status-right "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#(curl -H \"Metadata-Flavor: Google\" http://metadata.google.internal/computeMetadata/v1/instance/attributes/instance-id)\" %H:%M %d-%b-%y"
+EOF
+
 echo "Done. Now relogin, and don't forget to start tmux."
