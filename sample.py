@@ -23,6 +23,7 @@ parser.add_argument("--n", type=int, default=1)
 parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--top-p", type=float, default=0.9)
 parser.add_argument("--make-grids", action="store_true")
+parser.add_argument("--batch-size", type=int, default=16)
 parser.add_argument("out_dir", type=Path)
 args = parser.parse_args()
 
@@ -55,6 +56,7 @@ restored = checkpoint_mngr.restore(checkpoint_mngr.latest_step())
 
 model_cfg = ModelConfig.from_json_dict(checkpoint_mngr.metadata()["model_cfg"])
 model_cfg.dropout = None
+model_cfg.activations_dtype = jnp.float32  # Assume we're on the GPU at home
 im_mdl = ImageModel(**model_cfg.__dict__)
 im_params = restored["params"]
 
@@ -65,10 +67,30 @@ else:
     seed = randint(0, 2**32 - 1)
 rng = jax.random.PRNGKey(seed)
 
-sample_v = jax.vmap(lambda rng: sample(im_mdl, im_params, rng, args.top_p))
+
+def batches_split(n: int) -> list[int]:
+    """Split n into batches of size args.batch_size, plus the remainder."""
+    split = [args.batch_size] * (n // args.batch_size)
+    if n % args.batch_size != 0:
+        split.append(n % args.batch_size)
+    return split
+
+
+sample_v = jax.jit(
+    jax.vmap(
+        lambda params, rng: sample(im_mdl, params, rng, args.top_p), in_axes=(None, 0)
+    )
+)
+
 
 print("Sampling encoded images from the transformer model...")
-encoded_imgs = sample_v(jax.random.split(rng, args.n))
+
+with tqdm(total=args.n) as pbar:
+    encoded_imgs = []
+    for batch_size in batches_split(args.n):
+        rng, rng2 = jax.random.split(rng)
+        encoded_imgs.append(sample_v(im_params, jax.random.split(rng2, batch_size)))
+        pbar.update(batch_size)
 
 print("Loading autoencoder model...")
 ae_cfg = OmegaConf.load(args.autoencoder_cfg)["model"]["params"]  # type:ignore[index]
@@ -79,19 +101,29 @@ ae_params = LDMAutoencoder.params_from_torch(
 
 print("Decoding images...")
 args.out_dir.mkdir(exist_ok=True)
-decode_j = jax.jit(
-    lambda codes: ae_mdl.apply(ae_params, method=ae_mdl.decode, x=codes, shape=(16, 16))
+decode_jv = jax.jit(
+    lambda params, codeses: jax.vmap(
+        lambda codes: ae_mdl.apply(
+            params, method=ae_mdl.decode, x=codes, shape=(16, 16)
+        )
+    )(codeses)
 )
+decoded_imgs = []
+with tqdm(total=args.n) as pbar:
+    for encoded_img_batch in encoded_imgs:
+        decoded_imgs.append(decode_jv(ae_params, encoded_img_batch))
+        pbar.update(len(encoded_img_batch))
+decoded_imgs = np.concatenate(decoded_imgs, axis=0)
 
 print("Saving images...")
 imgs = []
-for i in trange(args.n):
-    img = decode_j(encoded_imgs[i])
+for i, img in enumerate(tqdm(decoded_imgs)):
     img = jnp.clip(-1, img, 1)
     img = ((img + 1) * 127.5).astype(jnp.uint8)
     img = PIL.Image.fromarray(np.array(img))
     img.save(args.out_dir / f"{i:04d}.png")
     imgs.append(img)
+
 
 if args.make_grids:
     print(f"Making {len(grid_imgs)} grids...")
