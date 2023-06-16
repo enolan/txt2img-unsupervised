@@ -24,6 +24,7 @@ from jax.experimental import mesh_utils
 from ldm_autoencoder import LDMAutoencoder
 from omegaconf import OmegaConf
 from pathlib import Path
+from sys import exit
 from tqdm import tqdm, trange
 from typing import Any, Tuple
 
@@ -147,7 +148,7 @@ if training_cfg.gradient_clipping is not None:
     clip = optax.clip_by_global_norm(training_cfg.gradient_clipping)
 else:
     clip = optax.identity()
-opt = optax.chain(clip, opt)
+opt = optax.apply_if_finite(optax.chain(clip, opt), 20)
 loss_grad_fn = jax.value_and_grad(transformer_model.loss_batch, argnums=1)
 loss_fn = jax.jit(
     lambda params, rng, batch: transformer_model.loss_batch(mdl, params, rng, batch)
@@ -311,14 +312,21 @@ for epoch in trange(training_cfg.epochs):
         ):
             batch = jax.device_put(batch["encoded_img"], sharding)
             my_train_state, loss, norm = train_step(my_train_state, batch)
+            if not jnp.isfinite(loss):
+                tqdm.write(f"Loss nonfinite 😢 ({loss})")
+            opt_state = my_train_state.opt_state
             global_step += 1
             wandb.log(
                 {
                     "global_step": global_step,
                     "train/loss": loss,
                     "grad_global_norm": norm,
+                    "debug/notfinite_count": opt_state.notfinite_count,
                 }
             )
+            if opt_state.notfinite_count > 50:
+                print(f"Too many nonfinite values in gradients, giving up")
+                exit(1)
             pbar.update()
             pbar.set_postfix(loss=f"{loss:.4f}")
             # Save checkpoint every 10 minutes
