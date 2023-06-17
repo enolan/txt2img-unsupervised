@@ -9,6 +9,7 @@ import numpy as np
 import optax  # type:ignore[import]
 import orbax.checkpoint  # type:ignore[import]
 import PIL.Image
+import time
 import torch
 import transformer_model
 import wandb
@@ -298,7 +299,15 @@ last_checkpoint_time = datetime.datetime.now()
 
 
 def save_checkpoint() -> None:
-    checkpoint_manager.save(global_step, my_train_state)
+    # TPU VMs run out of disk space a lot. Retrying in a loop lets me manually clean up the disk
+    while True:
+        try:
+            checkpoint_manager.save(global_step, my_train_state)
+            break
+        except ValueError as e:
+            print(f"Error saving checkpoint: {e}")
+            print("Retrying in 60 seconds")
+            time.sleep(60)
 
 
 rng = jax.random.PRNGKey(1337)
@@ -331,7 +340,7 @@ for epoch in trange(training_cfg.epochs):
             pbar.set_postfix(loss=f"{loss:.4f}")
             # Save checkpoint every 10 minutes
             if (datetime.datetime.now() - last_checkpoint_time) > datetime.timedelta(
-                minutes=10
+                minutes=30
             ):
                 tqdm.write("Saving checkpoint...", end="")
                 save_checkpoint()
