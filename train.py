@@ -334,7 +334,7 @@ for epoch in trange(training_cfg.epochs):
                 }
             )
             if opt_state.notfinite_count > 50:
-                print(f"Too many nonfinite values in gradients, giving up")
+                tqdm.write(f"Too many nonfinite values in gradients, giving up")
                 exit(1)
             pbar.update()
             pbar.set_postfix(loss=f"{loss:.4f}")
