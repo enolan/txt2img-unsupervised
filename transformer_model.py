@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from flax import struct
 from flax.core.frozen_dict import FrozenDict
 from functools import partial
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 from tqdm import trange
 
 
@@ -26,9 +26,20 @@ class ImageModel(nn.Module):
     activations_dtype: jnp.dtype
 
     def setup(self) -> None:
-        self.in_embed = nn.Embed(num_embeddings=8192, features=self.d_model, dtype=self.activations_dtype)
+        default_kernel_init = nn.initializers.normal(
+            stddev=0.02 / jnp.sqrt(self.n_layers)
+        )
+        self.in_embed = nn.Embed(
+            num_embeddings=8192,
+            features=self.d_model,
+            embedding_init=default_kernel_init,
+            dtype=self.activations_dtype,
+        )
         self.positional_encoding = nn.Embed(
-            num_embeddings=self.seq_len, features=self.d_model, dtype=self.activations_dtype
+            num_embeddings=self.seq_len,
+            features=self.d_model,
+            embedding_init=default_kernel_init,
+            dtype=self.activations_dtype,
         )
         self.transformer_layers = [
             TransformerLayer(
@@ -38,10 +49,16 @@ class ImageModel(nn.Module):
                 dropout=self.dropout,
                 use_biases=self.use_biases,
                 activations_dtype=self.activations_dtype,
+                kernel_init=default_kernel_init,
             )
             for _ in range(self.n_layers)
         ]
-        self.logits_decoder = nn.Dense(features=8192, use_bias=self.use_biases, dtype=self.activations_dtype)
+        self.logits_decoder = nn.Dense(
+            features=8192,
+            kernel_init=default_kernel_init,
+            use_bias=self.use_biases,
+            dtype=self.activations_dtype,
+        )
 
     def __call__(self, image: jax.Array) -> jax.Array:
         """Run the model, returning log probabilities. Input should be padded to seq_len."""
@@ -165,6 +182,7 @@ class TransformerLayer(nn.Module):
     dropout: Optional[float]
     use_biases: bool
     activations_dtype: jnp.dtype
+    kernel_init: Callable[..., jnp.ndarray]
 
     def setup(self) -> None:
         self.mha = nn.SelfAttention(
@@ -177,10 +195,21 @@ class TransformerLayer(nn.Module):
             deterministic=False,
             use_bias=self.use_biases,
             dtype=self.activations_dtype,
+            kernel_init=self.kernel_init,
         )
         self.layer_norm_1 = nn.LayerNorm(dtype=self.activations_dtype)
-        self.linear_1 = nn.Dense(features=self.ff_dim, use_bias=self.use_biases, dtype=self.activations_dtype)
-        self.linear_2 = nn.Dense(features=self.d_model, use_bias=self.use_biases, dtype=self.activations_dtype)
+        self.linear_1 = nn.Dense(
+            features=self.ff_dim,
+            use_bias=self.use_biases,
+            kernel_init=self.kernel_init,
+            dtype=self.activations_dtype,
+        )
+        self.linear_2 = nn.Dense(
+            features=self.d_model,
+            use_bias=self.use_biases,
+            kernel_init=self.kernel_init,
+            dtype=self.activations_dtype,
+        )
         self.layer_norm_2 = nn.LayerNorm(dtype=self.activations_dtype)
         if self.dropout is not None:
             self.dropout_layer = nn.Dropout(self.dropout, deterministic=False)
@@ -225,7 +254,13 @@ def loss_batch(
 
 # Parameters taken from GPT-1, except seq_len is 256 instead of 1024
 gpt_1_config = ModelConfig(
-    d_model=768, num_heads=12, ff_dim=3072, dropout=0.1, n_layers=12, seq_len=256, use_biases=True
+    d_model=768,
+    num_heads=12,
+    ff_dim=3072,
+    dropout=0.1,
+    n_layers=12,
+    seq_len=256,
+    use_biases=True,
 )
 
 

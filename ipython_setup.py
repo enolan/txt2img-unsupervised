@@ -8,6 +8,7 @@ import PIL.Image
 import random
 import torch
 import transformer_model
+from config import ModelConfig, TrainingConfig
 from copy import copy
 from ldm_autoencoder import LDMAutoencoder
 from omegaconf import OmegaConf
