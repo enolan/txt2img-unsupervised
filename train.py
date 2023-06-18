@@ -318,6 +318,7 @@ for epoch in trange(training_cfg.epochs):
         ):
             batch = jax.device_put(batch["encoded_img"], sharding)
             my_train_state, loss, norm = train_step(my_train_state, batch)
+            # TODO check if moving this check inside an if opt_state.notfinite_count > 0 is faster
             if not jnp.isfinite(loss):
                 tqdm.write(f"Loss nonfinite 😢 ({loss})")
             opt_state = my_train_state.opt_state
@@ -346,7 +347,10 @@ for epoch in trange(training_cfg.epochs):
     # Evaluate on test set
     losses = []
     for batch in tqdm(
-        test_imgs.iter(batch_size=training_cfg.batch_size, drop_last_batch=False),
+        # The last batch needs to be a multiple of the number of devices, and it isn't guaranteed
+        # to be, so we drop it. Shouldn't matter much when even 1% of the dataset is thousands of
+        # images.
+        test_imgs.iter(batch_size=training_cfg.batch_size, drop_last_batch=True),
         total=len(test_imgs) // training_cfg.batch_size,
         desc="test batches",
     ):
