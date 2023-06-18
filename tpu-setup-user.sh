@@ -45,7 +45,7 @@ curl -H "Metadata-Flavor: Google" \
 echo "Downloading dataset"
 mkdir -p ~/datasets/preprocessed
 rclone copy \
-    --fast-list --size-only --multi-thread-streams 16 --include '*.tar' --include '*.tar.zst' \
+    --fast-list --size-only --multi-thread-streams 16 --transfers 16 --include '*.tar' --include '*.tar.zst' \
     --include '*.parquet' -P \
     r2:txt2img-unsupervised-dataset/preprocessed/ ~/datasets/preprocessed/
 
@@ -58,5 +58,9 @@ echo "Adding tmux nicety"
 cat > ~/.tmux.conf << EOF
 set-option -g status-right "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#(curl -H \"Metadata-Flavor: Google\" http://metadata.google.internal/computeMetadata/v1/instance/attributes/instance-id)\" %H:%M %d-%b-%y"
 EOF
+
+echo "Fetching netrc for W&B"
+curl -H "Metadata-Flavor: Google" \
+    http://metadata.google.internal/computeMetadata/v1/instance/attributes/netrc > ~/.netrc
 
 echo "Done. Now relogin, and don't forget to start tmux."

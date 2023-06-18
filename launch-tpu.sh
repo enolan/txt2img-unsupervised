@@ -22,7 +22,7 @@ fi
 
 gcloud compute tpus tpu-vm create "$TPU_VM_NAME" --zone "$ZONE" \
   --accelerator-type "$ACCELERATOR_TYPE" --version tpu-vm-base \
-  --metadata-from-file=startup-script="$this_dir"/tpu-setup.sh,rclone_config="$this_dir"/tpu-rclone.conf,txt2img-user-setup="$this_dir"/tpu-setup-user.sh
+  --metadata-from-file=startup-script="$this_dir"/tpu-setup.sh,rclone_config="$this_dir"/tpu-rclone.conf,txt2img-user-setup="$this_dir"/tpu-setup-user.sh,netrc="$this_dir"/wandb-netrc
 
 echo "VM up, waiting 90s for root setup script to run."
 sleep 90
