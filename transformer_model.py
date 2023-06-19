@@ -24,6 +24,7 @@ class ImageModel(nn.Module):
     seq_len: int
     use_biases: bool
     activations_dtype: jnp.dtype
+    activation_function: Callable[[jax.Array], jax.Array]
 
     def setup(self) -> None:
         default_kernel_init = nn.initializers.normal(
@@ -49,6 +50,7 @@ class ImageModel(nn.Module):
                 dropout=self.dropout,
                 use_biases=self.use_biases,
                 activations_dtype=self.activations_dtype,
+                activation_function=self.activation_function,
                 kernel_init=default_kernel_init,
             )
             for _ in range(self.n_layers)
@@ -182,6 +184,7 @@ class TransformerLayer(nn.Module):
     dropout: Optional[float]
     use_biases: bool
     activations_dtype: jnp.dtype
+    activation_function: Callable[[jax.Array], jax.Array]
     kernel_init: Callable[..., jnp.ndarray]
 
     def setup(self) -> None:
@@ -221,7 +224,7 @@ class TransformerLayer(nn.Module):
         in_block_2: jax.Array = embeds + self.dropout_layer(out_block_1)
         out_block_2: jax.Array = self.layer_norm_2(
             self.dropout_layer(
-                self.linear_2(nn.activation.relu(self.linear_1(in_block_2)))  # type: ignore[attr-defined]
+                self.linear_2(self.activation_function(self.linear_1(in_block_2)))  # type: ignore[attr-defined]
             )
         )
         return in_block_2 + out_block_2
@@ -261,6 +264,7 @@ gpt_1_config = ModelConfig(
     n_layers=12,
     seq_len=256,
     use_biases=True,
+    activation_function=jax.nn.relu,
 )
 
 

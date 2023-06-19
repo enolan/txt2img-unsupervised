@@ -6,5 +6,6 @@
   "n_layers": 24,
   "seq_len": 256,
   "use_biases": true,
-  "activations_dtype": "float32"
+  "activations_dtype": "float32",
+  "activation_function": "gelu"
 }

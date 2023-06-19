@@ -13,7 +13,7 @@ import time
 import torch
 import transformer_model
 import wandb
-from config import ModelConfig, TrainingConfig
+from config import ModelConfig, TrainingConfig, str_to_activation, str_to_dtype
 from copy import copy
 from datasets import Dataset
 from distutils.util import strtobool
@@ -27,7 +27,7 @@ from omegaconf import OmegaConf
 from pathlib import Path
 from sys import exit
 from tqdm import tqdm, trange
-from typing import Any, Tuple
+from typing import Any, Callable, Tuple
 
 # TODO next sweep:
 # - learning rate
@@ -39,15 +39,14 @@ from typing import Any, Tuple
 parser = argparse.ArgumentParser()
 
 
-def parse_dtype(dtype_str):
-    dtype_mapping = {
-        "float32": jnp.float32,
-        "float16": jnp.float16,
-        "bfloat16": jnp.bfloat16,
-    }
-    if dtype_str not in dtype_mapping:
-        raise argparse.ArgumentTypeError(f"Invalid activations dtype: {dtype_str}")
-    return dtype_mapping[dtype_str]
+def argparse_from_dict(d: dict[str, Any]) -> Callable[[str], Any]:
+    """Create an argparse argument type from a dictionary."""
+    def f(x: str) -> Any:
+        if x in d:
+            return d[x]
+        else:
+            raise argparse.ArgumentTypeError(f"Unknown value {x}")
+    return f
 
 
 parser.add_argument("--pq-dir", type=Path, required=True)
@@ -64,7 +63,8 @@ parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--gradient-clipping", type=float, default=None)
 parser.add_argument("--ae-cfg", type=Path, required=True)
 parser.add_argument("--ae-ckpt", type=Path, required=True)
-parser.add_argument("--activations-dtype", type=parse_dtype)
+parser.add_argument("--activations-dtype", type=argparse_from_dict(str_to_dtype))
+parser.add_argument("--activation-function", type=argparse_from_dict(str_to_activation))
 args, _unknown = parser.parse_known_args()
 
 
