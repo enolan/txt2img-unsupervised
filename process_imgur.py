@@ -122,7 +122,11 @@ def decompress_and_extract_warc(compressed_warc_path: Path, dest_dir: Path) -> N
     # Delete the warc
     decompressed_warc_path.unlink()
     # Delete the HTML files
-    shutil.rmtree(dest_dir / "imgur.com")
+    htmldir = dest_dir / "imgur.com"
+    if htmldir.exists():
+        shutil.rmtree(htmldir)
+    else:
+        tqdm.write(f"No html in {compressed_warc_path} 🤷")
 
 
 def extract_from_dir(in_path: Path, out_path: Path) -> Tuple[list[Path], list[Path]]:
