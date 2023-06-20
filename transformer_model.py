@@ -25,6 +25,7 @@ class ImageModel(nn.Module):
     use_biases: bool
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
+    decode: bool = False
 
     def setup(self) -> None:
         default_kernel_init = nn.initializers.normal(
@@ -52,6 +53,7 @@ class ImageModel(nn.Module):
                 activations_dtype=self.activations_dtype,
                 activation_function=self.activation_function,
                 kernel_init=default_kernel_init,
+                decode=self.decode,
             )
             for _ in range(self.n_layers)
         ]
@@ -63,7 +65,7 @@ class ImageModel(nn.Module):
         )
 
     def __call__(self, image: jax.Array) -> jax.Array:
-        """Run the model, returning log probabilities. Input should be padded to seq_len."""
+        """Run the model, returning log probabilities."""
         assert image.shape == (self.seq_len,)
         assert image.dtype == jnp.int32 or image.dtype == jnp.int64
         embeds = self.in_embed(image)
@@ -74,6 +76,159 @@ class ImageModel(nn.Module):
         for tl in self.transformer_layers:
             h = tl(h, mask=mask)
         return self.logits_decoder(h)  # type: ignore[no-any-return]
+
+    def decode_step(self, tok: jax.Array, idx: jax.Array) -> jax.Array:
+        """Do a step of iterative decoding from the model. Returns the logits for the next token.
+        See below tests for usage examples. N.B. You need to start from "token 0" which is nothing
+        to get logits for output token 0. So when idx is 0, tok is ignored.
+        Both inputs are scalars.
+        """
+        assert (
+            self.decode
+        ), "Can't call decode_step on a model that wasn't set up for decoding."
+        assert tok.shape == ()
+        assert tok.dtype == jnp.int32 or tok.dtype == jnp.int64
+
+        # This bit is analagous to the right shift above.
+        def zeros_fn(mdl: ImageModel) -> jax.Array:
+            # Have to use the embeddding variable in both branches to make Flax happy
+            _ = mdl.in_embed(jnp.array(0))
+            return jnp.zeros((self.d_model,))
+
+        def embed_fn(mdl: ImageModel) -> jax.Array:
+            return mdl.in_embed(tok)
+
+        embed = nn.cond(idx == 0, zeros_fn, embed_fn, self)
+        assert embed.shape == (self.d_model,)
+
+        h = embed + self.positional_encoding(idx)
+        assert h.shape == (self.d_model,)
+        h = h[None, :]
+
+        for tl in self.transformer_layers:
+            h = tl(h)
+        return self.logits_decoder(h[0])  # type: ignore[no-any-return]
+
+
+def _assert_frozen_dicts_equal(d1, d2, name) -> None:
+    assert isinstance(d1, FrozenDict)
+    assert isinstance(d2, FrozenDict)
+    assert d1.keys() == d2.keys()
+    for k in d1.keys():
+        if isinstance(d1[k], FrozenDict):
+            _assert_frozen_dicts_equal(d1[k], d2[k], f"{name}.{k}")
+        elif isinstance(d1[k], jax.Array):
+            np.testing.assert_allclose(
+                np.array(d1[k]), np.array(d2[k]), atol=1e-8, rtol=0
+            )
+        else:
+            assert False, f"unknown type {type(d1[k])} for {name}.{k}"
+
+
+def _setup_test_sample() -> (
+    Tuple[ImageModel, ImageModel, FrozenDict, jax.Array, jax.Array]
+):
+    """Shared setup code for iterative sampling tests."""
+    cfg_nodec = copy(gpt_1_config)
+    cfg_nodec.dropout = None
+    # smaller model makes debug output easier to read
+    cfg_nodec.n_layers = 2
+    cfg_nodec.d_model = 64
+    cfg_nodec.num_heads = 4
+    mdl_nodec = ImageModel(**cfg_nodec.__dict__)
+    cfg_dec = copy(cfg_nodec)
+    cfg_dec.decode = True
+    mdl_dec = ImageModel(**cfg_dec.__dict__)
+
+    toks = jax.random.randint(jax.random.PRNGKey(420), (256,), 0, 8192)
+    params = mdl_nodec.init(jax.random.PRNGKey(69), toks)
+    # IMPORTANT: use regular __call__ here, not decode_step. The cache needs to be initialized to
+    # the full seq_len size.
+    params_dec = mdl_dec.init(jax.random.PRNGKey(69), toks)
+
+    _assert_frozen_dicts_equal(params["params"], params_dec["params"], "params")
+    # params_dec = params.copy({"cache": params_dec["cache"]})
+
+    logits_all = mdl_nodec.apply(params, image=toks)
+
+    return mdl_nodec, mdl_dec, params, params_dec["cache"], toks, logits_all
+
+
+def test_sample_tok_0() -> None:
+    """Test that step-by-step decoding is equivalent to all at once for token 0."""
+    mdl_nodec, mdl_dec, params, cache, toks, logits_all = _setup_test_sample()
+
+    params = params.copy({"cache": cache})
+    logits_0, cache = mdl_dec.apply(
+        params,
+        mutable=["cache"],
+        method=mdl_dec.decode_step,
+        tok=jnp.array(0),
+        idx=jnp.array(0),
+    )
+
+    np.testing.assert_allclose(logits_all[0], logits_0, rtol=0, atol=1e-5)
+
+
+def test_sample_tok_1() -> None:
+    """Test that step-by-step decoding is equivalent to all at once for token 1."""
+    mdl_nodec, mdl_dec, params, cache, toks, logits_all = _setup_test_sample()
+
+    params = params.copy({"cache": cache})
+
+    _logits_0, cache = mdl_dec.apply(
+        params,
+        mutable=["cache"],
+        method=mdl_dec.decode_step,
+        tok=jnp.array(0),
+        idx=jnp.array(0),
+    )
+    params = params.copy(cache)
+    logits_1, _cache = mdl_dec.apply(
+        params,
+        mutable=["cache"],
+        method=mdl_dec.decode_step,
+        tok=toks[0],
+        idx=jnp.array(1),
+    )
+
+    np.testing.assert_allclose(logits_all[1], logits_1, rtol=0, atol=1e-5)
+
+
+def test_sample_tok_all() -> None:
+    """Test that step-by-step decoding is equivalent to all at once for all tokens."""
+    mdl_nodec, mdl_dec, params, cache, toks, logits_all = _setup_test_sample()
+
+    decoded_logits = []
+    params = params.copy({"cache": cache})
+
+    # step 0
+    logits, new_cache = mdl_dec.apply(
+        params,
+        mutable=["cache"],
+        method=mdl_dec.decode_step,
+        tok=jnp.array(0),
+        idx=jnp.array(0),
+    )
+    decoded_logits.append(logits)
+    params = params.copy(new_cache)
+
+    # steps 1-255
+    for i in range(1, 256):
+        logits, new_cache = mdl_dec.apply(
+            params,
+            mutable=["cache"],
+            method=mdl_dec.decode_step,
+            tok=toks[i - 1],
+            idx=jnp.array(i),
+        )
+        assert logits.shape == (8192,)
+        decoded_logits.append(logits)
+        params = params.copy(new_cache)
+
+    decoded_logits = jnp.stack(decoded_logits, axis=0)
+    assert decoded_logits.shape == (256, 8192)
+    np.testing.assert_allclose(logits_all, decoded_logits, rtol=0, atol=1e-6)
 
 
 @partial(jax.jit, static_argnums=(0,))
@@ -186,6 +341,7 @@ class TransformerLayer(nn.Module):
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
     kernel_init: Callable[..., jnp.ndarray]
+    decode: bool
 
     def setup(self) -> None:
         self.mha = nn.SelfAttention(
@@ -199,6 +355,7 @@ class TransformerLayer(nn.Module):
             use_bias=self.use_biases,
             dtype=self.activations_dtype,
             kernel_init=self.kernel_init,
+            decode=self.decode,
         )
         self.layer_norm_1 = nn.LayerNorm(dtype=self.activations_dtype)
         self.linear_1 = nn.Dense(
@@ -219,7 +376,9 @@ class TransformerLayer(nn.Module):
         else:
             self.dropout_layer = nn.Dropout(rate=0, deterministic=True)
 
-    def __call__(self, embeds: jax.Array, mask: jax.Array) -> jax.Array:
+    def __call__(
+        self, embeds: jax.Array, mask: Optional[jax.Array] = None
+    ) -> jax.Array:
         out_block_1 = self.layer_norm_1(self.mha(embeds, mask=mask))
         in_block_2: jax.Array = embeds + self.dropout_layer(out_block_1)
         out_block_2: jax.Array = self.layer_norm_2(
