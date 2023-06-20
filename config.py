@@ -27,9 +27,12 @@ class ModelConfig:
     def from_json_dict(dict: dict[str, Any]) -> "ModelConfig":
         """Convert a dictionary parsed from JSON to a ModelConfig object."""
         out = copy(dict)
-        out["activation_function"] = str_to_x_or_valueerror(
-            dict["activation_function"], str_to_activation, "activation function"
-        )
+        if "activation_function" not in dict:
+            out["activation_function"] = jax.nn.relu # make old checkpoints work
+        else:
+            out["activation_function"] = str_to_x_or_valueerror(
+                dict["activation_function"], str_to_activation, "activation function"
+            )
         out["activations_dtype"] = str_to_x_or_valueerror(
             dict["activations_dtype"], str_to_dtype, "activations dtype"
         )

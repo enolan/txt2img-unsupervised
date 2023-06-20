@@ -85,7 +85,7 @@ sample_v = jax.jit(
 
 print("Sampling encoded images from the transformer model...")
 
-with tqdm(total=args.n) as pbar:
+with tqdm(total=args.n, unit="img") as pbar:
     encoded_imgs = []
     for batch_size in batches_split(args.n):
         rng, rng2 = jax.random.split(rng)
@@ -109,7 +109,7 @@ decode_jv = jax.jit(
     )(codeses)
 )
 decoded_imgs = []
-with tqdm(total=args.n) as pbar:
+with tqdm(total=args.n, unit="img") as pbar:
     for encoded_img_batch in encoded_imgs:
         decoded_imgs.append(decode_jv(ae_params, encoded_img_batch))
         pbar.update(len(encoded_img_batch))
@@ -117,7 +117,7 @@ decoded_imgs = np.concatenate(decoded_imgs, axis=0)
 
 print("Saving images...")
 imgs = []
-for i, img in enumerate(tqdm(decoded_imgs)):
+for i, img in enumerate(tqdm(decoded_imgs, unit="img")):
     img = jnp.clip(-1, img, 1)
     img = ((img + 1) * 127.5).astype(jnp.uint8)
     img = PIL.Image.fromarray(np.array(img))
