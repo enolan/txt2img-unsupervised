@@ -9,10 +9,11 @@ import numpy as np
 import optax  # type:ignore[import]
 import orbax.checkpoint  # type:ignore[import]
 import PIL.Image
+import time
 import torch
 import transformer_model
 import wandb
-from config import ModelConfig, TrainingConfig
+from config import ModelConfig, TrainingConfig, str_to_activation, str_to_dtype
 from copy import copy
 from datasets import Dataset
 from distutils.util import strtobool
@@ -24,8 +25,9 @@ from jax.experimental import mesh_utils
 from ldm_autoencoder import LDMAutoencoder
 from omegaconf import OmegaConf
 from pathlib import Path
+from sys import exit
 from tqdm import tqdm, trange
-from typing import Any, Tuple
+from typing import Any, Callable, Tuple
 
 # TODO next sweep:
 # - learning rate
@@ -37,15 +39,16 @@ from typing import Any, Tuple
 parser = argparse.ArgumentParser()
 
 
-def parse_dtype(dtype_str):
-    dtype_mapping = {
-        "float32": jnp.float32,
-        "float16": jnp.float16,
-        "bfloat16": jnp.bfloat16,
-    }
-    if dtype_str not in dtype_mapping:
-        raise argparse.ArgumentTypeError(f"Invalid activations dtype: {dtype_str}")
-    return dtype_mapping[dtype_str]
+def argparse_from_dict(d: dict[str, Any]) -> Callable[[str], Any]:
+    """Create an argparse argument type from a dictionary."""
+
+    def f(x: str) -> Any:
+        if x in d:
+            return d[x]
+        else:
+            raise argparse.ArgumentTypeError(f"Unknown value {x}")
+
+    return f
 
 
 parser.add_argument("--pq-dir", type=Path, required=True)
@@ -62,7 +65,8 @@ parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--gradient-clipping", type=float, default=None)
 parser.add_argument("--ae-cfg", type=Path, required=True)
 parser.add_argument("--ae-ckpt", type=Path, required=True)
-parser.add_argument("--activations-dtype", type=parse_dtype)
+parser.add_argument("--activations-dtype", type=argparse_from_dict(str_to_dtype))
+parser.add_argument("--activation-function", type=argparse_from_dict(str_to_activation))
 args, _unknown = parser.parse_known_args()
 
 
@@ -144,7 +148,7 @@ if training_cfg.gradient_clipping is not None:
     clip = optax.clip_by_global_norm(training_cfg.gradient_clipping)
 else:
     clip = optax.identity()
-opt = optax.chain(clip, opt)
+opt = optax.apply_if_finite(optax.chain(clip, opt), 20)
 loss_grad_fn = jax.value_and_grad(transformer_model.loss_batch, argnums=1)
 loss_fn = jax.jit(
     lambda params, rng, batch: transformer_model.loss_batch(mdl, params, rng, batch)
@@ -156,13 +160,17 @@ class TrainState(train_state.TrainState):  # type:ignore[no-untyped-call]
 
 
 # Set up for sampling:
-sample_mdl = copy(mdl)
-sample_mdl.dropout = 0.0
+sample_cfg = copy(model_cfg)
+sample_cfg.dropout = None
+sample_mdl = transformer_model.ImageModel(**sample_cfg.__dict__, decode=True)
+sample_params = sample_mdl.init(jax.random.PRNGKey(0), image=jnp.arange(256))
+sample_cache = sample_params["cache"]
+del sample_params
 
 sample_jv = jax.jit(
     jax.vmap(
         lambda params, rng, top_p: transformer_model.sample(
-            sample_mdl, params, rng, top_p
+            sample_mdl, params.copy({"cache": sample_cache}), rng, top_p
         ),
         in_axes=(None, 0, 0),
     )
@@ -294,7 +302,15 @@ last_checkpoint_time = datetime.datetime.now()
 
 
 def save_checkpoint() -> None:
-    checkpoint_manager.save(global_step, my_train_state)
+    # TPU VMs run out of disk space a lot. Retrying in a loop lets me manually clean up the disk
+    while True:
+        try:
+            checkpoint_manager.save(global_step, my_train_state)
+            break
+        except ValueError as e:
+            print(f"Error saving checkpoint: {e}")
+            print("Retrying in 60 seconds")
+            time.sleep(60)
 
 
 rng = jax.random.PRNGKey(1337)
@@ -308,19 +324,27 @@ for epoch in trange(training_cfg.epochs):
         ):
             batch = jax.device_put(batch["encoded_img"], sharding)
             my_train_state, loss, norm = train_step(my_train_state, batch)
+            # TODO check if moving this check inside an if opt_state.notfinite_count > 0 is faster
+            if not jnp.isfinite(loss):
+                tqdm.write(f"Loss nonfinite 😢 ({loss})")
+            opt_state = my_train_state.opt_state
             global_step += 1
             wandb.log(
                 {
                     "global_step": global_step,
                     "train/loss": loss,
                     "grad_global_norm": norm,
+                    "debug/notfinite_count": opt_state.notfinite_count,
                 }
             )
+            if opt_state.notfinite_count > 50:
+                tqdm.write(f"Too many nonfinite values in gradients, giving up")
+                exit(1)
             pbar.update()
             pbar.set_postfix(loss=f"{loss:.4f}")
             # Save checkpoint every 10 minutes
             if (datetime.datetime.now() - last_checkpoint_time) > datetime.timedelta(
-                minutes=10
+                minutes=30
             ):
                 tqdm.write("Saving checkpoint...", end="")
                 save_checkpoint()
@@ -329,7 +353,10 @@ for epoch in trange(training_cfg.epochs):
     # Evaluate on test set
     losses = []
     for batch in tqdm(
-        test_imgs.iter(batch_size=training_cfg.batch_size, drop_last_batch=False),
+        # The last batch needs to be a multiple of the number of devices, and it isn't guaranteed
+        # to be, so we drop it. Shouldn't matter much when even 1% of the dataset is thousands of
+        # images.
+        test_imgs.iter(batch_size=training_cfg.batch_size, drop_last_batch=True),
         total=len(test_imgs) // training_cfg.batch_size,
         desc="test batches",
     ):

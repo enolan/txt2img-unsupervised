@@ -1,11 +1,12 @@
 """Serializable configuration for the model and training parameters."""
 import argparse
 import dacite
+import jax
 import jax.numpy as jnp
 import json
 from copy import copy
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 @dataclass
@@ -19,20 +20,23 @@ class ModelConfig:
     n_layers: int
     seq_len: int
     use_biases: bool
+    activation_function: Callable[[jax.Array], jax.Array]
     activations_dtype: jnp.dtype = jnp.float32
 
     @staticmethod
     def from_json_dict(dict: dict[str, Any]) -> "ModelConfig":
         """Convert a dictionary parsed from JSON to a ModelConfig object."""
         out = copy(dict)
-        if dict["activations_dtype"] == "float32":
-            out["activations_dtype"] = jnp.float32
-        elif dict["activations_dtype"] == "float16":
-            out["activations_dtype"] = jnp.float16
-        elif dict["activations_dtype"] == "bfloat16":
-            out["activations_dtype"] = jnp.bfloat16
+        if "activation_function" not in dict:
+            out["activation_function"] = jax.nn.relu # make old checkpoints work
         else:
-            raise ValueError(f"Unknown dtype {dict['activations_dtype']}")
+            out["activation_function"] = str_to_x_or_valueerror(
+                dict["activation_function"], str_to_activation, "activation function"
+            )
+        out["activations_dtype"] = str_to_x_or_valueerror(
+            dict["activations_dtype"], str_to_dtype, "activations dtype"
+        )
+
         return dacite.from_dict(
             data_class=ModelConfig, data=out, config=dacite.Config(check_types=False)
         )
@@ -40,15 +44,52 @@ class ModelConfig:
     def to_json_dict(self) -> dict[str, Any]:
         """Convert a ModelConfig object to a dictionary that can be serialized to JSON."""
         out = copy(self.__dict__)
-        if self.activations_dtype == jnp.float32:
-            out["activations_dtype"] = "float32"
-        elif self.activations_dtype == jnp.float16:
-            out["activations_dtype"] = "float16"
-        elif self.activations_dtype == jnp.bfloat16:
-            out["activations_dtype"] = "bfloat16"
-        else:
-            raise ValueError(f"Unknown dtype {self.activations_dtype}")
+        out["activation_function"] = x_to_str_or_valueerror(
+            self.activation_function, activation_to_str, "activation function"
+        )
+        out["activations_dtype"] = x_to_str_or_valueerror(
+            self.activations_dtype, dtype_to_str, "dtype"
+        )
         return out
+
+
+def invert_dict(d: dict[Any, Any]) -> dict[Any, Any]:
+    """Invert a dictionary."""
+    return {v: k for k, v in d.items()}
+
+
+str_to_dtype: dict[str, jnp.dtype] = {
+    "float32": jnp.float32,
+    "float16": jnp.float16,
+    "bfloat16": jnp.bfloat16,
+}
+
+dtype_to_str: dict[jnp.dtype, str] = invert_dict(str_to_dtype)
+
+str_to_activation: dict[str, Callable[[jax.Array], jax.Array]] = {
+    "relu": jax.nn.relu,
+    "gelu": jax.nn.gelu,
+}
+
+activation_to_str: dict[Callable[[jax.Array], jax.Array], str] = invert_dict(
+    str_to_activation
+)
+
+
+def str_to_x_or_valueerror(x_str: str, d: dict[str, Any], tyname: str) -> Any:
+    """Convert a string to a value in a dictionary or raise a ValueError."""
+    if x_str in d:
+        return d[x_str]
+    else:
+        raise ValueError(f"Unknown {tyname} {x_str}")
+
+
+def x_to_str_or_valueerror(x: Any, d: dict[Any, str], tyname: str) -> str:
+    """Convert a value to a string in a dictionary or raise a ValueError."""
+    if x in d:
+        return d[x]
+    else:
+        raise ValueError(f"Unknown {tyname} {x}")
 
 
 def test_modelconfig_roundtrip_from_json() -> None:
@@ -61,7 +102,8 @@ def test_modelconfig_roundtrip_from_json() -> None:
         "n_layers": 6,
         "seq_len": 2048,
         "use_biases": true,
-        "activations_dtype": "float32"}"""
+        "activations_dtype": "float32",
+        "activation_function": "relu"}"""
     cfg = ModelConfig.from_json_dict(json.loads(json_str))
     assert ModelConfig.to_json_dict(cfg) == json.loads(json_str)
 
@@ -77,6 +119,7 @@ def test_modelconfig_roundtrip_from_object() -> None:
         seq_len=42,
         use_biases=True,
         activations_dtype=jnp.bfloat16,
+        activation_function=jax.nn.gelu,
     )
     assert ModelConfig.from_json_dict(ModelConfig.to_json_dict(cfg)) == cfg
 

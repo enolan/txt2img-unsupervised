@@ -1,4 +1,5 @@
 """Process imgur archives from ArchiveTeam/Internet Archive"""
+import CloseableQueue
 import concurrent.futures
 import hashlib
 import imageio_ffmpeg  # type: ignore[import]
@@ -11,8 +12,10 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+from CloseableQueue import CloseableQueue as CQueue
 from pathlib import Path
 from PIL import Image
+from threading import Thread
 from tqdm import tqdm
 from typing import Tuple, Union
 
@@ -62,8 +65,18 @@ def warc_id_to_url(id: str) -> str:
     """Convert a warc id to a url."""
     files = list(ia.get_files(id))
     warcs = [f for f in files if f.format == "Web ARChive ZST"]
-    assert len(warcs) == 1, f"Expected one warc, found {len(warcs)}"
-    return warcs[0].url
+    if len(warcs) == 1:
+        return warcs[0].url
+    elif len(warcs) > 0:
+        tqdm.write(f"Found {len(warcs)} warcs for {id}??? Choosing biggest.")
+        max_size = 0
+        for warc in warcs:
+            if warc.size > max_size:
+                max_size = warc.size
+                max_warc = warc
+        return max_warc.url
+    else:
+        assert False, f"Found no warcs for {id}"
 
 
 def download_warc(id: str, dest_dir: Path) -> Path:
@@ -71,9 +84,14 @@ def download_warc(id: str, dest_dir: Path) -> Path:
     named after the id. Returns the path to the compressed warc, which will be in dest_dir.
     """
     warc_url = warc_id_to_url(id)
-    subprocess.run(
-        ["aria2c", "-s", "16", "-x", "16", warc_url], check=True, cwd=dest_dir
-    )
+    with open(dest_dir / f"{id}.arialog", "w") as f:
+        subprocess.run(
+            ["aria2c", "-s", "32", "-x", "16", warc_url],
+            check=True,
+            cwd=dest_dir,
+            stdout=f,
+            stderr=f,
+        )
     filename_prefix = re.match(r"archiveteam_(imgur_.*)", id).group(1)
     warc_path = list(dest_dir.glob(f"{filename_prefix}*.warc.zst"))
     assert len(warc_path) == 1, f"Expected one warc, found {len(warc_path)}"
@@ -104,7 +122,11 @@ def decompress_and_extract_warc(compressed_warc_path: Path, dest_dir: Path) -> N
     # Delete the warc
     decompressed_warc_path.unlink()
     # Delete the HTML files
-    shutil.rmtree(dest_dir / "imgur.com")
+    htmldir = dest_dir / "imgur.com"
+    if htmldir.exists():
+        shutil.rmtree(htmldir)
+    else:
+        tqdm.write(f"No html in {compressed_warc_path} 🤷")
 
 
 def extract_from_dir(in_path: Path, out_path: Path) -> Tuple[list[Path], list[Path]]:
@@ -358,36 +380,65 @@ def process_warcs(
 ) -> None:
     """Process a list of warcs sequentially. warcs should be a list of either Path objects or IA ids."""
     assert outdir.exists(), f"Output directory {outdir} doesn't exist"
-    for warc in tqdm(warcs, desc="warcs"):
-        warc_type = type(warc)
-        if type(warc) is str:
-            ia_id: str = warc
-        elif issubclass(warc_type, Path):
-            # MyPy's narrowing is broken here
-            ia_id = ia_id_from_warc_filename(warc.name)  # type: ignore[union-attr]
-        else:
-            assert False, f"Invalid type for warc {warc}"
-        conn = pool.get_conn()
-        already_processed = conn.execute(
-            "SELECT COUNT(*) FROM warcs WHERE id = ? and processed = 1", (ia_id,)
-        ).fetchone()[0]
-        assert already_processed == 0, f"Warc {ia_id} has already been processed"
-        sub_workdir = workdir / ia_id
-        sub_workdir.mkdir()
-        if warc_type is str:
-            tqdm.write(f"Downloading and processing {ia_id}")
-            res = dl_and_process_warc(ia_id, sub_workdir, pool)
-        elif issubclass(warc_type, Path):
-            tqdm.write(f"Processing {warc}")
-            res = process_warc(warc, ia_id, sub_workdir, pool)  # type: ignore[arg-type]
-        deduped_dir, video_stills_dir, videos_dir = res
-        # Move the results to the output directory
-        this_outdir = outdir / ia_id
-        this_outdir.mkdir()
-        shutil.move(deduped_dir, this_outdir / "deduped")
-        shutil.move(video_stills_dir, this_outdir / "video_stills")
-        shutil.move(videos_dir, this_outdir / "videos")
-        shutil.rmtree(sub_workdir)
+    # Pipeline so downloading and processing can be simultaneous
+    # Queue of warcs that are ready to be processed, either downloaded or already present
+    ready_warc_queue = CQueue(maxsize=1)
+
+    def downloader_main() -> None:
+        for warc in warcs:
+            if type(warc) is str:
+                ia_id: str = warc
+            elif issubclass(type(warc), Path):
+                ia_id = ia_id_from_warc_filename(warc.name)
+            else:
+                assert False, f"Invalid type for warc {warc}"
+            conn = pool.get_conn()
+            already_processed = conn.execute(
+                "SELECT COUNT(*) FROM warcs WHERE id = ? and processed = 1", (ia_id,)
+            ).fetchone()[0]
+            assert already_processed == 0, f"Warc {ia_id} has already been processed"
+            sub_workdir = workdir / ia_id
+            sub_workdir.mkdir()
+            if type(warc) is str:
+                tqdm.write(f"Starting download of {warc}")
+                warc_path = download_warc(warc, sub_workdir)
+                ready_warc_queue.put((sub_workdir, warc_path))
+                tqdm.write(f"Download of {warc} complete")
+            else:
+                tqdm.write(f"Using existing warc {warc}")
+                ready_warc_queue.put((sub_workdir, warc))
+        ready_warc_queue.close()
+
+    downloader_thread = Thread(target=downloader_main, name="downloader")
+    downloader_thread.start()
+
+    with tqdm(total=len(warcs), desc="Processing warcs") as pbar:
+        for sub_workdir, warc_path in CloseableQueue.dequeue(ready_warc_queue):
+            tqdm.write(f"Starting processing of {warc_path}")
+            ia_id = sub_workdir.name
+            try:
+                deduped_dir, video_stills_dir, videos_dir = process_warc(
+                    warc_path, ia_id, sub_workdir, pool
+                )
+            except Exception as e:
+                tqdm.write(f"⚠️⚠️⚠️Error processing {warc_path}: {e}, skipping")
+                shutil.rmtree(sub_workdir)
+                continue
+            tqdm.write(f"Processing of {warc_path} complete")
+            this_outdir = outdir / ia_id
+            this_outdir.mkdir()
+            tqdm.write(f"Copying deduped images to {this_outdir}")
+            shutil.move(deduped_dir, this_outdir / "deduped")
+            tqdm.write(f"Copying video stills to {this_outdir}")
+            shutil.move(video_stills_dir, this_outdir / "video_stills")
+            tqdm.write(f"Copying videos to {this_outdir}")
+            shutil.move(videos_dir, this_outdir / "videos")
+            shutil.rmtree(sub_workdir)
+            tqdm.write(f"Done with {warc_path}")
+            pbar.update(1)
+
+    downloader_thread.join()
+    tqdm.write("Done processing warcs 🎉")
 
 
 def get_random_warc_ids(conn: sqlite3.Connection, n: int) -> list[str]:
