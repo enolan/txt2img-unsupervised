@@ -245,23 +245,45 @@ def sample(
     # inside them.
     def loop_iter(
         i: int, acc: Tuple[jax.Array, jax.random.KeyArray]
-    ) -> Tuple[jax.Array, jax.random.KeyArray]:
-        image, rng = acc
-        logits: jax.Array = mdl.apply(params, image=image)[i]  # type: ignore[assignment]
+    ) -> Tuple[jax.Array, jax.random.KeyArray, FrozenDict[str, Any]]:
+        image_toks, rng, params = acc
+        logits, new_cache = mdl.apply(
+            params,
+            mutable=["cache"],
+            method=mdl.decode_step,
+            tok=image_toks[i - 1],
+            idx=i,
+        )
         assert logits.shape == (8192,)
+        params = params.copy(new_cache)
         filtered_logits = _filter_top_p(logits, top_p)
-        rng2, rng3 = jax.random.split(rng, 2)
-        tok = jax.random.categorical(rng2, filtered_logits)
-        image = image.at[i].set(tok)
-        return (image, rng3)
+        rng_sample, rng_loop = jax.random.split(rng, 2)
+        tok = jax.random.categorical(rng_sample, filtered_logits)
+        image_toks = image_toks.at[i].set(tok)
+        return (image_toks, rng_loop, params)
 
-    image, _ = jax.lax.fori_loop(  # type: ignore[no-untyped-call]
-        0,
+    rng0, rng_loop = jax.random.split(rng, 2)
+    logits_0, cache = mdl.apply(
+        params,
+        mutable=["cache"],
+        method=mdl.decode_step,
+        tok=jnp.array(0),
+        idx=jnp.array(0),
+    )
+    assert logits_0.shape == (8192,)
+    filtered_logits_0 = _filter_top_p(logits_0, top_p)
+    tok_0 = jax.random.categorical(rng0, filtered_logits_0)
+
+    params = params.copy(cache)
+
+    image_toks = jnp.zeros((mdl.seq_len,), dtype=jnp.int32).at[0].set(tok_0)
+    image_toks, _, _ = jax.lax.fori_loop(  # type: ignore[no-untyped-call]
+        1,
         mdl.seq_len,
         loop_iter,
-        (jnp.zeros((mdl.seq_len,), dtype=jnp.int32), rng),
+        (image_toks, rng_loop, params),
     )
-    return image  # type: ignore[no-any-return]
+    return image_toks  # type: ignore[no-any-return]
 
 
 def _filter_top_p(logits: jax.Array, top_p: float) -> jax.Array:

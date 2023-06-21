@@ -41,11 +41,13 @@ parser = argparse.ArgumentParser()
 
 def argparse_from_dict(d: dict[str, Any]) -> Callable[[str], Any]:
     """Create an argparse argument type from a dictionary."""
+
     def f(x: str) -> Any:
         if x in d:
             return d[x]
         else:
             raise argparse.ArgumentTypeError(f"Unknown value {x}")
+
     return f
 
 
@@ -158,13 +160,17 @@ class TrainState(train_state.TrainState):  # type:ignore[no-untyped-call]
 
 
 # Set up for sampling:
-sample_mdl = copy(mdl)
-sample_mdl.dropout = 0.0
+sample_cfg = copy(model_cfg)
+sample_cfg.dropout = None
+sample_mdl = transformer_model.ImageModel(**sample_cfg.__dict__, decode=True)
+sample_params = sample_mdl.init(jax.random.PRNGKey(0), image=jnp.arange(256))
+sample_cache = sample_params["cache"]
+del sample_params
 
 sample_jv = jax.jit(
     jax.vmap(
         lambda params, rng, top_p: transformer_model.sample(
-            sample_mdl, params, rng, top_p
+            sample_mdl, params.copy({"cache": sample_cache}), rng, top_p
         ),
         in_axes=(None, 0, 0),
     )

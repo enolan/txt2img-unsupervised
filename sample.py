@@ -8,6 +8,7 @@ import orbax.checkpoint  # type: ignore[import]
 import PIL.Image
 import torch
 from copy import copy
+from flax.core import freeze
 from ldm_autoencoder import LDMAutoencoder
 from omegaconf import OmegaConf
 from pathlib import Path
@@ -57,8 +58,10 @@ restored = checkpoint_mngr.restore(checkpoint_mngr.latest_step())
 model_cfg = ModelConfig.from_json_dict(checkpoint_mngr.metadata()["model_cfg"])
 model_cfg.dropout = None
 model_cfg.activations_dtype = jnp.float32  # Assume we're on the GPU at home
-im_mdl = ImageModel(**model_cfg.__dict__)
-im_params = restored["params"]
+im_mdl = ImageModel(**model_cfg.__dict__, decode=True)
+im_params = freeze(restored["params"])
+decode_params = im_mdl.init(jax.random.PRNGKey(0), jnp.arange(256))
+im_params = im_params.copy({"cache": decode_params["cache"]})
 
 # Set up random seed
 if args.seed is not None:
