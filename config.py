@@ -18,10 +18,11 @@ class ModelConfig:
     ff_dim: int
     dropout: Optional[float]
     n_layers: int
-    seq_len: int
+    image_tokens: int
     use_biases: bool
     activation_function: Callable[[jax.Array], jax.Array]
     activations_dtype: jnp.dtype = jnp.float32
+    clip_conditioning: bool = False
 
     @staticmethod
     def from_json_dict(dict: dict[str, Any]) -> "ModelConfig":

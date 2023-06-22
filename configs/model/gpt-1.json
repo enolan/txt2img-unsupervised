@@ -4,7 +4,7 @@
   "ff_dim": 3072,
   "dropout": 0.1,
   "n_layers": 12,
-  "seq_len": 256,
+  "image_tokens": 256,
   "use_biases": true,
   "activations_dtype": "float32",
   "activation_function": "relu"

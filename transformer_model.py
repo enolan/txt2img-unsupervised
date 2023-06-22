@@ -21,7 +21,8 @@ class ImageModel(nn.Module):
     ff_dim: int
     dropout: Optional[float]
     n_layers: int
-    seq_len: int
+    image_tokens: int
+    clip_conditioning: bool
     use_biases: bool
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
@@ -37,8 +38,13 @@ class ImageModel(nn.Module):
             embedding_init=default_kernel_init,
             dtype=self.activations_dtype,
         )
+        self.clip_proj = nn.Dense(
+            features=self.d_model,
+            use_bias=self.use_biases,
+            dtype=self.activations_dtype,
+        )
         self.positional_encoding = nn.Embed(
-            num_embeddings=self.seq_len,
+            num_embeddings=self.seq_len(),
             features=self.d_model,
             embedding_init=default_kernel_init,
             dtype=self.activations_dtype,
@@ -64,17 +70,36 @@ class ImageModel(nn.Module):
             dtype=self.activations_dtype,
         )
 
-    def __call__(self, image: jax.Array) -> jax.Array:
-        """Run the model, returning log probabilities."""
-        assert image.shape == (self.seq_len,)
+    def seq_len(self) -> int:
+        return self.image_tokens + (1 if self.clip_conditioning else 0)
+
+    def __call__(self, image: jax.Array, clip_embedding: jax.Array) -> jax.Array:
+        """Run the model, returning log probabilities of the image tokens. No probabilities are computed
+        for any CLIP conditioning tokens."""
+        assert image.shape == (
+            self.image_tokens,
+        ), f"Expected image shape {(self.image_tokens,)}, got {image.shape}"
         assert image.dtype == jnp.int32 or image.dtype == jnp.int64
+
         embeds = self.in_embed(image)
+
+        if self.clip_conditioning:
+            assert clip_embedding.shape == (768,)
+            clip_tok = self.clip_proj(clip_embedding)
+            toks = jnp.concatenate([clip_tok[None, :], embeds], axis=0)
+        else:
+            assert clip_embedding.shape == (0,)
+            toks = embeds
         # Have to shift the input right so causality isn't violated
-        embeds = jnp.concatenate([jnp.zeros((1, self.d_model)), embeds[:-1]], axis=0)
-        h: jax.Array = embeds + self.positional_encoding(jnp.arange(self.seq_len))
-        mask = nn.attention.make_causal_mask(image, dtype=self.activations_dtype)
+        toks = jnp.concatenate([jnp.zeros((1, self.d_model)), toks[:-1]], axis=0)
+        h: jax.Array = toks + self.positional_encoding(jnp.arange(self.seq_len()))
+        mask = jnp.tril(jnp.ones((self.num_heads, self.seq_len(), self.seq_len())))
         for tl in self.transformer_layers:
             h = tl(h, mask=mask)
+
+        if self.clip_conditioning:
+            # no logits for CLIP token
+            h = h[1:, :]
         return self.logits_decoder(h)  # type: ignore[no-any-return]
 
     def decode_step(self, tok: jax.Array, idx: jax.Array) -> jax.Array:
@@ -240,6 +265,7 @@ def sample(
 ) -> jax.Array:
     """Sample a single image from the model. Returns an array of codes to be passed to the
     LDM decoder."""
+    assert not mdl.clip_conditioning
 
     # This needs to be outside the linen module because the fori_loop combinator doesn't work
     # inside them.
@@ -276,10 +302,10 @@ def sample(
 
     params = params.copy(cache)
 
-    image_toks = jnp.zeros((mdl.seq_len,), dtype=jnp.int32).at[0].set(tok_0)
+    image_toks = jnp.zeros((mdl.image_tokens,), dtype=jnp.int32).at[0].set(tok_0)
     image_toks, _, _ = jax.lax.fori_loop(  # type: ignore[no-untyped-call]
         1,
-        mdl.seq_len,
+        mdl.image_tokens,
         loop_iter,
         (image_toks, rng_loop, params),
     )
@@ -415,23 +441,35 @@ def loss(
     model: ImageModel,
     params: FrozenDict[str, Any],
     dropout_rng: jax.random.KeyArray,
-    ex: jax.Array,
+    ex_img: jax.Array,
+    ex_clip: jax.Array,
 ) -> jax.Array:
     """Compute the cross-entropy loss for a single example."""
-    logits: jax.Array = model.apply(params, rngs={"dropout": dropout_rng}, image=ex)  # type: ignore[assignment]
-    return optax.softmax_cross_entropy(logits, jax.nn.one_hot(ex, 8192))  # type: ignore[no-any-return]
+    assert ex_img.shape == (model.image_tokens,)
+    if model.clip_conditioning:
+        assert ex_clip.shape == (768,)
+    else:
+        assert ex_clip.shape == (0,)
+    logits: jax.Array = model.apply(params, rngs={"dropout": dropout_rng}, image=ex_img, clip_embedding=ex_clip)  # type: ignore[assignment]
+    return optax.softmax_cross_entropy(logits, jax.nn.one_hot(ex_img, 8192))  # type: ignore[no-any-return]
 
 
 def loss_batch(
     model: ImageModel,
     params: FrozenDict[str, Any],
     dropout_rng: jax.random.KeyArray,
-    batch: jax.Array,
+    batch_imgs: jax.Array,
+    batch_clips: jax.Array,
 ) -> jax.Array:
     """Compute the cross-entropy loss for a batch of examples."""
+    assert batch_imgs.shape[0] == batch_clips.shape[0]
     return jnp.mean(
-        jax.vmap(loss, in_axes=(None, None, 0, 0))(
-            model, params, jax.random.split(dropout_rng, batch.shape[0]), batch
+        jax.vmap(loss, in_axes=(None, None, 0, 0, 0))(
+            model,
+            params,
+            jax.random.split(dropout_rng, batch_imgs.shape[0]),
+            batch_imgs,
+            batch_clips,
         )
     )
 
@@ -443,9 +481,10 @@ gpt_1_config = ModelConfig(
     ff_dim=3072,
     dropout=0.1,
     n_layers=12,
-    seq_len=256,
+    image_tokens=256,
     use_biases=True,
     activation_function=jax.nn.relu,
+    clip_conditioning=False,
 )
 
 

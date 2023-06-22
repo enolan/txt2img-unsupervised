@@ -67,6 +67,7 @@ parser.add_argument("--ae-cfg", type=Path, required=True)
 parser.add_argument("--ae-ckpt", type=Path, required=True)
 parser.add_argument("--activations-dtype", type=argparse_from_dict(str_to_dtype))
 parser.add_argument("--activation-function", type=argparse_from_dict(str_to_activation))
+parser.add_argument("--clip-conditioning", type=lambda x: bool(strtobool(x)))
 args, _unknown = parser.parse_known_args()
 
 
@@ -114,7 +115,10 @@ mdl = transformer_model.ImageModel(**model_cfg.__dict__)
 
 params = mdl.init(
     rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
-    image=jnp.zeros((model_cfg.seq_len,), dtype=jnp.int32),
+    image=jnp.zeros((model_cfg.image_tokens,), dtype=jnp.int32),
+    clip_embedding=jnp.zeros((768,), dtype=jnp.float32)
+    if model_cfg.clip_conditioning
+    else jnp.zeros((0,), dtype=jnp.float32),
 )
 
 
@@ -151,7 +155,7 @@ else:
 opt = optax.apply_if_finite(optax.chain(clip, opt), 20)
 loss_grad_fn = jax.value_and_grad(transformer_model.loss_batch, argnums=1)
 loss_fn = jax.jit(
-    lambda params, rng, batch: transformer_model.loss_batch(mdl, params, rng, batch)
+    lambda params, rng, batch_imgs, batch_clips: transformer_model.loss_batch(mdl, params, rng, batch_imgs, batch_clips)
 )
 
 
@@ -163,7 +167,13 @@ class TrainState(train_state.TrainState):  # type:ignore[no-untyped-call]
 sample_cfg = copy(model_cfg)
 sample_cfg.dropout = None
 sample_mdl = transformer_model.ImageModel(**sample_cfg.__dict__, decode=True)
-sample_params = sample_mdl.init(jax.random.PRNGKey(0), image=jnp.arange(256))
+sample_params = sample_mdl.init(
+    jax.random.PRNGKey(0),
+    image=jnp.arange(256),
+    clip_embedding=jnp.zeros((768,), dtype=jnp.float32)
+    if model_cfg.clip_conditioning
+    else jnp.zeros((0,), dtype=jnp.float32),
+)
 sample_cache = sample_params["cache"]
 del sample_params
 
@@ -196,6 +206,9 @@ decode_jv = jax.jit(
 
 def sample_and_log(ts: TrainState, global_step: int) -> None:
     """Sample from the model and log to wandb."""
+    if model_cfg.clip_conditioning:
+        tqdm.write("Can't sample with CLIP conditioning yet 😭")
+        return
     # Sample with different top_p values
     top_ps = [0.2, 0.6, 0.8, 0.9, 0.95]
 
@@ -255,11 +268,18 @@ def sample_and_log(ts: TrainState, global_step: int) -> None:
 @partial(jax.jit, donate_argnums=(0,))
 def train_step(
     state: TrainState,
-    batch: jax.Array,
+    batch_imgs: jax.Array,
+    batch_clip: jax.Array,
 ) -> Tuple[TrainState, jax.Array, jax.Array]:
     """Compute a single optimization step."""
     rng, rng2 = jax.random.split(state.rng)
-    loss, grads = loss_grad_fn(mdl, state.params, rng, batch)
+    loss, grads = loss_grad_fn(
+        mdl,
+        state.params,
+        rng,
+        batch_imgs,
+        batch_clips
+    )
     new_state = state.apply_gradients(
         grads=grads, rng=rng2
     )  # type:ignore[no-untyped-call]
@@ -322,8 +342,12 @@ for epoch in trange(training_cfg.epochs):
         for batch in train_imgs.iter(
             batch_size=training_cfg.batch_size, drop_last_batch=True
         ):
-            batch = jax.device_put(batch["encoded_img"], sharding)
-            my_train_state, loss, norm = train_step(my_train_state, batch)
+            batch_imgs = jax.device_put(batch["encoded_img"], sharding)
+            if model_cfg.clip_conditioning:
+                batch_clips = jax.device_put(batch["clip_embedding"], sharding)
+            else:
+                batch_clips = jax.device_put(jnp.zeros((batch_imgs.shape[0], 0)), sharding)
+            my_train_state, loss, norm = train_step(my_train_state, batch_imgs, batch_clips)
             # TODO check if moving this check inside an if opt_state.notfinite_count > 0 is faster
             if not jnp.isfinite(loss):
                 tqdm.write(f"Loss nonfinite 😢 ({loss})")
@@ -361,8 +385,12 @@ for epoch in trange(training_cfg.epochs):
         desc="test batches",
     ):
         rng, rng2 = jax.random.split(rng)
-        batch = jax.device_put(batch["encoded_img"], sharding)
-        losses.append(loss_fn(my_train_state.params, rng2, batch))
+        batch_imgs = jax.device_put(batch["encoded_img"], sharding)
+        if model_cfg.clip_conditioning:
+            batch_clips = jax.device_put(batch["clip_embedding"], sharding)
+        else:
+            batch_clips = jax.device_put(jnp.zeros((batch_imgs.shape[0], 0)), sharding)
+        losses.append(loss_fn(my_train_state.params, rng2, batch_imgs, batch_clips))
     test_loss = jnp.mean(jnp.stack(losses))
     wandb.log({"global_step": global_step, "test/loss": test_loss})
     tqdm.write(
