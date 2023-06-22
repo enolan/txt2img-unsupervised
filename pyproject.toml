@@ -45,8 +45,12 @@ types-tqdm = "^4.65.0.1"
 [[tool.poetry.source]]
 name = "libtpu"
 url = "https://storage.googleapis.com/jax-releases/libtpu_releases.html"
-default = false
-secondary = false
+priority = "supplemental"
+
+
+[[tool.poetry.source]]
+name = "PyPI"
+priority = "primary"
 
 [build-system]
 requires = ["poetry-core"]
