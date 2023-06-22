@@ -29,7 +29,7 @@ from typing import Optional
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--batch-size", type=int)
-parser.add_argument("--pil-threads", type=int, default=os.cpu_count() / 2)
+parser.add_argument("--pil-threads", type=int, default=os.cpu_count() // 2)
 parser.add_argument("--ckpt", type=str)
 parser.add_argument("--autoencoder-cfg", type=str)
 parser.add_argument("in_dirs", type=Path, nargs="+")
@@ -108,7 +108,7 @@ def encode(ae_params, clip_params, img_ae: jax.Array, img_clip: jax.Array) -> ja
     img_clip = rearrange(img_clip, "w h c -> 1 c h w")
     img_clip_emb = clip_mdl.get_image_features(
         params=clip_params, pixel_values=img_clip
-    )[0]
+    )[0].astype(jnp.float32)
     img_clip_emb = img_clip_emb / jnp.linalg.norm(img_clip_emb)
 
     assert img_enc.shape == (
@@ -379,7 +379,7 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
                         pd_rows = [
                             {
                                 "encoded_img": img,
-                                "clip_embedding": embedding.astype(np.float32),
+                                "clip_embedding": embedding,
                                 "name": path.name,
                             }
                             for img, embedding, path in zip(
