@@ -23,14 +23,15 @@ from einops import rearrange
 from ldm_autoencoder import LDMAutoencoder
 from omegaconf import OmegaConf
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Lock, Semaphore, Thread
 from tqdm import tqdm
 from typing import Optional
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--batch_size", type=int)
+parser.add_argument("--batch-size", type=int)
+parser.add_argument("--pil-threads", type=int, default=os.cpu_count() / 2)
 parser.add_argument("--ckpt", type=str)
-parser.add_argument("--autoencoder_cfg", type=str)
+parser.add_argument("--autoencoder-cfg", type=str)
 parser.add_argument("in_dirs", type=Path, nargs="+")
 
 args = parser.parse_args()
@@ -81,12 +82,17 @@ clip_processor = transformers.AutoProcessor.from_pretrained(clip_mdl_name)
 # run the images throught transformers' CLIP preprocessor. I think this is just the different order
 # we do preprocessing in, but idk. Hopefully not significant.
 
+
 def encode(ae_params, clip_params, img_ae: jax.Array, img_clip: jax.Array) -> jax.Array:
     """Encode an image with the LDM encoder and compute its CLIP embedding. Takes the model
     parameters, an image of the right resolution for the LDM encoder and another one for CLIP.
     Returns a tuple of (LDM encoding, CLIP embedding)."""
     assert img_ae.shape == (64, 64, 3)
-    assert img_clip.shape == (clip_res, clip_res, 3), f"Expected ({clip_res}, {clip_res}, 3), got {img_clip.shape}"
+    assert img_clip.shape == (
+        clip_res,
+        clip_res,
+        3,
+    ), f"Expected ({clip_res}, {clip_res}, 3), got {img_clip.shape}"
     assert img_ae.dtype == jnp.uint8
     assert img_clip.dtype == jnp.uint8
 
@@ -100,12 +106,19 @@ def encode(ae_params, clip_params, img_ae: jax.Array, img_clip: jax.Array) -> ja
     img_clip = img_clip.astype(jnp.float32) / 255.0
     img_clip = (img_clip - clip_means) / clip_stds
     img_clip = rearrange(img_clip, "w h c -> 1 c h w")
-    img_clip_emb = clip_mdl.get_image_features(params = clip_params, pixel_values=img_clip)[0]
+    img_clip_emb = clip_mdl.get_image_features(
+        params=clip_params, pixel_values=img_clip
+    )[0]
     img_clip_emb = img_clip_emb / jnp.linalg.norm(img_clip_emb)
 
-    assert img_enc.shape == (256,), f"encoded image shape is {img_enc.shape}, should be (256,)"
-    assert img_clip_emb.shape == (768,), f"CLIP embedding shape is {img_clip_emb.shape}, should be (768,)"
+    assert img_enc.shape == (
+        256,
+    ), f"encoded image shape is {img_enc.shape}, should be (256,)"
+    assert img_clip_emb.shape == (
+        768,
+    ), f"CLIP embedding shape is {img_clip_emb.shape}, should be (768,)"
     return img_enc, img_clip_emb
+
 
 encode_vec = jax.jit(jax.vmap(encode, in_axes=(None, None, 0, 0)))
 
@@ -170,11 +183,15 @@ def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
             y1 = 0
             y2 = h
         img_for_enc = img.resize((64, 64), PIL.Image.BICUBIC, (x1, y1, x2, y2))
-        img_for_clip = img.resize((clip_res, clip_res), PIL.Image.BICUBIC, (x1, y1, x2, y2))
+        img_for_clip = img.resize(
+            (clip_res, clip_res), PIL.Image.BICUBIC, (x1, y1, x2, y2)
+        )
     return img_for_enc, img_for_clip
 
 
-imgs_queues = [CQueue(maxsize=args.batch_size * 4) for _ in in_dirs]
+imgs_queues = [CQueue() for _ in in_dirs]
+# Global limit on the number of waiting PIL images in queues
+queued_img_semaphore = Semaphore(args.batch_size * 4)
 
 # Thread pool for loading/scaling/cropping images
 
@@ -208,6 +225,7 @@ def pil_thread_fn(thread_num: int):
                             imgs_queues[i].close()
                     break
                 imgs = load_img(img_path)
+                queued_img_semaphore.acquire()
                 imgs_queues[i].put((imgs, img_path))
     except Exception as e:
         # This hangs the process, since the PIL thread won't get closed.
@@ -218,9 +236,7 @@ def pil_thread_fn(thread_num: int):
 
 pil_threads = {}
 
-pil_threads_num = 32
-
-for i in range(pil_threads_num):
+for i in range(args.pil_threads):
     t = Thread(target=pil_thread_fn, args=(i,), name=f"PIL thread {i}", daemon=True)
     pil_threads[i] = t
     t.start()
@@ -233,7 +249,9 @@ def flush_batches(jax_list, numpy_list, force=False):
     # TODO this will change with higher res
     bytes_per_enc_img = 256 * 4
     bytes_per_clip_embed = 768 * 4
-    batch_bytes = [len(j) * (bytes_per_enc_img + bytes_per_clip_embed) for j in jax_list]
+    batch_bytes = [
+        len(j) * (bytes_per_enc_img + bytes_per_clip_embed) for j in jax_list
+    ]
     if force or sum(batch_bytes) > 256 * 1024 * 1204:
         tqdm.write(f"Flushing {len(jax_list)} encoded batches to CPU memory")
         numpy_list.extend([np.array(batch_j) for batch_j in jax_list])
@@ -273,6 +291,7 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
                             batch_dir_indices.append((img_queue_idx, len(batch) - 1))
                     else:
                         # This image was skipped
+                        queued_img_semaphore.release()
                         files_pbar.update(1)
                 except CloseableQueue.Closed:
                     # This queue is closed, move on to the next one
@@ -302,7 +321,12 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
                 # Encode the batch
                 batch_for_encoder = jnp.stack([jnp.array(imgs[0]) for imgs in batch])
                 batch_for_clip = jnp.stack([jnp.array(imgs[1]) for imgs in batch])
-                encoded, embedded = encode_vec(autoencoder_params, clip_mdl.params, batch_for_encoder, batch_for_clip)
+                encoded, embedded = encode_vec(
+                    autoencoder_params,
+                    clip_mdl.params,
+                    batch_for_encoder,
+                    batch_for_clip,
+                )
                 # Add the parts of the batch to the appropriate lists
                 for i in range(len(batch_dir_indices)):
                     dir_idx, batch_start = batch_dir_indices[i]
@@ -315,6 +339,7 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
                     tqdm.write(
                         f"Assigning images {batch_start}:{batch_end} to dir {dir_idx}"
                     )
+                queued_img_semaphore.release(len(batch))
                 files_pbar.update(len(batch))
 
                 # Flush batches to CPU memory if necessary
@@ -338,9 +363,13 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
                         )
                     else:
                         encoded_imgs = np.concatenate(encoded_batches_np[i])
-                        print(f"encoded_imgs dtype: {encoded_imgs.dtype}, shape: {encoded_imgs.shape}")
+                        print(
+                            f"encoded_imgs dtype: {encoded_imgs.dtype}, shape: {encoded_imgs.shape}"
+                        )
                         embedded_imgs = np.concatenate(embedded_batches_np[i])
-                        print(f"embedded_imgs dtype: {embedded_imgs.dtype}, shape: {embedded_imgs.shape}")
+                        print(
+                            f"embedded_imgs dtype: {embedded_imgs.dtype}, shape: {embedded_imgs.shape}"
+                        )
                         assert len(encoded_imgs) == len(
                             encoded_imgs_paths[i]
                         ), f"{len(encoded_imgs)} encoded images but {len(encoded_imgs_paths[i])} paths"
@@ -348,8 +377,14 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
                             f"Writing {len(encoded_imgs)} encoded images to {out_paths[i]}"
                         )
                         pd_rows = [
-                            {"encoded_img": img, "clip_embedding": embedding.astype(np.float32), "name": path.name}
-                            for img, embedding, path in zip(encoded_imgs, embedded_imgs, encoded_imgs_paths[i])
+                            {
+                                "encoded_img": img,
+                                "clip_embedding": embedding.astype(np.float32),
+                                "name": path.name,
+                            }
+                            for img, embedding, path in zip(
+                                encoded_imgs, embedded_imgs, encoded_imgs_paths[i]
+                            )
                         ]
                         df = pd.DataFrame(pd_rows)
                         tqdm.write(
