@@ -193,6 +193,13 @@ imgs_queues = [CQueue() for _ in in_dirs]
 # Global limit on the number of waiting PIL images in queues
 queued_img_semaphore = Semaphore(args.batch_size * 4)
 
+# There's a potential deadlock with a single global limit, since the main thread can be waiting on
+# the head image queue but PIL threads can be waiting on the global limit, which isn't released
+# until the main thread dequeues stuff. Hacky, but we can avoid this by having a "backup" semaphore
+# for each directory that's only used when the global limit is reached. They start empty and are
+# incremented to 1 when the main thread starts processing that directory.
+per_dir_semaphores = [Semaphore(0) for _ in in_dirs]
+
 # Thread pool for loading/scaling/cropping images
 
 # How many threads are working on each directory
@@ -225,8 +232,13 @@ def pil_thread_fn(thread_num: int):
                             imgs_queues[i].close()
                     break
                 imgs = load_img(img_path)
-                queued_img_semaphore.acquire()
-                imgs_queues[i].put((imgs, img_path))
+                while True:
+                    if queued_img_semaphore.acquire(timeout=0.1):
+                        imgs_queues[i].put((imgs, img_path))
+                        break
+                    elif per_dir_semaphores[i].acquire(blocking=False):
+                        imgs_queues[i].put((imgs, img_path))
+                        break
     except Exception as e:
         # This hangs the process, since the PIL thread won't get closed.
         tqdm.write(
@@ -269,6 +281,8 @@ embedded_batches_j = {0: []}
 embedded_batches_np = {0: []}
 # The paths of the images that have been encoded
 encoded_imgs_paths = {0: []}
+# There is always capacity for at least one image in any live queue
+per_dir_semaphores[0].release()
 
 with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
     with tqdm(desc="files") as files_pbar:
@@ -289,9 +303,12 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
                             or batch_dir_indices[-1][0] != img_queue_idx
                         ):
                             batch_dir_indices.append((img_queue_idx, len(batch) - 1))
+                        queued_img_semaphore.release()
+                        per_dir_semaphores[img_queue_idx].release()
                     else:
                         # This image was skipped
                         queued_img_semaphore.release()
+                        per_dir_semaphores[img_queue_idx].release()
                         files_pbar.update(1)
                 except CloseableQueue.Closed:
                     # This queue is closed, move on to the next one
@@ -310,6 +327,7 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
                         embedded_batches_j[img_queue_idx] = []
                         embedded_batches_np[img_queue_idx] = []
                         encoded_imgs_paths[img_queue_idx] = []
+                        per_dir_semaphores[img_queue_idx].release()
                         tqdm.write(
                             f"Moving to image queue {img_queue_idx} ({in_dirs[img_queue_idx]})"
                         )
@@ -339,7 +357,6 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
                     tqdm.write(
                         f"Assigning images {batch_start}:{batch_end} to dir {dir_idx}"
                     )
-                queued_img_semaphore.release(len(batch))
                 files_pbar.update(len(batch))
 
                 # Flush batches to CPU memory if necessary
