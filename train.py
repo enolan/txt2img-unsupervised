@@ -193,6 +193,7 @@ sample_jv = jax.jit(
 # CLIP embeddings to use for diagnostic sampling
 embeddings_to_sample = 8
 
+
 def get_clip_embeddings_to_sample(n: int, dset) -> jax.Array:
     """Find n hopefully SFW CLIP embeddings to use for diagnostic sampling."""
 
@@ -431,8 +432,9 @@ checkpoint_manager = orbax.checkpoint.CheckpointManager(
 last_checkpoint_time = datetime.datetime.now()
 
 
-def save_checkpoint() -> None:
+def save_checkpoint_and_sample(my_train_state, global_step) -> None:
     # TPU VMs run out of disk space a lot. Retrying in a loop lets me manually clean up the disk
+    tqdm.write("Attempting to save checkpoint")
     while True:
         try:
             checkpoint_manager.save(global_step, my_train_state)
@@ -441,6 +443,10 @@ def save_checkpoint() -> None:
             tqdm.write(f"Error saving checkpoint: {e}")
             tqdm.write("Retrying in 60 seconds")
             time.sleep(60)
+    tqdm.write("Saved checkpoint")
+    tqdm.write("Sampling")
+    sample_and_log(my_train_state, global_step)
+    tqdm.write("Done sampling")
 
 
 rng = jax.random.PRNGKey(1337)
@@ -480,12 +486,11 @@ for epoch in trange(training_cfg.epochs):
                 exit(1)
             pbar.update()
             pbar.set_postfix(loss=f"{loss:.4f}")
-            # Save checkpoint every 10 minutes
+            # Save checkpoint every 30 minutes
             if (datetime.datetime.now() - last_checkpoint_time) > datetime.timedelta(
                 minutes=30
             ):
-                tqdm.write("Saving checkpoint...", end="")
-                save_checkpoint()
+                save_checkpoint_and_sample(my_train_state, global_step)
                 last_checkpoint_time = datetime.datetime.now()
                 tqdm.write(" DONE")
     # Evaluate on test set
@@ -508,11 +513,8 @@ for epoch in trange(training_cfg.epochs):
     test_loss = jnp.mean(jnp.stack(losses))
     wandb.log({"global_step": global_step, "test/loss": test_loss})
     tqdm.write(
-        f"Epoch {epoch} done, train loss: {loss:.4f}, test loss {test_loss:.4f} saving...",
+        f"Epoch {epoch} done, train loss: {loss:.4f}, test loss {test_loss:.4f}",
         end="",
     )
-    save_checkpoint()
-    tqdm.write(" DONE")
-    tqdm.write("Sampling...", end="")
-    sample_and_log(my_train_state, global_step)
-    tqdm.write(" DONE")
+    save_checkpoint_and_sample(my_train_state, global_step)
+    last_checkpoint_time = datetime.datetime.now()
