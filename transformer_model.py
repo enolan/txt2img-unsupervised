@@ -339,6 +339,24 @@ def test_sample_tok_all_clip() -> None:
     _test_sample_tok_all(True)
 
 
+def test_clip_does_anything() -> None:
+    """Test that changing the CLIP embedding changes the logits."""
+    (
+        mdl_nodec,
+        mdl_dec,
+        params,
+        cache,
+        toks,
+        clip_embedding,
+        logits_all,
+    ) = _setup_test_sample(True)
+
+    clip_embedding = jnp.zeros_like(clip_embedding)
+    logits_all_zero = mdl_nodec.apply(params, image=toks, clip_embedding=clip_embedding)
+
+    assert not jnp.allclose(logits_all, logits_all_zero, rtol=0, atol=1e-3)
+
+
 @partial(jax.jit, static_argnums=(0,))
 def sample(
     mdl: ImageModel,
