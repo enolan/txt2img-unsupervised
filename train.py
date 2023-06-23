@@ -155,7 +155,9 @@ else:
 opt = optax.apply_if_finite(optax.chain(clip, opt), 20)
 loss_grad_fn = jax.value_and_grad(transformer_model.loss_batch, argnums=1)
 loss_fn = jax.jit(
-    lambda params, rng, batch_imgs, batch_clips: transformer_model.loss_batch(mdl, params, rng, batch_imgs, batch_clips)
+    lambda params, rng, batch_imgs, batch_clips: transformer_model.loss_batch(
+        mdl, params, rng, batch_imgs, batch_clips
+    )
 )
 
 
@@ -179,10 +181,10 @@ del sample_params
 
 sample_jv = jax.jit(
     jax.vmap(
-        lambda params, rng, top_p: transformer_model.sample(
-            sample_mdl, params.copy({"cache": sample_cache}), rng, top_p
+        lambda params, clip_embedding, rng, top_p: transformer_model.sample(
+            sample_mdl, params.copy({"cache": sample_cache}), clip_embedding, rng, top_p
         ),
-        in_axes=(None, 0, 0),
+        in_axes=(None, 0, 0, 0),
     )
 )
 
@@ -245,7 +247,9 @@ def sample_and_log(ts: TrainState, global_step: int) -> None:
     )
     rngs = jax.device_put(jax.random.split(ts.rng, imgs_to_sample), rng_sharding)
 
-    samples = sample_jv(ts.params, rngs, img_top_ps)
+    clip_embeddings = jnp.zeros((imgs_to_sample, 0), dtype=jnp.float32)
+
+    samples = sample_jv(ts.params, clip_embeddings, rngs, img_top_ps)
 
     ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
 
@@ -273,13 +277,7 @@ def train_step(
 ) -> Tuple[TrainState, jax.Array, jax.Array]:
     """Compute a single optimization step."""
     rng, rng2 = jax.random.split(state.rng)
-    loss, grads = loss_grad_fn(
-        mdl,
-        state.params,
-        rng,
-        batch_imgs,
-        batch_clips
-    )
+    loss, grads = loss_grad_fn(mdl, state.params, rng, batch_imgs, batch_clips)
     new_state = state.apply_gradients(
         grads=grads, rng=rng2
     )  # type:ignore[no-untyped-call]
@@ -346,8 +344,12 @@ for epoch in trange(training_cfg.epochs):
             if model_cfg.clip_conditioning:
                 batch_clips = jax.device_put(batch["clip_embedding"], sharding)
             else:
-                batch_clips = jax.device_put(jnp.zeros((batch_imgs.shape[0], 0)), sharding)
-            my_train_state, loss, norm = train_step(my_train_state, batch_imgs, batch_clips)
+                batch_clips = jax.device_put(
+                    jnp.zeros((batch_imgs.shape[0], 0)), sharding
+                )
+            my_train_state, loss, norm = train_step(
+                my_train_state, batch_imgs, batch_clips
+            )
             # TODO check if moving this check inside an if opt_state.notfinite_count > 0 is faster
             if not jnp.isfinite(loss):
                 tqdm.write(f"Loss nonfinite 😢 ({loss})")

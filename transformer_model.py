@@ -71,7 +71,9 @@ class ImageModel(nn.Module):
         )
 
     def seq_len(self) -> int:
-        return self.image_tokens + (1 if self.clip_conditioning else 0)
+        # How many tokens are fed to the model at once and equally how many are output. This
+        # function will actually do something once we have more than one conditioning token.
+        return self.image_tokens
 
     def __call__(self, image: jax.Array, clip_embedding: jax.Array) -> jax.Array:
         """Run the model, returning log probabilities of the image tokens. No probabilities are computed
@@ -83,47 +85,58 @@ class ImageModel(nn.Module):
 
         embeds = self.in_embed(image)
 
+        # We either insert a zero token at the start, or a CLIP token at the start. In either case
+        # the nth output predicts the nth token, conditional on all *previous* tokens. In future
+        # when there's more than one conditioning token, we'll have to do something more
+        # complicated.
         if self.clip_conditioning:
             assert clip_embedding.shape == (768,)
             clip_tok = self.clip_proj(clip_embedding)
-            toks = jnp.concatenate([clip_tok[None, :], embeds], axis=0)
+            toks = jnp.concatenate([clip_tok[None, :], embeds[:-1]], axis=0)
         else:
             assert clip_embedding.shape == (0,)
-            toks = embeds
-        # Have to shift the input right so causality isn't violated
-        toks = jnp.concatenate([jnp.zeros((1, self.d_model)), toks[:-1]], axis=0)
+            toks = jnp.concatenate([jnp.zeros((1, self.d_model)), embeds[:-1]], axis=0)
+
         h: jax.Array = toks + self.positional_encoding(jnp.arange(self.seq_len()))
         mask = jnp.tril(jnp.ones((self.num_heads, self.seq_len(), self.seq_len())))
         for tl in self.transformer_layers:
             h = tl(h, mask=mask)
 
-        if self.clip_conditioning:
-            # no logits for CLIP token
-            h = h[1:, :]
         return self.logits_decoder(h)  # type: ignore[no-any-return]
 
-    def decode_step(self, tok: jax.Array, idx: jax.Array) -> jax.Array:
+    def decode_step(
+        self, tok: jax.Array, idx: jax.Array, clip_embedding: jax.Array
+    ) -> jax.Array:
         """Do a step of iterative decoding from the model. Returns the logits for the next token.
-        See below tests for usage examples. N.B. You need to start from "token 0" which is nothing
-        to get logits for output token 0. So when idx is 0, tok is ignored.
-        Both inputs are scalars.
+        See below tests for usage examples. N.B. You need to start from "token 0" which is either
+        nothing or the CLIP embedding to get logits for output token 0. So when idx is 0, tok is
+        ignored.
+        tok and idx are scalars, clip_embed is a 768-d vector or an empty array depending on
+        whether the model is conditioned on CLIP or not.
         """
         assert (
             self.decode
         ), "Can't call decode_step on a model that wasn't set up for decoding."
         assert tok.shape == ()
         assert tok.dtype == jnp.int32 or tok.dtype == jnp.int64
+        if self.clip_conditioning:
+            assert clip_embedding.shape == (768,)
+        else:
+            assert clip_embedding.shape == (0,)
 
         # This bit is analagous to the right shift above.
-        def zeros_fn(mdl: ImageModel) -> jax.Array:
-            # Have to use the embeddding variable in both branches to make Flax happy
+        def init_tok_fn(mdl: ImageModel) -> jax.Array:
+            # Have to use the embed variable in both branches to make Flax happy
             _ = mdl.in_embed(jnp.array(0))
-            return jnp.zeros((self.d_model,))
+            if self.clip_conditioning:
+                return mdl.clip_proj(clip_embedding)
+            else:
+                return jnp.zeros((self.d_model,))
 
         def embed_fn(mdl: ImageModel) -> jax.Array:
             return mdl.in_embed(tok)
 
-        embed = nn.cond(idx == 0, zeros_fn, embed_fn, self)
+        embed = nn.cond(idx == 0, init_tok_fn, embed_fn, self)
         assert embed.shape == (self.d_model,)
 
         h = embed + self.positional_encoding(idx)
@@ -150,9 +163,9 @@ def _assert_frozen_dicts_equal(d1, d2, name) -> None:
             assert False, f"unknown type {type(d1[k])} for {name}.{k}"
 
 
-def _setup_test_sample() -> (
-    Tuple[ImageModel, ImageModel, FrozenDict, jax.Array, jax.Array]
-):
+def _setup_test_sample(
+    clip_conditioning: bool = False,
+) -> Tuple[ImageModel, ImageModel, FrozenDict, jax.Array, jax.Array]:
     """Shared setup code for iterative sampling tests."""
     cfg_nodec = copy(gpt_1_config)
     cfg_nodec.dropout = None
@@ -160,28 +173,53 @@ def _setup_test_sample() -> (
     cfg_nodec.n_layers = 2
     cfg_nodec.d_model = 64
     cfg_nodec.num_heads = 4
+    if clip_conditioning:
+        cfg_nodec.clip_conditioning = True
     mdl_nodec = ImageModel(**cfg_nodec.__dict__)
     cfg_dec = copy(cfg_nodec)
     cfg_dec.decode = True
     mdl_dec = ImageModel(**cfg_dec.__dict__)
 
     toks = jax.random.randint(jax.random.PRNGKey(420), (256,), 0, 8192)
-    params = mdl_nodec.init(jax.random.PRNGKey(69), toks)
+    if clip_conditioning:
+        clip_embedding = jax.random.normal(jax.random.PRNGKey(1337), (768,))
+        clip_embedding = clip_embedding / jnp.linalg.norm(clip_embedding)
+        # print(f"clip_embedding norm: {jnp.linalg.norm(clip_embedding)}")
+    else:
+        clip_embedding = jnp.zeros((0,), dtype=jnp.float32)
+    params = mdl_nodec.init(jax.random.PRNGKey(69), toks, clip_embedding=clip_embedding)
     # IMPORTANT: use regular __call__ here, not decode_step. The cache needs to be initialized to
     # the full seq_len size.
-    params_dec = mdl_dec.init(jax.random.PRNGKey(69), toks)
+    params_dec = mdl_dec.init(
+        jax.random.PRNGKey(69), toks, clip_embedding=clip_embedding
+    )
 
     _assert_frozen_dicts_equal(params["params"], params_dec["params"], "params")
-    # params_dec = params.copy({"cache": params_dec["cache"]})
 
-    logits_all = mdl_nodec.apply(params, image=toks)
+    logits_all = mdl_nodec.apply(params, image=toks, clip_embedding=clip_embedding)
 
-    return mdl_nodec, mdl_dec, params, params_dec["cache"], toks, logits_all
+    return (
+        mdl_nodec,
+        mdl_dec,
+        params,
+        params_dec["cache"],
+        toks,
+        clip_embedding,
+        logits_all,
+    )
 
 
-def test_sample_tok_0() -> None:
+def _test_sample_tok_0(clip_conditioning: bool) -> None:
     """Test that step-by-step decoding is equivalent to all at once for token 0."""
-    mdl_nodec, mdl_dec, params, cache, toks, logits_all = _setup_test_sample()
+    (
+        mdl_nodec,
+        mdl_dec,
+        params,
+        cache,
+        toks,
+        clip_embedding,
+        logits_all,
+    ) = _setup_test_sample(clip_conditioning)
 
     params = params.copy({"cache": cache})
     logits_0, cache = mdl_dec.apply(
@@ -189,15 +227,32 @@ def test_sample_tok_0() -> None:
         mutable=["cache"],
         method=mdl_dec.decode_step,
         tok=jnp.array(0),
+        clip_embedding=clip_embedding,
         idx=jnp.array(0),
     )
 
     np.testing.assert_allclose(logits_all[0], logits_0, rtol=0, atol=1e-5)
 
 
-def test_sample_tok_1() -> None:
+def test_sample_tok_0_no_clip() -> None:
+    _test_sample_tok_0(False)
+
+
+def test_sample_tok_0_clip() -> None:
+    _test_sample_tok_0(True)
+
+
+def _test_sample_tok_1(clip_conditioning: bool) -> None:
     """Test that step-by-step decoding is equivalent to all at once for token 1."""
-    mdl_nodec, mdl_dec, params, cache, toks, logits_all = _setup_test_sample()
+    (
+        mdl_nodec,
+        mdl_dec,
+        params,
+        cache,
+        toks,
+        clip_embedding,
+        logits_all,
+    ) = _setup_test_sample(clip_conditioning)
 
     params = params.copy({"cache": cache})
 
@@ -206,6 +261,7 @@ def test_sample_tok_1() -> None:
         mutable=["cache"],
         method=mdl_dec.decode_step,
         tok=jnp.array(0),
+        clip_embedding=clip_embedding,
         idx=jnp.array(0),
     )
     params = params.copy(cache)
@@ -214,15 +270,32 @@ def test_sample_tok_1() -> None:
         mutable=["cache"],
         method=mdl_dec.decode_step,
         tok=toks[0],
+        clip_embedding=clip_embedding,
         idx=jnp.array(1),
     )
 
     np.testing.assert_allclose(logits_all[1], logits_1, rtol=0, atol=1e-5)
 
 
-def test_sample_tok_all() -> None:
+def test_sample_tok_1_no_clip() -> None:
+    _test_sample_tok_1(False)
+
+
+def test_sample_tok_1_clip() -> None:
+    _test_sample_tok_1(True)
+
+
+def _test_sample_tok_all(clip_conditioning: bool) -> None:
     """Test that step-by-step decoding is equivalent to all at once for all tokens."""
-    mdl_nodec, mdl_dec, params, cache, toks, logits_all = _setup_test_sample()
+    (
+        mdl_nodec,
+        mdl_dec,
+        params,
+        cache,
+        toks,
+        clip_embedding,
+        logits_all,
+    ) = _setup_test_sample(clip_conditioning)
 
     decoded_logits = []
     params = params.copy({"cache": cache})
@@ -234,6 +307,7 @@ def test_sample_tok_all() -> None:
         method=mdl_dec.decode_step,
         tok=jnp.array(0),
         idx=jnp.array(0),
+        clip_embedding=clip_embedding,
     )
     decoded_logits.append(logits)
     params = params.copy(new_cache)
@@ -246,6 +320,7 @@ def test_sample_tok_all() -> None:
             method=mdl_dec.decode_step,
             tok=toks[i - 1],
             idx=jnp.array(i),
+            clip_embedding=clip_embedding,
         )
         assert logits.shape == (8192,)
         decoded_logits.append(logits)
@@ -256,16 +331,28 @@ def test_sample_tok_all() -> None:
     np.testing.assert_allclose(logits_all, decoded_logits, rtol=0, atol=1e-6)
 
 
+def test_sample_tok_all_no_clip() -> None:
+    _test_sample_tok_all(False)
+
+
+def test_sample_tok_all_clip() -> None:
+    _test_sample_tok_all(True)
+
+
 @partial(jax.jit, static_argnums=(0,))
 def sample(
     mdl: ImageModel,
     params: FrozenDict[str, Any],
+    clip_embedding: jax.Array,
     rng: jax.random.KeyArray,
     top_p: float = 0.95,
 ) -> jax.Array:
     """Sample a single image from the model. Returns an array of codes to be passed to the
     LDM decoder."""
-    assert not mdl.clip_conditioning
+    if mdl.clip_conditioning:
+        assert clip_embedding.shape == (768,)
+    else:
+        assert clip_embedding.shape == (0,)
 
     # This needs to be outside the linen module because the fori_loop combinator doesn't work
     # inside them.
@@ -279,6 +366,7 @@ def sample(
             method=mdl.decode_step,
             tok=image_toks[i - 1],
             idx=i,
+            clip_embedding=clip_embedding,
         )
         assert logits.shape == (8192,)
         params = params.copy(new_cache)
@@ -295,6 +383,7 @@ def sample(
         method=mdl.decode_step,
         tok=jnp.array(0),
         idx=jnp.array(0),
+        clip_embedding=clip_embedding,
     )
     assert logits_0.shape == (8192,)
     filtered_logits_0 = _filter_top_p(logits_0, top_p)

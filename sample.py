@@ -8,6 +8,7 @@ import orbax.checkpoint  # type: ignore[import]
 import PIL.Image
 import torch
 from copy import copy
+from einops import repeat
 from flax.core import freeze
 from ldm_autoencoder import LDMAutoencoder
 from omegaconf import OmegaConf
@@ -60,7 +61,11 @@ model_cfg.dropout = None
 model_cfg.activations_dtype = jnp.float32  # Assume we're on the GPU at home
 im_mdl = ImageModel(**model_cfg.__dict__, decode=True)
 im_params = freeze(restored["params"])
-decode_params = im_mdl.init(jax.random.PRNGKey(0), jnp.arange(256))
+if model_cfg.clip_conditioning:
+    faux_clip_embedding = jnp.zeros((768,), dtype=jnp.float32)
+else:
+    faux_clip_embedding = jnp.zeros((0,), dtype=jnp.float32)
+decode_params = im_mdl.init(jax.random.PRNGKey(0), jnp.arange(256), faux_clip_embedding)
 im_params = im_params.copy({"cache": decode_params["cache"]})
 
 # Set up random seed
@@ -81,7 +86,10 @@ def batches_split(n: int) -> list[int]:
 
 sample_v = jax.jit(
     jax.vmap(
-        lambda params, rng: sample(im_mdl, params, rng, args.top_p), in_axes=(None, 0)
+        lambda params, clip_embedding, rng: sample(
+            im_mdl, params, clip_embedding, rng, args.top_p
+        ),
+        in_axes=(None, 0, 0),
     )
 )
 
@@ -92,7 +100,11 @@ with tqdm(total=args.n, unit="img") as pbar:
     encoded_imgs = []
     for batch_size in batches_split(args.n):
         rng, rng2 = jax.random.split(rng)
-        encoded_imgs.append(sample_v(im_params, jax.random.split(rng2, batch_size)))
+        # In future we'll let the user prompt with an actual CLIP embedding.
+        clip_embeddings = repeat(faux_clip_embedding, "d -> n d", n=batch_size)
+        encoded_imgs.append(
+            sample_v(im_params, clip_embeddings, jax.random.split(rng2, batch_size))
+        )
         pbar.update(batch_size)
 
 print("Loading autoencoder model...")

@@ -29,7 +29,7 @@ class ModelConfig:
         """Convert a dictionary parsed from JSON to a ModelConfig object."""
         out = copy(dict)
         if "activation_function" not in dict:
-            out["activation_function"] = jax.nn.relu # make old checkpoints work
+            out["activation_function"] = jax.nn.relu  # make old checkpoints work
         else:
             out["activation_function"] = str_to_x_or_valueerror(
                 dict["activation_function"], str_to_activation, "activation function"
@@ -37,7 +37,8 @@ class ModelConfig:
         out["activations_dtype"] = str_to_x_or_valueerror(
             dict["activations_dtype"], str_to_dtype, "activations dtype"
         )
-
+        if "image_tokens" not in dict and "seq_len" in dict:
+            out["image_tokens"] = dict["seq_len"]
         return dacite.from_dict(
             data_class=ModelConfig, data=out, config=dacite.Config(check_types=False)
         )
