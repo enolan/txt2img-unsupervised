@@ -131,7 +131,7 @@ class ImageModel(nn.Module):
             if self.clip_conditioning:
                 return mdl.clip_proj(clip_embedding)
             else:
-                return jnp.zeros((self.d_model,))
+                return jnp.zeros((self.d_model,), dtype=self.activations_dtype)
 
         def embed_fn(mdl: ImageModel) -> jax.Array:
             return mdl.in_embed(tok)
