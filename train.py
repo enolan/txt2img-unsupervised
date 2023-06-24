@@ -243,7 +243,6 @@ def sample_and_log(ts: TrainState, global_step: int) -> None:
     )
 
     ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
-    ae_params = jax.device_put(ae_params, sharding_2d.replicate())
 
     if model_cfg.clip_conditioning:
         # Create a grid of samples for each testing CLIP embedding/top-p pair.
@@ -279,12 +278,12 @@ def sample_and_log(ts: TrainState, global_step: int) -> None:
             == samples_count
         )
 
-        conditioning_embeds_rep = jax.device_put(conditioning_embeds_rep, sharding_2d)
-        top_ps_rep = jax.device_put(top_ps_rep, sharding_1d)
-        rngs = jax.device_put(rngs, sharding_2d)
+        # something weird is going on with sharding and padding on TPU. If I shard the inputs
+        # across all TPUs it OOMs and a bunch of intermediate buffers are padded 2x for some reason.
+        # works ok this way - on just the primary accelerator.
 
         batches = sample.batches_split(
-            training_cfg.batch_size, len(conditioning_embeds_rep)
+            training_cfg.batch_size // jax.device_count() * 2, len(conditioning_embeds_rep)
         )
 
         sampled_codes = []
@@ -304,6 +303,8 @@ def sample_and_log(ts: TrainState, global_step: int) -> None:
                 top_ps_rep = top_ps_rep[batch_size:]
 
                 pbar.update(batch_size)
+
+        ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
 
         sampled_imgs = []
         with tqdm(total=samples_count, desc="decoding", unit="img") as pbar:
@@ -367,6 +368,8 @@ def sample_and_log(ts: TrainState, global_step: int) -> None:
         clip_embeddings = jnp.zeros((imgs_to_sample, 0), dtype=jnp.float32)
 
         samples = sample_jv(ts.params, clip_embeddings, rngs, img_top_ps)
+
+        ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
 
         decoded = sample.decode_jv(ae_mdl, ae_params, samples)
         decoded = np.array(decoded)
