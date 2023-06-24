@@ -495,7 +495,6 @@ for epoch in trange(training_cfg.epochs):
             ):
                 save_checkpoint_and_sample(my_train_state, global_step)
                 last_checkpoint_time = datetime.datetime.now()
-                tqdm.write(" DONE")
     # Evaluate on test set
     losses = []
     for batch in tqdm(
