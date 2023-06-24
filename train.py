@@ -79,7 +79,9 @@ wandb.define_metric("*", step_metric="global_step")
 
 
 # Load the dataset
-dset_paths = list(args.pq_dir.glob("**/*.parquet"))
+# The paths don't necessarily come out in the same order on every machine, so we sort to make the
+# example order consistent.
+dset_paths = list(sorted(args.pq_dir.glob("**/*.parquet")))
 dset_all = Dataset.from_parquet([str(path) for path in dset_paths])
 dset_all.set_format("numpy")
 dset_split = dset_all.train_test_split(test_size=0.01, seed=19900515)
@@ -283,7 +285,8 @@ def sample_and_log(ts: TrainState, global_step: int) -> None:
         # works ok this way - on just the primary accelerator.
 
         batches = sample.batches_split(
-            training_cfg.batch_size // jax.device_count() * 2, len(conditioning_embeds_rep)
+            training_cfg.batch_size // jax.device_count() * 2,
+            len(conditioning_embeds_rep),
         )
 
         sampled_codes = []
