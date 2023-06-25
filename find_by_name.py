@@ -30,10 +30,14 @@ def decode_names(
     dset = dset.select_columns("encoded_img")
 
     codes = dset[idxs]["encoded_img"]
-    assert codes.shape == (len(names), 256)
+    assert len(codes.shape) == 2
+    assert codes.shape[0] == len(names)
+    res_tokens = int(codes.shape[1] ** 0.5)
+    assert res_tokens**2 == codes.shape[1]
+    res_pixels = res_tokens * 4
 
-    images = ldm_autoencoder.decode_jv(mdl, params, codes)
-    assert images.shape == (len(names), 64, 64, 3)
+    images = ldm_autoencoder.decode_jv(mdl, params, (res_tokens, res_tokens), codes)
+    assert images.shape == (len(names), res_pixels, res_pixels, 3)
 
     return [PIL.Image.fromarray(np.array(img)) for img in images]
 

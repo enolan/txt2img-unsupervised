@@ -522,21 +522,24 @@ class BatchlessGroupNorm(nn.GroupNorm):
         return rearrange(res, "1 ... -> ...")  # type:ignore[no-any-return]
 
 
-def decode_and_denorm(mdl: LDMAutoencoder, params: Any, codes: jax.Array) -> jax.Array:
+def decode_and_denorm(
+    mdl: LDMAutoencoder, params: Any, codes: jax.Array, shape=(16, 16)
+) -> jax.Array:
     """Decode from codes and return uint8s."""
-    pixels_f32 = mdl.apply(params, method=mdl.decode, x=codes, shape=(16, 16))
+    pixels_f32 = mdl.apply(params, method=mdl.decode, x=codes, shape=shape)
     pixels_f32 = jnp.clip(0, (pixels_f32 + 1) * 127.5, 255)
     pixels_u8 = pixels_f32.astype(jnp.uint8)
-    #pixels_u8 = rearrange(pixels_u8, "h w c -> w h c")
     return pixels_u8
 
 
 decode_jv = jax.jit(
     jax.vmap(
-        lambda mdl, params, codes: decode_and_denorm(mdl, params, codes),
-        in_axes=(None, None, 0),
+        lambda mdl, params, shape, codes: decode_and_denorm(
+            mdl, params, codes, shape=shape
+        ),
+        in_axes=(None, None, None, 0),
     ),
-    static_argnums=(0,),
+    static_argnums=(0, 2),
 )
 
 

@@ -5,6 +5,7 @@ import datetime
 import jax
 import jax.numpy as jnp
 import json
+import ldm_autoencoder
 import numpy as np
 import optax  # type:ignore[import]
 import orbax.checkpoint  # type:ignore[import]
@@ -175,7 +176,7 @@ sample_cfg.dropout = None
 sample_mdl = transformer_model.ImageModel(**sample_cfg.__dict__, decode=True)
 sample_params = sample_mdl.init(
     jax.random.PRNGKey(0),
-    image=jnp.arange(256),
+    image=jnp.arange(model_cfg.image_tokens, dtype=jnp.int32),
     clip_embedding=jnp.zeros((768,), dtype=jnp.float32)
     if model_cfg.clip_conditioning
     else jnp.zeros((0,), dtype=jnp.float32),
@@ -314,7 +315,11 @@ def sample_and_log(ts: TrainState, global_step: int) -> None:
         sampled_imgs = []
         with tqdm(total=samples_count, desc="decoding", unit="img") as pbar:
             for codes_batch in sampled_codes:
-                sampled_imgs.append(sample.decode_jv(ae_mdl, ae_params, codes_batch))
+                sampled_imgs.append(
+                    ldm_autoencoder.decode_jv(
+                        ae_mdl, ae_params, mdl.output_shape_tokens(), codes_batch
+                    )
+                )
                 pbar.update(len(codes_batch))
         imgs_np = np.concatenate(sampled_imgs)
 
@@ -437,7 +442,7 @@ checkpoint_manager = orbax.checkpoint.CheckpointManager(
     },
 )
 
-last_checkpoint_time = datetime.datetime.now()
+last_checkpoint_time = None
 
 
 def save_checkpoint_and_sample(my_train_state, global_step) -> None:
@@ -466,6 +471,14 @@ for epoch in trange(training_cfg.epochs):
         for batch in train_imgs.iter(
             batch_size=training_cfg.batch_size, drop_last_batch=True
         ):
+            # Save checkpoint every 30 minutes. This does one at step 0 too, which is nice so we
+            # don't have to wait half an hour to find out if it crashes.
+            if last_checkpoint_time is None or (
+                datetime.datetime.now() - last_checkpoint_time
+            ) > datetime.timedelta(minutes=30):
+                save_checkpoint_and_sample(my_train_state, global_step)
+                last_checkpoint_time = datetime.datetime.now()
+
             batch_imgs = jax.device_put(batch["encoded_img"], sharding)
             if model_cfg.clip_conditioning:
                 batch_clips = jax.device_put(batch["clip_embedding"], sharding)
@@ -494,12 +507,6 @@ for epoch in trange(training_cfg.epochs):
                 exit(1)
             pbar.update()
             pbar.set_postfix(loss=f"{loss:.4f}")
-            # Save checkpoint every 30 minutes
-            if (datetime.datetime.now() - last_checkpoint_time) > datetime.timedelta(
-                minutes=30
-            ):
-                save_checkpoint_and_sample(my_train_state, global_step)
-                last_checkpoint_time = datetime.datetime.now()
     # Evaluate on test set
     losses = []
     for batch in tqdm(

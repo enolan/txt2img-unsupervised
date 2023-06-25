@@ -41,6 +41,7 @@ sample_v = jax.jit(
 )
 
 
+# TODO delete. this is wrong, and redundant with ldm_autoencoder
 def decode_to_u8(ae_mdl, ae_params, codes):
     pxls_f32 = ae_mdl.apply(ae_params, method=ae_mdl.decode, x=codes, shape=(16, 16))
     pxls_f32 = jnp.clip(0, (pxls_f32 + 1) * 127.5, 255.0)

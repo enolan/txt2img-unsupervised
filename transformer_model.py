@@ -49,20 +49,31 @@ class ImageModel(nn.Module):
             embedding_init=default_kernel_init,
             dtype=self.activations_dtype,
         )
-        self.transformer_layers = [
-            TransformerLayer(
-                d_model=self.d_model,
-                num_heads=self.num_heads,
-                ff_dim=self.ff_dim,
-                dropout=self.dropout,
-                use_biases=self.use_biases,
-                activations_dtype=self.activations_dtype,
-                activation_function=self.activation_function,
-                kernel_init=default_kernel_init,
-                decode=self.decode,
+
+        checkpoint_interval = int(self.n_layers**0.5)
+        print(f"checkpointing every {checkpoint_interval} layers")
+        transformer_layers = []
+        for i in range(self.n_layers):
+            if i % checkpoint_interval == 0:
+                print(f"Checkpointing at layer {i}")
+                tl = nn.checkpoint(TransformerLayer)
+            else:
+                tl = TransformerLayer
+            transformer_layers.append(
+                tl(
+                    d_model=self.d_model,
+                    num_heads=self.num_heads,
+                    ff_dim=self.ff_dim,
+                    dropout=self.dropout,
+                    use_biases=self.use_biases,
+                    activations_dtype=self.activations_dtype,
+                    activation_function=self.activation_function,
+                    kernel_init=default_kernel_init,
+                    decode=self.decode,
+                )
             )
-            for _ in range(self.n_layers)
-        ]
+        self.transformer_layers = transformer_layers
+
         self.logits_decoder = nn.Dense(
             features=8192,
             kernel_init=default_kernel_init,
@@ -70,10 +81,18 @@ class ImageModel(nn.Module):
             dtype=self.activations_dtype,
         )
 
+        tokens_res = int(self.image_tokens**0.5)
+        assert tokens_res * tokens_res == self.image_tokens
+
     def seq_len(self) -> int:
         # How many tokens are fed to the model at once and equally how many are output. This
         # function will actually do something once we have more than one conditioning token.
         return self.image_tokens
+
+    def output_shape_tokens(self) -> int:
+        """What (2-D) shape of tokens is output by the model."""
+        res = int(self.image_tokens**0.5)
+        return (res, res)
 
     def __call__(self, image: jax.Array, clip_embedding: jax.Array) -> jax.Array:
         """Run the model, returning log probabilities of the image tokens. No probabilities are computed

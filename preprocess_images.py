@@ -33,10 +33,14 @@ parser.add_argument("--batch-size", type=int)
 parser.add_argument("--pil-threads", type=int, default=os.cpu_count() // 2)
 parser.add_argument("--ckpt", type=str)
 parser.add_argument("--autoencoder-cfg", type=str)
+parser.add_argument("--res", type=int, required=True)
 parser.add_argument("in_dirs", type=Path, nargs="+")
 
 args = parser.parse_args()
 
+pxl_res = args.res
+token_count = pxl_res // 4 * pxl_res // 4
+assert pxl_res % 4 == 0
 
 # Load the autoencoder model
 autoencoder_cfg = OmegaConf.load(args.autoencoder_cfg)["model"]["params"]
@@ -88,7 +92,7 @@ def encode(ae_params, clip_params, img_ae: jax.Array, img_clip: jax.Array) -> ja
     """Encode an image with the LDM encoder and compute its CLIP embedding. Takes the model
     parameters, an image of the right resolution for the LDM encoder and another one for CLIP.
     Returns a tuple of (LDM encoding, CLIP embedding)."""
-    assert img_ae.shape == (64, 64, 3)
+    assert img_ae.shape == (pxl_res, pxl_res, 3)
     assert img_clip.shape == (
         clip_res,
         clip_res,
@@ -113,8 +117,8 @@ def encode(ae_params, clip_params, img_ae: jax.Array, img_clip: jax.Array) -> ja
     img_clip_emb = img_clip_emb / jnp.linalg.norm(img_clip_emb)
 
     assert img_enc.shape == (
-        256,
-    ), f"encoded image shape is {img_enc.shape}, should be (256,)"
+        token_count,
+    ), f"encoded image shape is {img_enc.shape}, should be ({token_count},)"
     assert img_clip_emb.shape == (
         768,
     ), f"CLIP embedding shape is {img_clip_emb.shape}, should be (768,)"
@@ -162,7 +166,7 @@ def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
         tqdm.write(f"Skipping {img_path}, PIL can't open it due to {e}")
         return None
     w, h = img.size
-    if w < 64 or h < 64 or img.mode != "RGB":
+    if w < pxl_res or h < pxl_res or img.mode != "RGB":
         tqdm.write(f"Skipping {img_path}, size {w}x{h}, mode {img.mode}")
         return None
     else:
@@ -183,7 +187,9 @@ def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
             x2 = w
             y1 = 0
             y2 = h
-        img_for_enc = img.resize((64, 64), PIL.Image.BICUBIC, (x1, y1, x2, y2))
+        img_for_enc = img.resize(
+            (pxl_res, pxl_res), PIL.Image.BICUBIC, (x1, y1, x2, y2)
+        )
         img_for_clip = img.resize(
             (clip_res, clip_res), PIL.Image.BICUBIC, (x1, y1, x2, y2)
         )
@@ -260,7 +266,7 @@ def flush_batches(jax_list, numpy_list, force=False):
     # GPU->CPU is expensive, so we want to do it infrequently, but often enogh that we don't
     # exhaust GPU memory.
     # TODO this will change with higher res
-    bytes_per_enc_img = 256 * 4
+    bytes_per_enc_img = token_count * 4
     bytes_per_clip_embed = 768 * 4
     batch_bytes = [
         len(j) * (bytes_per_enc_img + bytes_per_clip_embed) for j in jax_list
