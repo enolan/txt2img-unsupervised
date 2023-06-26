@@ -7,6 +7,7 @@ import numpy as np
 import orbax.checkpoint  # type: ignore[import]
 import PIL.Image
 import torch
+import transformers
 from copy import copy
 from einops import repeat
 from flax.core import freeze
@@ -91,6 +92,7 @@ if __name__ == "__main__":
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--make-grids", action="store_true")
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--cond-img", type=Path, default=None)
     parser.add_argument("out_dir", type=Path)
     args = parser.parse_args()
 
@@ -122,11 +124,27 @@ if __name__ == "__main__":
     im_mdl = ImageModel(**model_cfg.__dict__, decode=True)
     im_params = freeze(restored["params"])
     if model_cfg.clip_conditioning:
-        faux_clip_embedding = jnp.zeros((768,), dtype=jnp.float32)
+        print("Loading CLIP model...")
+
+        clip_mdl_name = "openai/clip-vit-large-patch14"
+        clip_mdl = transformers.FlaxCLIPModel.from_pretrained(clip_mdl_name, dtype=jnp.float16)
+        clip_processor = transformers.AutoProcessor.from_pretrained(clip_mdl_name)
+
+        print(f"Loading conditioning image {args.cond_img}...")
+        cond_img = PIL.Image.open(args.cond_img)
+
+        print("Preprocessing conditioning image...")
+        clip_inputs = clip_processor(images=cond_img, return_tensors="np")
+
+        print("Computing CLIP embedding...")
+        clip_embedding = clip_mdl.get_image_features(**clip_inputs)[0].astype(jnp.float32)
+        print(f"Got CLIP embedding of shape {clip_embedding.shape}, norm {jnp.linalg.norm(clip_embedding)}")
+        clip_embedding = clip_embedding / jnp.linalg.norm(clip_embedding)
     else:
-        faux_clip_embedding = jnp.zeros((0,), dtype=jnp.float32)
+        assert args.cond_img is None, "Can't condition on an image without CLIP conditioning"
+        clip_embedding = jnp.zeros((0,), dtype=jnp.float32)
     decode_params = im_mdl.init(
-        jax.random.PRNGKey(0), jnp.arange(256), faux_clip_embedding
+        jax.random.PRNGKey(0), jnp.arange(256), clip_embedding
     )
     im_params = im_params.copy({"cache": decode_params["cache"]})
 
@@ -143,8 +161,7 @@ if __name__ == "__main__":
         encoded_imgs = []
         for batch_size in batches_split(args.batch_size, args.n):
             rng, rng2 = jax.random.split(rng)
-            # In future we'll let the user prompt with an actual CLIP embedding.
-            clip_embeddings = repeat(faux_clip_embedding, "d -> n d", n=batch_size)
+            clip_embeddings = repeat(clip_embedding, "d -> n d", n=batch_size)
             encoded_imgs.append(
                 sample_v(im_params, clip_embeddings, jax.random.split(rng2, batch_size))
             )
