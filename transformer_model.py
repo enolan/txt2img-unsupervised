@@ -1,3 +1,8 @@
+import os
+
+# Makes JAX computation actually reproducible
+os.environ["XLA_FLAGS"] = "--xla_gpu_deterministic_ops=true"
+
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -51,11 +56,9 @@ class ImageModel(nn.Module):
         )
 
         checkpoint_interval = int(self.n_layers**0.5)
-        print(f"checkpointing every {checkpoint_interval} layers")
         transformer_layers = []
         for i in range(self.n_layers):
             if i % checkpoint_interval == 0:
-                print(f"Checkpointing at layer {i}")
                 tl = nn.checkpoint(TransformerLayer)
             else:
                 tl = TransformerLayer
@@ -618,11 +621,13 @@ def train_loop_simple(
     data: jax.Array, mdl: ImageModel, iters: int
 ) -> Tuple[jax.Array, FrozenDict[str, Any]]:
     """Train the model repeatedly on a single batch for testing."""
+    assert mdl.clip_conditioning is False
     params = mdl.init(
         rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
-        image=jnp.zeros((gpt_1_config.seq_len,), dtype=jnp.int32),
+        image=jnp.zeros((gpt_1_config.image_tokens,), dtype=jnp.int32),
+        clip_embedding=jnp.zeros((0,), dtype=jnp.float32),
     )
-    opt = optax.adam(learning_rate=optax.linear_onecycle_schedule(iters, 1e-3))
+    opt = optax.adam(learning_rate=optax.linear_onecycle_schedule(iters, 3e-4))
     opt_state = opt.init(params)
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
 
@@ -630,10 +635,16 @@ def train_loop_simple(
         params: FrozenDict[str, Any],
         opt_state: Any,
         dropout_rng: jax.random.KeyArray,
-        batch: jax.Array,
+        batch_imgs: jax.Array,
     ) -> Tuple[FrozenDict[str, Any], Any, jax.random.KeyArray, jax.Array]:
         rng1, rng2 = jax.random.split(dropout_rng)
-        loss, grads = loss_grad_fn(mdl, params, rng1, batch)
+        loss, grads = loss_grad_fn(
+            mdl,
+            params,
+            rng1,
+            batch_imgs=batch_imgs,
+            batch_clips=jnp.zeros((batch_imgs.shape[0], 0), dtype=jnp.float32),
+        )
         updates, opt_state = opt.update(grads, opt_state)
         new_params: FrozenDict[str, Any] = optax.apply_updates(params, updates)
         return new_params, opt_state, rng2, loss
@@ -652,27 +663,48 @@ def train_loop_simple(
 def test_learn_zeros() -> None:
     """Test whether the model can learn to predict all zeros."""
     mdl = ImageModel(**gpt_1_config.__dict__)
-    data = jnp.zeros((16, gpt_1_config.seq_len), dtype=jnp.int32)
+    data = jnp.zeros((16, gpt_1_config.image_tokens), dtype=jnp.int32)
     loss, params = train_loop_simple(data, mdl, 10)
     assert loss < 1e-10
-    cfg = copy(gpt_1_config)
-    cfg.dropout = None
-    mdl = ImageModel(**cfg.__dict__)
-    sampled_arr = sample(mdl, params, jax.random.PRNGKey(0))
+
+    mdl = mdl.clone(dropout=None, decode=True)
+    decode_params = mdl.init(
+        jax.random.PRNGKey(0),
+        image=jnp.zeros((gpt_1_config.image_tokens,), dtype=jnp.int32),
+        clip_embedding=jnp.zeros((0,), dtype=jnp.float32),
+    )
+    sampled_arr = sample(
+        mdl,
+        params.copy({"cache": decode_params["cache"]}),
+        jnp.zeros((0,), dtype=jnp.float32),
+        jax.random.PRNGKey(0),
+    )
     assert jnp.all(sampled_arr == 0)
 
 
 def test_learn_ranges() -> None:
     """Test whether the model can learn to predict a range of integers."""
     mdl = ImageModel(**gpt_1_config.__dict__)
-    data = jnp.arange(16 * gpt_1_config.seq_len).reshape((16, gpt_1_config.seq_len))
+    data = jnp.arange(16 * gpt_1_config.image_tokens).reshape(
+        (16, gpt_1_config.image_tokens)
+    )
     # It's annoying how many iterations we need to get to minimal loss on such a trivial dataset
-    loss, params = train_loop_simple(data, mdl, 500)
+    loss, params = train_loop_simple(data, mdl, 1000)
     assert loss < 0.6
-    cfg = copy(gpt_1_config)
-    cfg.dropout = None
-    mdl = ImageModel(**cfg.__dict__)
-    sample_jv = jax.jit(jax.vmap(lambda rng: sample(mdl, params, rng, top_p=0.99)))
+    mdl = mdl.clone(dropout=None, decode=True)
+    params_cache = mdl.init(
+        jax.random.PRNGKey(0),
+        image=data[0],
+        clip_embedding=jnp.zeros((0,), dtype=jnp.float32),
+    )
+    params_with_cache = params.copy({"cache": params_cache["cache"]})
+    sample_jv = jax.jit(
+        lambda params, rng: jax.vmap(
+            lambda rng: sample(
+                mdl, params, jnp.zeros((0,), dtype=jnp.float32), rng, top_p=0.98
+            )
+        )(rng)
+    )
     print("Generating samples...")
     total_samples = 256
     samples_per_batch = 64
@@ -681,7 +713,9 @@ def test_learn_ranges() -> None:
     rng = jax.random.PRNGKey(0)
     for _ in trange(total_samples // samples_per_batch):
         rng, rng2 = jax.random.split(rng)
-        sample_batches.append(sample_jv(jax.random.split(rng2, samples_per_batch)))
+        sample_batches.append(
+            sample_jv(params_with_cache, jax.random.split(rng2, samples_per_batch))
+        )
     sampled_arr: jax.Array = jnp.concatenate(sample_batches, axis=0)
     print(f"Generated samples, shape: {sampled_arr.shape}")
     counts = dict([(i, 0) for i in range(16)])
