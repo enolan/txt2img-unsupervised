@@ -117,18 +117,14 @@ if __name__ == "__main__":
     restored = checkpoint_mngr.restore(checkpoint_mngr.latest_step())
 
     model_cfg = ModelConfig.from_json_dict(checkpoint_mngr.metadata()["model_cfg"])
-    model_cfg.dropout = None
     model_cfg.activations_dtype = jnp.float32  # Assume we're on the GPU at home
-    im_mdl = ImageModel(**model_cfg.__dict__, decode=True)
+    im_mdl = ImageModel(**model_cfg.__dict__)
     im_params = freeze(restored["params"])
     if model_cfg.clip_conditioning:
         faux_clip_embedding = jnp.zeros((768,), dtype=jnp.float32)
     else:
         faux_clip_embedding = jnp.zeros((0,), dtype=jnp.float32)
-    decode_params = im_mdl.init(
-        jax.random.PRNGKey(0), jnp.arange(256), faux_clip_embedding
-    )
-    im_params = im_params.copy({"cache": decode_params["cache"]})
+
 
     # Set up random seed
     if args.seed is not None:

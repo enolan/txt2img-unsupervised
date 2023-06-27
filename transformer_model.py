@@ -11,13 +11,41 @@ import optax  # type: ignore[import]
 from config import ModelConfig
 from copy import copy
 from dataclasses import dataclass
+from einops import rearrange
+from flash_attention_jax import causal_flash_attention
 from flax import struct
 from flax.core.frozen_dict import FrozenDict
 from functools import partial
 from typing import Any, Callable, Optional, Tuple
 from tqdm import trange
 
+# TODO
+# benchmarks
 
+# bench on 2080
+# gpt-1, gelu, CLIP off, 64x64
+# new hotness
+# max batch size 31
+# bs 16 2.45it/s = 39.2/sec
+# bs 25 1.60it/s = 40/sec
+# bs 31 1.31it/s = 40.61/sec
+# old coldness
+# max batch size 31
+# bs 26 1.56it/s = 40.56/sec
+# bs 31 1.30it/s = 40.3/sec
+
+# ?????????
+# the sampling was what was making it OOM :/
+
+# gpt-1, gelu, CLIP on, 128x128 (4x sequence length)
+# new hotness
+# max batch size 5
+# bs 4 1.91it/s = 7.64/sec
+# bs 5 1.56it/s = 7.8/sec
+
+# old coldness
+# max batch size 5
+# bs 5 1.52it/s = 7.6/sec
 class ImageModel(nn.Module):
     """A transformer model for images encoded to a discrete representation."""
 
@@ -32,6 +60,7 @@ class ImageModel(nn.Module):
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
     decode: bool = False
+    flash_attention: bool = False  # TODO turn on by default
 
     def setup(self) -> None:
         default_kernel_init = nn.initializers.normal(
@@ -73,6 +102,7 @@ class ImageModel(nn.Module):
                     activation_function=self.activation_function,
                     kernel_init=default_kernel_init,
                     decode=self.decode,
+                    flash_attention=self.flash_attention,
                 )
             )
         self.transformer_layers = transformer_layers
@@ -120,7 +150,11 @@ class ImageModel(nn.Module):
             toks = jnp.concatenate([jnp.zeros((1, self.d_model)), embeds[:-1]], axis=0)
 
         h: jax.Array = toks + self.positional_encoding(jnp.arange(self.seq_len()))
-        mask = jnp.tril(jnp.ones((self.num_heads, self.seq_len(), self.seq_len())))
+        if self.flash_attention:
+            # causal_flash_attention doesn't use a mask, the causal part is built in.
+            mask = None
+        else:
+            mask = jnp.tril(jnp.ones((self.num_heads, self.seq_len(), self.seq_len())))
         for tl in self.transformer_layers:
             h = tl(h, mask=mask)
 
@@ -139,6 +173,7 @@ class ImageModel(nn.Module):
         assert (
             self.decode
         ), "Can't call decode_step on a model that wasn't set up for decoding."
+        assert not self.flash_attention, "Flash attention doesn't work with decoding."
         assert tok.shape == ()
         assert tok.dtype == jnp.int32 or tok.dtype == jnp.int64
         if self.clip_conditioning:
@@ -198,9 +233,7 @@ def _setup_test_sample(
     if clip_conditioning:
         cfg_nodec.clip_conditioning = True
     mdl_nodec = ImageModel(**cfg_nodec.__dict__)
-    cfg_dec = copy(cfg_nodec)
-    cfg_dec.decode = True
-    mdl_dec = ImageModel(**cfg_dec.__dict__)
+    mdl_dec = mdl_nodec.clone(decode=True, flash_attention=False)
 
     toks = jax.random.randint(jax.random.PRNGKey(420), (256,), 0, 8192)
     if clip_conditioning:
@@ -394,16 +427,25 @@ def sample(
     else:
         assert clip_embedding.shape == (0,)
 
+    mdl_decode = mdl.clone(decode=True, flash_attention=False, dropout=0.0)
+    params_fake = mdl_decode.init(
+        jax.random.PRNGKey(0),
+        image=jnp.zeros((mdl.image_tokens,), dtype=jnp.int32),
+        clip_embedding=clip_embedding,
+    )
+    params = params.copy({"cache": params_fake["cache"]})
+    del params_fake
+
     # This needs to be outside the linen module because the fori_loop combinator doesn't work
     # inside them.
     def loop_iter(
         i: int, acc: Tuple[jax.Array, jax.random.KeyArray]
     ) -> Tuple[jax.Array, jax.random.KeyArray, FrozenDict[str, Any]]:
         image_toks, rng, params = acc
-        logits, new_cache = mdl.apply(
+        logits, new_cache = mdl_decode.apply(
             params,
             mutable=["cache"],
-            method=mdl.decode_step,
+            method=mdl_decode.decode_step,
             tok=image_toks[i - 1],
             idx=i,
             clip_embedding=clip_embedding,
@@ -417,10 +459,10 @@ def sample(
         return (image_toks, rng_loop, params)
 
     rng0, rng_loop = jax.random.split(rng, 2)
-    logits_0, cache = mdl.apply(
+    logits_0, cache = mdl_decode.apply(
         params,
         mutable=["cache"],
-        method=mdl.decode_step,
+        method=mdl_decode.decode_step,
         tok=jnp.array(0),
         idx=jnp.array(0),
         clip_embedding=clip_embedding,
@@ -519,8 +561,56 @@ class TransformerLayer(nn.Module):
     activation_function: Callable[[jax.Array], jax.Array]
     kernel_init: Callable[..., jnp.ndarray]
     decode: bool
+    flash_attention: bool
 
     def setup(self) -> None:
+        if self.flash_attention:
+            # Use fast flash attention implementation
+            print("Using flash attention")
+
+            def attn_function(
+                q,
+                k,
+                v,
+                bias=None,
+                mask=None,
+                broadcast_dropout=True,
+                dropout_rng=None,
+                dropout_rate=0.0,
+                deterministic=False,
+                dtype=None,
+                precision=None,
+            ):
+                assert len(q.shape) == 3, "batch dimensions not implemented"
+                assert q.shape[1] == k.shape[1] == v.shape[1]
+                assert q.shape[2] == k.shape[2] == v.shape[2]
+                assert k.shape[0] == v.shape[0]
+
+                rearrange_qkv = lambda x: rearrange(
+                    x, "seq_len heads head_dim -> 1 heads seq_len head_dim"
+                )
+                q, k, v = map(rearrange_qkv, (q, k, v))
+
+                assert bias == None, "attention bias not implemented"
+                assert (
+                    mask == None
+                ), "attention mask is redundant with causal_flash_attention"
+                assert dropout_rate == 0.0, "attention dropout not implemented"
+
+                res = causal_flash_attention(q, k, v)
+
+                if dtype != None:
+                    # There's no dtype parameter to fast attention and for some reason it doesn't
+                    # return results in the same dtype as the input
+                    res = res.astype(dtype)
+
+                return rearrange(
+                    res, "1 heads seq_len head_dim -> seq_len heads head_dim"
+                )
+
+        else:
+            print("using vanila attention")
+            attn_function = nn.attention.dot_product_attention
         self.mha = nn.SelfAttention(
             num_heads=self.num_heads,
             qkv_features=self.d_model,
@@ -533,6 +623,7 @@ class TransformerLayer(nn.Module):
             dtype=self.activations_dtype,
             kernel_init=self.kernel_init,
             decode=self.decode,
+            attention_fn=attn_function,
         )
         self.layer_norm_1 = nn.LayerNorm(dtype=self.activations_dtype)
         self.linear_1 = nn.Dense(
@@ -564,6 +655,37 @@ class TransformerLayer(nn.Module):
             )
         )
         return in_block_2 + out_block_2
+
+
+def test_flash_attention_equals_standard() -> None:
+    """Test that flash attention gives the same results as Flax's standard attention."""
+    mdl_std = TransformerLayer(
+        d_model=768,
+        num_heads=12,
+        ff_dim=3072,
+        dropout=None,
+        use_biases=False,
+        activations_dtype=jnp.float32,
+        activation_function=jax.nn.relu,
+        kernel_init=jax.nn.initializers.xavier_uniform(),
+        decode=False,
+        flash_attention=False,
+    )
+
+    input_shape = (64, 768)
+    input_vals = jax.random.normal(jax.random.PRNGKey(0), input_shape)
+
+    params = mdl_std.init(
+        jax.random.PRNGKey(1), jnp.ones(input_shape, dtype=jnp.float32)
+    )
+
+    causal_mask = jnp.tril(jnp.ones((64, 64), dtype=jnp.float32))
+    out_std = mdl_std.apply(params, input_vals, mask=causal_mask)
+
+    mdl_flash = mdl_std.clone(flash_attention=True)
+    out_flash = mdl_flash.apply(params, input_vals)
+
+    np.testing.assert_allclose(out_std, out_flash, atol=2e-6, rtol=0)
 
 
 def loss(
@@ -667,15 +789,9 @@ def test_learn_zeros() -> None:
     loss, params = train_loop_simple(data, mdl, 10)
     assert loss < 1e-10
 
-    mdl = mdl.clone(dropout=None, decode=True)
-    decode_params = mdl.init(
-        jax.random.PRNGKey(0),
-        image=jnp.zeros((gpt_1_config.image_tokens,), dtype=jnp.int32),
-        clip_embedding=jnp.zeros((0,), dtype=jnp.float32),
-    )
     sampled_arr = sample(
         mdl,
-        params.copy({"cache": decode_params["cache"]}),
+        params,
         jnp.zeros((0,), dtype=jnp.float32),
         jax.random.PRNGKey(0),
     )
@@ -691,13 +807,6 @@ def test_learn_ranges() -> None:
     # It's annoying how many iterations we need to get to minimal loss on such a trivial dataset
     loss, params = train_loop_simple(data, mdl, 1000)
     assert loss < 0.6
-    mdl = mdl.clone(dropout=None, decode=True)
-    params_cache = mdl.init(
-        jax.random.PRNGKey(0),
-        image=data[0],
-        clip_embedding=jnp.zeros((0,), dtype=jnp.float32),
-    )
-    params_with_cache = params.copy({"cache": params_cache["cache"]})
     sample_jv = jax.jit(
         lambda params, rng: jax.vmap(
             lambda rng: sample(
@@ -714,7 +823,7 @@ def test_learn_ranges() -> None:
     for _ in trange(total_samples // samples_per_batch):
         rng, rng2 = jax.random.split(rng)
         sample_batches.append(
-            sample_jv(params_with_cache, jax.random.split(rng2, samples_per_batch))
+            sample_jv(params, jax.random.split(rng2, samples_per_batch))
         )
     sampled_arr: jax.Array = jnp.concatenate(sample_batches, axis=0)
     print(f"Generated samples, shape: {sampled_arr.shape}")
