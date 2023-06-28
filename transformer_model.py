@@ -41,6 +41,46 @@ from tqdm import trange
 # old coldness
 # max batch size 5
 # bs 5 1.52it/s = 7.6/sec
+
+# gpu determinism mode was on oopsie. off for h100
+# on H100 80GB, 256x256, gelu, CLIP on, bf16
+# old coldness
+# max batch size 7
+# bs 4 1.93it/s = 7.72/sec
+# bs 6 1.33it/s = 7.98/sec
+# bs 7 1.15it/s = 8.05/sec
+
+# new hotness
+# broken with bf16 :(
+# using --activations-dtype float32
+# max batch size 25
+# bs 4 1.42it/s = 5.68/sec
+# bs 6 1.05s/it = 5.71/sec
+# bs 7 1.20s/it = 5.83/sec
+# bs 8 1.37s/it = 5.83/sec
+# bs 16 2.71s/it = 5.90/sec
+# bs 24 4.06s/it = 5.91/sec
+# bs 25 4.24s/it = 5.89/sec
+
+# fixed bf16 new hotness
+# max batch size 47
+# bs 25 2.57s/it = 9.727/sec
+# bs 32 3.30s/it = 9.69/sec
+# bs 40 4.13s/it = 9.68/sec
+# bs 44 4.52s/it = 9.73/sec
+# bs 46 4.75s/it = 9.68/sec
+# bs 47 4.86s/it = 9.67/sec
+
+# back on the 2080, GPU determinism off, gpt-1, gelu, clip off, 64x64
+# new hotness
+# max batch size 31
+# bs 31 1.43 it/s = 44.33/sec
+
+# old coldness
+# 16 <= max batch size < 31
+# bs 24 1.82it/s = 43.68/sec
+#
+
 class ImageModel(nn.Module):
     """A transformer model for images encoded to a discrete representation."""
 
