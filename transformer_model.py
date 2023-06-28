@@ -427,6 +427,8 @@ def sample(
     else:
         assert clip_embedding.shape == (0,)
 
+    # Flash attention doesn't work with Flax's fast decoding. Something to do with how masks are
+    # handled. Would be nice to fix it, but for now we just use the slower attention when sampling.
     mdl_decode = mdl.clone(decode=True, flash_attention=False, dropout=0.0)
     params_fake = mdl_decode.init(
         jax.random.PRNGKey(0),
