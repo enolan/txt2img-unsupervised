@@ -1,8 +1,3 @@
-import os
-
-# Makes JAX computation actually reproducible
-os.environ["XLA_FLAGS"] = "--xla_gpu_deterministic_ops=true"
-
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
