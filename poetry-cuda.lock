@@ -747,14 +747,18 @@ version = "0.3.0"
 description = "Flash Attention - in Jax"
 optional = false
 python-versions = "*"
-files = [
-    {file = "flash-attention-jax-0.3.0.tar.gz", hash = "sha256:2624b0841be08cd3756168b80e9bdbb7b7797af4bc47cdad052ea06586b6ccbd"},
-    {file = "flash_attention_jax-0.3.0-py3-none-any.whl", hash = "sha256:c881d6b46720cf1e681b7fc9a1056d8b1da2fd95a004c8c6621efa073b185339"},
-]
+files = []
+develop = false
 
 [package.dependencies]
 einops = "*"
 jax = ">=0.2.20"
+
+[package.source]
+type = "git"
+url = "https://github.com/enolan/flash-attention-jax.git"
+reference = "5ddd3fe600c30daa14612b271045c077d5a6249e"
+resolved_reference = "5ddd3fe600c30daa14612b271045c077d5a6249e"
 
 [[package]]
 name = "flax"
@@ -3495,4 +3499,4 @@ multidict = ">=4.0"
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.11"
-content-hash = "2c4c7c76d6da55f4c069aa7615b7b55410b2e57c7569ba94a8c140b9977cf778"
+content-hash = "1a90826c72b3f5be240893ad95b9cb1947f114385ccb4712478fbb106eae77c5"

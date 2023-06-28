@@ -566,8 +566,6 @@ class TransformerLayer(nn.Module):
     def setup(self) -> None:
         if self.flash_attention:
             # Use fast flash attention implementation
-            print("Using flash attention")
-
             def attn_function(
                 q,
                 k,
@@ -600,16 +598,13 @@ class TransformerLayer(nn.Module):
                 res = causal_flash_attention(q, k, v)
 
                 if dtype != None:
-                    # There's no dtype parameter to fast attention and for some reason it doesn't
-                    # return results in the same dtype as the input
-                    res = res.astype(dtype)
+                    assert res.dtype == dtype
 
                 return rearrange(
                     res, "1 heads seq_len head_dim -> seq_len heads head_dim"
                 )
 
         else:
-            print("using vanila attention")
             attn_function = nn.attention.dot_product_attention
         self.mha = nn.SelfAttention(
             num_heads=self.num_heads,
