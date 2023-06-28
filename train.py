@@ -402,7 +402,6 @@ def train_step(
     batch_clips: jax.Array,
 ) -> Tuple[TrainState, jax.Array, jax.Array]:
     """Compute a single optimization step."""
-    print("train_step")
     rng, rng2 = jax.random.split(state.rng)
     loss, grads = loss_grad_fn(mdl, state.params, rng, batch_imgs, batch_clips)
     new_state = state.apply_gradients(
