@@ -119,9 +119,8 @@ if __name__ == "__main__":
     restored = checkpoint_mngr.restore(checkpoint_mngr.latest_step())
 
     model_cfg = ModelConfig.from_json_dict(checkpoint_mngr.metadata()["model_cfg"])
-    model_cfg.dropout = None
     model_cfg.activations_dtype = jnp.float32  # Assume we're on the GPU at home
-    im_mdl = ImageModel(**model_cfg.__dict__, decode=True)
+    im_mdl = ImageModel(**model_cfg.__dict__)
     im_params = freeze(restored["params"])
     if model_cfg.clip_conditioning:
         print("Loading CLIP model...")

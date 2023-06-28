@@ -458,7 +458,8 @@ def save_checkpoint_and_sample(my_train_state, global_step) -> None:
             time.sleep(60)
     tqdm.write("Saved checkpoint")
     tqdm.write("Sampling")
-    sample_and_log(my_train_state, global_step)
+    tqdm.write("skipping")
+    # sample_and_log(my_train_state, global_step)
     tqdm.write("Done sampling")
 
 

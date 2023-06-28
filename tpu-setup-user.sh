@@ -52,7 +52,7 @@ rclone copy \
 echo "Downloading VQGAN"
 wget https://ommer-lab.com/files/latent-diffusion/vq-f4.zip -O ~/vq-f4.zip
 unzip ~/vq-f4.zip -d ~/vq-f4
-mv ~/vq-f4/model.ckpt ~/txt2img-unsupervised/vq-f4.ckpt
+ln -s ~/vq-f4/model.ckpt ~/txt2img-unsupervised/vq-f4.ckpt
 
 echo "Adding tmux nicety"
 cat > ~/.tmux.conf << EOF
