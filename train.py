@@ -21,7 +21,6 @@ from copy import copy
 from datasets import Dataset
 from distutils.util import strtobool
 from einops import rearrange, repeat
-from flax.core.frozen_dict import FrozenDict
 from flax.training import train_state
 from functools import partial
 from jax.experimental import mesh_utils
@@ -71,93 +70,190 @@ parser.add_argument("--ae-ckpt", type=Path, required=True)
 parser.add_argument("--activations-dtype", type=argparse_from_dict(str_to_dtype))
 parser.add_argument("--activation-function", type=argparse_from_dict(str_to_activation))
 parser.add_argument("--clip-conditioning", type=lambda x: bool(strtobool(x)))
+parser.add_argument("--resume", type=Path)
 args, _unknown = parser.parse_known_args()
 
 
-wandb.init()
-global_step: int = 0  # gradients computed so far
-wandb.define_metric("*", step_metric="global_step")
+def json_pretty(dict):
+    """Print a dictionary as pretty JSON."""
+    return json.dumps(dict, indent=2)
 
 
-# Load the dataset
-# The paths don't necessarily come out in the same order on every machine, so we sort to make the
-# example order consistent.
-dset_paths = list(sorted(args.pq_dir.glob("**/*.parquet")))
-dset_all = Dataset.from_parquet([str(path) for path in dset_paths])
-dset_all.set_format("numpy")
-dset_split = dset_all.train_test_split(test_size=0.01, seed=19900515)
-train_imgs = dset_split["train"]
-test_imgs = dset_split["test"]
-print(f"Train set {train_imgs.shape}, test set {test_imgs.shape}")
+def setup_cfg_and_wandb():
+    """Set up our ModelConfig and TrainingConfig and initialize wandb."""
+    checkpoint_options = orbax.checkpoint.CheckpointManagerOptions(
+        max_to_keep=3, keep_time_interval=datetime.timedelta(hours=6)
+    )
+    if args.resume is not None:
+        print(f"Resuming from checkpoint {args.resume}...")
+        checkpoint_dir = args.resume.absolute()
+        checkpoint_manager = orbax.checkpoint.CheckpointManager(
+            checkpoint_dir,
+            orbax.checkpoint.Checkpointer(orbax.checkpoint.PyTreeCheckpointHandler()),
+            options=checkpoint_options,
+        )
+        global_step = checkpoint_manager.latest_step()
+        restoring = True
+        metadata = checkpoint_manager.metadata()
+        model_cfg = ModelConfig.from_json_dict(metadata["model_cfg"])
+        training_cfg = TrainingConfig.from_json_dict(metadata["training_cfg"])
+        run_id = metadata["run_id"]
+        print(f"Resuming run {run_id}")
+        print(
+            "ALL TRAINING AND MODEL PARAMETERS PASSED ON THE COMMAND LINE WILL BE IGNORNED."
+        )
+        print(f"ModelConfig {json_pretty(model_cfg.to_json_dict())}")
+        print(f"TrainingConfig {json_pretty(training_cfg.to_json_dict())}")
+        wandb.init(id=run_id, resume="must")
+    else:
+        print("Starting new run...")
+        wandb.init()
 
+        global_step = 0
+        restoring = False
+        # Load model configuration
+        with open(args.model_config) as f:
+            model_cfg = ModelConfig.from_json_dict(json.load(f))
+        config.merge_attrs(model_cfg, args)
+        # Load training configuration
+        with open(args.training_config) as f:
+            training_cfg = TrainingConfig.from_json_dict(json.load(f))
+        config.merge_attrs(training_cfg, args)
+
+        # Send config to wandb
+        wandb.config.update(model_cfg.to_json_dict())
+        wandb.config.update(training_cfg.to_json_dict())
+
+        # Read potentially sweep-controlled parameters from wandb
+        model_cfg = ModelConfig.from_json_dict(wandb.config.as_dict())
+        training_cfg = TrainingConfig.from_json_dict(wandb.config.as_dict())
+        print(f"Model config post-wandb: {json_pretty(model_cfg.to_json_dict())}")
+        print(f"Training config post-wandb: {json_pretty(training_cfg.to_json_dict())}")
+
+        checkpoint_dir = Path(f"checkpoints/{wandb.run.id}")
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_manager = orbax.checkpoint.CheckpointManager(
+            checkpoint_dir,
+            orbax.checkpoint.Checkpointer(orbax.checkpoint.PyTreeCheckpointHandler()),
+            options=checkpoint_options,
+            metadata={
+                "model_cfg": model_cfg.to_json_dict(),
+                "training_cfg": training_cfg.to_json_dict(),
+                "run_id": wandb.run.id,
+            },
+        )
+
+    wandb.define_metric("*", step_metric="global_step")
+    wandb.define_metric("test/loss", summary="last")
+    wandb.define_metric("train/loss", summary="last")
+
+    return global_step, model_cfg, training_cfg, checkpoint_manager, restoring
+
+
+(
+    global_step,
+    model_cfg,
+    training_cfg,
+    checkpoint_manager,
+    restoring,
+) = setup_cfg_and_wandb()
+
+
+def load_dataset(dir: Path) -> Tuple[Dataset, Dataset]:
+    # The paths don't necessarily come out in the same order on every machine, so we sort to make the
+    # example order consistent.
+    dset_paths = list(sorted(dir.glob("**/*.parquet")))
+    dset_all = Dataset.from_parquet([str(path) for path in dset_paths])
+    dset_all.set_format("numpy")
+    dset_split = dset_all.train_test_split(test_size=0.01, seed=19900515)
+    train_imgs = dset_split["train"]
+    test_imgs = dset_split["test"]
+    print(f"Train set {train_imgs.shape}, test set {test_imgs.shape}")
+    return train_imgs, test_imgs
+
+
+train_imgs, test_imgs = load_dataset(args.pq_dir)
 # Make the RNG partitionable across devices
 jax.config.update("jax_threefry_partitionable", True)
 
-# Load the model configuration
-with open(args.model_config) as f:
-    model_cfg = ModelConfig.from_json_dict(json.load(f))
-config.merge_attrs(model_cfg, args)
 
-with open(args.training_config) as f:
-    training_cfg = TrainingConfig.from_json_dict(json.load(f))
-config.merge_attrs(training_cfg, args)
-
-wandb.config.update(model_cfg.to_json_dict())
-wandb.config.update(training_cfg.to_json_dict())
-
-# Get possibly sweep-controlled parameters from wandb
-model_cfg = ModelConfig.from_json_dict(wandb.config.as_dict())
-training_cfg = TrainingConfig.from_json_dict(wandb.config.as_dict())
-print(f"Model config post-wandb: {json.dumps(model_cfg.to_json_dict(), indent=2)}")
-print(
-    f"Training config post-wandb: {json.dumps(training_cfg.to_json_dict(), indent=2)}"
-)
-
-wandb.define_metric("test/loss", summary="last")
-wandb.define_metric("train/loss", summary="last")
-
-mdl = transformer_model.ImageModel(**model_cfg.__dict__)
-
-params = mdl.init(
-    rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
-    image=jnp.zeros((model_cfg.image_tokens,), dtype=jnp.int32),
-    clip_embedding=jnp.zeros((768,), dtype=jnp.float32)
-    if model_cfg.clip_conditioning
-    else jnp.zeros((0,), dtype=jnp.float32),
-)
+class TrainState(train_state.TrainState):  # type:ignore[no-untyped-call]
+    rng: jax.random.KeyArray  # type:ignore[misc]
 
 
-def triangle_schedule(max_lr: float, total_steps: int) -> optax.Schedule:
-    """Simple linear trianguar learning rate schedule. Best schedule found in Cramming paper.
-    https://arxiv.org/abs/2212.14034"""
-    sched_up = optax.linear_schedule(
-        init_value=0, end_value=max_lr, transition_steps=total_steps // 2
-    )
-    sched_down = optax.linear_schedule(
-        init_value=max_lr, end_value=0, transition_steps=total_steps // 2
-    )
-    return optax.join_schedules([sched_up, sched_down], [total_steps // 2])
+def setup_optimizer(
+    model_cfg, training_cfg, checkpoint_manager, global_step, restoring
+):
+    """Set up a model and create a - possibly restored from disk - TrainState to begin training
+    with."""
 
+    # Set up model
+    mdl = transformer_model.ImageModel(**model_cfg.__dict__)
 
-if training_cfg.triangle_schedule:
-    opt = optax.adam(
-        learning_rate=triangle_schedule(
-            training_cfg.learning_rate, training_cfg.epochs * len(train_imgs)
+    # Set up optimizer
+    def triangle_schedule(max_lr: float, total_steps: int) -> optax.Schedule:
+        """Simple linear trianguar learning rate schedule. Best schedule found in Cramming paper.
+        https://arxiv.org/abs/2212.14034"""
+        sched_up = optax.linear_schedule(
+            init_value=0, end_value=max_lr, transition_steps=total_steps // 2
         )
-    )
-else:
-    opt = optax.adam(learning_rate=training_cfg.learning_rate)
+        sched_down = optax.linear_schedule(
+            init_value=max_lr, end_value=0, transition_steps=total_steps // 2
+        )
+        return optax.join_schedules([sched_up, sched_down], [total_steps // 2])
 
-assert training_cfg.gradient_accumulation_steps > 0
-if training_cfg.gradient_accumulation_steps > 1:
-    opt = optax.MultiSteps(
-        opt, every_k_schedule=training_cfg.gradient_accumulation_steps
+    if training_cfg.triangle_schedule:
+        opt = optax.adam(
+            learning_rate=triangle_schedule(
+                training_cfg.learning_rate,
+                training_cfg.epochs * (len(train_imgs) // training_cfg.batch_size),
+            )
+        )
+    else:
+        opt = optax.adam(learning_rate=training_cfg.learning_rate)
+
+    assert training_cfg.gradient_accumulation_steps > 0
+    if training_cfg.gradient_accumulation_steps > 1:
+        opt = optax.MultiSteps(
+            opt, every_k_schedule=training_cfg.gradient_accumulation_steps
+        )
+    if training_cfg.gradient_clipping is not None:
+        clip = optax.clip_by_global_norm(training_cfg.gradient_clipping)
+    else:
+        clip = optax.identity()
+    opt = optax.apply_if_finite(optax.chain(clip, opt), 20)
+
+    # We need templates to feed to checkpoint_manager.restore so we get a TrainState instead of a
+    # dict
+    params_empty = mdl.init(
+        rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
+        image=jnp.zeros((model_cfg.image_tokens,), dtype=jnp.int32),
+        clip_embedding=jnp.zeros((768,), dtype=jnp.float32)
+        if model_cfg.clip_conditioning
+        else jnp.zeros((0,), dtype=jnp.float32),
     )
-if training_cfg.gradient_clipping is not None:
-    clip = optax.clip_by_global_norm(training_cfg.gradient_clipping)
-else:
-    clip = optax.identity()
-opt = optax.apply_if_finite(optax.chain(clip, opt), 20)
+
+    ts_empty = TrainState.create(
+        apply_fn=mdl.apply, params=params_empty, tx=opt, rng=jax.random.PRNGKey(1337)
+    )
+
+    # Set up parameters
+    if restoring:
+        ts = checkpoint_manager.restore(global_step, items=ts_empty)
+        assert (
+            ts.step == global_step
+        ), f"restored trainstate step {ts.step} != {global_step}"
+    else:
+        ts = ts_empty
+
+    return mdl, ts
+
+
+mdl, my_train_state = setup_optimizer(
+    model_cfg, training_cfg, checkpoint_manager, global_step, restoring
+)
+
+
 loss_grad_fn = jax.value_and_grad(transformer_model.loss_batch, argnums=1)
 loss_fn = jax.jit(
     lambda params, rng, batch_imgs, batch_clips: transformer_model.loss_batch(
@@ -166,10 +262,7 @@ loss_fn = jax.jit(
 )
 
 
-class TrainState(train_state.TrainState):  # type:ignore[no-untyped-call]
-    rng: jax.random.KeyArray  # type:ignore[misc]
-
-
+# TODO delete this, unnecessary now
 # Set up for sampling:
 sample_cfg = copy(model_cfg)
 sample_cfg.dropout = None
@@ -418,29 +511,10 @@ print(
 )
 assert training_cfg.batch_size % devices == 0
 sharding = jax.sharding.PositionalSharding(mesh_utils.create_device_mesh((devices, 1)))
-params = jax.device_put(params, sharding.replicate())
-
-my_train_state: TrainState = TrainState.create(  # type:ignore[no-untyped-call]
-    apply_fn=mdl.apply, params=params, tx=opt, rng=jax.random.PRNGKey(1337)
+my_train_state = my_train_state.replace(
+    params=jax.device_put(my_train_state.params, sharding.replicate())
 )
 
-run_id = wandb.run.id  # type:ignore[union-attr]
-
-checkpoint_dir = Path(f"checkpoints/{run_id}")
-checkpoint_dir.mkdir(parents=True, exist_ok=True)
-checkpoint_options = orbax.checkpoint.CheckpointManagerOptions(
-    max_to_keep=3, keep_time_interval=datetime.timedelta(hours=6)
-)
-checkpoint_manager = orbax.checkpoint.CheckpointManager(
-    checkpoint_dir,
-    orbax.checkpoint.Checkpointer(orbax.checkpoint.PyTreeCheckpointHandler()),
-    options=checkpoint_options,
-    metadata={
-        "model_cfg": model_cfg.to_json_dict(),
-        "training_cfg": training_cfg.to_json_dict(),
-        "run_id": run_id,
-    },
-)
 
 last_checkpoint_time = None
 
@@ -462,13 +536,35 @@ def save_checkpoint_and_sample(my_train_state, global_step) -> None:
     tqdm.write("Done sampling")
 
 
-rng = jax.random.PRNGKey(1337)
-rng_np = np.random.default_rng(1337)
-for epoch in trange(training_cfg.epochs):
-    train_imgs = train_imgs.shuffle(generator=rng_np)
+epoch_steps = train_imgs.shape[0] // training_cfg.batch_size
+assert global_step < training_cfg.epochs * epoch_steps, "training run is over my dude"
+start_epoch = global_step // epoch_steps
+start_step = global_step % epoch_steps
+tqdm.write(f"Starting at epoch {start_epoch}, step {start_step}")
+
+for epoch in trange(
+    start_epoch,
+    training_cfg.epochs,
+    initial=start_epoch,
+    total=training_cfg.epochs,
+    desc="epochs",
+):
+    # Consistent shuffle so resuming gets the same ordering
+    shuffled_train_imgs = train_imgs.shuffle(seed=epoch)
     batches = train_imgs.shape[0] // training_cfg.batch_size
-    with tqdm(total=batches, leave=False, desc="train batches") as pbar:
-        for batch in train_imgs.iter(
+    with tqdm(
+        total=batches, leave=False, desc="train batches", initial=start_step
+    ) as pbar:
+        iter = shuffled_train_imgs.iter(
+            batch_size=training_cfg.batch_size, drop_last_batch=True
+        )
+        if epoch == start_epoch and start_step > 0:
+            # This feels real inefficient but oh well I guess?
+            tqdm.write(f"Skipping {start_step} batches")
+            for _ in range(start_step):
+                next(iter)
+            tqdm.write("Done skipping")
+        for batch in shuffled_train_imgs.iter(
             batch_size=training_cfg.batch_size, drop_last_batch=True
         ):
             # Save checkpoint every 30 minutes. This does one at step 0 too, which is nice so we
@@ -517,7 +613,8 @@ for epoch in trange(training_cfg.epochs):
         total=len(test_imgs) // training_cfg.batch_size,
         desc="test batches",
     ):
-        rng, rng2 = jax.random.split(rng)
+        rng, rng2 = jax.random.split(my_train_state.rng)
+        my_train_state = my_train_state.replace(rng=rng)
         batch_imgs = jax.device_put(batch["encoded_img"], sharding)
         if model_cfg.clip_conditioning:
             batch_clips = jax.device_put(batch["clip_embedding"], sharding)
