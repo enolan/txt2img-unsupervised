@@ -328,17 +328,8 @@ ae_mdl = LDMAutoencoder(ae_cfg)
 ae_params_torch = torch.load(args.ae_ckpt, map_location="cpu")
 
 
-def sample_and_log(ts: TrainState, global_step: int) -> None:
+def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
     """Sample from the model and log to wandb."""
-
-    # We need one sharding per rank if we're just always doing data parallelism.
-    sharding_1d = jax.sharding.PositionalSharding(
-        mesh_utils.create_device_mesh((jax.device_count(),))
-    )
-
-    sharding_2d = jax.sharding.PositionalSharding(
-        mesh_utils.create_device_mesh((jax.device_count(), 1))
-    )
 
     ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
 
@@ -360,6 +351,7 @@ def sample_and_log(ts: TrainState, global_step: int) -> None:
             g=grid_size,
             clip_dim=768,
         )
+        conditioning_embeds_rep = jax.device_put(conditioning_embeds_rep, sharding)
         top_ps_rep = repeat(
             top_ps,
             "t -> (clips t g)",
@@ -367,7 +359,10 @@ def sample_and_log(ts: TrainState, global_step: int) -> None:
             g=grid_size,
             clips=embeddings_to_sample,
         )
+        top_ps_rep = jax.device_put(top_ps_rep, sharding.reshape((jax.device_count(),)))
+
         rngs = jax.random.split(ts.rng, samples_count)
+        rngs = jax.device_put(rngs, sharding)
 
         assert (
             len(conditioning_embeds_rep)
@@ -376,12 +371,8 @@ def sample_and_log(ts: TrainState, global_step: int) -> None:
             == samples_count
         )
 
-        # something weird is going on with sharding and padding on TPU. If I shard the inputs
-        # across all TPUs it OOMs and a bunch of intermediate buffers are padded 2x for some reason.
-        # works ok this way - on just the primary accelerator.
-
         batches = sample.batches_split(
-            training_cfg.batch_size // jax.device_count() * 2,
+            training_cfg.batch_size,
             len(conditioning_embeds_rep),
         )
 
@@ -505,12 +496,12 @@ def train_step(
 
 
 # Set up sharding
-devices = jax.device_count()
 print(
-    f"Sharding batches of {training_cfg.batch_size} across {devices} devices, {training_cfg.batch_size / devices} per device"
+    f"Sharding batches of {training_cfg.batch_size} across {jax.device_count()} devices, {training_cfg.batch_size / jax.device_count()} per device"
 )
-assert training_cfg.batch_size % devices == 0
-sharding = jax.sharding.PositionalSharding(mesh_utils.create_device_mesh((devices, 1)))
+assert training_cfg.batch_size % jax.device_count() == 0
+devices = mesh_utils.create_device_mesh((jav.device_count(),))
+sharding = jax.sharding.PositionalSharding(devices).reshape(jax.device_count(), 1)
 my_train_state = my_train_state.replace(
     params=jax.device_put(my_train_state.params, sharding.replicate())
 )
@@ -519,7 +510,7 @@ my_train_state = my_train_state.replace(
 last_checkpoint_time = None
 
 
-def save_checkpoint_and_sample(my_train_state, global_step) -> None:
+def save_checkpoint_and_sample(my_train_state, global_step, sharding) -> None:
     # TPU VMs run out of disk space a lot. Retrying in a loop lets me manually clean up the disk
     tqdm.write("Attempting to save checkpoint")
     while True:
@@ -532,7 +523,7 @@ def save_checkpoint_and_sample(my_train_state, global_step) -> None:
             time.sleep(60)
     tqdm.write("Saved checkpoint")
     tqdm.write("Sampling")
-    sample_and_log(my_train_state, global_step)
+    sample_and_log(my_train_state, global_step, sharding)
     tqdm.write("Done sampling")
 
 
@@ -572,7 +563,7 @@ for epoch in trange(
             if last_checkpoint_time is None or (
                 datetime.datetime.now() - last_checkpoint_time
             ) > datetime.timedelta(minutes=30):
-                save_checkpoint_and_sample(my_train_state, global_step)
+                save_checkpoint_and_sample(my_train_state, global_step, sharding)
                 last_checkpoint_time = datetime.datetime.now()
 
             batch_imgs = jax.device_put(batch["encoded_img"], sharding)
