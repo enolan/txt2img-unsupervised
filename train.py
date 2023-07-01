@@ -500,7 +500,7 @@ print(
     f"Sharding batches of {training_cfg.batch_size} across {jax.device_count()} devices, {training_cfg.batch_size / jax.device_count()} per device"
 )
 assert training_cfg.batch_size % jax.device_count() == 0
-devices = mesh_utils.create_device_mesh((jav.device_count(),))
+devices = mesh_utils.create_device_mesh((jax.device_count(),))
 sharding = jax.sharding.PositionalSharding(devices).reshape(jax.device_count(), 1)
 my_train_state = my_train_state.replace(
     params=jax.device_put(my_train_state.params, sharding.replicate())
@@ -618,5 +618,5 @@ for epoch in trange(
         f"Epoch {epoch} done, train loss: {loss:.4f}, test loss {test_loss:.4f}",
         end="",
     )
-    save_checkpoint_and_sample(my_train_state, global_step)
+    save_checkpoint_and_sample(my_train_state, global_step, sharding)
     last_checkpoint_time = datetime.datetime.now()
