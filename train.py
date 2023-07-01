@@ -320,7 +320,7 @@ def get_clip_embeddings_to_sample(n: int, dset) -> jax.Array:
 
 sampling_clips = get_clip_embeddings_to_sample(embeddings_to_sample, test_imgs[:2048])
 
-print(f"Using {sampling_clips['name']} for diagnostic sampling")
+print(f"Using {[name for name in sampling_clips['name']]} for diagnostic sampling")
 
 ae_cfg = OmegaConf.load(args.ae_cfg)["model"]["params"]
 ae_mdl = LDMAutoencoder(ae_cfg)
