@@ -3,6 +3,7 @@ import argparse
 import dacite
 import jax
 import jax.numpy as jnp
+import ldm_autoencoder
 import numpy as np
 import orbax.checkpoint  # type: ignore[import]
 import PIL.Image
@@ -39,21 +40,6 @@ sample_v = jax.jit(
         ),
         in_axes=(None, 0, 0),
     )
-)
-
-
-# TODO delete. this is wrong, and redundant with ldm_autoencoder
-def decode_to_u8(ae_mdl, ae_params, codes):
-    pxls_f32 = ae_mdl.apply(ae_params, method=ae_mdl.decode, x=codes, shape=(16, 16))
-    pxls_f32 = jnp.clip(0, (pxls_f32 + 1) * 127.5, 255.0)
-    return pxls_f32.astype(jnp.uint8)
-
-
-decode_jv = jax.jit(
-    lambda ae_mdl, ae_params, codeses: jax.vmap(decode_to_u8, in_axes=(None, None, 0))(
-        ae_mdl, ae_params, codeses
-    ),
-    static_argnums=0,
 )
 
 
@@ -142,10 +128,6 @@ if __name__ == "__main__":
     else:
         assert args.cond_img is None, "Can't condition on an image without CLIP conditioning"
         clip_embedding = jnp.zeros((0,), dtype=jnp.float32)
-    decode_params = im_mdl.init(
-        jax.random.PRNGKey(0), jnp.arange(256), clip_embedding
-    )
-    im_params = im_params.copy({"cache": decode_params["cache"]})
 
     # Set up random seed
     if args.seed is not None:
@@ -167,6 +149,8 @@ if __name__ == "__main__":
             pbar.update(batch_size)
 
     print("Loading autoencoder model...")
+    ae_res = int(model_cfg.image_tokens ** 0.5)
+    assert ae_res ** 2 == model_cfg.image_tokens, "Image tokens must be a square number"
     ae_cfg = OmegaConf.load(args.autoencoder_cfg)["model"][
         "params"
     ]  # type:ignore[index]
@@ -181,7 +165,7 @@ if __name__ == "__main__":
     decoded_imgs = []
     with tqdm(total=args.n, unit="img") as pbar:
         for encoded_img_batch in encoded_imgs:
-            decoded_imgs.append(decode_jv(ae_mdl, ae_params, encoded_img_batch))
+            decoded_imgs.append(ldm_autoencoder.decode_jv(ae_mdl, ae_params, (ae_res, ae_res), encoded_img_batch))
             pbar.update(len(encoded_img_batch))
     decoded_imgs = np.concatenate(decoded_imgs, axis=0)
 
