@@ -28,7 +28,7 @@ class ImageModel(nn.Module):
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
     decode: bool = False
-    flash_attention: bool = True  # TODO turn on by default
+    flash_attention: bool = True
 
     def setup(self) -> None:
         default_kernel_init = nn.initializers.normal(
