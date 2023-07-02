@@ -23,6 +23,7 @@ from distutils.util import strtobool
 from einops import rearrange, repeat
 from flax.training import train_state
 from functools import partial
+from itertools import islice
 from jax.experimental import mesh_utils
 from ldm_autoencoder import LDMAutoencoder
 from omegaconf import OmegaConf
@@ -58,6 +59,7 @@ parser.add_argument("--model-config", type=Path, required=True)
 parser.add_argument("--training-config", type=Path, required=True)
 parser.add_argument("--batch-size", type=int)
 parser.add_argument("--epochs", type=int)
+parser.add_argument("--training-images", type=int)
 parser.add_argument("--learning-rate", type=float, default=1e-4)
 parser.add_argument(
     "--triangle-schedule", type=lambda x: bool(strtobool(x)), default=True
@@ -527,24 +529,49 @@ def save_checkpoint_and_sample(my_train_state, global_step, sharding) -> None:
     tqdm.write("Done sampling")
 
 
-epoch_steps = train_imgs.shape[0] // training_cfg.batch_size
-assert global_step < training_cfg.epochs * epoch_steps, "training run is over my dude"
-start_epoch = global_step // epoch_steps
-start_step = global_step % epoch_steps
+# How many batches to do for the training duration that is specified by --training-images
+batches_for_image_count = training_cfg.training_images // training_cfg.batch_size
+batches_per_epoch = train_imgs.shape[0] // training_cfg.batch_size
+image_count_epochs = batches_for_image_count // batches_per_epoch
+extra_batches = batches_for_image_count % batches_per_epoch
+epochs_total = (
+    image_count_epochs + training_cfg.epochs + (1 if extra_batches > 0 else 0)
+)
+batches_total = (
+    training_cfg.epochs + image_count_epochs
+) * batches_per_epoch + extra_batches
+assert epochs_total > 0, "Can't train for 0 steps"
+
+print(
+    f"Training for {batches_total * training_cfg.batch_size} images in {batches_total} steps over {image_count_epochs + training_cfg.epochs} full epochs plus {extra_batches} extra batches"
+)
+
+assert global_step < batches_total, "training run is over my dude"
+start_epoch = global_step // batches_per_epoch
+start_step = global_step % batches_per_epoch
 tqdm.write(f"Starting at epoch {start_epoch}, step {start_step}")
 
 for epoch in trange(
     start_epoch,
-    training_cfg.epochs,
+    epochs_total,
     initial=start_epoch,
-    total=training_cfg.epochs,
+    total=epochs_total,
     desc="epochs",
 ):
     # Consistent shuffle so resuming gets the same ordering
     shuffled_train_imgs = train_imgs.shuffle(seed=epoch)
-    batches = train_imgs.shape[0] // training_cfg.batch_size
+
+    # If we're doing a partial epoch, set the number of batches to do
+    if epoch == epochs_total - 1:
+        batches = extra_batches if extra_batches > 0 else batches_per_epoch
+    else:
+        batches = batches_per_epoch
+
     with tqdm(
-        total=batches, leave=False, desc="train batches", initial=start_step
+        total=batches,
+        leave=False,
+        desc="train batches",
+        initial=(start_step if epoch == start_epoch else 0),
     ) as pbar:
         iter = shuffled_train_imgs.iter(
             batch_size=training_cfg.batch_size, drop_last_batch=True
@@ -555,8 +582,11 @@ for epoch in trange(
             for _ in range(start_step):
                 next(iter)
             tqdm.write("Done skipping")
-        for batch in shuffled_train_imgs.iter(
-            batch_size=training_cfg.batch_size, drop_last_batch=True
+        for batch in islice(
+            shuffled_train_imgs.iter(
+                batch_size=training_cfg.batch_size, drop_last_batch=True
+            ),
+            batches,
         ):
             # Save checkpoint every 30 minutes. This does one at step 0 too, which is nice so we
             # don't have to wait half an hour to find out if it crashes.
