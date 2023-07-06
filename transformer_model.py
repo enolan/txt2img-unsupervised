@@ -52,28 +52,27 @@ class ImageModel(nn.Module):
             dtype=self.activations_dtype,
         )
 
-        checkpoint_interval = int(self.n_layers**0.5)
-        transformer_layers = []
-        for i in range(self.n_layers):
-            if i % checkpoint_interval == 0:
-                tl = nn.checkpoint(TransformerLayer)
-            else:
-                tl = TransformerLayer
-            transformer_layers.append(
-                tl(
-                    d_model=self.d_model,
-                    num_heads=self.num_heads,
-                    ff_dim=self.ff_dim,
-                    dropout=self.dropout,
-                    use_biases=self.use_biases,
-                    activations_dtype=self.activations_dtype,
-                    activation_function=self.activation_function,
-                    kernel_init=default_kernel_init,
-                    decode=self.decode,
-                    flash_attention=self.flash_attention,
-                )
-            )
-        self.transformer_layers = transformer_layers
+        # "Optimal" checkpointing is every sqrt n layers, flax's remat_scan needs the number of
+        # layers to be a product (checkpointing happens every loop)
+        checkpoint_a = int(self.n_layers**0.5)
+        checkpoint_b = self.n_layers // checkpoint_a
+        assert (
+            checkpoint_a * checkpoint_b == self.n_layers
+        ), "n_layers must be divisible by floor(sqrt(n_layers)). Change n_layers or write code to support removing the limitation."
+        self.transformer_layers = nn.remat_scan(
+            TransformerLayer, lengths=(checkpoint_a, checkpoint_b)
+        )(
+            d_model=self.d_model,
+            num_heads=self.num_heads,
+            ff_dim=self.ff_dim,
+            dropout=self.dropout,
+            use_biases=self.use_biases,
+            activations_dtype=self.activations_dtype,
+            activation_function=self.activation_function,
+            kernel_init=default_kernel_init,
+            decode=self.decode,
+            flash_attention=self.flash_attention,
+        )
 
         self.logits_decoder = nn.Dense(
             features=8192,
@@ -118,13 +117,7 @@ class ImageModel(nn.Module):
             toks = jnp.concatenate([jnp.zeros((1, self.d_model)), embeds[:-1]], axis=0)
 
         h: jax.Array = toks + self.positional_encoding(jnp.arange(self.seq_len()))
-        if self.flash_attention:
-            # causal_flash_attention doesn't use a mask, the causal part is built in.
-            mask = None
-        else:
-            mask = jnp.tril(jnp.ones((self.num_heads, self.seq_len(), self.seq_len())))
-        for tl in self.transformer_layers:
-            h = tl(h, mask=mask)
+        h = self.transformer_layers(h)
 
         return self.logits_decoder(h)  # type: ignore[no-any-return]
 
@@ -168,8 +161,7 @@ class ImageModel(nn.Module):
         assert h.shape == (self.d_model,)
         h = h[None, :]
 
-        for tl in self.transformer_layers:
-            h = tl(h)
+        h = self.transformer_layers(h)
         return self.logits_decoder(h[0])  # type: ignore[no-any-return]
 
 
@@ -609,9 +601,13 @@ class TransformerLayer(nn.Module):
         else:
             self.dropout_layer = nn.Dropout(rate=0, deterministic=True)
 
-    def __call__(
-        self, embeds: jax.Array, mask: Optional[jax.Array] = None
-    ) -> jax.Array:
+    def __call__(self, embeds: jax.Array) -> jax.Array:
+        if self.flash_attention:
+            mask = None
+        else:
+            mask = jnp.tril(
+                jnp.ones((self.num_heads, embeds.shape[0], embeds.shape[0]))
+            )
         out_block_1 = self.layer_norm_1(self.mha(embeds, mask=mask))
         in_block_2: jax.Array = embeds + self.dropout_layer(out_block_1)
         out_block_2: jax.Array = self.layer_norm_2(
@@ -644,8 +640,7 @@ def test_flash_attention_equals_standard() -> None:
         jax.random.PRNGKey(1), jnp.ones(input_shape, dtype=jnp.float32)
     )
 
-    causal_mask = jnp.tril(jnp.ones((64, 64), dtype=jnp.float32))
-    out_std = mdl_std.apply(params, input_vals, mask=causal_mask)
+    out_std = mdl_std.apply(params, input_vals)
 
     mdl_flash = mdl_std.clone(flash_attention=True)
     out_flash = mdl_flash.apply(params, input_vals)
@@ -714,7 +709,7 @@ def train_loop_simple(
         image=jnp.zeros((gpt_1_config.image_tokens,), dtype=jnp.int32),
         clip_embedding=jnp.zeros((0,), dtype=jnp.float32),
     )
-    opt = optax.adam(learning_rate=optax.linear_onecycle_schedule(iters, 3e-4))
+    opt = optax.adam(learning_rate=3e-5)
     opt_state = opt.init(params)
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
 
