@@ -171,6 +171,9 @@ def load_dataset(dir: Path) -> Tuple[Dataset, Dataset]:
     train_imgs = dset_split["train"]
     test_imgs = dset_split["test"]
     print(f"Train set {train_imgs.shape}, test set {test_imgs.shape}")
+    wandb.config.update(
+        {"train_set_size": len(train_imgs), "test_set_size": len(test_imgs)}
+    )
     return train_imgs, test_imgs
 
 
