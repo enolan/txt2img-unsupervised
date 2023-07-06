@@ -183,8 +183,34 @@ class TrainState(train_state.TrainState):  # type:ignore[no-untyped-call]
     rng: jax.random.KeyArray  # type:ignore[misc]
 
 
+def calculate_steps(train_set_size, training_cfg):
+    """Calculate the number of steps and epochs to do."""
+
+    batches_for_image_count = training_cfg.training_images // training_cfg.batch_size
+    batches_per_epoch = train_set_size // training_cfg.batch_size
+    image_count_epochs = batches_for_image_count // batches_per_epoch
+    extra_batches = batches_for_image_count % batches_per_epoch
+    epochs_total = (
+        image_count_epochs + training_cfg.epochs + (1 if extra_batches > 0 else 0)
+    )
+    batches_total = (
+        training_cfg.epochs + image_count_epochs
+    ) * batches_per_epoch + extra_batches
+    assert epochs_total > 0, "Can't train for 0 steps"
+
+    print(
+        f"Training for {batches_total * training_cfg.batch_size} images in {batches_total} steps over {image_count_epochs + training_cfg.epochs} full epochs plus {extra_batches} extra batches"
+    )
+    return batches_total, epochs_total, batches_per_epoch, extra_batches
+
+
+batches_total, epochs_total, batches_per_epoch, extra_batches = calculate_steps(
+    train_imgs.shape[0], training_cfg
+)
+
+
 def setup_optimizer(
-    model_cfg, training_cfg, checkpoint_manager, global_step, restoring
+    model_cfg, training_cfg, batches_total, checkpoint_manager, global_step, restoring
 ):
     """Set up a model and create a - possibly restored from disk - TrainState to begin training
     with."""
@@ -208,7 +234,7 @@ def setup_optimizer(
         opt = optax.adam(
             learning_rate=triangle_schedule(
                 training_cfg.learning_rate,
-                training_cfg.epochs * (len(train_imgs) // training_cfg.batch_size),
+                batches_total,
             )
         )
     else:
@@ -252,7 +278,7 @@ def setup_optimizer(
 
 
 mdl, my_train_state = setup_optimizer(
-    model_cfg, training_cfg, checkpoint_manager, global_step, restoring
+    model_cfg, training_cfg, batches_total, checkpoint_manager, global_step, restoring
 )
 
 
@@ -528,23 +554,6 @@ def save_checkpoint_and_sample(my_train_state, global_step, sharding) -> None:
     sample_and_log(my_train_state, global_step, sharding)
     tqdm.write("Done sampling")
 
-
-# How many batches to do for the training duration that is specified by --training-images
-batches_for_image_count = training_cfg.training_images // training_cfg.batch_size
-batches_per_epoch = train_imgs.shape[0] // training_cfg.batch_size
-image_count_epochs = batches_for_image_count // batches_per_epoch
-extra_batches = batches_for_image_count % batches_per_epoch
-epochs_total = (
-    image_count_epochs + training_cfg.epochs + (1 if extra_batches > 0 else 0)
-)
-batches_total = (
-    training_cfg.epochs + image_count_epochs
-) * batches_per_epoch + extra_batches
-assert epochs_total > 0, "Can't train for 0 steps"
-
-print(
-    f"Training for {batches_total * training_cfg.batch_size} images in {batches_total} steps over {image_count_epochs + training_cfg.epochs} full epochs plus {extra_batches} extra batches"
-)
 
 assert global_step < batches_total, "training run is over my dude"
 start_epoch = global_step // batches_per_epoch
