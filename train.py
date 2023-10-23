@@ -132,7 +132,7 @@ def setup_cfg_and_wandb():
         print(f"Model config post-wandb: {json_pretty(model_cfg.to_json_dict())}")
         print(f"Training config post-wandb: {json_pretty(training_cfg.to_json_dict())}")
 
-        checkpoint_dir = Path(f"checkpoints/{wandb.run.id}")
+        checkpoint_dir = Path(f"checkpoints/{wandb.run.id}").absolute()
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_manager = orbax.checkpoint.CheckpointManager(
             checkpoint_dir,
