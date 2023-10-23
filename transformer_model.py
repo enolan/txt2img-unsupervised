@@ -14,6 +14,7 @@ from functools import partial
 from typing import Any, Callable, Optional, Tuple
 from tqdm import trange
 
+
 class ImageModel(nn.Module):
     """A transformer model for images encoded to a discrete representation."""
 
@@ -59,8 +60,31 @@ class ImageModel(nn.Module):
         assert (
             checkpoint_a * checkpoint_b == self.n_layers
         ), "n_layers must be divisible by floor(sqrt(n_layers)). Change n_layers or write code to support removing the limitation."
-        self.transformer_layers = nn.remat_scan(
-            TransformerLayer, lengths=(checkpoint_a, checkpoint_b)
+        # first train_step (mostly compile time) measurements, H100, GPT-2-s-128, batch size 61
+        # w/ remat_scan: 12.095674, 10.785334, 10.944534
+        # (first run I ran the sampling code first, other two I commented it out)
+        # w/o remat_scan: OOM???????
+        # w/o remat_scan, batch size 60 65.351195, 66.500989, 71.402747
+        # w/ remat_scan, batch size 60 12.159995, 13.822369, 11.411569
+
+        # sampling at train startup:
+        # w/ remat_scan, bs 84 11:57
+        # w/o remat_scan bs 84 3:29 then OOM training
+        # w/o remat_scan bs 64 3:17, no OOM
+        # what the shit?
+        # w/ remat_scan, bs 64 12:00
+        # home 2080 sampling, gpt-1, 64
+        # w/ remat_scan, bs 12 3:16
+        # w/o remat_scan, bs 12 1:06
+        # self.transformer_layers = nn.remat_scan(
+        #     TransformerLayer, lengths=(checkpoint_a, checkpoint_b)
+        # )(
+        self.transformer_layers = nn.scan(
+            TransformerLayer,
+            variable_axes={"params": 0, "cache": 0},
+            variable_broadcast=False,
+            split_rngs={"params": True, "dropout": True},
+            length=self.n_layers,
         )(
             d_model=self.d_model,
             num_heads=self.num_heads,
@@ -117,7 +141,8 @@ class ImageModel(nn.Module):
             toks = jnp.concatenate([jnp.zeros((1, self.d_model)), embeds[:-1]], axis=0)
 
         h: jax.Array = toks + self.positional_encoding(jnp.arange(self.seq_len()))
-        h = self.transformer_layers(h)
+        h, c = self.transformer_layers(h, None)
+        print(f"transformer_layers h shape {h.shape}, c type {type(c)}")
 
         return self.logits_decoder(h)  # type: ignore[no-any-return]
 
@@ -161,7 +186,7 @@ class ImageModel(nn.Module):
         assert h.shape == (self.d_model,)
         h = h[None, :]
 
-        h = self.transformer_layers(h)
+        h, _ = self.transformer_layers(h, None)
         return self.logits_decoder(h[0])  # type: ignore[no-any-return]
 
 
@@ -601,7 +626,7 @@ class TransformerLayer(nn.Module):
         else:
             self.dropout_layer = nn.Dropout(rate=0, deterministic=True)
 
-    def __call__(self, embeds: jax.Array) -> jax.Array:
+    def __call__(self, embeds: jax.Array, _) -> jax.Array:
         if self.flash_attention:
             mask = None
         else:
@@ -615,7 +640,7 @@ class TransformerLayer(nn.Module):
                 self.linear_2(self.activation_function(self.linear_1(in_block_2)))  # type: ignore[attr-defined]
             )
         )
-        return in_block_2 + out_block_2
+        return in_block_2 + out_block_2, None
 
 
 def test_flash_attention_equals_standard() -> None:

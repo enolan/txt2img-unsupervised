@@ -615,9 +615,14 @@ for epoch in trange(
                 batch_clips = jax.device_put(
                     jnp.zeros((batch_imgs.shape[0], 0)), sharding
                 )
+            #tqdm.write("First train_step")
+            #start = datetime.datetime.now()
             my_train_state, loss, norm = train_step(
                 my_train_state, batch_imgs, batch_clips
             )
+            # end = datetime.datetime.now()
+            # print(f"first train_step took {end - start}")
+            # exit(0)
             # TODO check if moving this check inside an if opt_state.notfinite_count > 0 is faster
             if not jnp.isfinite(loss):
                 tqdm.write(f"Loss nonfinite 😢 ({loss})")
