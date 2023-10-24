@@ -52,33 +52,10 @@ class ImageModel(nn.Module):
             embedding_init=default_kernel_init,
             dtype=self.activations_dtype,
         )
-
-        # "Optimal" checkpointing is every sqrt n layers, flax's remat_scan needs the number of
-        # layers to be a product (checkpointing happens every loop)
-        checkpoint_a = int(self.n_layers**0.5)
-        checkpoint_b = self.n_layers // checkpoint_a
-        assert (
-            checkpoint_a * checkpoint_b == self.n_layers
-        ), "n_layers must be divisible by floor(sqrt(n_layers)). Change n_layers or write code to support removing the limitation."
-        # first train_step (mostly compile time) measurements, H100, GPT-2-s-128, batch size 61
-        # w/ remat_scan: 12.095674, 10.785334, 10.944534
-        # (first run I ran the sampling code first, other two I commented it out)
-        # w/o remat_scan: OOM???????
-        # w/o remat_scan, batch size 60 65.351195, 66.500989, 71.402747
-        # w/ remat_scan, batch size 60 12.159995, 13.822369, 11.411569
-
-        # sampling at train startup:
-        # w/ remat_scan, bs 84 11:57
-        # w/o remat_scan bs 84 3:29 then OOM training
-        # w/o remat_scan bs 64 3:17, no OOM
-        # what the shit?
-        # w/ remat_scan, bs 64 12:00
-        # home 2080 sampling, gpt-1, 64
-        # w/ remat_scan, bs 12 3:16
-        # w/o remat_scan, bs 12 1:06
-        # self.transformer_layers = nn.remat_scan(
-        #     TransformerLayer, lengths=(checkpoint_a, checkpoint_b)
-        # )(
+        # it'd potentially be better to use nn.remat_scan here, but it makes inference massively
+        # slower for some reason. Even though checkpointing should only affect gradient computation.
+        # Might have to do with the fact that remat_scan creates a scan-of-scans? Could cause bad
+        # optimization in JAX or XLA.
         self.transformer_layers = nn.scan(
             TransformerLayer,
             variable_axes={"params": 0, "cache": 0},
@@ -141,8 +118,7 @@ class ImageModel(nn.Module):
             toks = jnp.concatenate([jnp.zeros((1, self.d_model)), embeds[:-1]], axis=0)
 
         h: jax.Array = toks + self.positional_encoding(jnp.arange(self.seq_len()))
-        h, c = self.transformer_layers(h, None)
-        print(f"transformer_layers h shape {h.shape}, c type {type(c)}")
+        h, _ = self.transformer_layers(h, None)
 
         return self.logits_decoder(h)  # type: ignore[no-any-return]
 
