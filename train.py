@@ -2,6 +2,7 @@
 import argparse
 import config
 import datetime
+import flax.core
 import jax
 import jax.numpy as jnp
 import json
@@ -311,7 +312,7 @@ del sample_params
 sample_jv = jax.jit(
     jax.vmap(
         lambda params, clip_embedding, rng, top_p: transformer_model.sample(
-            sample_mdl, params.copy({"cache": sample_cache}), clip_embedding, rng, top_p
+            sample_mdl, flax.core.copy(params, {"cache": sample_cache}), clip_embedding, rng, top_p
         ),
         in_axes=(None, 0, 0, 0),
     )

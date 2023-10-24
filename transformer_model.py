@@ -1,3 +1,4 @@
+import flax.core
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -9,7 +10,6 @@ from dataclasses import dataclass
 from einops import rearrange
 from flash_attention_jax import causal_flash_attention
 from flax import struct
-from flax.core.frozen_dict import FrozenDict
 from functools import partial
 from typing import Any, Callable, Optional, Tuple
 from tqdm import trange
@@ -166,13 +166,13 @@ class ImageModel(nn.Module):
         return self.logits_decoder(h[0])  # type: ignore[no-any-return]
 
 
-def _assert_frozen_dicts_equal(d1, d2, name) -> None:
-    assert isinstance(d1, FrozenDict)
-    assert isinstance(d2, FrozenDict)
+def _assert_dicts_equal(d1, d2, name) -> None:
+    assert isinstance(d1, dict)
+    assert isinstance(d2, dict)
     assert d1.keys() == d2.keys()
     for k in d1.keys():
-        if isinstance(d1[k], FrozenDict):
-            _assert_frozen_dicts_equal(d1[k], d2[k], f"{name}.{k}")
+        if isinstance(d1[k], dict):
+            _assert_dicts_equal(d1[k], d2[k], f"{name}.{k}")
         elif isinstance(d1[k], jax.Array):
             np.testing.assert_allclose(
                 np.array(d1[k]), np.array(d2[k]), atol=1e-8, rtol=0
@@ -183,7 +183,7 @@ def _assert_frozen_dicts_equal(d1, d2, name) -> None:
 
 def _setup_test_sample(
     clip_conditioning: bool = False,
-) -> Tuple[ImageModel, ImageModel, FrozenDict, jax.Array, jax.Array]:
+) -> Tuple[ImageModel, ImageModel, dict, jax.Array, jax.Array]:
     """Shared setup code for iterative sampling tests."""
     cfg_nodec = copy(gpt_1_config)
     cfg_nodec.dropout = None
@@ -210,7 +210,7 @@ def _setup_test_sample(
         jax.random.PRNGKey(69), toks, clip_embedding=clip_embedding
     )
 
-    _assert_frozen_dicts_equal(params["params"], params_dec["params"], "params")
+    _assert_dicts_equal(params["params"], params_dec["params"], "params")
 
     logits_all = mdl_nodec.apply(params, image=toks, clip_embedding=clip_embedding)
 
@@ -237,7 +237,7 @@ def _test_sample_tok_0(clip_conditioning: bool) -> None:
         logits_all,
     ) = _setup_test_sample(clip_conditioning)
 
-    params = params.copy({"cache": cache})
+    params = flax.core.copy(params, {"cache": cache})
     logits_0, cache = mdl_dec.apply(
         params,
         mutable=["cache"],
@@ -270,7 +270,7 @@ def _test_sample_tok_1(clip_conditioning: bool) -> None:
         logits_all,
     ) = _setup_test_sample(clip_conditioning)
 
-    params = params.copy({"cache": cache})
+    params = flax.core.copy(params, {"cache": cache})
 
     _logits_0, cache = mdl_dec.apply(
         params,
@@ -280,7 +280,7 @@ def _test_sample_tok_1(clip_conditioning: bool) -> None:
         clip_embedding=clip_embedding,
         idx=jnp.array(0),
     )
-    params = params.copy(cache)
+    params = flax.core.copy(params, cache)
     logits_1, _cache = mdl_dec.apply(
         params,
         mutable=["cache"],
@@ -314,7 +314,7 @@ def _test_sample_tok_all(clip_conditioning: bool) -> None:
     ) = _setup_test_sample(clip_conditioning)
 
     decoded_logits = []
-    params = params.copy({"cache": cache})
+    params = flax.core.copy(params, {"cache": cache})
 
     # step 0
     logits, new_cache = mdl_dec.apply(
@@ -326,7 +326,7 @@ def _test_sample_tok_all(clip_conditioning: bool) -> None:
         clip_embedding=clip_embedding,
     )
     decoded_logits.append(logits)
-    params = params.copy(new_cache)
+    params = flax.core.copy(params, new_cache)
 
     # steps 1-255
     for i in range(1, 256):
@@ -340,7 +340,7 @@ def _test_sample_tok_all(clip_conditioning: bool) -> None:
         )
         assert logits.shape == (8192,)
         decoded_logits.append(logits)
-        params = params.copy(new_cache)
+        params = flax.core.copy(params, new_cache)
 
     decoded_logits = jnp.stack(decoded_logits, axis=0)
     assert decoded_logits.shape == (256, 8192)
@@ -376,7 +376,7 @@ def test_clip_does_anything() -> None:
 @partial(jax.jit, static_argnums=(0,))
 def sample(
     mdl: ImageModel,
-    params: FrozenDict[str, Any],
+    params: dict[str, Any],
     clip_embedding: jax.Array,
     rng: jax.Array,
     top_p: float = 0.95,
@@ -396,14 +396,14 @@ def sample(
         image=jnp.zeros((mdl.image_tokens,), dtype=jnp.int32),
         clip_embedding=clip_embedding,
     )
-    params = params.copy({"cache": params_fake["cache"]})
+    params = flax.core.copy(params, {"cache": params_fake["cache"]})
     del params_fake
 
     # This needs to be outside the linen module because the fori_loop combinator doesn't work
     # inside them.
     def loop_iter(
         i: int, acc: Tuple[jax.Array, jax.Array]
-    ) -> Tuple[jax.Array, jax.Array, FrozenDict[str, Any]]:
+    ) -> Tuple[jax.Array, jax.Array, dict[str, Any]]:
         image_toks, rng, params = acc
         logits, new_cache = mdl_decode.apply(
             params,
@@ -414,7 +414,7 @@ def sample(
             clip_embedding=clip_embedding,
         )
         assert logits.shape == (8192,)
-        params = params.copy(new_cache)
+        params = flax.core.copy(params, new_cache)
         filtered_logits = _filter_top_p(logits, top_p)
         rng_sample, rng_loop = jax.random.split(rng, 2)
         tok = jax.random.categorical(rng_sample, filtered_logits)
@@ -434,7 +434,7 @@ def sample(
     filtered_logits_0 = _filter_top_p(logits_0, top_p)
     tok_0 = jax.random.categorical(rng0, filtered_logits_0)
 
-    params = params.copy(cache)
+    params = flax.core.copy(params, cache)
 
     image_toks = jnp.zeros((mdl.image_tokens,), dtype=jnp.int32).at[0].set(tok_0)
     image_toks, _, _ = jax.lax.fori_loop(  # type: ignore[no-untyped-call]
@@ -651,7 +651,7 @@ def test_flash_attention_equals_standard() -> None:
 
 def loss(
     model: ImageModel,
-    params: FrozenDict[str, Any],
+    params: dict[str, Any],
     dropout_rng: jax.Array,
     ex_img: jax.Array,
     ex_clip: jax.Array,
@@ -668,7 +668,7 @@ def loss(
 
 def loss_batch(
     model: ImageModel,
-    params: FrozenDict[str, Any],
+    params: dict[str, Any],
     dropout_rng: jax.Array,
     batch_imgs: jax.Array,
     batch_clips: jax.Array,
@@ -702,7 +702,7 @@ gpt_1_config = ModelConfig(
 
 def train_loop_simple(
     data: jax.Array, mdl: ImageModel, iters: int
-) -> Tuple[jax.Array, FrozenDict[str, Any]]:
+) -> Tuple[jax.Array, dict[str, Any]]:
     """Train the model repeatedly on a single batch for testing."""
     assert mdl.clip_conditioning is False
     params = mdl.init(
@@ -715,11 +715,11 @@ def train_loop_simple(
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
 
     def opt_step(
-        params: FrozenDict[str, Any],
+        params: dict[str, Any],
         opt_state: Any,
         dropout_rng: jax.Array,
         batch_imgs: jax.Array,
-    ) -> Tuple[FrozenDict[str, Any], Any, jax.Array, jax.Array]:
+    ) -> Tuple[dict[str, Any], Any, jax.Array, jax.Array]:
         rng1, rng2 = jax.random.split(dropout_rng)
         loss, grads = loss_grad_fn(
             mdl,
@@ -729,7 +729,7 @@ def train_loop_simple(
             batch_clips=jnp.zeros((batch_imgs.shape[0], 0), dtype=jnp.float32),
         )
         updates, opt_state = opt.update(grads, opt_state)
-        new_params: FrozenDict[str, Any] = optax.apply_updates(params, updates)
+        new_params: dict[str, Any] = optax.apply_updates(params, updates)
         return new_params, opt_state, rng2, loss
 
     opt_step = jax.jit(opt_step, donate_argnums=(0, 1, 2))
