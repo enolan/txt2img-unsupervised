@@ -638,13 +638,13 @@ def test_flash_attention_equals_standard() -> None:
     input_vals = jax.random.normal(jax.random.PRNGKey(0), input_shape)
 
     params = mdl_std.init(
-        jax.random.PRNGKey(1), jnp.ones(input_shape, dtype=jnp.float32)
+        jax.random.PRNGKey(1), jnp.ones(input_shape, dtype=jnp.float32), None
     )
 
-    out_std = mdl_std.apply(params, input_vals)
+    out_std, _ = mdl_std.apply(params, input_vals, None)
 
     mdl_flash = mdl_std.clone(flash_attention=True)
-    out_flash = mdl_flash.apply(params, input_vals)
+    out_flash, _ = mdl_flash.apply(params, input_vals, None)
 
     np.testing.assert_allclose(out_std, out_flash, atol=2e-6, rtol=0)
 
