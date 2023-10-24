@@ -378,7 +378,7 @@ def sample(
     mdl: ImageModel,
     params: FrozenDict[str, Any],
     clip_embedding: jax.Array,
-    rng: jax.random.KeyArray,
+    rng: jax.Array,
     top_p: float = 0.95,
 ) -> jax.Array:
     """Sample a single image from the model. Returns an array of codes to be passed to the
@@ -402,8 +402,8 @@ def sample(
     # This needs to be outside the linen module because the fori_loop combinator doesn't work
     # inside them.
     def loop_iter(
-        i: int, acc: Tuple[jax.Array, jax.random.KeyArray]
-    ) -> Tuple[jax.Array, jax.random.KeyArray, FrozenDict[str, Any]]:
+        i: int, acc: Tuple[jax.Array, jax.Array]
+    ) -> Tuple[jax.Array, jax.Array, FrozenDict[str, Any]]:
         image_toks, rng, params = acc
         logits, new_cache = mdl_decode.apply(
             params,
@@ -652,7 +652,7 @@ def test_flash_attention_equals_standard() -> None:
 def loss(
     model: ImageModel,
     params: FrozenDict[str, Any],
-    dropout_rng: jax.random.KeyArray,
+    dropout_rng: jax.Array,
     ex_img: jax.Array,
     ex_clip: jax.Array,
 ) -> jax.Array:
@@ -669,7 +669,7 @@ def loss(
 def loss_batch(
     model: ImageModel,
     params: FrozenDict[str, Any],
-    dropout_rng: jax.random.KeyArray,
+    dropout_rng: jax.Array,
     batch_imgs: jax.Array,
     batch_clips: jax.Array,
 ) -> jax.Array:
@@ -717,9 +717,9 @@ def train_loop_simple(
     def opt_step(
         params: FrozenDict[str, Any],
         opt_state: Any,
-        dropout_rng: jax.random.KeyArray,
+        dropout_rng: jax.Array,
         batch_imgs: jax.Array,
-    ) -> Tuple[FrozenDict[str, Any], Any, jax.random.KeyArray, jax.Array]:
+    ) -> Tuple[FrozenDict[str, Any], Any, jax.Array, jax.Array]:
         rng1, rng2 = jax.random.split(dropout_rng)
         loss, grads = loss_grad_fn(
             mdl,

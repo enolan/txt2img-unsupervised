@@ -183,7 +183,7 @@ jax.config.update("jax_threefry_partitionable", True)
 
 
 class TrainState(train_state.TrainState):  # type:ignore[no-untyped-call]
-    rng: jax.random.KeyArray  # type:ignore[misc]
+    rng: jax.Array  # type:ignore[misc]
 
 
 def calculate_steps(train_set_size, training_cfg):
