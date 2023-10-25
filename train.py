@@ -367,8 +367,8 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
 
     if model_cfg.clip_conditioning:
         # Create a grid of samples for each testing CLIP embedding/top-p pair.
-        top_ps = jnp.array([0.6, 0.8, 0.9, 0.95], dtype=jnp.float32)
-        grid_size = 16
+        top_ps = jnp.array([0.9, 0.95], dtype=jnp.float32)
+        grid_size = 9
 
         samples_count = embeddings_to_sample * len(top_ps) * grid_size
         assert (samples_count % training_cfg.batch_size) % jax.device_count() == 0
