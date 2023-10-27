@@ -57,7 +57,7 @@ class ImageModel(nn.Module):
         # Might have to do with the fact that remat_scan creates a scan-of-scans? Could cause bad
         # optimization in JAX or XLA.
         self.transformer_layers = nn.scan(
-            TransformerLayer,
+            nn.remat(TransformerLayer),
             variable_axes={"params": 0, "cache": 0},
             variable_broadcast=False,
             split_rngs={"params": True, "dropout": True},
