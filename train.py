@@ -549,7 +549,7 @@ def save_checkpoint_and_sample(my_train_state, global_step, sharding) -> None:
         try:
             checkpoint_manager.save(global_step, my_train_state)
             break
-        except ValueError as e:
+        except (OSError, ValueError) as e:
             tqdm.write(f"Error saving checkpoint: {e}")
             tqdm.write("Retrying in 60 seconds")
             time.sleep(60)
