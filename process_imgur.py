@@ -372,6 +372,36 @@ def dl_and_process_warc(
     return process_warc(warc_path, id, workdir, pool)
 
 
+def upload_tar(pool: SQLiteConnectionPool, tar_path: Path, log_path: Path) -> None:
+    """Upload a tarball to R2."""
+    conn = pool.get_conn()
+    with conn:
+        # Check if this tar has already been uploaded
+        uploaded = conn.execute(
+            "SELECT uploaded FROM warcs WHERE id = ?", (tar_path.stem,)
+        ).fetchone()[0]
+        assert uploaded == 0, f"Tar {tar_path} has already been uploaded"
+    tqdm.write(f"Uploading {tar_path}...")
+    with log_path.open("w") as f:
+        subprocess.run(
+            [
+                "rclone",
+                "copyto",
+                "-P",
+                "--s3-upload-concurrency",
+                "16",
+                str(tar_path),
+                f"r2:txt2img-unsupervised-dataset/original-tarballs/{tar_path.name}",
+            ],
+            check=True,
+            stdout=f,
+            stderr=f,
+        )
+    with conn:
+        conn.execute("UPDATE warcs SET uploaded = 1 WHERE id = ?", (tar_path.stem,))
+    tqdm.write(f"Uploaded {tar_path}")
+
+
 def process_warcs(
     pool: SQLiteConnectionPool,
     warcs: list[Union[Path, str]],
@@ -380,9 +410,12 @@ def process_warcs(
 ) -> None:
     """Process a list of warcs sequentially. warcs should be a list of either Path objects or IA ids."""
     assert outdir.exists(), f"Output directory {outdir} doesn't exist"
-    # Pipeline so downloading and processing can be simultaneous
+    assert workdir.exists(), f"Work directory {workdir} doesn't exist"
+    # Pipeline so downloading, processing, and uploading can be simultaneous
     # Queue of warcs that are ready to be processed, either downloaded or already present
     ready_warc_queue = CQueue(maxsize=1)
+    # Queue of tarballs ready to be uploaded
+    ready_tarball_queue = CQueue(maxsize=1)
 
     def downloader_main() -> None:
         for warc in warcs:
@@ -412,6 +445,16 @@ def process_warcs(
     downloader_thread = Thread(target=downloader_main, name="downloader")
     downloader_thread.start()
 
+    def uploader_main() -> None:
+        for tarball in CloseableQueue.dequeue(ready_tarball_queue):
+            tqdm.write(f"Starting upload of {tarball}")
+            upload_tar(pool, tarball, tarball.with_suffix(".log"))
+            tqdm.write(f"Upload of {tarball} complete")
+            tarball.unlink()
+
+    uploader_thread = Thread(target=uploader_main, name="uploader")
+    uploader_thread.start()
+
     with tqdm(total=len(warcs), desc="Processing warcs") as pbar:
         for sub_workdir, warc_path in CloseableQueue.dequeue(ready_warc_queue):
             tqdm.write(f"Starting processing of {warc_path}")
@@ -434,10 +477,23 @@ def process_warcs(
             tqdm.write(f"Copying videos to {this_outdir}")
             shutil.move(videos_dir, this_outdir / "videos")
             shutil.rmtree(sub_workdir)
-            tqdm.write(f"Done with {warc_path}")
+            tar_path = this_outdir.with_suffix(".tar")
+            tqdm.write(f"Creating tar {tar_path}")
+            subprocess.run(
+                ["tar", "-cf", tar_path, "-C", outdir, ia_id],
+                check=True,
+            )
+            tqdm.write(f"Tar done, deleting {this_outdir}")
+            shutil.rmtree(this_outdir)
+            tqdm.write(f"Tarball {tar_path} ready for upload")
+            ready_tarball_queue.put(tar_path)
             pbar.update(1)
 
+    ready_tarball_queue.close()
+    tqdm.write("Waiting for last uploads...")
+    uploader_thread.join()
     downloader_thread.join()
+
     tqdm.write("Done processing warcs 🎉")
 
 
