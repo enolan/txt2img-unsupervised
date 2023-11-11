@@ -297,7 +297,7 @@ class SQLiteConnectionPool:
 
     def get_conn(self) -> sqlite3.Connection:
         if not hasattr(self.local, "conn"):
-            self.local.conn = sqlite3.connect(self.db_name, timeout=60)
+            self.local.conn = sqlite3.connect(self.db_name, timeout=600)
             self.local.conn.execute("PRAGMA FOREIGN_KEYS = ON")
         return self.local.conn  # type: ignore[no-any-return]
 
