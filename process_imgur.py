@@ -47,6 +47,7 @@ def setup_db(db_path: Path) -> sqlite3.Connection:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_file_blake2b ON files (blake2b)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_file_warc ON files (warc)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_blake2b_processed ON files (blake2b) WHERE processed = 1")
     return conn
 
 
@@ -225,7 +226,13 @@ def dedup_dir(
     """Go through a directory of images and videos, moving them to the destination if they aren't
     duplicates."""
     taken, skipped = 0, 0
+
+    # We do this in chunks because otherwise it holds a lock on the DB for way too long and other
+    # transactions time out.
+    chunk_size = 1000
+    files_ctr = 0
     conn.execute("BEGIN IMMEDIATE")
+
     for img_path in tqdm(list(src_path.iterdir()), desc="deduping"):
         # Has a duplicate of this file been processed?
         duplicates = conn.execute(
@@ -242,6 +249,12 @@ def dedup_dir(
             )
         else:
             skipped += 1
+
+        files_ctr += 1
+        if files_ctr % chunk_size == 0:
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+
     conn.commit()
     return taken, skipped
 
