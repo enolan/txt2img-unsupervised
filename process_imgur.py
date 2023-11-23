@@ -104,7 +104,7 @@ def decompress_and_extract_warc(compressed_warc_path: Path, dest_dir: Path) -> N
     i.imgur.com"""
     # Decompress using their weird zstd variant format.
     with tempfile.NamedTemporaryFile(dir=dest_dir, delete=False) as f:
-        subprocess.run(["zstdwarccat", compressed_warc_path], stdout=f)
+        subprocess.run(["zstdwarccat", compressed_warc_path], stdout=f, check=True)
         decompressed_warc_path = Path(f.name)
     compressed_warc_path.unlink()
     # Extract the warc
