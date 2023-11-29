@@ -299,6 +299,8 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
             # batch from that dir
             batch_dir_indices = []
             while len(batch) < args.batch_size:
+                if img_queue_idx is None:
+                    break
                 try:
                     while True:
                         try:
@@ -332,7 +334,7 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
                     if img_queue_idx == len(imgs_queues) - 1:
                         # We've reached the end of the queues
                         tqdm.write("All image queues closed, we're almost done")
-                        break
+                        img_queue_idx = None
                     else:
                         img_queue_idx += 1
                         encoded_batches_j[img_queue_idx] = []
@@ -377,58 +379,55 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
                     flush_batches(encoded_batches_j[i], encoded_batches_np[i])
                     flush_batches(embedded_batches_j[i], embedded_batches_np[i])
 
-                # Finalize directories that are done, writing the encoded images to parquet files.
-                for i in dirs_to_write:
-                    flush_batches(
-                        encoded_batches_j[i], encoded_batches_np[i], force=True
+            # Finalize directories that are done, writing the encoded images to parquet files.
+            for i in dirs_to_write:
+                tqdm.write(f"Finalizing directory #{i}...")
+                flush_batches(encoded_batches_j[i], encoded_batches_np[i], force=True)
+                flush_batches(embedded_batches_j[i], embedded_batches_np[i], force=True)
+                assert len(encoded_batches_np[i]) == len(embedded_batches_np[i])
+                if len(encoded_batches_np[i]) == 0:
+                    tqdm.write(
+                        f"Skipping directory {i} because it has no encoded images"
                     )
-                    flush_batches(
-                        embedded_batches_j[i], embedded_batches_np[i], force=True
+                else:
+                    encoded_imgs = np.concatenate(encoded_batches_np[i])
+                    print(
+                        f"encoded_imgs dtype: {encoded_imgs.dtype}, shape: {encoded_imgs.shape}"
                     )
-                    assert len(encoded_batches_np[i]) == len(embedded_batches_np[i])
-                    if len(encoded_batches_np[i]) == 0:
-                        tqdm.write(
-                            f"Skipping directory {i} because it has no encoded images"
+                    embedded_imgs = np.concatenate(embedded_batches_np[i])
+                    print(
+                        f"embedded_imgs dtype: {embedded_imgs.dtype}, shape: {embedded_imgs.shape}"
+                    )
+                    assert len(encoded_imgs) == len(
+                        encoded_imgs_paths[i]
+                    ), f"{len(encoded_imgs)} encoded images but {len(encoded_imgs_paths[i])} paths"
+                    tqdm.write(
+                        f"Writing {len(encoded_imgs)} encoded images to {out_paths[i]} for dir #{i}"
+                    )
+                    pd_rows = [
+                        {
+                            "encoded_img": img,
+                            "clip_embedding": embedding,
+                            "name": path.name,
+                        }
+                        for img, embedding, path in zip(
+                            encoded_imgs, embedded_imgs, encoded_imgs_paths[i]
                         )
-                    else:
-                        encoded_imgs = np.concatenate(encoded_batches_np[i])
-                        print(
-                            f"encoded_imgs dtype: {encoded_imgs.dtype}, shape: {encoded_imgs.shape}"
-                        )
-                        embedded_imgs = np.concatenate(embedded_batches_np[i])
-                        print(
-                            f"embedded_imgs dtype: {embedded_imgs.dtype}, shape: {embedded_imgs.shape}"
-                        )
-                        assert len(encoded_imgs) == len(
-                            encoded_imgs_paths[i]
-                        ), f"{len(encoded_imgs)} encoded images but {len(encoded_imgs_paths[i])} paths"
-                        tqdm.write(
-                            f"Writing {len(encoded_imgs)} encoded images to {out_paths[i]}"
-                        )
-                        pd_rows = [
-                            {
-                                "encoded_img": img,
-                                "clip_embedding": embedding,
-                                "name": path.name,
-                            }
-                            for img, embedding, path in zip(
-                                encoded_imgs, embedded_imgs, encoded_imgs_paths[i]
-                            )
-                        ]
-                        df = pd.DataFrame(pd_rows)
-                        tqdm.write(
-                            f"Writing {len(df)} rows to {out_paths[i]}, cols {df.columns}"
-                        )
-                        pq.write_table(pa.Table.from_pandas(df), out_paths[i])
-                        tqdm.write(f"Done writing {out_paths[i]}")
-                    del encoded_batches_np[i]
-                    del embedded_batches_np[i]
-                    del encoded_batches_j[i]
-                    del embedded_batches_j[i]
-                    del encoded_imgs_paths[i]
-                    dirs_pbar.update(1)
-                dirs_to_write.clear()
-            else:
+                    ]
+                    df = pd.DataFrame(pd_rows)
+                    tqdm.write(
+                        f"Writing {len(df)} rows to {out_paths[i]}, cols {df.columns}"
+                    )
+                    pq.write_table(pa.Table.from_pandas(df), out_paths[i])
+                    tqdm.write(f"Done writing {out_paths[i]}")
+                del encoded_batches_np[i]
+                del embedded_batches_np[i]
+                del encoded_batches_j[i]
+                del embedded_batches_j[i]
+                del encoded_imgs_paths[i]
+                dirs_pbar.update(1)
+            dirs_to_write.clear()
+            if len(batch) == 0:
                 # We've reached the end of the queues
                 tqdm.write("All done :) Joining PIL threads")
                 for t in pil_threads.values():
