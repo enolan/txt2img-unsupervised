@@ -391,11 +391,11 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
                     )
                 else:
                     encoded_imgs = np.concatenate(encoded_batches_np[i])
-                    print(
+                    tqdm.write(
                         f"encoded_imgs dtype: {encoded_imgs.dtype}, shape: {encoded_imgs.shape}"
                     )
                     embedded_imgs = np.concatenate(embedded_batches_np[i])
-                    print(
+                    tqdm.write(
                         f"embedded_imgs dtype: {embedded_imgs.dtype}, shape: {embedded_imgs.shape}"
                     )
                     assert len(encoded_imgs) == len(
