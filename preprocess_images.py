@@ -34,6 +34,7 @@ parser.add_argument("--pil-threads", type=int, default=os.cpu_count() // 2)
 parser.add_argument("--ckpt", type=str)
 parser.add_argument("--autoencoder-cfg", type=str)
 parser.add_argument("--res", type=int, required=True)
+parser.add_argument("--random-crop", action="store_true")
 parser.add_argument("in_dirs", type=Path, nargs="+")
 
 args = parser.parse_args()
@@ -171,22 +172,27 @@ def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
         return None
     else:
         if w > h:
-            px_to_remove = w - h
-            x1 = px_to_remove // 2
-            x2 = w - px_to_remove // 2
-            y1 = 0
-            y2 = h
-        elif h > w:
-            px_to_remove = h - w
-            x1 = 0
-            x2 = w
-            y1 = px_to_remove // 2
-            y2 = h - px_to_remove // 2
+            short_axis = "h"
+            short_axis_len = h
+            long_axis_len = w
         else:
-            x1 = 0
-            x2 = w
-            y1 = 0
-            y2 = h
+            short_axis = "w"
+            short_axis_len = w
+            long_axis_len = h
+        if args.random_crop:
+            # Randomly crop a square from the image
+            long_axis_crop_start = random.randint(0, long_axis_len - short_axis_len)
+        else:
+            # Center crop the image
+            long_axis_crop_start = (long_axis_len - short_axis_len) // 2
+        long_axis_crop_end = long_axis_crop_start + short_axis_len
+        if short_axis == "h":
+            x1, y1, x2, y2 = long_axis_crop_start, 0, long_axis_crop_end, short_axis_len
+        elif short_axis == "w":
+            x1, y1, x2, y2 = 0, long_axis_crop_start, short_axis_len, long_axis_crop_end
+        else:
+            assert False, f"Unexpected short_axis {short_axis}"
+        assert x2 - x1 == y2 - y1 == short_axis_len
         img_for_enc = img.resize(
             (pxl_res, pxl_res), PIL.Image.BICUBIC, (x1, y1, x2, y2)
         )
