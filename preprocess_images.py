@@ -30,6 +30,17 @@ from typing import Optional
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--batch-size", type=int)
+# batch sizes on 4090 (all reddit):
+# 128 (PIL threads default): 01:56 170.30it/s
+# 128 (PIL threads 32): 02:26 135.29it/s
+# 256 (PIL threads default): 02:07 155.83it/s
+# 64  (PIL threads default): 01:48 183.13it/s
+# 64  (PIL threads 32): 02:11 150.36it/s
+# 64  (PIL threads 24): 02:04 159.04it/s
+# 64  (PIL threads 20): 01:56 169.71it/s
+# 64  (PIL threads  8): 02:08 154.60it/s
+# 32  (PIL threads default): 01:42 193.71it/s
+# 16  (PIL threads default): 01:51 178.18it/s
 parser.add_argument("--pil-threads", type=int, default=os.cpu_count() // 2)
 parser.add_argument("--ckpt", type=str)
 parser.add_argument("--autoencoder-cfg", type=str)
@@ -295,6 +306,13 @@ embedded_batches_np = {0: []}
 # The paths of the images that have been encoded
 encoded_imgs_paths = {0: []}
 
+pq_schema = pa.schema(
+    [
+        ("encoded_img", pa.list_(pa.int32())),
+        ("clip_embedding", pa.list_(pa.float32())),
+        ("name", pa.string()),
+    ]
+)
 
 with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
     with tqdm(desc="files") as files_pbar:
@@ -393,7 +411,10 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
                 assert len(encoded_batches_np[i]) == len(embedded_batches_np[i])
                 if len(encoded_batches_np[i]) == 0:
                     tqdm.write(
-                        f"Skipping directory {i} because it has no encoded images"
+                        f"⚠️⚠️⚠️WARNING: Directory {i} has no encoded images, outputting empty parquet file as marker"
+                    )
+                    table = pa.Table.from_arrays(
+                        [[]] * len(pq_schema), schema=pq_schema
                     )
                 else:
                     encoded_imgs = np.concatenate(encoded_batches_np[i])
@@ -424,8 +445,9 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
                     tqdm.write(
                         f"Writing {len(df)} rows to {out_paths[i]}, cols {df.columns}"
                     )
-                    pq.write_table(pa.Table.from_pandas(df), out_paths[i])
-                    tqdm.write(f"Done writing {out_paths[i]}")
+                    table = pa.Table.from_pandas(df, schema=pq_schema)
+                pq.write_table(table, out_paths[i])
+                tqdm.write(f"Done writing {out_paths[i]}")
                 del encoded_batches_np[i]
                 del embedded_batches_np[i]
                 del encoded_batches_j[i]

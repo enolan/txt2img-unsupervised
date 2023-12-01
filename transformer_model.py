@@ -657,7 +657,9 @@ def loss(
     ex_clip: jax.Array,
 ) -> jax.Array:
     """Compute the cross-entropy loss for a single example."""
-    assert ex_img.shape == (model.image_tokens,)
+    assert ex_img.shape == (
+        model.image_tokens,
+    ), f"ex_img.shape: {ex_img.shape}, expected: {(model.image_tokens,)}"
     if model.clip_conditioning:
         assert ex_clip.shape == (768,)
     else:
