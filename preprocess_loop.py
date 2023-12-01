@@ -153,6 +153,7 @@ def preprocess_images(dirs: list[Path], res: int, batch_size: int) -> list[Path]
         "vq-f4.ckpt",
         "--autoencoder-cfg",
         "vq-f4-cfg.yaml",
+        "--random-crop"
     ] + [str(d) for d in dirs]
     print(f"Running {' '.join(cmd)}")
     subprocess.check_call(cmd)
