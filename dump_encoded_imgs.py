@@ -58,4 +58,4 @@ with tqdm(total=args.n, unit="img") as pbar:
         for img, name in zip(imgs_j, batch["name"]):
             img = PIL.Image.fromarray(np.array(img))
             img.save(args.output_dir / f"{name}.png")
-            pbar.update(1)
+        pbar.update(len(imgs_j))
