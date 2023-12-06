@@ -10,12 +10,17 @@ from datasets import Dataset
 from ldm_autoencoder import LDMAutoencoder
 from omegaconf import OmegaConf
 from pathlib import Path
+from tqdm.contrib import tenumerate
 from typing import Any
 
 
 def index_dset(dset: Dataset) -> dict[str, int]:
     """Return a dict mapping image names to their index in the dataset"""
-    return {img["name"]: i for i, img in enumerate(dset.select_columns("name"))}
+    idx = {}
+    for i, img in tenumerate(dset.select_columns("name")):
+        idx[img["name"]] = i
+    return idx
+    # return {img["name"]: i for i, img in enumerate(dset.select_columns("name"))}
 
 
 def decode_names(
@@ -27,6 +32,7 @@ def decode_names(
 ) -> list[PIL.Image.Image]:
     """Decode images from a dataset by name"""
     idxs = [idx[name] for name in names]
+    print(f"Found indices {idxs} for images {names}")
     dset = dset.select_columns("encoded_img")
 
     codes = dset[idxs]["encoded_img"]
@@ -59,7 +65,7 @@ def main() -> None:
         torch.load(args.ae_ckpt, map_location="cpu"), cfg=ae_cfg
     )
 
-    pqs = [str(pq) for pq in args.dataset_dir.glob("**/*.parquet")]
+    pqs = list(sorted([str(pq) for pq in args.dataset_dir.glob("**/*.parquet")]))
     dset = Dataset.from_parquet(pqs).with_format("np")
     print(f"Loaded dataset with {len(dset)} images")
 
