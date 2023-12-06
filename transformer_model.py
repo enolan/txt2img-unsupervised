@@ -96,7 +96,7 @@ class ImageModel(nn.Module):
         # Might have to do with the fact that remat_scan creates a scan-of-scans? Could cause bad
         # optimization in JAX or XLA.
         self.transformer_layers = nn.scan(
-            TransformerLayer,
+            nn.remat(TransformerLayer),
             variable_axes={"params": 0, "cache": 0},
             variable_broadcast=False,
             split_rngs={"params": True, "dropout": True},
@@ -911,7 +911,9 @@ def loss(
     ex_clip: jax.Array,
 ) -> jax.Array:
     """Compute the cross-entropy loss for a single example."""
-    assert ex_img.shape == (model.image_tokens,)
+    assert ex_img.shape == (
+        model.image_tokens,
+    ), f"ex_img.shape: {ex_img.shape}, expected: {(model.image_tokens,)}"
     if model.clip_conditioning:
         assert ex_clip.shape == (768,)
     else:

@@ -312,7 +312,11 @@ del sample_params
 sample_jv = jax.jit(
     jax.vmap(
         lambda params, clip_embedding, rng, top_p: transformer_model.sample(
-            sample_mdl, flax.core.copy(params, {"cache": sample_cache}), clip_embedding, rng, top_p
+            sample_mdl,
+            flax.core.copy(params, {"cache": sample_cache}),
+            clip_embedding,
+            rng,
+            top_p,
         ),
         in_axes=(None, 0, 0, 0),
     )
@@ -549,7 +553,7 @@ def save_checkpoint_and_sample(my_train_state, global_step, sharding) -> None:
         try:
             checkpoint_manager.save(global_step, my_train_state)
             break
-        except ValueError as e:
+        except (OSError, ValueError) as e:
             tqdm.write(f"Error saving checkpoint: {e}")
             tqdm.write("Retrying in 60 seconds")
             time.sleep(60)
@@ -576,31 +580,29 @@ for epoch in trange(
 
     # If we're doing a partial epoch, set the number of batches to do
     if epoch == epochs_total - 1:
-        batches = extra_batches if extra_batches > 0 else batches_per_epoch
+        # The number of batches for the epoch, assuming we're not resuming
+        batches_for_this_epoch = (
+            extra_batches if extra_batches > 0 else batches_per_epoch
+        )
     else:
-        batches = batches_per_epoch
+        batches_for_this_epoch = batches_per_epoch
 
+    this_start_step = start_step if epoch == start_epoch else 0
+    actual_batches = batches_for_this_epoch - this_start_step
+    this_end_step = this_start_step + actual_batches
+    tqdm.write(
+        f"Epoch {epoch} starting at step {this_start_step}, doing {actual_batches} steps, ending at step {this_end_step}"
+    )
     with tqdm(
-        total=batches,
+        total=batches_for_this_epoch,
         leave=False,
         desc="train batches",
-        initial=(start_step if epoch == start_epoch else 0),
+        initial=this_start_step,
     ) as pbar:
         iter = shuffled_train_imgs.iter(
             batch_size=training_cfg.batch_size, drop_last_batch=True
         )
-        if epoch == start_epoch and start_step > 0:
-            # This feels real inefficient but oh well I guess?
-            tqdm.write(f"Skipping {start_step} batches")
-            for _ in range(start_step):
-                next(iter)
-            tqdm.write("Done skipping")
-        for batch in islice(
-            shuffled_train_imgs.iter(
-                batch_size=training_cfg.batch_size, drop_last_batch=True
-            ),
-            batches,
-        ):
+        for batch in islice(iter, this_start_step, this_end_step):
             # Save checkpoint every 30 minutes. This does one at step 0 too, which is nice so we
             # don't have to wait half an hour to find out if it crashes.
             if last_checkpoint_time is None or (
