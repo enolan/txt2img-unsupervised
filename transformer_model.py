@@ -830,14 +830,14 @@ def _random_pt_with_cosine_similarity(
 
     # Generate a random point v on the sphere
     v = jax.random.normal(rng, shape=pt.shape, dtype=pt.dtype)
-    v = v / np.linalg.norm(v)
+    v = v / jnp.linalg.norm(v)
 
     # Orthogonalize v with respect to pt
-    v_orthogonal = v - np.dot(pt, v) * pt
-    v_orthogonal = v_orthogonal / np.linalg.norm(v_orthogonal)
+    v_orthogonal = v - jnp.dot(pt, v) * pt
+    v_orthogonal = v_orthogonal / jnp.linalg.norm(v_orthogonal)
 
     # Find the orthogonal component
-    orthogonal_length = np.sqrt(1 - sim**2)
+    orthogonal_length = jnp.sqrt(1 - sim**2)
 
     # Scale v_orthogonal to achieve the desired cosine similarity with u
     new_point = sim * pt + orthogonal_length * v_orthogonal

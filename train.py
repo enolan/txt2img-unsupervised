@@ -73,6 +73,7 @@ parser.add_argument("--ae-ckpt", type=Path, required=True)
 parser.add_argument("--activations-dtype", type=argparse_from_dict(str_to_dtype))
 parser.add_argument("--activation-function", type=argparse_from_dict(str_to_activation))
 parser.add_argument("--clip-conditioning", type=lambda x: bool(strtobool(x)))
+parser.add_argument("--clip-cones", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--resume", type=Path)
 args, _unknown = parser.parse_known_args()
 
@@ -257,12 +258,19 @@ def setup_optimizer(
 
     # We need templates to feed to checkpoint_manager.restore so we get a TrainState instead of a
     # dict
+    cos_sim_dummy = (
+        jnp.zeros((), dtype=jnp.float32)
+        if model_cfg.clip_cones
+        else jnp.array([], dtype=jnp.float32)
+    )
     params_empty = mdl.init(
         rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
         image=jnp.zeros((model_cfg.image_tokens,), dtype=jnp.int32),
         clip_embedding=jnp.zeros((768,), dtype=jnp.float32)
         if model_cfg.clip_conditioning
         else jnp.zeros((0,), dtype=jnp.float32),
+        cos_sim_lower=cos_sim_dummy,
+        cos_sim_upper=cos_sim_dummy,
     )
 
     ts_empty = TrainState.create(
@@ -288,8 +296,8 @@ mdl, my_train_state = setup_optimizer(
 
 loss_grad_fn = jax.value_and_grad(transformer_model.loss_batch, argnums=1)
 loss_fn = jax.jit(
-    lambda params, rng, batch_imgs, batch_clips: transformer_model.loss_batch(
-        mdl, params, rng, batch_imgs, batch_clips
+    lambda params, dropout_rng, cones_rng, batch_imgs, batch_clips: transformer_model.loss_batch(
+        mdl, params, dropout_rng, cones_rng, batch_imgs, batch_clips
     )
 )
 
@@ -299,26 +307,36 @@ loss_fn = jax.jit(
 sample_cfg = copy(model_cfg)
 sample_cfg.dropout = None
 sample_mdl = transformer_model.ImageModel(**sample_cfg.__dict__, decode=True)
+cos_sim_dummy = (
+    jnp.zeros((), dtype=jnp.float32)
+    if model_cfg.clip_cones
+    else jnp.array([], dtype=jnp.float32)
+)
 sample_params = sample_mdl.init(
     jax.random.PRNGKey(0),
     image=jnp.arange(model_cfg.image_tokens, dtype=jnp.int32),
     clip_embedding=jnp.zeros((768,), dtype=jnp.float32)
     if model_cfg.clip_conditioning
     else jnp.zeros((0,), dtype=jnp.float32),
+    cos_sim_lower=cos_sim_dummy,
+    cos_sim_upper=cos_sim_dummy,
 )
 sample_cache = sample_params["cache"]
 del sample_params
+del cos_sim_dummy
 
 sample_jv = jax.jit(
     jax.vmap(
-        lambda params, clip_embedding, rng, top_p: transformer_model.sample(
+        lambda params, clip_embedding, cos_sim_lower, cos_sim_upper, rng, top_p: transformer_model.sample(
             sample_mdl,
             flax.core.copy(params, {"cache": sample_cache}),
             clip_embedding,
+            cos_sim_lower,
+            cos_sim_upper,
             rng,
             top_p,
         ),
-        in_axes=(None, 0, 0, 0),
+        in_axes=(None, 0, 0, 0, 0, 0),
     )
 )
 
@@ -370,11 +388,24 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
     ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
 
     if model_cfg.clip_conditioning:
-        # Create a grid of samples for each testing CLIP embedding/top-p pair.
-        top_ps = jnp.array([0.9, 0.95], dtype=jnp.float32)
+        # When cones are enabled, we sample a few different ranges for each embedding. Otherwise we
+        # sample with different top_p values. The difference between top p 0.9 and 0.95 is minimal
+        # and I might remove that comparison.
+        if model_cfg.clip_cones:
+            top_ps = jnp.array([0.95], dtype=jnp.float32)
+            # One set of samples should be "semantically" similar but not necessarily a very
+            # similar image, the second set should be very similar. NB this is all conjecture at
+            # this point.
+            cos_sim_ranges = jnp.array([[0.15, 0.45], [0.7, 1.0]], dtype=jnp.float32)
+        else:
+            top_ps = jnp.array([0.9, 0.95], dtype=jnp.float32)
+            cos_sim_ranges = jnp.array([[[], []]], dtype=jnp.float32)
+        # Create a grid of samples for each set of conditions.
         grid_size = 9
 
-        samples_count = embeddings_to_sample * len(top_ps) * grid_size
+        samples_count = (
+            embeddings_to_sample * len(top_ps) * len(cos_sim_ranges) * grid_size
+        )
         assert (samples_count % training_cfg.batch_size) % jax.device_count() == 0
 
         conditioning_embeds = sampling_clips["clip_embedding"]
@@ -382,18 +413,36 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
 
         conditioning_embeds_rep = repeat(
             conditioning_embeds,
-            "clips clip_dim -> (clips t g) clip_dim",
+            "clips clip_dim -> (clips t c g) clip_dim",
             t=len(top_ps),
+            c=len(cos_sim_ranges),
             g=grid_size,
             clip_dim=768,
         )
         conditioning_embeds_rep = jax.device_put(conditioning_embeds_rep, sharding)
-        top_ps_rep = repeat(
-            top_ps,
-            "t -> (clips t g)",
+        cos_sim_lower_rep = repeat(
+            cos_sim_ranges[:, 0],
+            "c -> (clips t c g)",
+            clips=embeddings_to_sample,
             t=len(top_ps),
             g=grid_size,
+        )
+        cos_sim_lower_rep = jax.device_put(cos_sim_lower_rep, sharding)
+        cos_sim_upper_rep = repeat(
+            cos_sim_ranges[:, 1],
+            "c -> (clips t c g)",
             clips=embeddings_to_sample,
+            t=len(top_ps),
+            g=grid_size,
+        )
+        cos_sim_upper_rep = jax.device_put(cos_sim_upper_rep, sharding)
+        top_ps_rep = repeat(
+            top_ps,
+            "t -> (clips t c g)",
+            clips=embeddings_to_sample,
+            t=len(top_ps),
+            c=len(cos_sim_ranges),
+            g=grid_size,
         )
         top_ps_rep = jax.device_put(top_ps_rep, sharding.reshape((jax.device_count(),)))
 
@@ -403,6 +452,8 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
         assert (
             len(conditioning_embeds_rep)
             == len(top_ps_rep)
+            == len(cos_sim_lower_rep)
+            == len(cos_sim_upper_rep)
             == len(rngs)
             == samples_count
         )
@@ -420,11 +471,15 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
                     sample_jv(
                         ts.params,
                         conditioning_embeds_rep[:batch_size],
+                        cos_sim_lower_rep[:batch_size],
+                        cos_sim_upper_rep[:batch_size],
                         rngs[:batch_size],
                         top_ps_rep[:batch_size],
                     )
                 )
                 conditioning_embeds_rep = conditioning_embeds_rep[batch_size:]
+                cos_sim_lower_rep = cos_sim_lower_rep[batch_size:]
+                cos_sim_upper_rep = cos_sim_upper_rep[batch_size:]
                 rngs = rngs[batch_size:]
                 top_ps_rep = top_ps_rep[batch_size:]
 
@@ -447,9 +502,10 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
 
         grid_imgs = rearrange(
             imgs_np,
-            "(clips t g) w h c -> clips t g w h c",
+            "(clips t cos g) w h c -> clips t cos g w h c",
             clips=embeddings_to_sample,
             t=len(top_ps),
+            cos=len(cos_sim_ranges),
             g=grid_size,
         )
         tqdm.write(f"Made grids of shape: {grid_imgs.shape}")
@@ -459,10 +515,21 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
 
         for i, name in enumerate(conditioning_names):
             for j, top_p in enumerate(top_ps):
-                grid_pil = sample.make_grid(
-                    [PIL.Image.fromarray(np.array(img)) for img in grid_imgs[i, j]]
-                )
-                to_log[f"samples/{name}/top_p_{top_p:.2f}"] = wandb.Image(grid_pil)
+                for k, (lower, upper) in enumerate(cos_sim_ranges):
+                    grid_pil = sample.make_grid(
+                        [
+                            PIL.Image.fromarray(np.array(img))
+                            for img in grid_imgs[i, j, k]
+                        ],
+                    )
+                    if model_cfg.clip_cones:
+                        to_log[
+                            f"samples/{name}/top_p_{top_p:.2f}/cos_sim_{lower:.2f}_{upper:.2f}"
+                        ] = wandb.Image(grid_pil)
+                    else:
+                        to_log[f"samples/{name}/top_p_{top_p:.2f}"] = wandb.Image(
+                            grid_pil
+                        )
 
         wandb.log(to_log)
     else:
@@ -522,8 +589,10 @@ def train_step(
     batch_clips: jax.Array,
 ) -> Tuple[TrainState, jax.Array, jax.Array]:
     """Compute a single optimization step."""
-    rng, rng2 = jax.random.split(state.rng)
-    loss, grads = loss_grad_fn(mdl, state.params, rng, batch_imgs, batch_clips)
+    dropout_rng, cones_rng, rng2 = jax.random.split(state.rng, 3)
+    loss, grads = loss_grad_fn(
+        mdl, state.params, dropout_rng, cones_rng, batch_imgs, batch_clips
+    )
     new_state = state.apply_gradients(
         grads=grads, rng=rng2
     )  # type:ignore[no-untyped-call]
@@ -649,14 +718,18 @@ for epoch in trange(
         total=len(test_imgs) // training_cfg.batch_size,
         desc="test batches",
     ):
-        rng, rng2 = jax.random.split(my_train_state.rng)
+        dropout_rng, cones_rng, rng = jax.random.split(my_train_state.rng, 3)
         my_train_state = my_train_state.replace(rng=rng)
         batch_imgs = jax.device_put(batch["encoded_img"], sharding)
         if model_cfg.clip_conditioning:
             batch_clips = jax.device_put(batch["clip_embedding"], sharding)
         else:
             batch_clips = jax.device_put(jnp.zeros((batch_imgs.shape[0], 0)), sharding)
-        losses.append(loss_fn(my_train_state.params, rng2, batch_imgs, batch_clips))
+        losses.append(
+            loss_fn(
+                my_train_state.params, dropout_rng, cones_rng, batch_imgs, batch_clips
+            )
+        )
     test_loss = jnp.mean(jnp.stack(losses))
     wandb.log({"global_step": global_step, "test/loss": test_loss})
     tqdm.write(
