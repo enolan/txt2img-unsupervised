@@ -427,7 +427,7 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
             t=len(top_ps),
             g=grid_size,
         )
-        cos_sim_lower_rep = jax.device_put(cos_sim_lower_rep, sharding)
+        cos_sim_lower_rep = jax.device_put(cos_sim_lower_rep, sharding.reshape((jax.device_count(),)))
         cos_sim_upper_rep = repeat(
             cos_sim_ranges[:, 1],
             "c -> (clips t c g)",
@@ -435,7 +435,7 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
             t=len(top_ps),
             g=grid_size,
         )
-        cos_sim_upper_rep = jax.device_put(cos_sim_upper_rep, sharding)
+        cos_sim_upper_rep = jax.device_put(cos_sim_upper_rep, sharding.reshape((jax.device_count(),)))
         top_ps_rep = repeat(
             top_ps,
             "t -> (clips t c g)",
