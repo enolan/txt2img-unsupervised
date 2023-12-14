@@ -540,7 +540,7 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
                     pbar.update(batch_size)
 
             tqdm.write(
-                f"Sampled {len(sampled_codes)} codes, 1st shape {sampled_codes[0].shape}"
+                f"Sampled {len(sampled_codes)} batches of codes, 1st shape {sampled_codes[0].shape}"
             )
 
             ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
@@ -556,7 +556,7 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
                     pbar.update(len(codes_batch))
             imgs_np = np.concatenate(sampled_imgs)
             tqdm.write(
-                f"Sampled {len(sampled_imgs)} images, overall shape {imgs_np.shape}"
+                f"Decoded images, overall shape {imgs_np.shape}"
             )
 
             assert imgs_np.shape[0] == samples_count
