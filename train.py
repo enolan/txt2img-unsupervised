@@ -74,6 +74,7 @@ parser.add_argument("--activations-dtype", type=argparse_from_dict(str_to_dtype)
 parser.add_argument("--activation-function", type=argparse_from_dict(str_to_activation))
 parser.add_argument("--clip-conditioning", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--clip-cones", type=lambda x: bool(strtobool(x)))
+parser.add_argument("--clip-cone-count", type=int)
 parser.add_argument("--resume", type=Path)
 args, _unknown = parser.parse_known_args()
 
@@ -259,16 +260,23 @@ def setup_optimizer(
     # We need templates to feed to checkpoint_manager.restore so we get a TrainState instead of a
     # dict
     cos_sim_dummy = (
-        jnp.zeros((), dtype=jnp.float32)
+        jnp.zeros((model_cfg.clip_cone_count,), dtype=jnp.float32)
         if model_cfg.clip_cones
         else jnp.array([], dtype=jnp.float32)
     )
+    if model_cfg.clip_conditioning and not model_cfg.clip_cones:
+        clip_embedding_dummy = jnp.zeros((768,), dtype=jnp.float32)
+    elif model_cfg.clip_conditioning and model_cfg.clip_cones:
+        clip_embedding_dummy = jnp.zeros(
+            (model_cfg.clip_cone_count, 768), dtype=jnp.float32
+        )
+    else:
+        clip_embedding_dummy = jnp.zeros((0,), dtype=jnp.float32)
+
     params_empty = mdl.init(
         rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
         image=jnp.zeros((model_cfg.image_tokens,), dtype=jnp.int32),
-        clip_embedding=jnp.zeros((768,), dtype=jnp.float32)
-        if model_cfg.clip_conditioning
-        else jnp.zeros((0,), dtype=jnp.float32),
+        clip_embedding=clip_embedding_dummy,
         cos_sim_lower=cos_sim_dummy,
         cos_sim_upper=cos_sim_dummy,
     )
@@ -308,22 +316,29 @@ sample_cfg = copy(model_cfg)
 sample_cfg.dropout = None
 sample_mdl = transformer_model.ImageModel(**sample_cfg.__dict__, decode=True)
 cos_sim_dummy = (
-    jnp.zeros((), dtype=jnp.float32)
+    jnp.zeros((model_cfg.clip_cone_count,), dtype=jnp.float32)
     if model_cfg.clip_cones
     else jnp.array([], dtype=jnp.float32)
 )
+if model_cfg.clip_conditioning and not model_cfg.clip_cones:
+    clip_embedding_dummy = jnp.zeros((768,), dtype=jnp.float32)
+elif model_cfg.clip_conditioning and model_cfg.clip_cones:
+    clip_embedding_dummy = jnp.zeros(
+        (model_cfg.clip_cone_count, 768), dtype=jnp.float32
+    )
+else:
+    clip_embedding_dummy = jnp.zeros((0,), dtype=jnp.float32)
 sample_params = sample_mdl.init(
     jax.random.PRNGKey(0),
     image=jnp.arange(model_cfg.image_tokens, dtype=jnp.int32),
-    clip_embedding=jnp.zeros((768,), dtype=jnp.float32)
-    if model_cfg.clip_conditioning
-    else jnp.zeros((0,), dtype=jnp.float32),
+    clip_embedding=clip_embedding_dummy,
     cos_sim_lower=cos_sim_dummy,
     cos_sim_upper=cos_sim_dummy,
 )
 sample_cache = sample_params["cache"]
 del sample_params
 del cos_sim_dummy
+del clip_embedding_dummy
 
 sample_jv = jax.jit(
     jax.vmap(
@@ -388,150 +403,278 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
     ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
 
     if model_cfg.clip_conditioning:
-        # When cones are enabled, we sample a few different ranges for each embedding. Otherwise we
-        # sample with different top_p values. The difference between top p 0.9 and 0.95 is minimal
-        # and I might remove that comparison.
+        # Create a grid of samples for each set of conditions.
+        grid_size = 9
+
+        conditioning_names = sampling_clips["name"]
+
         if model_cfg.clip_cones:
-            top_ps = jnp.array([0.95], dtype=jnp.float32)
             # One set of samples should be "semantically" similar but not necessarily a very
             # similar image, the second set should be very similar. NB this is all conjecture at
             # this point.
             cos_sim_ranges = jnp.array([[0.15, 0.45], [0.7, 1.0]], dtype=jnp.float32)
-        else:
-            top_ps = jnp.array([0.9, 0.95], dtype=jnp.float32)
-            cos_sim_ranges = jnp.array([[[], []]], dtype=jnp.float32)
-        # Create a grid of samples for each set of conditions.
-        grid_size = 9
 
-        samples_count = (
-            embeddings_to_sample * len(top_ps) * len(cos_sim_ranges) * grid_size
-        )
-        assert (samples_count % training_cfg.batch_size) % jax.device_count() == 0
+            # We fill any extra cone slots with ranges that cover all possible embeddings
+            # 🤔 is this the right way to prompt it? Alternatively, we could repeat the cone in
+            # every slot. Or some subset. In training the norm is that the conditioning information
+            # is pretty redundant, right?
+            clip_embeddings_fill = jax.random.normal(
+                jax.random.PRNGKey(20231213), (model_cfg.clip_cone_count - 1, 768)
+            )
+            clip_embeddings_fill = clip_embeddings_fill / jnp.linalg.norm(
+                clip_embeddings_fill, axis=-1, keepdims=True
+            )
+            assert clip_embeddings_fill.shape == (
+                model_cfg.clip_cone_count - 1,
+                768,
+            )
 
-        conditioning_embeds = sampling_clips["clip_embedding"]
-        conditioning_names = sampling_clips["name"]
+            clip_embeddings = sampling_clips["clip_embedding"]
+            assert clip_embeddings.shape == (
+                embeddings_to_sample,
+                768,
+            )
+            clip_embeddings = rearrange(
+                clip_embeddings,
+                "clips_to_sample clip_dim -> clips_to_sample 1 clip_dim",
+            )
+            clip_embeddings_fill = repeat(
+                clip_embeddings_fill,
+                "cones clip_dim -> clips_to_sample cones clip_dim",
+                clips_to_sample=embeddings_to_sample,
+            )
+            clip_embeddings = jnp.concatenate(
+                [clip_embeddings, clip_embeddings_fill], axis=1
+            )
+            assert clip_embeddings.shape == (
+                embeddings_to_sample,
+                model_cfg.clip_cone_count,
+                768,
+            )
 
-        conditioning_embeds_rep = repeat(
-            conditioning_embeds,
-            "clips clip_dim -> (clips t c g) clip_dim",
-            t=len(top_ps),
-            c=len(cos_sim_ranges),
-            g=grid_size,
-            clip_dim=768,
-        )
-        conditioning_embeds_rep = jax.device_put(conditioning_embeds_rep, sharding)
-        cos_sim_lower_rep = repeat(
-            cos_sim_ranges[:, 0],
-            "c -> (clips t c g)",
-            clips=embeddings_to_sample,
-            t=len(top_ps),
-            g=grid_size,
-        )
-        cos_sim_lower_rep = jax.device_put(cos_sim_lower_rep, sharding.reshape((jax.device_count(),)))
-        cos_sim_upper_rep = repeat(
-            cos_sim_ranges[:, 1],
-            "c -> (clips t c g)",
-            clips=embeddings_to_sample,
-            t=len(top_ps),
-            g=grid_size,
-        )
-        cos_sim_upper_rep = jax.device_put(cos_sim_upper_rep, sharding.reshape((jax.device_count(),)))
-        top_ps_rep = repeat(
-            top_ps,
-            "t -> (clips t c g)",
-            clips=embeddings_to_sample,
-            t=len(top_ps),
-            c=len(cos_sim_ranges),
-            g=grid_size,
-        )
-        top_ps_rep = jax.device_put(top_ps_rep, sharding.reshape((jax.device_count(),)))
+            cos_sim_lower_fill = jnp.full(
+                (len(cos_sim_ranges), model_cfg.clip_cone_count - 1),
+                -1.0,
+                dtype=jnp.float32,
+            )
+            cos_sim_upper_fill = jnp.full(
+                (len(cos_sim_ranges), model_cfg.clip_cone_count - 1),
+                1.0,
+                dtype=jnp.float32,
+            )
 
-        rngs = jax.random.split(ts.rng, samples_count)
-        rngs = jax.device_put(rngs, sharding)
+            cos_sim_lower = jnp.concatenate(
+                [cos_sim_ranges[:, 0:1], cos_sim_lower_fill], axis=1
+            )
+            cos_sim_upper = jnp.concatenate(
+                [cos_sim_ranges[:, 1:2], cos_sim_upper_fill], axis=1
+            )
+            assert (
+                cos_sim_lower.shape
+                == cos_sim_upper.shape
+                == (len(cos_sim_ranges), model_cfg.clip_cone_count)
+            )
 
-        assert (
-            len(conditioning_embeds_rep)
-            == len(top_ps_rep)
-            == len(cos_sim_lower_rep)
-            == len(cos_sim_upper_rep)
-            == len(rngs)
-            == samples_count
-        )
+            samples_count = embeddings_to_sample * len(cos_sim_ranges) * grid_size
+            assert (samples_count % training_cfg.batch_size) % jax.device_count() == 0
 
-        batches = sample.batches_split(
-            training_cfg.batch_size,
-            len(conditioning_embeds_rep),
-        )
+            clip_embeds_rep = repeat(
+                clip_embeddings,
+                "clips_to_sample cones clip_dim -> (clips_to_sample sims g) cones clip_dim",
+                sims=len(cos_sim_ranges),
+                g=grid_size,
+            )
+            clip_embeds_rep = jax.device_put(clip_embeds_rep, sharding)
 
-        sampled_codes = []
+            cos_sim_lower_rep = repeat(
+                cos_sim_lower,
+                "sims cones -> (clips_to_sample sims g) cones",
+                clips_to_sample=embeddings_to_sample,
+                g=grid_size,
+            )
+            cos_sim_lower_rep = jax.device_put(cos_sim_lower_rep, sharding)
 
-        with tqdm(total=samples_count, desc="sampling", unit="img") as pbar:
-            for batch_size in batches:
-                sampled_codes.append(
-                    sample_jv(
-                        ts.params,
-                        conditioning_embeds_rep[:batch_size],
-                        cos_sim_lower_rep[:batch_size],
-                        cos_sim_upper_rep[:batch_size],
-                        rngs[:batch_size],
-                        top_ps_rep[:batch_size],
-                    )
-                )
-                conditioning_embeds_rep = conditioning_embeds_rep[batch_size:]
-                cos_sim_lower_rep = cos_sim_lower_rep[batch_size:]
-                cos_sim_upper_rep = cos_sim_upper_rep[batch_size:]
-                rngs = rngs[batch_size:]
-                top_ps_rep = top_ps_rep[batch_size:]
+            cos_sim_upper_rep = repeat(
+                cos_sim_upper,
+                "sims cones -> (clips_to_sample sims g) cones",
+                clips_to_sample=embeddings_to_sample,
+                g=grid_size,
+            )
+            cos_sim_upper_rep = jax.device_put(cos_sim_upper_rep, sharding)
 
-                pbar.update(batch_size)
+            rngs = jax.random.split(ts.rng, samples_count)
+            rngs = jax.device_put(rngs, sharding)
 
-        ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
+            assert (
+                len(clip_embeds_rep)
+                == len(cos_sim_lower_rep)
+                == len(cos_sim_upper_rep)
+                == len(rngs)
+                == samples_count
+            )
 
-        sampled_imgs = []
-        with tqdm(total=samples_count, desc="decoding", unit="img") as pbar:
-            for codes_batch in sampled_codes:
-                sampled_imgs.append(
-                    ldm_autoencoder.decode_jv(
-                        ae_mdl, ae_params, mdl.output_shape_tokens(), codes_batch
-                    )
-                )
-                pbar.update(len(codes_batch))
-        imgs_np = np.concatenate(sampled_imgs)
+            batches = sample.batches_split(
+                training_cfg.batch_size,
+                len(clip_embeds_rep),
+            )
 
-        assert imgs_np.shape[0] == samples_count
+            sampled_codes = []
 
-        grid_imgs = rearrange(
-            imgs_np,
-            "(clips t cos g) w h c -> clips t cos g w h c",
-            clips=embeddings_to_sample,
-            t=len(top_ps),
-            cos=len(cos_sim_ranges),
-            g=grid_size,
-        )
-        tqdm.write(f"Made grids of shape: {grid_imgs.shape}")
-        assert grid_imgs.shape[0] == embeddings_to_sample
-
-        to_log = {"global_step": global_step}
-
-        for i, name in enumerate(conditioning_names):
-            for j, top_p in enumerate(top_ps):
-                for k, (lower, upper) in enumerate(cos_sim_ranges):
-                    grid_pil = sample.make_grid(
-                        [
-                            PIL.Image.fromarray(np.array(img))
-                            for img in grid_imgs[i, j, k]
-                        ],
-                    )
-                    if model_cfg.clip_cones:
-                        to_log[
-                            f"samples/{name}/top_p_{top_p:.2f}/cos_sim_{lower:.2f}_{upper:.2f}"
-                        ] = wandb.Image(grid_pil)
-                    else:
-                        to_log[f"samples/{name}/top_p_{top_p:.2f}"] = wandb.Image(
-                            grid_pil
+            with tqdm(total=samples_count, desc="sampling", unit="img") as pbar:
+                for batch_size in batches:
+                    sampled_codes.append(
+                        sample_jv(
+                            ts.params,
+                            clip_embeds_rep[:batch_size],
+                            cos_sim_lower_rep[:batch_size],
+                            cos_sim_upper_rep[:batch_size],
+                            rngs[:batch_size],
+                            jnp.full(batch_size, 0.95),  # fixed top-p value
                         )
+                    )
+                    clip_embeds_rep = clip_embeds_rep[batch_size:]
+                    cos_sim_lower_rep = cos_sim_lower_rep[batch_size:]
+                    cos_sim_upper_rep = cos_sim_upper_rep[batch_size:]
+                    rngs = rngs[batch_size:]
 
-        wandb.log(to_log)
+                    pbar.update(batch_size)
+
+            tqdm.write(
+                f"Sampled {len(sampled_codes)} codes, 1st shape {sampled_codes[0].shape}"
+            )
+
+            ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
+
+            sampled_imgs = []
+            with tqdm(total=samples_count, desc="decoding", unit="img") as pbar:
+                for codes_batch in sampled_codes:
+                    sampled_imgs.append(
+                        ldm_autoencoder.decode_jv(
+                            ae_mdl, ae_params, mdl.output_shape_tokens(), codes_batch
+                        )
+                    )
+                    pbar.update(len(codes_batch))
+            imgs_np = np.concatenate(sampled_imgs)
+            tqdm.write(
+                f"Sampled {len(sampled_imgs)} images, overall shape {imgs_np.shape}"
+            )
+
+            assert imgs_np.shape[0] == samples_count
+
+            grid_imgs = rearrange(
+                imgs_np,
+                "(clips_to_sample sims g) w h c -> clips_to_sample sims g w h c",
+                clips_to_sample=embeddings_to_sample,
+                sims=len(cos_sim_ranges),
+                g=grid_size,
+            )
+            tqdm.write(f"Made grids of shape: {grid_imgs.shape}")
+
+            to_log = {"global_step": global_step}
+
+            for i, name in enumerate(conditioning_names):
+                for j, (lower, upper) in enumerate(cos_sim_ranges):
+                    grid_pil = sample.make_grid(
+                        [PIL.Image.fromarray(np.array(img)) for img in grid_imgs[i, j]],
+                    )
+                    to_log[
+                        f"samples/{name}/cos_sim_{lower:.2f}_{upper:.2f}"
+                    ] = wandb.Image(grid_pil)
+
+            wandb.log(to_log)
+        else:
+            samples_count = (
+                embeddings_to_sample * grid_size
+            )
+            assert (samples_count % training_cfg.batch_size) % jax.device_count() == 0
+
+            conditioning_embeds_rep = repeat(
+                sampling_clips["clip_embedding"],
+                "clips clip_dim -> (clips g) clip_dim",
+                g=grid_size,
+                clip_dim=768,
+            )
+            conditioning_embeds_rep = jax.device_put(conditioning_embeds_rep, sharding)
+
+            cos_sim_lower_rep = jax.device_put(jnp.zeros((samples_count, 0)), sharding)
+            cos_sim_upper_rep = jax.device_put(jnp.zeros((samples_count, 0)), sharding)
+            top_ps_rep = jax.device_put(jnp.full((samples_count,), 0.95), sharding)
+
+            rngs = jax.random.split(ts.rng, samples_count)
+            rngs = jax.device_put(rngs, sharding)
+
+            assert (
+                len(conditioning_embeds_rep)
+                == len(top_ps_rep)
+                == len(cos_sim_lower_rep)
+                == len(cos_sim_upper_rep)
+                == len(rngs)
+                == samples_count
+            )
+
+            batches = sample.batches_split(
+                training_cfg.batch_size,
+                len(conditioning_embeds_rep),
+            )
+
+            sampled_codes = []
+
+            with tqdm(total=samples_count, desc="sampling", unit="img") as pbar:
+                for batch_size in batches:
+                    sampled_codes.append(
+                        sample_jv(
+                            ts.params,
+                            conditioning_embeds_rep[:batch_size],
+                            cos_sim_lower_rep[:batch_size],
+                            cos_sim_upper_rep[:batch_size],
+                            rngs[:batch_size],
+                            top_ps_rep[:batch_size],
+                        )
+                    )
+                    conditioning_embeds_rep = conditioning_embeds_rep[batch_size:]
+                    cos_sim_lower_rep = cos_sim_lower_rep[batch_size:]
+                    cos_sim_upper_rep = cos_sim_upper_rep[batch_size:]
+                    rngs = rngs[batch_size:]
+                    top_ps_rep = top_ps_rep[batch_size:]
+
+                    pbar.update(batch_size)
+
+            ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
+
+            sampled_imgs = []
+            with tqdm(total=samples_count, desc="decoding", unit="img") as pbar:
+                for codes_batch in sampled_codes:
+                    sampled_imgs.append(
+                        ldm_autoencoder.decode_jv(
+                            ae_mdl, ae_params, mdl.output_shape_tokens(), codes_batch
+                        )
+                    )
+                    pbar.update(len(codes_batch))
+            imgs_np = np.concatenate(sampled_imgs)
+
+            assert imgs_np.shape[0] == samples_count
+
+            grid_imgs = rearrange(
+                imgs_np,
+                "(clips g) w h c -> clips g w h c",
+                clips=embeddings_to_sample,
+                g=grid_size,
+            )
+            tqdm.write(f"Made grids of shape: {grid_imgs.shape}")
+            assert grid_imgs.shape[0] == embeddings_to_sample
+
+            to_log = {"global_step": global_step}
+
+            for i, name in enumerate(conditioning_names):
+                grid_pil = sample.make_grid(
+                    [
+                        PIL.Image.fromarray(np.array(img))
+                        for img in grid_imgs[i]
+                    ],
+                )
+                to_log[f"samples/{name}"] = wandb.Image(grid_pil)
+
+            wandb.log(to_log)
     else:
         # Sample with different top_p values
         top_ps = [0.2, 0.6, 0.8, 0.9, 0.95]

@@ -24,6 +24,7 @@ class ModelConfig:
     activations_dtype: jnp.dtype = jnp.float32
     clip_conditioning: bool = False
     clip_cones: bool = False
+    clip_cone_count: int = None
 
     @staticmethod
     def from_json_dict(dict: dict[str, Any]) -> "ModelConfig":

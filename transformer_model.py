@@ -7,7 +7,7 @@ import optax  # type: ignore[import]
 from config import ModelConfig
 from copy import copy
 from dataclasses import dataclass
-from einops import rearrange
+from einops import rearrange, repeat
 from flash_attention_jax import causal_flash_attention
 from flax import struct
 from functools import partial
@@ -26,6 +26,7 @@ class ImageModel(nn.Module):
     image_tokens: int
     clip_conditioning: bool
     clip_cones: bool
+    clip_cone_count: Optional[int]
     use_biases: bool
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
@@ -43,32 +44,42 @@ class ImageModel(nn.Module):
             dtype=self.activations_dtype,
         )
         # A note on how CLIP conditioning works:
-        # in order to generate images conditioned on CLIP embeddings (and thus image or text
-        # prompts), we add a conditioning token to the beginning of the sequences the model learns
-        # This takes the place of what would otherwise be a zero token at the start of the
-        # sequence. Doing that is pretty narrow though, an ideal model would produce images with
-        # that *exact* CLIP embedding, when in reality image-text prompt cosine similarities are
-        # usually between like 0.15 and 0.4 and and image-very similiar image cosine similarities
-        # are around 0.8. The central idea of this whole project is to condition generation on
-        # *ranges* of CLIP embeddings, more specifically on ranges of cosine similarities to a
-        # particular CLIP embedding. A central point on a (high dimensional) sphere and a range of
-        # cosine similarities corresponds to a point and a range of angles, the area inside that
-        # range forms a cone (with volume).
+        # There are three modes:
+        # 1) No conditioning. We prepend a zero token to the input sequence.
+        # 2) Conditioning on one CLIP embedding. We project the CLIP embedding into d_model
+        # and prepend it to the input sequence. This works, and the model learns to produce images
+        # that look like an image with that CLIP embedding.
+        # 3) Conditioning on multiple cones, corresponding to areas of CLIP space centered on
+        # (but not necessarily containing) CLIP embedings. Each cone is a CLIP embedding along with
+        # lower and upper bound cosine similarity the image's embedding should have to that
+        # embedding. We project the CLIP embedding and the lower and upper bounds into d_model and
+        # sum them, producing one conditioning token per cone, which we then prepend to the input.
+        # So the image's embedding must be in the intersection of all the cones. I'm trying this
+        # for a few reasons: firstly, because an ideal model conditioning on a single exact
+        # embedding would learn to produce images with that exact embedding, when in reality
+        # image-text prompt cosine similarities are usually between like 0.15 and 0.4 and
+        # image-very similiar image cosine similarities are around 0.8. Secondly, because the
+        # intersections may allow you to do things with prompting that are impossible with a single
+        # prompt. Other models do allow multiple prompts but AFAICT they're not doing
+        # *intersections* they're just taking an average. Thirdly, this gives us something similar
+        # to classifier free guidance - prompting with bigger cones is like lower cfg scale and
+        # will hopefully lead to more realistic - though less prompt-aligned - images.
+        # N.B. the more cones we condition on the more the model learns about the CLIP embeddings
+        # of the examples at train time. One cone mayb be a very large area, but more allows it to
+        # effectively "triangulate".
 
-        # We'll find out whether this whole idea works soon, hopefully.
+        # At training time we take the CLIP embedding and generate n random cones that contain it,
+        # using those are our conditioning cones.
 
-        # if clip_conditioning is on and clip_cones is off, we project the CLIP embedding into
-        # d_model through a linear layer. If both clip_conditioning and clip_cones are on, we
-        # do the same projection for the clip embedding and add a projection for lower cos sim
-        # bound and the size of the range. If clip_conditioning is off, we just use a zero token.
-
-        # Questions:
-        # Does shoving all the conditioning info into one token make sense? Should we instead use
-        # two or even three?
+        # 1 & 2 work, we'll find out whether 3 does soon, hopefully.
 
         assert (
             self.clip_conditioning or not self.clip_cones
         ), "Can't use clip_cones without clip_conditioning"
+
+        if self.clip_cones:
+            assert self.clip_cone_count is not None, "clip_cone_count must be set"
+            assert self.clip_cone_count > 0, "clip_cone_count must be positive"
 
         self.clip_proj = nn.Dense(
             features=self.d_model,
@@ -80,7 +91,7 @@ class ImageModel(nn.Module):
             use_bias=self.use_biases,
             dtype=self.activations_dtype,
         )
-        self.cos_sim_range_proj = nn.Dense(
+        self.cos_sim_upper_proj = nn.Dense(
             features=self.d_model,
             use_bias=self.use_biases,
             dtype=self.activations_dtype,
@@ -125,9 +136,56 @@ class ImageModel(nn.Module):
         assert tokens_res * tokens_res == self.image_tokens
 
     def seq_len(self) -> int:
-        # How many tokens are fed to the model at once and equally how many are output. This
-        # function will actually do something once we have more than one conditioning token.
-        return self.image_tokens
+        """How many tokens are in the sequence being modeled."""
+        return self.image_tokens + self.prepended_tokens() - 1
+
+    def prepended_tokens(self) -> int:
+        """How many tokens are prepended to the image tokens."""
+        # We always prepend at least one, becuase the first image token must be conditioned on
+        # *something* even when that's a constant.
+        if self.clip_conditioning:
+            if self.clip_cones:
+                return self.clip_cone_count
+            else:
+                return 1
+        else:
+            return 1
+
+    def gen_conditioning_tokens(
+        self,
+        clip_embedding: jax.Array,
+        cos_sim_lower: jax.Array,
+        cos_sim_upper: jax.Array,
+    ) -> jax.Array:
+        """Generate the conditioning tokens that should be prepended to the image tokens. Returns a
+        (self.prepended_tokens(), self.d_model) shaped array."""
+        if not self.clip_conditioning:
+            assert (
+                clip_embedding.shape
+                == cos_sim_lower.shape
+                == cos_sim_upper.shape
+                == (0,)
+            )
+            res = jnp.zeros((1, self.d_model), dtype=self.activations_dtype)
+        else:
+            if not self.clip_cones:
+                assert clip_embedding.shape == (768,)
+                assert cos_sim_lower.shape == cos_sim_upper.shape == (0,)  # both empty
+                res = self.clip_proj(clip_embedding)[None, :]
+            else:
+                assert clip_embedding.shape == (self.clip_cone_count, 768)
+                assert (
+                    cos_sim_lower.shape
+                    == cos_sim_upper.shape
+                    == (self.clip_cone_count,)
+                )
+                res = (
+                    self.clip_proj(clip_embedding)
+                    + self.cos_sim_lower_proj(cos_sim_lower)
+                    + self.cos_sim_upper_proj(cos_sim_upper)
+                )
+        assert res.shape == (self.prepended_tokens(), self.d_model)
+        return res
 
     def output_shape_tokens(self) -> int:
         """What (2-D) shape of tokens is output by the model."""
@@ -146,52 +204,52 @@ class ImageModel(nn.Module):
 
         embeds = self.in_embed(image)
 
-        # We either insert a zero token at the start, or a CLIP token at the start. In either case
-        # the nth output predicts the nth token, conditional on all *previous* tokens. In future
-        # when there's more than one conditioning token, we'll have to do something more
-        # complicated.
-        if self.clip_conditioning:
-            assert clip_embedding.shape == (768,)
-            if self.clip_cones:
-                assert cos_sim_lower.shape == cos_sim_upper.shape == ()  # both scalars
-                # The cosine similarity values need to be arrays for the linear layers to work
-                clip_tok = (
-                    self.clip_proj(clip_embedding)
-                    + self.cos_sim_lower_proj(cos_sim_lower[None])
-                    + self.cos_sim_range_proj((cos_sim_upper - cos_sim_lower)[None])
-                )
-            else:
-                assert cos_sim_lower.shape == cos_sim_upper.shape == (0,)  # both empty
-                clip_tok = self.clip_proj(clip_embedding)
-            toks = jnp.concatenate([clip_tok[None, :], embeds[:-1]], axis=0)
-        else:
-            assert (
-                clip_embedding.shape
-                == cos_sim_lower.shape
-                == cos_sim_upper.shape
-                == (0,)
-            )
-            toks = jnp.concatenate([jnp.zeros((1, self.d_model)), embeds[:-1]], axis=0)
+        cond_tokens = self.gen_conditioning_tokens(
+            clip_embedding, cos_sim_lower, cos_sim_upper
+        )
+        toks = jnp.concatenate([cond_tokens, embeds[:-1]], axis=0)
+        assert toks.shape == (self.seq_len(), self.d_model)
 
         h: jax.Array = toks + self.positional_encoding(jnp.arange(self.seq_len()))
         h, _ = self.transformer_layers(h, None)
+        h = h[self.prepended_tokens() - 1 :]
+        h = self.logits_decoder(h)
+        assert h.shape == (self.image_tokens, 8192)
 
-        return self.logits_decoder(h)  # type: ignore[no-any-return]
+        return h
 
-    def decode_step(
+    def decode_init(
         self,
-        tok: jax.Array,
-        idx: jax.Array,
         clip_embedding: jax.Array,
-        cos_sim_lower,
-        cos_sim_upper,
-    ) -> jax.Array:
+        cos_sim_lower: jax.Array,
+        cos_sim_upper: jax.Array,
+    ):
+        """Initialize the cache for decoding by computing and feeding the conditioning tokens. Returns
+        the logits for the first image token. The cache should be ready for use with decode_step
+        when this is done."""
+        assert self.decode
+        assert not self.flash_attention, "Flash attention doesn't work with decoding."
+
+        cond_tokens = self.gen_conditioning_tokens(
+            clip_embedding, cos_sim_lower, cos_sim_upper
+        )
+
+        h = cond_tokens + self.positional_encoding(jnp.arange(self.prepended_tokens()))
+        assert h.shape == (self.prepended_tokens(), self.d_model)
+
+        # TODO vectorize, don't loop
+        for tok in h:
+            h, _ = self.transformer_layers(tok[None, :], None)
+            last_tok = h[0]
+        assert last_tok.shape == (self.d_model,)
+
+        logits_out = self.logits_decoder(last_tok)
+        assert logits_out.shape == (8192,)
+        return logits_out
+
+    def decode_step(self, tok: jax.Array, idx: jax.Array) -> jax.Array:
         """Do a step of iterative decoding from the model. Returns the logits for the next token.
-        See below tests for usage examples. N.B. You need to start from "token 0" which is either
-        nothing or the CLIP embedding to get logits for output token 0. So when idx is 0, tok is
-        ignored.
-        tok and idx are scalars, clip_embed is a 768-d vector or an empty array depending on
-        whether the model is conditioned on CLIP or not.
+        See below tests for usage examples.
         """
         assert (
             self.decode
@@ -199,38 +257,12 @@ class ImageModel(nn.Module):
         assert not self.flash_attention, "Flash attention doesn't work with decoding."
         assert tok.shape == ()
         assert tok.dtype == jnp.int32 or tok.dtype == jnp.int64
-        if self.clip_conditioning:
-            assert clip_embedding.shape == (768,)
-        else:
-            assert clip_embedding.shape == (0,)
-        if self.clip_cones:
-            assert cos_sim_lower.shape == cos_sim_upper.shape == ()
-        else:
-            assert cos_sim_lower.shape == cos_sim_upper.shape == (0,)
+        assert idx.shape == ()
 
-        # This bit is analagous to the right shift above.
-        def init_tok_fn(mdl: ImageModel) -> jax.Array:
-            # Have to use the embed variable in both branches to make Flax happy
-            _ = mdl.in_embed(jnp.array(0))
-            if self.clip_conditioning:
-                if self.clip_cones:
-                    return (
-                        mdl.clip_proj(clip_embedding)
-                        + mdl.cos_sim_lower_proj(cos_sim_lower[None])
-                        + mdl.cos_sim_range_proj((cos_sim_upper - cos_sim_lower)[None])
-                    )
-                else:
-                    return mdl.clip_proj(clip_embedding)
-            else:
-                return jnp.zeros((self.d_model,), dtype=self.activations_dtype)
-
-        def embed_fn(mdl: ImageModel) -> jax.Array:
-            return mdl.in_embed(tok)
-
-        embed = nn.cond(idx == 0, init_tok_fn, embed_fn, self)
+        embed = self.in_embed(tok)
         assert embed.shape == (self.d_model,)
 
-        h = embed + self.positional_encoding(idx)
+        h = embed + self.positional_encoding(idx + self.prepended_tokens())
         assert h.shape == (self.d_model,)
         h = h[None, :]
 
@@ -254,11 +286,15 @@ def _assert_dicts_equal(d1, d2, name) -> None:
 
 
 def _setup_test_sample(
-    clip_conditioning: bool = False, clip_cones: bool = False
+    clip_conditioning: bool = False,
+    clip_cones: bool = False,
+    clip_cone_count: Optional[int] = None,
+    image_tokens: int = 256,
 ) -> Tuple[ImageModel, ImageModel, dict, jax.Array, jax.Array]:
     """Shared setup code for iterative sampling tests."""
     cfg_nodec = copy(gpt_1_config)
     cfg_nodec.dropout = None
+    cfg_nodec.image_tokens = image_tokens
     # smaller model makes debug output easier to read
     cfg_nodec.n_layers = 2
     cfg_nodec.d_model = 64
@@ -267,35 +303,42 @@ def _setup_test_sample(
         cfg_nodec.clip_conditioning = True
     if clip_cones:
         cfg_nodec.clip_cones = True
+        if clip_cone_count is None:
+            clip_cone_count = 2
+        cfg_nodec.clip_cone_count = clip_cone_count
     mdl_nodec = ImageModel(**cfg_nodec.__dict__)
     mdl_dec = mdl_nodec.clone(decode=True, flash_attention=False)
 
-    toks = jax.random.randint(jax.random.PRNGKey(420), (256,), 0, 8192)
+    img_toks = jax.random.randint(jax.random.PRNGKey(420), (image_tokens,), 0, 8192)
     if clip_conditioning:
-        clip_embedding = jax.random.normal(jax.random.PRNGKey(1337), (768,))
-        clip_embedding = clip_embedding / jnp.linalg.norm(clip_embedding)
+        if clip_cones:
+            clip_embedding = jax.random.normal(
+                jax.random.PRNGKey(1337), (clip_cone_count, 768)
+            )
+            clip_embedding = clip_embedding / jnp.linalg.norm(
+                clip_embedding, axis=-1, keepdims=True
+            )
+            cos_sim_lower = jnp.full(clip_cone_count, 0.1)
+            cos_sim_upper = jnp.full(clip_cone_count, 0.5)
+        else:
+            clip_embedding = jax.random.normal(jax.random.PRNGKey(1337), (768,))
+            clip_embedding = clip_embedding / jnp.linalg.norm(clip_embedding)
+            cos_sim_lower = cos_sim_upper = jnp.array([])
     else:
-        clip_embedding = jnp.zeros((0,), dtype=jnp.float32)
-
-    if clip_cones:
-        cos_sim_lower = jnp.array(0.1)
-        cos_sim_upper = jnp.array(0.5)
-    else:
-        cos_sim_lower = jnp.array([], dtype=jnp.float32)
-        cos_sim_upper = jnp.array([], dtype=jnp.float32)
+        clip_embedding = cos_sim_lower = cos_sim_upper = jnp.array([])
 
     params = mdl_nodec.init(
         jax.random.PRNGKey(69),
-        toks,
+        img_toks,
         clip_embedding=clip_embedding,
         cos_sim_lower=cos_sim_lower,
-        cos_sim_upper=cos_sim_lower,
+        cos_sim_upper=cos_sim_upper,
     )
     # IMPORTANT: use regular __call__ here, not decode_step. The cache needs to be initialized to
     # the full seq_len size.
     params_dec = mdl_dec.init(
         jax.random.PRNGKey(69),
-        toks,
+        img_toks,
         clip_embedding=clip_embedding,
         cos_sim_lower=cos_sim_lower,
         cos_sim_upper=cos_sim_lower,
@@ -305,7 +348,7 @@ def _setup_test_sample(
 
     logits_all = mdl_nodec.apply(
         params,
-        image=toks,
+        image=img_toks,
         clip_embedding=clip_embedding,
         cos_sim_lower=cos_sim_lower,
         cos_sim_upper=cos_sim_upper,
@@ -316,7 +359,7 @@ def _setup_test_sample(
         mdl_dec,
         params,
         params_dec["cache"],
-        toks,
+        img_toks,
         clip_embedding,
         cos_sim_lower,
         cos_sim_upper,
@@ -324,8 +367,10 @@ def _setup_test_sample(
     )
 
 
-def _test_sample_tok_0(clip_conditioning: bool, clip_cones: bool) -> None:
-    """Test that step-by-step decoding is equivalent to all at once for token 0."""
+def _test_sample_tok_0(
+    clip_conditioning: bool, clip_cones: bool, clip_cone_count: Optional[int] = None
+) -> None:
+    """Test that step-by-step decoding is equivalent to all at once for image token 0."""
     (
         mdl_nodec,
         mdl_dec,
@@ -336,19 +381,18 @@ def _test_sample_tok_0(clip_conditioning: bool, clip_cones: bool) -> None:
         cos_sim_lower,
         cos_sim_upper,
         logits_all,
-    ) = _setup_test_sample(clip_conditioning, clip_cones)
+    ) = _setup_test_sample(clip_conditioning, clip_cones, clip_cone_count)
 
     params = flax.core.copy(params, {"cache": cache})
     logits_0, cache = mdl_dec.apply(
         params,
         mutable=["cache"],
-        method=mdl_dec.decode_step,
-        tok=jnp.array(0),
+        method=mdl_dec.decode_init,
         clip_embedding=clip_embedding,
         cos_sim_lower=cos_sim_lower,
         cos_sim_upper=cos_sim_upper,
-        idx=jnp.array(0),
     )
+    assert logits_0.shape == (8192,)
 
     np.testing.assert_allclose(logits_all[0], logits_0, rtol=0, atol=1e-5)
 
@@ -361,8 +405,12 @@ def test_sample_tok_0_clip() -> None:
     _test_sample_tok_0(True, False)
 
 
-def test_sample_tok_0_clip_cones() -> None:
-    _test_sample_tok_0(True, True)
+def test_sample_tok_0_clip_cones_1() -> None:
+    _test_sample_tok_0(True, True, 1)
+
+
+def test_sample_tok_0_clip_cones_2() -> None:
+    _test_sample_tok_0(True, True, 2)
 
 
 def _test_sample_tok_1(clip_conditioning: bool, clip_cones: bool) -> None:
@@ -384,12 +432,10 @@ def _test_sample_tok_1(clip_conditioning: bool, clip_cones: bool) -> None:
     _logits_0, cache = mdl_dec.apply(
         params,
         mutable=["cache"],
-        method=mdl_dec.decode_step,
-        tok=jnp.array(0),
+        method=mdl_dec.decode_init,
         clip_embedding=clip_embedding,
         cos_sim_lower=cos_sim_lower,
         cos_sim_upper=cos_sim_upper,
-        idx=jnp.array(0),
     )
     params = flax.core.copy(params, cache)
     logits_1, _cache = mdl_dec.apply(
@@ -397,10 +443,7 @@ def _test_sample_tok_1(clip_conditioning: bool, clip_cones: bool) -> None:
         mutable=["cache"],
         method=mdl_dec.decode_step,
         tok=toks[0],
-        clip_embedding=clip_embedding,
-        cos_sim_lower=cos_sim_lower,
-        cos_sim_upper=cos_sim_upper,
-        idx=jnp.array(1),
+        idx=jnp.array(0),
     )
 
     np.testing.assert_allclose(logits_all[1], logits_1, rtol=0, atol=1e-5)
@@ -418,7 +461,9 @@ def test_sample_tok_1_clip_cones() -> None:
     _test_sample_tok_1(True, True)
 
 
-def _test_sample_tok_all(clip_conditioning: bool, clip_cones: bool) -> None:
+def _test_sample_tok_all(
+    clip_conditioning: bool, clip_cones: bool, image_tokens: int = 256
+) -> None:
     """Test that step-by-step decoding is equivalent to all at once for all tokens."""
     (
         mdl_nodec,
@@ -430,43 +475,39 @@ def _test_sample_tok_all(clip_conditioning: bool, clip_cones: bool) -> None:
         cos_sim_lower,
         cos_sim_upper,
         logits_all,
-    ) = _setup_test_sample(clip_conditioning, clip_cones)
+    ) = _setup_test_sample(clip_conditioning, clip_cones, None, image_tokens)
 
     decoded_logits = []
     params = flax.core.copy(params, {"cache": cache})
 
-    # step 0
+    # compute logits for image tok 0
     logits, new_cache = mdl_dec.apply(
         params,
         mutable=["cache"],
-        method=mdl_dec.decode_step,
-        tok=jnp.array(0),
-        idx=jnp.array(0),
+        method=mdl_dec.decode_init,
         clip_embedding=clip_embedding,
         cos_sim_lower=cos_sim_lower,
         cos_sim_upper=cos_sim_upper,
     )
+    assert logits.shape == (8192,)
     decoded_logits.append(logits)
     params = flax.core.copy(params, new_cache)
 
-    # steps 1-255
-    for i in range(1, 256):
+    # compute logits for image toks 1-255 (inputting toks 0-254)
+    for i in range(image_tokens - 1):
         logits, new_cache = mdl_dec.apply(
             params,
             mutable=["cache"],
             method=mdl_dec.decode_step,
-            tok=toks[i - 1],
+            tok=toks[i],
             idx=jnp.array(i),
-            clip_embedding=clip_embedding,
-            cos_sim_lower=cos_sim_lower,
-            cos_sim_upper=cos_sim_upper,
         )
         assert logits.shape == (8192,)
         decoded_logits.append(logits)
         params = flax.core.copy(params, new_cache)
 
     decoded_logits = jnp.stack(decoded_logits, axis=0)
-    assert decoded_logits.shape == (256, 8192)
+    assert decoded_logits.shape == (image_tokens, 8192)
     np.testing.assert_allclose(logits_all, decoded_logits, rtol=0, atol=1e-6)
 
 
@@ -480,6 +521,12 @@ def test_sample_tok_all_clip() -> None:
 
 def test_sample_tok_all_clip_cones() -> None:
     _test_sample_tok_all(True, True)
+
+
+def test_sample_tok_all_clip_cones_1024() -> None:
+    # There was a boundary issue with flash attention that broke with sequence lengths that > 1024
+    # & not multiples of 1024.
+    _test_sample_tok_all(True, True, 1024)
 
 
 def test_clip_does_anything() -> None:
@@ -526,8 +573,8 @@ def test_clip_cones_do_anything() -> None:
         params,
         image=toks,
         clip_embedding=clip_embedding,
-        cos_sim_lower=jnp.array(-1.0),
-        cos_sim_upper=jnp.array(1.0),
+        cos_sim_lower=jnp.array([-1.0, 0.1]),
+        cos_sim_upper=jnp.array([1.0, 0.4]),
     )
 
     assert not jnp.allclose(logits_all, logits_full_range, rtol=0, atol=1e-3)
@@ -545,15 +592,16 @@ def sample(
 ) -> jax.Array:
     """Sample a single image from the model. Returns an array of codes to be passed to the
     LDM decoder."""
-    if mdl.clip_conditioning:
+    if mdl.clip_conditioning and mdl.clip_cones:
+        assert clip_embedding.shape == (mdl.clip_cone_count, 768)
+        assert cos_sim_lower.shape == cos_sim_upper.shape == (mdl.clip_cone_count,)
+    elif mdl.clip_conditioning and not mdl.clip_cones:
         assert clip_embedding.shape == (768,)
-    else:
-        assert clip_embedding.shape == (0,)
-
-    if mdl.clip_cones:
-        assert cos_sim_lower.shape == cos_sim_upper.shape == ()
-    else:
         assert cos_sim_lower.shape == cos_sim_upper.shape == (0,)
+    else:
+        assert (
+            clip_embedding.shape == cos_sim_lower.shape == cos_sim_upper.shape == (0,)
+        )
 
     # Flash attention doesn't work with Flax's fast decoding. Something to do with how masks are
     # handled. Would be nice to fix it, but for now we just use the slower attention when sampling.
@@ -578,27 +626,22 @@ def sample(
             params,
             mutable=["cache"],
             method=mdl_decode.decode_step,
-            tok=image_toks[i - 1],
+            tok=image_toks[i],
             idx=i,
-            clip_embedding=clip_embedding,
-            cos_sim_lower=cos_sim_lower,
-            cos_sim_upper=cos_sim_upper,
         )
         assert logits.shape == (8192,)
         params = flax.core.copy(params, new_cache)
         filtered_logits = _filter_top_p(logits, top_p)
         rng_sample, rng_loop = jax.random.split(rng, 2)
         tok = jax.random.categorical(rng_sample, filtered_logits)
-        image_toks = image_toks.at[i].set(tok)
+        image_toks = image_toks.at[i + 1].set(tok)
         return (image_toks, rng_loop, params)
 
     rng0, rng_loop = jax.random.split(rng, 2)
     logits_0, cache = mdl_decode.apply(
         params,
         mutable=["cache"],
-        method=mdl_decode.decode_step,
-        tok=jnp.array(0),
-        idx=jnp.array(0),
+        method=mdl_decode.decode_init,
         clip_embedding=clip_embedding,
         cos_sim_lower=cos_sim_lower,
         cos_sim_upper=cos_sim_upper,
@@ -611,8 +654,8 @@ def sample(
 
     image_toks = jnp.zeros((mdl.image_tokens,), dtype=jnp.int32).at[0].set(tok_0)
     image_toks, _, _ = jax.lax.fori_loop(  # type: ignore[no-untyped-call]
-        1,
-        mdl.image_tokens,
+        0,
+        mdl.image_tokens - 1,
         loop_iter,
         (image_toks, rng_loop, params),
     )
@@ -919,7 +962,11 @@ def loss(
     else:
         assert ex_clip.shape == (0,)
     if model.clip_cones:
-        cond_clip, lower_bound, upper_bound = _generate_clip_cone(cone_rng, ex_clip)
+        clips = repeat(ex_clip, "d -> n d", n=model.clip_cone_count)
+        cone_rngs = jax.random.split(cone_rng, model.clip_cone_count)
+        cond_clip, lower_bound, upper_bound = jax.vmap(_generate_clip_cone)(
+            cone_rngs, clips
+        )
     else:
         cond_clip = ex_clip
         lower_bound = upper_bound = jnp.array([], dtype=jnp.float32)
@@ -1066,7 +1113,7 @@ def test_learn_ranges() -> None:
     print(f"Generated samples, shape: {sampled_arr.shape}")
     counts = dict([(i, 0) for i in range(16)])
     for i, s in enumerate(sampled_arr):
-        assert s[0] % 256 == 0
+        assert s[0] % 256 == 0, f"sample {i} starts with {s[0]}"
         np.testing.assert_equal(np.array(s), np.array(s[0] + np.arange(256)))
         counts[int(s[0] // 256)] += 1
     print(f"counts: {counts}")
