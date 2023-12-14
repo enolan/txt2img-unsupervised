@@ -484,7 +484,7 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
                 sims=len(cos_sim_ranges),
                 g=grid_size,
             )
-            clip_embeds_rep = jax.device_put(clip_embeds_rep, sharding)
+            clip_embeds_rep = jax.device_put(clip_embeds_rep, sharding.reshape(jax.device_count(), 1, 1))
 
             cos_sim_lower_rep = repeat(
                 cos_sim_lower,
