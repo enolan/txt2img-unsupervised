@@ -183,7 +183,7 @@ class ImageModel(nn.Module):
                     self.clip_proj(clip_embedding)
                     + self.cos_sim_lower_proj(cos_sim_lower)
                     + self.cos_sim_upper_proj(cos_sim_upper)
-                )
+                ) / 3
         assert res.shape == (self.prepended_tokens(), self.d_model)
         return res
 
