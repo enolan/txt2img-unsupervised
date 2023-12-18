@@ -864,7 +864,7 @@ def test_flash_attention_equals_standard() -> None:
 
     np.testing.assert_allclose(out_std, out_flash, atol=3e-6, rtol=0)
 
-
+# TODO delet this
 def _random_pt_with_cosine_similarity(
     rng: jax.Array, pt: jax.Array, sim: jax.Array
 ) -> jax.Array:

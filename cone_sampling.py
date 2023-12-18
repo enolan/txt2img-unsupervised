@@ -108,56 +108,60 @@ def test_log_surface_area_symmetry():
     )
 
 
-@dataclass
+@jax.tree_util.register_pytree_node_class
 class LogitsTable:
     """Table of slice logits for sampling from a sphere."""
 
-    d: int
-    buckets: int
-    table: np.ndarray
-
     def __init__(self, d, n):
         """Generate a table of logits for sampling from a cone."""
+        # I'm paranoid about floating point issues and this is a precomputation step so I don't
+        # care if it's a bit slow.
         slice_heights = np.linspace(-1.0, 1.0, n, dtype=np.float64)
         slice_logits = np.array(
             [log_surface_area_of_slice(d, h) for h in slice_heights]
         )
-        # Normalize the logits. This doesn't do anything useful, but it makes them easier to read
-        # when debugging.
-        # slice_logits = scipy.special.log_softmax(slice_logits).astype(np.float32)
         slice_logits = slice_logits.astype(np.float32)
 
         assert slice_logits.shape == (n,)
 
         self.d = d
         self.buckets = n
-        self.table = slice_logits
+        self.table = jnp.array(slice_logits)
+
+    def tree_flatten(self):
+        return (self.d, self.table), self.buckets
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        out = cls.__new__(cls)
+        out.d, out.table = children
+        out.buckets = aux_data
+        return out
 
     def _height_to_idx(self, h):
         """Convert a slice height to an index in the table."""
-        assert h >= -1.0 and h <= 1.0
+        h = jnp.float32(h)
         val = (h + 1) / 2
-        idx = int(val * (self.buckets - 1))
+        idx = (val * (self.buckets - 1)).astype(jnp.int32)
         return idx
 
     def _idx_to_height(self, idx):
         """Convert an index in the table to a slice height."""
-        assert idx >= 0 and idx < self.buckets
         val = idx / (self.buckets - 1)
         h = 2 * val - 1
         return h
 
     def filter_slice_logits(self, lower_bound, upper_bound):
         """Filter the table of slice logits to only include slices within the given bounds."""
-        assert lower_bound < upper_bound
-        assert lower_bound >= -1.0 and upper_bound <= 1.0
-        assert upper_bound - lower_bound > 0.0
 
         out = copy(self)
-        out.table = np.copy(self.table)
-        out.table[: self._height_to_idx(lower_bound)] = -np.inf
-        out.table[self._height_to_idx(upper_bound) :] = -np.inf
 
+        # This seems like a kind of inefficient way to mask stuff, oh well.
+        idxs = jnp.arange(self.buckets)
+        lower_mask = idxs < self._height_to_idx(lower_bound)
+        upper_mask = idxs > self._height_to_idx(upper_bound)
+        out.table = jnp.where(lower_mask, -np.inf, out.table)
+        out.table = jnp.where(upper_mask, -np.inf, out.table)
         return out
 
     def sample_slice_from_table(self, rng):
@@ -181,17 +185,30 @@ def test_logits_are_symmetric():
     np.testing.assert_array_equal(table.table, table.table[::-1])
 
 
+_test_sample_jv = jax.jit(
+    lambda table, batch_size, rng: jax.vmap(
+        lambda rng: table.sample_slice_from_table(rng)
+    )(jax.random.split(rng, batch_size)),
+    static_argnums=(1,),
+)
+
+
 def test_distribution_is_symmetric():
     """Test that sampling heights returns ~50% less than 0 and ~50% greater than 0."""
     table = LogitsTable(768, 8192)
-    iters = 100_000
+
+    batch_size = 1024
+    iters = 1024
+    samples = batch_size * iters
 
     rng = jax.random.PRNGKey(3)
     heights = []
     for _ in range(iters):
         rng, subrng = jax.random.split(rng)
-        heights.append(table.sample_slice_from_table(subrng))
-    heights = np.array(heights)
+        heights.append(_test_sample_jv(table, batch_size, subrng))
+    heights = np.concatenate(heights)
+
+    assert heights.shape == (samples,)
 
     mean = np.mean(heights)
     less_than_zero = np.sum(heights < 0)
@@ -200,8 +217,8 @@ def test_distribution_is_symmetric():
     # The empirical mean is slightly less than 0. I suspect ghosts. Or floating point issues.
     # ~ -5e-5.
     np.testing.assert_allclose(mean, 0.0, atol=1e-4, rtol=0)
-    np.testing.assert_allclose(less_than_zero / iters, 0.5, atol=0.001, rtol=0)
-    np.testing.assert_allclose(greater_than_zero / iters, 0.5, atol=0.001, rtol=0)
+    np.testing.assert_allclose(less_than_zero / samples, 0.5, atol=0.001, rtol=0)
+    np.testing.assert_allclose(greater_than_zero / samples, 0.5, atol=0.001, rtol=0)
 
 
 def _test_filtering_range(lower_bound, upper_bound):
@@ -209,11 +226,15 @@ def _test_filtering_range(lower_bound, upper_bound):
     table = LogitsTable(767, 8192)
     filtered_table = table.filter_slice_logits(lower_bound, upper_bound)
 
+    batch_size = 1024
+    iters = 1024
+    samples = batch_size * iters
+
     rng = jax.random.PRNGKey(420_69)
     samples = []
-    for _ in range(10_000):
+    for _ in range(iters):
         rng, subrng = jax.random.split(rng)
-        samples.append(filtered_table.sample_slice_from_table(subrng))
+        samples.append(_test_sample_jv(filtered_table, batch_size, subrng))
     samples = np.array(samples)
 
     # Rounding error can make samples slightly out of range.
@@ -301,7 +322,6 @@ def test_random_pt_with_cosine_similarity() -> None:
 
 def sample_from_cone(rng, table, v, lower_bound, upper_bound):
     """Sample from a cone centered at v."""
-    assert np.isclose(np.linalg.norm(v), 1.0)
 
     cos_rng, pt_rng = jax.random.split(rng)
     # Sample a cosine similarity inside the bounds
@@ -326,7 +346,7 @@ def test_sample_from_cone():
 
     # Generate some cone sizes
     sizes = jax.random.uniform(
-        size_rng, minval=1/8192, maxval=2.0, shape=(n_cones,), dtype=jnp.float32
+        size_rng, minval=1 / 8192, maxval=2.0, shape=(n_cones,), dtype=jnp.float32
     )
 
     # Generate some cosine similarity bounds
@@ -347,14 +367,20 @@ def test_sample_from_cone():
     table = LogitsTable(767, 8192)
     tolerance = 2 / table.buckets
 
+    sample_jv = jax.jit(
+        lambda rng, v, lower_bound, upper_bound: jax.vmap(
+            lambda rng: sample_from_cone(rng, table, v, lower_bound, upper_bound),
+            in_axes=(0,),
+        )(jax.random.split(rng, 128))
+    )
+
     for i in range(n_cones):
-        for j in range(128):
-            samples_rng, subrng = jax.random.split(samples_rng)
-            sample = sample_from_cone(
-                subrng, table, vectors[i], lower_bounds[i], upper_bounds[i]
-            )
-            assert sample.shape == (768,)
-            np.testing.assert_allclose(jnp.linalg.norm(sample), 1.0, atol=1e-5, rtol=0)
-            sim = jnp.dot(sample, vectors[i])
-            assert (sim + tolerance) >= lower_bounds[i]
-            assert (sim - tolerance) <= upper_bounds[i]
+        samples_rng, subrng = jax.random.split(samples_rng)
+        samples = sample_jv(subrng, vectors[i], lower_bounds[i], upper_bounds[i])
+        assert samples.shape == (128, 768)
+        np.testing.assert_allclose(
+            jnp.linalg.norm(samples, axis=1), 1.0, atol=1e-5, rtol=0
+        )
+        sims = jnp.dot(samples, vectors[i])
+        assert jnp.all((sims + tolerance) >= lower_bounds[i])
+        assert jnp.all((sims - tolerance) <= upper_bounds[i])
