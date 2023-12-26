@@ -15,24 +15,34 @@ from tqdm.contrib import tenumerate
 from typing import Any
 
 
-def index_dset(dset: Dataset) -> dict[str, int]:
-    """Return a dict mapping image names to their index in the dataset"""
-    idx = {}
-    for i, img in tenumerate(dset.select_columns("name")):
-        idx[img["name"]] = i
-    return idx
-    # return {img["name"]: i for i, img in enumerate(dset.select_columns("name"))}
+def find_binsearch(dset: Dataset, name: str) -> int:
+    """Find an image in a sorted dataset by name using binary search."""
+
+    lower_bound = 0
+    upper_bound = len(dset) - 1
+
+    while lower_bound <= upper_bound:
+        midpoint = (lower_bound + upper_bound) // 2
+        value = dset[midpoint]["name"]
+
+        if value == name:
+            return midpoint
+        elif value < name:
+            lower_bound = midpoint + 1
+        else:
+            upper_bound = midpoint - 1
+
+    return None
 
 
 def decode_names(
     mdl: LDMAutoencoder,
     params: Any,
-    idx: dict[str, int],
     dset: Dataset,
     names: list[str],
 ) -> list[PIL.Image.Image]:
     """Decode images from a dataset by name"""
-    idxs = [idx[name] for name in names]
+    idxs = [find_binsearch(dset, name) for name in names]
     print(f"Found indices {idxs} for images {names}")
     dset = dset.select_columns("encoded_img")
 
@@ -67,15 +77,13 @@ def main() -> None:
     )
 
     dset = load_pq_dir(args.dataset_dir)
-    print(f"Loaded dataset with {len(dset)} images")
+    print(f"Loaded dataset with {len(dset)} images. Sorting...")
+    dset = dset.sort("name")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Indexing dataset...")
-    idx = index_dset(dset)
-
     print("Decoding images...")
-    imgs = decode_names(ae_mdl, ae_params, idx, dset, args.names)
+    imgs = decode_names(ae_mdl, ae_params, dset, args.names)
     for name, img in zip(args.names, imgs):
         img.save(f"{args.output_dir / name}.png")
 
