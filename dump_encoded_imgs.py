@@ -8,6 +8,7 @@ import tqdm
 from datasets import Dataset
 from itertools import islice
 from ldm_autoencoder import LDMAutoencoder
+from load_pq_dir import load_pq_dir
 from omegaconf import OmegaConf
 from pathlib import Path
 from tqdm import tqdm
@@ -36,7 +37,7 @@ ae_params = ae_mdl.params_from_torch(
 )
 
 print(f"Loading dataset from {args.pq_dir}")
-dset = Dataset.from_parquet([str(pq) for pq in args.pq_dir.glob("**/*.parquet")])
+dset = load_pq_dir(args.pq_dir)
 dset.set_format("numpy")
 dset = dset.shuffle()
 print(f"Found {len(dset)} images")

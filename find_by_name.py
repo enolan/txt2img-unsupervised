@@ -8,6 +8,7 @@ import torch
 
 from datasets import Dataset
 from ldm_autoencoder import LDMAutoencoder
+from load_pq_dir import load_pq_dir
 from omegaconf import OmegaConf
 from pathlib import Path
 from tqdm.contrib import tenumerate
@@ -65,8 +66,7 @@ def main() -> None:
         torch.load(args.ae_ckpt, map_location="cpu"), cfg=ae_cfg
     )
 
-    pqs = list(sorted([str(pq) for pq in args.dataset_dir.glob("**/*.parquet")]))
-    dset = Dataset.from_parquet(pqs).with_format("np")
+    dset = load_pq_dir(args.dataset_dir)
     print(f"Loaded dataset with {len(dset)} images")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)

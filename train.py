@@ -27,6 +27,7 @@ from functools import partial
 from itertools import islice
 from jax.experimental import mesh_utils
 from ldm_autoencoder import LDMAutoencoder
+from load_pq_dir import load_pq_dir
 from omegaconf import OmegaConf
 from pathlib import Path
 from sys import exit
@@ -168,9 +169,7 @@ def setup_cfg_and_wandb():
 def load_dataset(dir: Path) -> Tuple[Dataset, Dataset]:
     # The paths don't necessarily come out in the same order on every machine, so we sort to make the
     # example order consistent.
-    dset_paths = list(sorted(dir.glob("**/*.parquet")))
-    dset_all = Dataset.from_parquet([str(path) for path in dset_paths])
-    dset_all.set_format("numpy")
+    dset_all = load_pq_dir(dir)
     dset_split = dset_all.train_test_split(test_size=0.01, seed=19900515)
     train_imgs = dset_split["train"]
     test_imgs = dset_split["test"]
