@@ -46,6 +46,7 @@ import numpy as np
 import scipy.special
 from copy import copy
 from dataclasses import dataclass
+from typing import Tuple
 
 
 def log_surface_area_of_slice(d, h):
@@ -333,6 +334,43 @@ def sample_from_cone(rng, table, v, lower_bound, upper_bound):
     return pt
 
 
+def generate_clip_cone(
+    table: LogitsTable, rng: jax.Array, clip: jax.Array
+) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    """Given a CLIP embedding, generate a random cone that contains it."""
+    lower_bound_rng, sim_rng, new_pt_rng = jax.random.split(rng, 3)
+
+    lower_bound = jax.random.uniform(lower_bound_rng, minval=-1.0, maxval=1.0)
+    upper_bound = 1.0
+
+    # Generate the new point
+    new_pt_sim = table.filter_slice_logits(
+        lower_bound, upper_bound
+    ).sample_slice_from_table(sim_rng)
+    new_pt = random_pt_with_cosine_similarity(new_pt_rng, clip, new_pt_sim)
+
+    return new_pt, lower_bound, upper_bound
+
+
+def test_generate_clip_cone() -> None:
+    # Generate some inputs
+    n_inputs = 128
+
+    table = LogitsTable(767, 8192)
+
+    inputs = jax.random.normal(jax.random.PRNGKey(0), shape=(n_inputs, 768))
+    inputs = inputs / jnp.linalg.norm(inputs, axis=1, keepdims=True)
+
+    rng = jax.random.PRNGKey(90210)
+    for clip in inputs:
+        rng, gen_rng = jax.random.split(rng, 2)
+        new_pt, lower_bound, upper_bound = generate_clip_cone(table, gen_rng, clip)
+        assert jnp.isclose(jnp.linalg.norm(new_pt), 1.0, atol=1e-5)
+        sim = jnp.dot(clip, new_pt)
+        assert (sim + 2 / 8192) >= lower_bound
+        assert (sim - 2 / 8192) <= upper_bound
+
+
 def test_sample_from_cone():
     """Test that sample_from_cone works."""
     # Generate some cones
@@ -346,7 +384,7 @@ def test_sample_from_cone():
 
     # Generate some cone sizes
     sizes = jax.random.uniform(
-        size_rng, minval=1 / 8192, maxval=2.0, shape=(n_cones,), dtype=jnp.float32
+        size_rng, minval=2 / 8192, maxval=2.0, shape=(n_cones,), dtype=jnp.float32
     )
 
     # Generate some cosine similarity bounds

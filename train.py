@@ -31,6 +31,7 @@ from omegaconf import OmegaConf
 from pathlib import Path
 from sys import exit
 from tqdm import tqdm, trange
+from triangle_schedule import triangle_schedule
 from typing import Any, Callable, Tuple
 
 # TODO next sweep:
@@ -225,17 +226,6 @@ def setup_optimizer(
     mdl = transformer_model.ImageModel(**model_cfg.__dict__)
 
     # Set up optimizer
-    def triangle_schedule(max_lr: float, total_steps: int) -> optax.Schedule:
-        """Simple linear trianguar learning rate schedule. Best schedule found in Cramming paper.
-        https://arxiv.org/abs/2212.14034"""
-        sched_up = optax.linear_schedule(
-            init_value=0, end_value=max_lr, transition_steps=total_steps // 2
-        )
-        sched_down = optax.linear_schedule(
-            init_value=max_lr, end_value=0, transition_steps=total_steps // 2
-        )
-        return optax.join_schedules([sched_up, sched_down], [total_steps // 2])
-
     if training_cfg.triangle_schedule:
         opt = optax.adam(
             learning_rate=triangle_schedule(
@@ -484,7 +474,9 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
                 sims=len(cos_sim_ranges),
                 g=grid_size,
             )
-            clip_embeds_rep = jax.device_put(clip_embeds_rep, sharding.reshape(jax.device_count(), 1, 1))
+            clip_embeds_rep = jax.device_put(
+                clip_embeds_rep, sharding.reshape(jax.device_count(), 1, 1)
+            )
 
             cos_sim_lower_rep = repeat(
                 cos_sim_lower,
@@ -555,9 +547,7 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
                     )
                     pbar.update(len(codes_batch))
             imgs_np = np.concatenate(sampled_imgs)
-            tqdm.write(
-                f"Decoded images, overall shape {imgs_np.shape}"
-            )
+            tqdm.write(f"Decoded images, overall shape {imgs_np.shape}")
 
             assert imgs_np.shape[0] == samples_count
 
@@ -583,9 +573,7 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
 
             wandb.log(to_log)
         else:
-            samples_count = (
-                embeddings_to_sample * grid_size
-            )
+            samples_count = embeddings_to_sample * grid_size
             assert (samples_count % training_cfg.batch_size) % jax.device_count() == 0
 
             conditioning_embeds_rep = repeat(
@@ -667,10 +655,7 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
 
             for i, name in enumerate(conditioning_names):
                 grid_pil = sample.make_grid(
-                    [
-                        PIL.Image.fromarray(np.array(img))
-                        for img in grid_imgs[i]
-                    ],
+                    [PIL.Image.fromarray(np.array(img)) for img in grid_imgs[i]],
                 )
                 to_log[f"samples/{name}"] = wandb.Image(grid_pil)
 

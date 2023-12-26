@@ -1,3 +1,4 @@
+import cone_sampling
 import flax.core
 import flax.linen as nn
 import jax
@@ -7,12 +8,14 @@ import optax  # type: ignore[import]
 from config import ModelConfig
 from copy import copy
 from dataclasses import dataclass
+from datetime import datetime
 from einops import rearrange, repeat
 from flash_attention_jax import causal_flash_attention
 from flax import struct
 from functools import partial
 from typing import Any, Callable, Optional, Tuple
-from tqdm import trange
+from tqdm import tqdm, trange
+from triangle_schedule import triangle_schedule
 
 
 class ImageModel(nn.Module):
@@ -34,9 +37,8 @@ class ImageModel(nn.Module):
     flash_attention: bool = True
 
     def setup(self) -> None:
-        default_kernel_init = nn.initializers.normal(
-            stddev=0.02 / jnp.sqrt(self.n_layers)
-        )
+        default_stddev = 0.02 / jnp.sqrt(self.n_layers)
+        default_kernel_init = nn.initializers.normal(stddev=default_stddev)
         self.in_embed = nn.Embed(
             num_embeddings=8192,
             features=self.d_model,
@@ -81,20 +83,28 @@ class ImageModel(nn.Module):
             assert self.clip_cone_count is not None, "clip_cone_count must be set"
             assert self.clip_cone_count > 0, "clip_cone_count must be positive"
 
+        # The initializers for CLIP conditioning are chosen such that the projected clip emedding
+        # has the same distribution as the token embeddings and the projected cosine similarities
+        # have the same average magnitude as the token embeddings, assuming the cos sims are drawn
+        # from U[-1, 1].
         self.clip_proj = nn.Dense(
             features=self.d_model,
             use_bias=self.use_biases,
             dtype=self.activations_dtype,
+            kernel_init=default_kernel_init,
         )
+        cos_sim_kernel_init = nn.initializers.normal(stddev=2 * default_stddev)
         self.cos_sim_lower_proj = nn.Dense(
             features=self.d_model,
             use_bias=self.use_biases,
             dtype=self.activations_dtype,
+            kernel_init=cos_sim_kernel_init,
         )
         self.cos_sim_upper_proj = nn.Dense(
             features=self.d_model,
             use_bias=self.use_biases,
             dtype=self.activations_dtype,
+            kernel_init=cos_sim_kernel_init,
         )
         self.positional_encoding = nn.Embed(
             num_embeddings=self.seq_len(),
@@ -493,15 +503,19 @@ def _test_sample_tok_all(
     decoded_logits.append(logits)
     params = flax.core.copy(params, new_cache)
 
-    # compute logits for image toks 1-255 (inputting toks 0-254)
-    for i in range(image_tokens - 1):
-        logits, new_cache = mdl_dec.apply(
+    step_j = jax.jit(
+        lambda params, i: mdl_dec.apply(
             params,
             mutable=["cache"],
             method=mdl_dec.decode_step,
             tok=toks[i],
             idx=jnp.array(i),
         )
+    )
+
+    # compute logits for image toks 1-255 (inputting toks 0-254)
+    for i in range(image_tokens - 1):
+        logits, new_cache = step_j(params, i)
         assert logits.shape == (8192,)
         decoded_logits.append(logits)
         params = flax.core.copy(params, new_cache)
@@ -864,85 +878,11 @@ def test_flash_attention_equals_standard() -> None:
 
     np.testing.assert_allclose(out_std, out_flash, atol=3e-6, rtol=0)
 
-# TODO delet this
-def _random_pt_with_cosine_similarity(
-    rng: jax.Array, pt: jax.Array, sim: jax.Array
-) -> jax.Array:
-    """Generate a random point on the unit sphere that has a given cosine similarity with a given
-    point."""
 
-    # Generate a random point v on the sphere
-    v = jax.random.normal(rng, shape=pt.shape, dtype=pt.dtype)
-    v = v / jnp.linalg.norm(v)
-
-    # Orthogonalize v with respect to pt
-    v_orthogonal = v - jnp.dot(pt, v) * pt
-    v_orthogonal = v_orthogonal / jnp.linalg.norm(v_orthogonal)
-
-    # Find the orthogonal component
-    orthogonal_length = jnp.sqrt(1 - sim**2)
-
-    # Scale v_orthogonal to achieve the desired cosine similarity with u
-    new_point = sim * pt + orthogonal_length * v_orthogonal
-
-    # Ensure the new point is on the sphere
-    new_point = new_point / jnp.linalg.norm(new_point)
-
-    return new_point
-
-
-def test_random_pt_with_cosine_similarity() -> None:
-    # Generate some inputs
-    n_inputs = 128
-    inputs = jax.random.normal(jax.random.PRNGKey(0), shape=(n_inputs, 768))
-    inputs = inputs / jnp.linalg.norm(inputs, axis=1, keepdims=True)
-    assert jnp.linalg.norm(inputs[0]) == 1.0
-
-    rng = jax.random.PRNGKey(1)
-    for pt in inputs:
-        rng, new_pt_rng, sim_rng = jax.random.split(rng, 3)
-        tgt_sim = jax.random.uniform(sim_rng, minval=-1.0, maxval=1.0)
-        new_pt = _random_pt_with_cosine_similarity(new_pt_rng, pt, tgt_sim)
-        assert jnp.isclose(jnp.linalg.norm(new_pt), 1.0, atol=1e-5)
-        assert jnp.isclose(jnp.dot(pt, new_pt), tgt_sim, atol=1e-5)
-
-
-def _generate_clip_cone(
-    rng: jax.Array, clip: jax.Array
-) -> Tuple[jax.Array, jax.Array, jax.Array]:
-    """Given a CLIP embedding, generate a random new embedding that is within a randomly generated
-    range of consine similarity to it."""
-    size_rng, lower_bound_rng, sim_rng, new_pt_rng = jax.random.split(rng, 4)
-
-    # Generate the range of cosine similarities
-    size = jax.random.uniform(size_rng, minval=0.0, maxval=2.0)
-    max_lower_bound = 1 - size
-    lower_bound = jax.random.uniform(
-        lower_bound_rng, minval=-1.0, maxval=max_lower_bound
-    )
-    upper_bound = lower_bound + size
-
-    # Generate the new point
-    new_pt_sim = jax.random.uniform(sim_rng, minval=lower_bound, maxval=upper_bound)
-    new_pt = _random_pt_with_cosine_similarity(new_pt_rng, clip, new_pt_sim)
-
-    return new_pt, lower_bound, upper_bound
-
-
-def test_generate_clip_cone() -> None:
-    # Generate some inputs
-    n_inputs = 128
-    inputs = jax.random.normal(jax.random.PRNGKey(0), shape=(n_inputs, 768))
-    inputs = inputs / jnp.linalg.norm(inputs, axis=1, keepdims=True)
-
-    rng = jax.random.PRNGKey(90210)
-    for clip in inputs:
-        rng, gen_rng = jax.random.split(rng, 2)
-        new_pt, lower_bound, upper_bound = _generate_clip_cone(gen_rng, clip)
-        assert jnp.isclose(jnp.linalg.norm(new_pt), 1.0, atol=1e-5)
-        sim = jnp.dot(clip, new_pt)
-        assert sim >= lower_bound
-        assert sim <= upper_bound
+# A cache for the cosine similarity table is important. It's possible to create it in
+# ImageModel.setup but that gets called every time apply is called which makes the tests slow. So
+# we use a global one.
+_cos_sim_table = None
 
 
 def loss(
@@ -954,6 +894,7 @@ def loss(
     ex_clip: jax.Array,
 ) -> jax.Array:
     """Compute the cross-entropy loss for a single example."""
+    global _cos_sim_table
     assert ex_img.shape == (
         model.image_tokens,
     ), f"ex_img.shape: {ex_img.shape}, expected: {(model.image_tokens,)}"
@@ -962,11 +903,19 @@ def loss(
     else:
         assert ex_clip.shape == (0,)
     if model.clip_cones:
-        clips = repeat(ex_clip, "d -> n d", n=model.clip_cone_count)
+        if _cos_sim_table is None:
+            print("Creating cosine similarity table...")
+            start_time = datetime.now()
+            # 64 KiB ought to be enough for anybody
+            _cos_sim_table = cone_sampling.LogitsTable(767, 64 // 4 * 1024)
+            end_time = datetime.now()
+            print(f"Created cosine similarity table in {end_time - start_time}")
+        else:
+            print("Using cached cosine similarity table")
         cone_rngs = jax.random.split(cone_rng, model.clip_cone_count)
-        cond_clip, lower_bound, upper_bound = jax.vmap(_generate_clip_cone)(
-            cone_rngs, clips
-        )
+        cond_clip, lower_bound, upper_bound = jax.vmap(
+            cone_sampling.generate_clip_cone, in_axes=(None, 0, None)
+        )(_cos_sim_table, cone_rngs, ex_clip)
     else:
         cond_clip = ex_clip
         lower_bound = upper_bound = jnp.array([], dtype=jnp.float32)
@@ -1015,6 +964,133 @@ gpt_1_config = ModelConfig(
     activation_function=jax.nn.relu,
     clip_conditioning=False,
 )
+
+
+def test_cone_train() -> None:
+    """Test the model can memorize some image/clip pairs."""
+    mdl_cfg = copy(gpt_1_config)
+    mdl_cfg.clip_conditioning = True
+    mdl_cfg.clip_cones = True
+    mdl_cfg.clip_cone_count = 9
+    mdl_cfg.dropout = None
+    # This may or may not actually need a model this big, I'm tired of fucking with it.
+    mdl_cfg.d_model = 1024
+    mdl_cfg.num_heads = 16
+    mdl_cfg.n_layers = 24
+
+    n_imgs = 8
+
+    mdl = ImageModel(**mdl_cfg.__dict__)
+
+    img_rng, clip_rng, params_rng, train_rng, test_rng = jax.random.split(
+        jax.random.PRNGKey(0), 5
+    )
+
+    imgs = jax.random.randint(img_rng, (n_imgs, mdl.image_tokens), 0, 8192)
+    clips = jax.random.normal(clip_rng, (n_imgs, 768))
+    clips = clips / jnp.linalg.norm(clips, axis=-1, keepdims=True)
+
+    params = mdl.init(
+        {"params": params_rng, "dropout": jax.random.PRNGKey(0)},
+        image=jnp.zeros((mdl.image_tokens,), dtype=jnp.int32),
+        clip_embedding=jnp.zeros((mdl.clip_cone_count, 768), dtype=jnp.float32),
+        cos_sim_lower=jnp.zeros((mdl.clip_cone_count,), dtype=jnp.float32),
+        cos_sim_upper=jnp.zeros((mdl.clip_cone_count,), dtype=jnp.float32),
+    )
+
+    loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
+
+    steps = 2_000
+    adam = optax.adam(learning_rate=triangle_schedule(3e-5, steps))
+    opt = optax.chain(optax.clip_by_global_norm(0.25), adam)
+    opt_state = opt.init(params)
+
+    def opt_step(params, opt_state, rng):
+        dropout_rng, cones_rng, rng2 = jax.random.split(rng, 3)
+        loss, grads = loss_grad_fn(
+            mdl,
+            params,
+            dropout_rng,
+            cones_rng,
+            batch_imgs=imgs,
+            batch_clips=clips,
+        )
+        updates, opt_state = opt.update(grads, opt_state)
+        new_params = optax.apply_updates(params, updates)
+        norm = optax.global_norm(grads)
+        return new_params, opt_state, rng2, loss, norm
+
+    opt_step = jax.jit(opt_step, donate_argnums=(0, 1, 2))
+
+    for i in trange(steps):
+        params, opt_state, train_rng, loss, norm = opt_step(
+            params, opt_state, train_rng
+        )
+        tqdm.write(f"iter {i:04d} loss: {loss:0.4f} grad norm: {norm:7.2f}")
+
+    sampled_imgs = []
+    for i in trange(n_imgs):
+        sample_rng, tgt_rng, fill_rng, test_rng = jax.random.split(test_rng, 4)
+
+        # The model should've memorized the dataset at this point, but it can only generate images
+        # with a specified similarity to a given embedding. It can't generate an image with an
+        # exact embedding. So we generate a random target with a specified similarity.
+        tgt_v = cone_sampling.random_pt_with_cosine_similarity(tgt_rng, clips[i], 0.5)[
+            None, :
+        ]
+        tgt_lower_bound = jnp.array([0.5])
+        tgt_upper_bound = jnp.array([1.0])
+
+        fill_vs = jax.random.normal(fill_rng, (mdl.clip_cone_count - 1, 768))
+        fill_vs = fill_vs / jnp.linalg.norm(fill_vs, axis=-1, keepdims=True)
+
+        fill_lower_bounds = jnp.full((mdl.clip_cone_count - 1,), -1.0)
+        fill_upper_bounds = jnp.full((mdl.clip_cone_count - 1,), 1.0)
+
+        cond_vs = jnp.concatenate([tgt_v, fill_vs], axis=0)
+        cond_lower_bounds = jnp.concatenate(
+            [tgt_lower_bound, fill_lower_bounds], axis=0
+        )
+        cond_upper_bounds = jnp.concatenate(
+            [tgt_upper_bound, fill_upper_bounds], axis=0
+        )
+
+        assert cond_vs.shape == (mdl.clip_cone_count, 768)
+        assert (
+            cond_lower_bounds.shape == cond_upper_bounds.shape == (mdl.clip_cone_count,)
+        )
+
+        toks = sample(
+            mdl,
+            params,
+            cond_vs,
+            cond_lower_bounds,
+            cond_upper_bounds,
+            sample_rng,
+            top_p=0.25,
+        )
+        sampled_imgs.append(toks)
+
+    sampled_imgs = jnp.stack(sampled_imgs, axis=0)
+
+    # Test that sampled images are the training images
+    correct_imgs = [0] * n_imgs
+    for img in sampled_imgs:
+        for i, train_img in enumerate(imgs):
+            if jnp.all(img == train_img):
+                correct_imgs[i] += 1
+                break
+    correct_img_cnt = sum(correct_imgs)
+    print(f"correct_imgs: {correct_imgs}, count {correct_img_cnt}")
+    assert correct_img_cnt == n_imgs
+
+    # Test that sampled images match the CLIP conditioning
+    correct_conds = [False] * n_imgs
+    for i in range(n_imgs):
+        correct_conds[i] = jnp.array_equal(imgs[i], sampled_imgs[i])
+    correct_conds = np.array(correct_conds)
+    print(f"correct_conds: {correct_conds}")
+    assert all(correct_conds)
 
 
 def train_loop_simple(
