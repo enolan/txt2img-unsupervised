@@ -206,6 +206,7 @@ class CapTree:
         found_duplicates=[],
     ):
         self.dset = dset
+        self.len = len(dset)
         self.batch_size = batch_size
         self.k = k
         self.iters = iters
@@ -219,7 +220,7 @@ class CapTree:
         self.found_duplicates = found_duplicates
 
     def __len__(self):
-        return len(self.dset)
+        return self.len
 
     def split_once(self):
         """Split this cap into children."""
@@ -249,6 +250,7 @@ class CapTree:
             for i in range(len(centroids))
             if len(assignments[i]) > 0
         ]
+        self.dset = None
 
         if len(self.children) == 1:
             # There may be very rare cases where this isn't caused by duplicate vectors, but in
@@ -289,7 +291,7 @@ class CapTree:
                     if len(rows) > 1
                 )
 
-                # Creat a new, deduplicate Dataset
+                # Creat a new, deduplicated Dataset
                 dset_dict = {}
                 for col in self.dset.column_names:
                     dset_dict[col] = np.array(
@@ -358,12 +360,16 @@ class CapTree:
         """Check invariants of the tree."""
         assert len(self) > 0
         if len(self.children) > 0:
+            assert self.dset is None
             assert sum(len(child) for child in self.children) == len(self)
+        else:
+            assert self.dset is not None
+            assert self.len == len(self.dset)
+            assert self.center.shape == self.dset[0]["clip_embedding"].shape
 
         assert self.max_cos_distance <= 2
         assert np.isclose(np.linalg.norm(self.center), 1.0)
         assert self.center.dtype == np.float32
-        assert self.center.shape == self.dset[0]["clip_embedding"].shape
 
         self._check_inside_cap(self.center, self.max_cos_distance)
 
