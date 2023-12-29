@@ -39,6 +39,7 @@ nvidia-cudnn-cu12 = "8.9.4.25" # 8.9.5.29 is latest as of now (2023-10-19) but i
 [tool.poetry.group.dev.dependencies]
 black = "^23.3.0"
 flameprof = "^0.4"
+hypothesis = {extras = ["numpy"], version = "^6.92.2"}
 ipython = "^8.14.0"
 matplotlib = "^3.7.1"
 memray = "^1.11.0"
