@@ -1,20 +1,21 @@
 """Find images from parquet files by name and decode them"""
 
 import argparse
-import ldm_autoencoder
 import numpy as np
 import PIL.Image
 import torch
 
 from datasets import Dataset
 from einops import rearrange
-from ldm_autoencoder import LDMAutoencoder
-from load_pq_dir import load_pq_dir
 from omegaconf import OmegaConf
 from pathlib import Path
-from sample import batches_split
 from tqdm import tqdm
 from typing import Any
+
+from txt2img_unsupervised import ldm_autoencoder
+from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
+from txt2img_unsupervised.load_pq_dir import load_pq_dir
+from txt2img_unsupervised.sample import batches_split
 
 
 def find_binsearch(dset: Dataset, name: str) -> int:

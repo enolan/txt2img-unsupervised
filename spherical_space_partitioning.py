@@ -10,10 +10,10 @@ from datasets import Dataset
 from datetime import timedelta
 from functools import partial
 from hypothesis import given, strategies as st
-from load_pq_dir import load_pq_dir
 from pathlib import Path
 from tqdm import tqdm
 
+from txt2img_unsupervised.load_pq_dir import load_pq_dir
 
 def find_k_means(dset, batch_size, k, iters):
     # Mini-batch k-means, see "Web-Scale K-Means Clustering" by D. Sculley 2010

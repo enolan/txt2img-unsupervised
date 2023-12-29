@@ -3,7 +3,6 @@ import argparse
 import dacite
 import jax
 import jax.numpy as jnp
-import ldm_autoencoder
 import numpy as np
 import orbax.checkpoint  # type: ignore[import]
 import PIL.Image
@@ -12,14 +11,15 @@ import transformers
 from copy import copy
 from einops import repeat
 from flax.core import freeze
-from ldm_autoencoder import LDMAutoencoder
 from omegaconf import OmegaConf
 from pathlib import Path
 from random import randint
 from tqdm import tqdm, trange
-from transformer_model import ImageModel, ModelConfig, gpt_1_config, sample
 from typing import Tuple
 
+from . import ldm_autoencoder
+from .ldm_autoencoder import LDMAutoencoder
+from .transformer_model import ImageModel, ModelConfig, gpt_1_config, sample
 
 def can_make_grid(n: int) -> bool:
     return (n**0.5) % 1 == 0

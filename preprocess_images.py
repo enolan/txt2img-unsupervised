@@ -21,12 +21,13 @@ from CloseableQueue import CloseableQueue as CQueue
 from concurrent import futures
 from copy import copy
 from einops import rearrange
-from ldm_autoencoder import LDMAutoencoder
 from omegaconf import OmegaConf
 from pathlib import Path
 from threading import Lock, Semaphore, Thread
 from tqdm import tqdm
 from typing import Optional
+
+from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--batch-size", type=int)

@@ -1,23 +1,18 @@
 """Train the image model."""
 import argparse
-import config
 import datetime
 import flax.core
 import jax
 import jax.numpy as jnp
 import json
-import ldm_autoencoder
 import numpy as np
 import optax  # type:ignore[import]
 import orbax.checkpoint  # type:ignore[import]
 import PIL.Image
-import sample
 import time
 import torch
 import transformers
-import transformer_model
 import wandb
-from config import ModelConfig, TrainingConfig, str_to_activation, str_to_dtype
 from copy import copy
 from datasets import Dataset
 from distutils.util import strtobool
@@ -26,14 +21,26 @@ from flax.training import train_state
 from functools import partial
 from itertools import islice
 from jax.experimental import mesh_utils
-from ldm_autoencoder import LDMAutoencoder
-from load_pq_dir import load_pq_dir
 from omegaconf import OmegaConf
 from pathlib import Path
 from sys import exit
 from tqdm import tqdm, trange
-from triangle_schedule import triangle_schedule
 from typing import Any, Callable, Tuple
+
+from txt2img_unsupervised.config import (
+    ModelConfig,
+    TrainingConfig,
+    str_to_activation,
+    str_to_dtype,
+)
+from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
+from txt2img_unsupervised.load_pq_dir import load_pq_dir
+from txt2img_unsupervised.triangle_schedule import triangle_schedule
+import txt2img_unsupervised.config as config
+import txt2img_unsupervised.ldm_autoencoder as ldm_autoencoder
+import txt2img_unsupervised.sample as sample
+import txt2img_unsupervised.transformer_model as transformer_model
+
 
 # TODO next sweep:
 # - learning rate

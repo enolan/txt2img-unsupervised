@@ -1,11 +1,9 @@
-import cone_sampling
 import flax.core
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax  # type: ignore[import]
-from config import ModelConfig
 from copy import copy
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,8 +13,10 @@ from flax import struct
 from functools import partial
 from typing import Any, Callable, Optional, Tuple
 from tqdm import tqdm, trange
-from triangle_schedule import triangle_schedule
 
+from . import cone_sampling
+from .config import ModelConfig
+from .triangle_schedule import triangle_schedule
 
 class ImageModel(nn.Module):
     """A transformer model for images encoded to a discrete representation."""
