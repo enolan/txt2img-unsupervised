@@ -7,11 +7,13 @@ import PIL.Image
 import torch
 
 from datasets import Dataset
+from einops import rearrange
 from ldm_autoencoder import LDMAutoencoder
 from load_pq_dir import load_pq_dir
 from omegaconf import OmegaConf
 from pathlib import Path
-from tqdm.contrib import tenumerate
+from sample import batches_split
+from tqdm import tqdm
 from typing import Any
 
 
@@ -53,8 +55,18 @@ def decode_names(
     assert res_tokens**2 == codes.shape[1]
     res_pixels = res_tokens * 4
 
-    images = ldm_autoencoder.decode_jv(mdl, params, (res_tokens, res_tokens), codes)
-    assert images.shape == (len(names), res_pixels, res_pixels, 3)
+    images = []
+    with tqdm(total=len(codes), unit="img") as pbar:
+        for batch_size in batches_split(batch_size=16, n=len(codes)):
+            images.append(
+                ldm_autoencoder.decode_jv(
+                    mdl, params, (res_tokens, res_tokens), codes[:batch_size]
+                )
+            )
+            codes = codes[batch_size:]
+            pbar.update(batch_size)
+    images = np.concatenate(images, axis=0)
+    assert images.shape == (len(names), res_pixels, res_pixels, 3), f"{images.shape}"
 
     return [PIL.Image.fromarray(np.array(img)) for img in images]
 
