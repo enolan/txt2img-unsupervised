@@ -788,8 +788,17 @@ class TransformerLayer(nn.Module):
                 ), "attention mask is redundant with causal_flash_attention"
                 assert dropout_rate == 0.0, "attention dropout not implemented"
 
-                res = causal_flash_attention(q, k, v)
-
+                try:
+                    res = causal_flash_attention(q, k, v)
+                except TypeError as e:
+                    if "cannot reshape array of shape" in str(e):
+                        raise ValueError(
+                            (
+                                "Got an exception from causal_flash_attention: {}. You may have "
+                                "run into its bug with sequence lengths that are not a multiple of "
+                                "the chunk size."
+                            ).format(e)
+                        )
                 if dtype != None:
                     assert res.dtype == dtype
 
