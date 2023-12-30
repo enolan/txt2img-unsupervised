@@ -457,6 +457,7 @@ def main():
     parser.add_argument("--summary-file", type=Path, default=None)
     parser.add_argument("--write-dup-blacklist", type=Path, default=None)
     parser.add_argument("--read-dup-blacklist", type=Path, default=None)
+    parser.add_argument("--paranoid", action="store_true")
     args = parser.parse_args()
 
     dset_all = load_pq_dir(args.pq_dir)
@@ -491,8 +492,9 @@ def main():
     )
     tree.split_rec()
 
-    # This is a pretty slow check, but I don't 100% trust the code
-    tree._check_invariants()
+    if args.paranoid:
+        # This is a pretty slow check, but I don't 100% trust the code
+        tree._check_invariants()
 
     # minimum possible depth, given branching factor is k and leaves can have at most k^2 vectors
     min_depth = int(np.ceil(np.log(len(dset)) / np.log(args.k**2)))
