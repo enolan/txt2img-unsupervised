@@ -1,19 +1,21 @@
 import argparse
+import base64
 import hypothesis as hyp
 import hypothesis.extra.numpy as hyp_np
 import jax
 import jax.numpy as jnp
 import json
 import numpy as np
-import tqdm
+
 from datasets import Dataset
-from datetime import timedelta
+from datetime import datetime, timedelta
 from functools import partial
 from hypothesis import given, strategies as st
 from pathlib import Path
 from tqdm import tqdm
-
+from tqdm.contrib import tenumerate
 from txt2img_unsupervised.load_pq_dir import load_pq_dir
+
 
 def find_k_means(dset, batch_size, k, iters):
     # Mini-batch k-means, see "Web-Scale K-Means Clustering" by D. Sculley 2010
@@ -172,10 +174,48 @@ def cosine_distance(x, y):
     return 1 - jnp.dot(x, y)
 
 
-@jax.jit
+@partial(jax.jit, inline=True)
 def cosine_distance_many_to_one(xs, y):
     """Cosine distance between each x in xs and y. Assumes xs and y are unit vectors."""
     return 1 - jnp.dot(xs, y)
+
+
+def caps_overlap(center1, max_cos_distance1, center2, max_cos_distance2):
+    """Check if two caps overlap."""
+    return (
+        cosine_distance(center1, center2)
+        <= max_cos_distance1 + max_cos_distance2 + CapTree.EPSILON
+    )
+
+
+def caps_overlap_v(center1, max_cost_distance1, centers, max_cos_distances):
+    """Check if a cap overlaps with any of a set of caps. Returns an array of bools."""
+    return jax.vmap(caps_overlap, in_axes=(None, None, 0, 0))(
+        center1, max_cost_distance1, centers, max_cos_distances
+    )
+
+
+@jax.jit
+def sample_overlapping_caps_weighted(
+    rng, center1, max_cos_distance1, centers, max_cos_distances, weights
+):
+    """Given a query cap and a set of target caps plus a set of weights for the targets, sample
+    from the subset of the targets that overlap the query with probability proportional to the
+    weights."""
+    assert len(centers) == len(max_cos_distances) == len(weights)
+    assert len(centers) > 0
+
+    overlapping_caps_mask = caps_overlap_v(
+        center1, max_cos_distance1, centers, max_cos_distances
+    )
+    assert overlapping_caps_mask.shape == (len(centers),)
+
+    logits = jnp.where(overlapping_caps_mask, jnp.log(weights), -1e6)
+    assert logits.shape == (len(centers),)
+
+    selected = jax.random.categorical(rng, logits)
+    assert selected.shape == ()
+    return selected, overlapping_caps_mask
 
 
 def find_nearest_centroid(x, centroids):
@@ -205,6 +245,7 @@ class CapTree:
         max_cos_distance=2.0,
         found_duplicates=[],
     ):
+        assert len(dset) > 0, "CapTree must be initialized with a non-empty dataset"
         self.dset = dset
         self.len = len(dset)
         self.batch_size = batch_size
@@ -217,6 +258,8 @@ class CapTree:
         self.center = center
         self.max_cos_distance = max_cos_distance
         self.children = []
+        self.child_cap_centers = None
+        self.child_cap_max_cos_distances = None
         self.found_duplicates = found_duplicates
 
     def __len__(self):
@@ -250,6 +293,11 @@ class CapTree:
             for i in range(len(centroids))
             if len(assignments[i]) > 0
         ]
+        self.child_cap_centers = np.array([child.center for child in self.children])
+        self.child_cap_max_cos_distances = np.array(
+            [child.max_cos_distance for child in self.children]
+        )
+
         self.dset = None
 
         if len(self.children) == 1:
@@ -362,10 +410,22 @@ class CapTree:
         if len(self.children) > 0:
             assert self.dset is None
             assert sum(len(child) for child in self.children) == len(self)
+            assert (
+                self.child_cap_centers.shape[0]
+                == self.child_cap_max_cos_distances.shape[0]
+                == len(self.children)
+            )
+            for i in range(len(self.child_cap_centers)):
+                assert np.all(self.child_cap_centers[i] == self.children[i].center)
+                assert (
+                    self.child_cap_max_cos_distances[i]
+                    == self.children[i].max_cos_distance
+                )
         else:
             assert self.dset is not None
             assert self.len == len(self.dset)
             assert self.center.shape == self.dset[0]["clip_embedding"].shape
+            assert self.child_cap_centers == self.child_cap_max_cos_distances == None
 
         assert self.max_cos_distance <= 2
         assert np.isclose(np.linalg.norm(self.center), 1.0)
@@ -403,7 +463,7 @@ class CapTree:
 
     def items(self):
         """Generator for all the original rows in the dataset."""
-        # The primary purpose of this function is testing, so we get everything from the leaves.
+        # The primary purpose of this function is testing
         if len(self.children) == 0:
             for row in self.dset:
                 yield row
@@ -412,24 +472,142 @@ class CapTree:
                 for row in child.items():
                     yield row
 
+    def leaves(self):
+        """Generator for all the leaves of the tree."""
+        if len(self.children) == 0:
+            yield self
+        else:
+            for child in self.children:
+                for leaf in child.leaves():
+                    yield leaf
+
+    def shuffle_leaves(self):
+        """Shuffle the leaves of the tree."""
+        for leaf in self.leaves():
+            leaf.dset = leaf.dset.shuffle()
+
+    def sample_in_cap(self, center, max_cos_distance):
+        """Sample uniformly from the vectors in this cap that are inside the input cap."""
+        if len(self.children) == 0:
+            # leaf
+            distances = cosine_distance_many_to_one(self.dset["clip_embedding"], center)
+            valid_distances_mask = distances <= max_cos_distance
+            valid_idxs = np.arange(len(self.dset))[valid_distances_mask]
+            if len(valid_idxs) == 0:
+                return None
+            else:
+                random_valid_idx = np.random.randint(len(valid_idxs))
+                random_idx = int(valid_idxs[random_valid_idx])
+                return self.dset[random_idx]
+        else:
+            # inner node
+            rng = jax.random.PRNGKey(np.random.randint(0, 2**32))
+            sizes = np.array([len(child) for child in self.children])
+            assert np.all(sizes > 0)
+            while True:
+                # Loop until we eliminate all children from consideration (setting their sizes to
+                # 0) or we find a sample.
+                sub_rng, rng = jax.random.split(rng)
+                sampled_child, overlapping_caps_mask = sample_overlapping_caps_weighted(
+                    sub_rng,
+                    center,
+                    max_cos_distance + self.EPSILON,
+                    self.child_cap_centers,
+                    self.child_cap_max_cos_distances,
+                    sizes,
+                )
+                sizes = np.where(overlapping_caps_mask, sizes, 0)
+                if np.all(sizes == 0):
+                    return None
+                inner_sample = self.children[sampled_child].sample_in_cap(
+                    center, max_cos_distance
+                )
+                if inner_sample is None:
+                    sizes[sampled_child] = 0
+                else:
+                    return inner_sample
+                if np.all(sizes == 0):
+                    return None
+
+    def save_to_disk(self, dir):
+        """Save the tree to disk."""
+        dir.mkdir(exist_ok=False, parents=True)
+        info = {
+            "len": len(self),
+            "batch_size": self.batch_size,
+            "k": self.k,
+            "iters": self.iters,
+            "dup_check": self.dup_check,
+            "max_cos_distance": float(self.max_cos_distance),
+            "children_cnt": len(self.children),
+            "center": base64.b64encode(self.center.tobytes()).decode("ascii"),
+        }
+        with open(dir / "info.json", "w") as f:
+            json.dump(info, f, indent=2)
+        if len(self.children) > 0:
+            for i, child in tenumerate(
+                self.children, desc="saving children", leave=None
+            ):
+                child.save_to_disk(dir / f"child_{i}")
+            assert self.dset is None
+        else:
+            self.dset.to_parquet(dir / "dset", compression="zstd")
+
+    @classmethod
+    def load_from_disk(cls, dir):
+        """Load a tree from disk."""
+        out = cls.__new__(cls)
+        with open(dir / "info.json", "r") as f:
+            info = json.load(f)
+        out.len = info["len"]
+        out.batch_size = info["batch_size"]
+        out.k = info["k"]
+        out.iters = info["iters"]
+        out.dup_check = info["dup_check"]
+        out.found_duplicates = []
+        out.center = np.frombuffer(base64.b64decode(info["center"]), dtype=np.float32)
+        out.max_cos_distance = info["max_cos_distance"]
+        out.children = []
+
+        if info["children_cnt"] > 0:
+            for i in range(info["children_cnt"]):
+                out.children.append(CapTree.load_from_disk(dir / f"child_{i}"))
+            out.dset = None
+            out.child_cap_centers = np.array([child.center for child in out.children])
+            out.child_cap_max_cos_distances = np.array(
+                [child.max_cos_distance for child in out.children]
+            )
+        else:
+            out.dset = Dataset.from_parquet(str(dir / "dset")).with_format("numpy")
+            out.child_cap_centers = None
+            out.child_cap_max_cos_distances = None
+        return out
+
+
+@st.composite
+def _unit_vecs(draw, shape):
+    """Strategy for drawing unique unit vectors."""
+    vecs = draw(
+        hyp_np.arrays(
+            np.float32, shape, elements=st.floats(-1.0, 1.0, width=32), unique=True
+        )
+    )
+    hyp.assume(np.all(np.linalg.norm(vecs, axis=1) > 0))
+    return vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+
 
 @hyp.settings(
-    suppress_health_check=[hyp.HealthCheck.data_too_large],
     deadline=timedelta(seconds=30),
     max_examples=500,
+    suppress_health_check=[hyp.HealthCheck.data_too_large],
 )
 @given(
-    hyp_np.arrays(
-        np.float32,
-        st.tuples(st.integers(1, 512), st.integers(2, 4)),
-        elements=st.floats(-1.0, 1.0, width=32),
-        unique=True,
+    _unit_vecs(
+        st.tuples(st.integers(1, 1024), st.integers(2, 4)),
     )
 )
 def test_tree_invariants(vecs):
     """Test that the tree invariants hold for any set of vectors."""
-    hyp.assume(np.all(np.linalg.norm(vecs, axis=1) > 0))
-    vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
 
     vecs_set = set(tuple(vec) for vec in vecs)
     hyp.assume(len(vecs_set) == len(vecs))
@@ -441,8 +619,67 @@ def test_tree_invariants(vecs):
     tree._check_invariants()
 
     # check that the elements in the tree are the ones we put in
-    tree_vecs = set(tuple(row["clip_embedding"]) for row in tree.items())
-    assert tree_vecs == vecs_set
+    tree_vecs_set = set(tuple(row["clip_embedding"]) for row in tree.items())
+    assert tree_vecs_set == vecs_set
+
+
+@hyp.settings(
+    deadline=timedelta(seconds=30),
+    max_examples=500,
+    suppress_health_check=[hyp.HealthCheck.data_too_large],
+)
+@given(
+    _unit_vecs(
+        st.tuples(st.integers(2, 1025), st.integers(2, 4)),
+    ),
+    st.floats(0, 2.0, width=32),
+)
+def test_tree_sample_in_bounds(vecs, max_cos_distance):
+    """Test that sampling retrieves vectors in the specified cap."""
+
+    query_center = vecs[0]
+    vecs = vecs[1:]
+    vecs_set = set(tuple(vec) for vec in vecs)
+
+    dset = Dataset.from_dict({"clip_embedding": vecs}).with_format("numpy")
+    tree = CapTree(dset, batch_size=32, k=4, iters=16)
+    tree.split_rec()
+    print(f"items: {len(tree)} max depth: {tree.depth()}")
+
+    sample = tree.sample_in_cap(query_center, max_cos_distance)
+    if sample is not None:
+        assert (
+            cosine_distance(sample["clip_embedding"], query_center)
+            <= max_cos_distance + tree.EPSILON
+        )
+        assert tuple(sample["clip_embedding"]) in vecs_set
+
+
+@hyp.settings(
+    deadline=timedelta(seconds=30),
+    max_examples=500,
+    suppress_health_check=[hyp.HealthCheck.data_too_large],
+)
+@given(
+    _unit_vecs(
+        st.tuples(st.integers(1, 1024), st.integers(2, 4)),
+    )
+)
+def test_tree_sample_finds_all(vecs):
+    """Test that sampling retrieves all vectors in the tree when sampling from tiny caps centered
+    on each vector."""
+
+    dset = Dataset.from_dict({"clip_embedding": vecs}).with_format("numpy")
+    tree = CapTree(dset, batch_size=32, k=4, iters=16)
+    tree.split_rec()
+
+    for vec in vecs:
+        sample = tree.sample_in_cap(vec, 0.00001)
+        distance = cosine_distance(sample["clip_embedding"], vec)
+        assert distance <= 0.00001
+        # Hypothesis sometimes generates vectors that are *very* close together, so even with a
+        # very small cap we can sample a different vector.
+        # np.testing.assert_array_equal(sample["clip_embedding"], vec)
 
 
 def main():
@@ -458,11 +695,16 @@ def main():
     parser.add_argument("--write-dup-blacklist", type=Path, default=None)
     parser.add_argument("--read-dup-blacklist", type=Path, default=None)
     parser.add_argument("--paranoid", action="store_true")
+    parser.add_argument("--save-dir", type=Path, required=True)
     args = parser.parse_args()
+
+    get_timestamp = lambda: datetime.utcnow().isoformat()
+    print(f"Time at start: {get_timestamp()}")
 
     dset_all = load_pq_dir(args.pq_dir)
     dset_split = dset_all.train_test_split(test_size=0.01, seed=19900515)
     dset = dset_split["train"]
+    print(f"Time after split: {get_timestamp()}")
 
     if args.read_dup_blacklist is not None:
         with open(args.read_dup_blacklist, "r") as f:
@@ -479,9 +721,15 @@ def main():
             lambda name: name not in blacklist, input_columns="name", num_proc=16
         )
         print(f"Removed {pre_count - len(dset)} blacklisted images")
-
+        print(f"Time after blacklist: {get_timestamp()}")
     if args.subset is not None:
         dset = dset.select(range(args.subset))
+
+    if args.save_dir.exists():
+        print(f"Save dir {args.save_dir} exists, exiting")
+        exit(1)
+
+    print(f"Time after subset/before building tree: {get_timestamp()}")
 
     tree = CapTree(
         dset,
@@ -517,6 +765,11 @@ def main():
             )
             with open(args.write_dup_blacklist, "w") as f:
                 json.dump(tree.found_duplicates, f, indent=2)
+
+    print(f"Time at end: {get_timestamp()}")
+
+    print(f"Saving to {args.save_dir}")
+    tree.save_to_disk(args.save_dir)
 
 
 if __name__ == "__main__":
