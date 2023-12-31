@@ -1,11 +1,13 @@
 import argparse
 import base64
+import datasets
 import hypothesis as hyp
 import hypothesis.extra.numpy as hyp_np
 import jax
 import jax.numpy as jnp
 import json
 import numpy as np
+import tempfile
 
 from datasets import Dataset
 from datetime import datetime, timedelta
@@ -348,31 +350,37 @@ class CapTree:
                 self.dset = Dataset.from_dict(dset_dict).with_format("numpy")
                 tqdm.write(f"New leaf size: {len(self.dset)}")
 
-    def _to_summary_inner(self):
-        """Make a python dict summary representation of the tree for visualization."""
-        return {
+    def _to_summary_inner(self, centers=False):
+        """Make a JSON representation of a node. If centers is True, include the centers of the
+        caps. A captree can be reconstructed from this representation if centers is True and the
+        contents of the dsets in the leaves are saved as well."""
+        out = {
             "max_cos_distance": float(self.max_cos_distance),
-            "size": len(self),
-        } | (
-            {"children": [child._to_summary_inner() for child in self.children]}
-            if len(self.children) > 0
-            else {}
-        )
+            "len": len(self),
+        }
+        if centers:
+            out["center"] = base64.b64encode(self.center.tobytes()).decode("ascii")
+        if len(self.children) > 0:
+            out["children"] = [
+                child._to_summary_inner(centers) for child in self.children
+            ]
+        return out
 
-    def to_summary(self):
-        """Make a JSON summary representation of the tree for visualization."""
-        return json.dumps(
-            {
-                "structure": self._to_summary_inner(),
-                "depth": self.depth(),
-                "total_vectors": len(self),
-                "k": self.k,
-                "max_leaf_size": self.max_leaf_size(),
-                "min_leaf_size": self.min_leaf_size(),
-                "mean_depth": np.mean(list(self.leaf_depths())),
-            },
-            indent=2,
-        )
+    def to_summary(self, centers=False):
+        """Make a summary representation of the tree. Returns a dict to be encoded as JSON. Same
+        deal as above re reconstructing the tree."""
+        return {
+            "structure": self._to_summary_inner(centers),
+            "total_vectors": len(self),
+            "batch_size": self.batch_size,
+            "k": self.k,
+            "iters": self.iters,
+            "dup_check": self.dup_check,
+            "depth": self.depth(),
+            "max_leaf_size": self.max_leaf_size(),
+            "min_leaf_size": self.min_leaf_size(),
+            "mean_depth": np.mean(list(self.leaf_depths())),
+        }
 
     def depth(self):
         """Depth of the tree."""
@@ -532,55 +540,89 @@ class CapTree:
     def save_to_disk(self, dir):
         """Save the tree to disk."""
         dir.mkdir(exist_ok=False, parents=True)
-        info = {
-            "len": len(self),
-            "batch_size": self.batch_size,
-            "k": self.k,
-            "iters": self.iters,
-            "dup_check": self.dup_check,
-            "max_cos_distance": float(self.max_cos_distance),
-            "children_cnt": len(self.children),
-            "center": base64.b64encode(self.center.tobytes()).decode("ascii"),
-        }
-        with open(dir / "info.json", "w") as f:
-            json.dump(info, f, indent=2)
+        summary = self.to_summary(centers=True)
+        with open(dir / "structure.json", "w") as f:
+            json.dump(summary, f, indent=2)
+
+        # We concatenate all the leaves into one big dataset before saving to disk. This is a bit
+        # more complicated (especially loading) but lets the parquet compression work much better.
+        dsets = [leaf.dset for leaf in self.leaves()]
+        dset_all = datasets.concatenate_datasets(dsets)
+        with open(dir / "data.parquet", "wb") as f:
+            dset_all.to_parquet(f, compression="zstd")
+
+    def _empty_from_summary(self, root, node_json):
+        """Fill in everything in a node based on the JSON representation (with centers) except the
+        dset."""
+        self.batch_size = root.batch_size
+        self.k = root.k
+        self.iters = root.iters
+        self.dup_check = root.dup_check
+        self.found_duplicates = root.found_duplicates
+
+        self.len = node_json["len"]
+        assert (
+            "center" in node_json
+        ), "centers must be included in summary if you want to load a tree"
+        self.center = np.frombuffer(
+            base64.b64decode(node_json["center"]), dtype=np.float32
+        )
+        self.max_cos_distance = node_json["max_cos_distance"]
+        self.children = []
+
+        if "children" in node_json:
+            for child_json in node_json["children"]:
+                child = self.__class__.__new__(self.__class__)
+                child._empty_from_summary(root, child_json)
+                self.children.append(child)
+            self.dset = None
+
+    def _fixup_traversal_arrays(self):
+        """Fix up the arrays used for traversing the tree."""
         if len(self.children) > 0:
-            for i, child in tenumerate(
-                self.children, desc="saving children", leave=None
-            ):
-                child.save_to_disk(dir / f"child_{i}")
-            assert self.dset is None
+            self.child_cap_centers = np.array([child.center for child in self.children])
+            self.child_cap_max_cos_distances = np.array(
+                [child.max_cos_distance for child in self.children]
+            )
+            for child in self.children:
+                child._fixup_traversal_arrays()
         else:
-            self.dset.to_parquet(dir / "dset", compression="zstd")
+            self.child_cap_centers = self.child_cap_max_cos_distances = None
 
     @classmethod
     def load_from_disk(cls, dir):
         """Load a tree from disk."""
-        out = cls.__new__(cls)
-        with open(dir / "info.json", "r") as f:
-            info = json.load(f)
-        out.len = info["len"]
-        out.batch_size = info["batch_size"]
-        out.k = info["k"]
-        out.iters = info["iters"]
-        out.dup_check = info["dup_check"]
-        out.found_duplicates = []
-        out.center = np.frombuffer(base64.b64decode(info["center"]), dtype=np.float32)
-        out.max_cos_distance = info["max_cos_distance"]
-        out.children = []
+        with open(dir / "structure.json", "r") as f:
+            summary = json.load(f)
 
-        if info["children_cnt"] > 0:
-            for i in range(info["children_cnt"]):
-                out.children.append(CapTree.load_from_disk(dir / f"child_{i}"))
-            out.dset = None
-            out.child_cap_centers = np.array([child.center for child in out.children])
-            out.child_cap_max_cos_distances = np.array(
-                [child.max_cos_distance for child in out.children]
-            )
-        else:
-            out.dset = Dataset.from_parquet(str(dir / "dset")).with_format("numpy")
-            out.child_cap_centers = None
-            out.child_cap_max_cos_distances = None
+        out = cls.__new__(cls)
+
+        out.batch_size = summary["batch_size"]
+        out.k = summary["k"]
+        out.iters = summary["iters"]
+        out.dup_check = summary["dup_check"]
+        out.found_duplicates = []
+        out.dset = None
+        out.len = summary["total_vectors"]
+
+        out._empty_from_summary(out, summary["structure"])
+
+        dset_full = Dataset.from_parquet(str(dir / "data.parquet")).with_format("numpy")
+
+        leaf_ranges = []
+        leaf_idx = 0
+
+        for leaf in out.leaves():
+            leaf_ranges.append((leaf_idx, leaf_idx + len(leaf)))
+            leaf_idx += len(leaf)
+
+        assert leaf_ranges[-1][1] == len(dset_full)
+
+        for i, leaf in enumerate(out.leaves()):
+            leaf.dset = dset_full.select(range(*leaf_ranges[i]))
+
+        out._fixup_traversal_arrays()
+
         return out
 
 
@@ -682,6 +724,34 @@ def test_tree_sample_finds_all(vecs):
         # np.testing.assert_array_equal(sample["clip_embedding"], vec)
 
 
+@hyp.settings(
+    deadline=timedelta(seconds=30),
+    max_examples=500,
+    suppress_health_check=[hyp.HealthCheck.data_too_large],
+)
+@given(
+    _unit_vecs(
+        st.tuples(st.integers(1, 1024), st.integers(2, 4)),
+    )
+)
+def test_tree_save_load(vecs):
+    """Test that saving and loading a tree preserves the tree structure and vectors."""
+
+    dset = Dataset.from_dict({"clip_embedding": vecs}).with_format("numpy")
+    tree = CapTree(dset, batch_size=32, k=4, iters=16)
+    tree.split_rec()
+    tree_vecs_set = set(tuple(row["clip_embedding"]) for row in tree.items())
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir) / "tree_save_test"
+        tree.save_to_disk(temp_path)
+        tree2 = CapTree.load_from_disk(temp_path)
+
+        tree2._check_invariants()
+        tree2_vecs_set = set(tuple(row["clip_embedding"]) for row in tree2.items())
+        assert tree_vecs_set == tree2_vecs_set
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Build a captree from a set of txt2img-unsupervised parquet files."
@@ -749,7 +819,7 @@ def main():
     print(f"Tree depth: {tree.depth()}, minimum possible depth: {min_depth}")
 
     if args.summary_file is not None:
-        args.summary_file.write_text(tree.to_summary())
+        args.summary_file.write_text(json.dumps(tree.to_summary(), indent=2))
 
     if len(tree.found_duplicates) > 0:
         dup_set_count = len(tree.found_duplicates)
