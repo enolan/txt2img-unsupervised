@@ -268,7 +268,7 @@ class CapTree:
         return self.len
 
     def split_once(self):
-        """Split this cap into children."""
+        """Split this cap into children. The dset should be shuffled beforehand."""
 
         # If we don't flatten the indices the process uses gobs of RAM and OOMs. This doesn't make
         # any sense any is probably related to a bug in datasets. If we do flatten the indices it
@@ -310,7 +310,8 @@ class CapTree:
             self.children[0]._check_for_duplicates(force=True)
 
     def split_rec(self):
-        """Split this cap and all children recursively until each leaf has at most k^2 vectors."""
+        """Split this cap and all children recursively until each leaf has at most k^2 vectors.
+        The dset should be shuffled beforehand."""
         assert self.children == [], "Can only split once"
 
         if len(self) > self.k**2:
