@@ -3,10 +3,14 @@ import base64
 import datasets
 import hypothesis as hyp
 import hypothesis.extra.numpy as hyp_np
+import infinidata
 import jax
 import jax.numpy as jnp
 import json
 import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import tempfile
 
 from datasets import Dataset
@@ -16,7 +20,10 @@ from hypothesis import given, strategies as st
 from pathlib import Path
 from tqdm import tqdm
 from tqdm.contrib import tenumerate
-from txt2img_unsupervised.load_pq_dir import load_pq_dir
+from txt2img_unsupervised.load_pq_dir import (
+    load_pq_dir_to_infinidata,
+    load_pq_to_infinidata,
+)
 
 
 def find_k_means(dset, batch_size, k, iters):
@@ -24,21 +31,19 @@ def find_k_means(dset, batch_size, k, iters):
     # This is a spherical k-means, using cosine similarity inside of euclidean distance. We assume
     # all vectors have unit norm.
 
-    # We assume dset is shuffled, and in numpy mode
     assert len(dset) > k
     assert batch_size > k
 
     # Initialize centroids
     tqdm.write(f"Initializing centroids with {k} random samples")
-    centroids = dset[:k]["clip_embedding"]
-    tqdm.write(f"Skipping initial samples, {len(dset) - k} remaining")
+    centroids = dset.shuffle()[:k]["clip_embedding"]
 
     # To make batch sizes even, we drop the last batch if it's smaller than batch_size, since
     # shuffling means we can see every example either way.
     drop_last_batch = len(dset) > batch_size
-    # Skip initial samples
-    dset_iter = dset.select(range(k, len(dset))).iter(
-        batch_size=batch_size, drop_last_batch=drop_last_batch
+
+    dset_iter = dset.shuffle().batch_iter(
+        batch_size=batch_size, drop_last_batch=drop_last_batch, threads=8, readahead=8
     )
 
     per_center_counts = np.zeros(k, dtype=np.int32)
@@ -48,9 +53,11 @@ def find_k_means(dset, batch_size, k, iters):
             try:
                 batch = next(dset_iter)
             except StopIteration:
-                dset = dset.shuffle()
-                dset_iter = dset.iter(
-                    batch_size=batch_size, drop_last_batch=drop_last_batch
+                dset_iter = dset.shuffle().batch_iter(
+                    batch_size=batch_size,
+                    drop_last_batch=drop_last_batch,
+                    threads=8,
+                    readahead=8,
                 )
                 batch = next(dset_iter)
 
@@ -132,8 +139,14 @@ def assign_centroids(dset, centroids, batch_size):
     max_distances = jnp.zeros(len(centroids), dtype=np.float32)
     centroid_assignments = [[] for _ in range(len(centroids))]
 
-    with tqdm(total=len(dset), desc="Assigning centroids", leave=None) as pbar:
-        for batch_idx, batch in enumerate(dset.iter(batch_size=batch_size)):
+    with tqdm(
+        total=len(dset), desc="Assigning centroids", unit="vecs", leave=None
+    ) as pbar:
+        for batch_idx, batch in enumerate(
+            dset.batch_iter(
+                batch_size=batch_size, drop_last_batch=False, threads=8, readahead=8
+            )
+        ):
             this_batch_size = len(batch["clip_embedding"])
 
             nearest_centroids, max_distances = nearest_centroids_and_max_distances(
@@ -157,9 +170,9 @@ def assign_centroids(dset, centroids, batch_size):
 def test_assign_centroids():
     """Test that assign_centroids works."""
     centroids = np.array([[1, 0], [0, 1]], dtype=np.float32)
-    vecs = np.array([[1, -0.2], [1, 0.1], [-0.1, 1], [0.1, 1]])
+    vecs = np.array([[1, -0.2], [1, 0.1], [-0.1, 1], [0.1, 1]], dtype=np.float32)
     vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
-    dset = Dataset.from_dict({"clip_embedding": vecs}).with_format("numpy")
+    dset = infinidata.TableView({"clip_embedding": vecs})
 
     assignments, max_distances = assign_centroids(dset, centroids, 2)
 
@@ -268,22 +281,16 @@ class CapTree:
         return self.len
 
     def split_once(self):
-        """Split this cap into children. The dset should be shuffled beforehand."""
+        """Split this cap into children."""
 
-        # If we don't flatten the indices the process uses gobs of RAM and OOMs. This doesn't make
-        # any sense any is probably related to a bug in datasets. If we do flatten the indices it
-        # makes a ton of cache files which need to be deleted afterward.
-        # num_proc is an asspulled guess. The correct value is the smallest that saturates SSD
-        # bandwidth.
-        self.dset = self.dset.flatten_indices(num_proc=8)
-        dset_thin = self.dset.select_columns(["clip_embedding"])
+        dset_thin = self.dset.select_columns({"clip_embedding"})
         centroids = find_k_means(dset_thin, self.batch_size, self.k, self.iters)
         assignments, max_distances = assign_centroids(
             dset_thin, centroids, self.batch_size
         )
         self.children = [
             CapTree(
-                self.dset.select(assignments[i]),
+                self.dset.new_view(np.array(assignments[i])),
                 self.batch_size,
                 self.k,
                 self.iters,
@@ -310,8 +317,7 @@ class CapTree:
             self.children[0]._check_for_duplicates(force=True)
 
     def split_rec(self):
-        """Split this cap and all children recursively until each leaf has at most k^2 vectors.
-        The dset should be shuffled beforehand."""
+        """Split this cap and all children recursively until each leaf has at most k^2 vectors."""
         assert self.children == [], "Can only split once"
 
         if len(self) > self.k**2:
@@ -348,7 +354,7 @@ class CapTree:
                     dset_dict[col] = np.array(
                         [rows[0][col] for rows in vecs_dict.values()]
                     )
-                self.dset = Dataset.from_dict(dset_dict).with_format("numpy")
+                self.dset = infinidata.TableView(dset_dict)
                 tqdm.write(f"New leaf size: {len(self.dset)}")
 
     def _to_summary_inner(self, centers=False):
@@ -456,7 +462,7 @@ class CapTree:
         """Check that all vectors in this node are inside the given cap."""
         if len(self.children) == 0:
             distances = cosine_distance_many_to_one(
-                self.dset["clip_embedding"], cap_center
+                self.dset[:]["clip_embedding"], cap_center
             )
             assert distances.shape == (len(self),)
             valid_distances_mask = distances <= max_cos_distance + self.EPSILON
@@ -499,7 +505,9 @@ class CapTree:
         """Sample uniformly from the vectors in this cap that are inside the input cap."""
         if len(self.children) == 0:
             # leaf
-            distances = cosine_distance_many_to_one(self.dset["clip_embedding"], center)
+            distances = cosine_distance_many_to_one(
+                self.dset[:]["clip_embedding"], center
+            )
             valid_distances_mask = distances <= max_cos_distance
             valid_idxs = np.arange(len(self.dset))[valid_distances_mask]
             if len(valid_idxs) == 0:
@@ -548,9 +556,31 @@ class CapTree:
         # We concatenate all the leaves into one big dataset before saving to disk. This is a bit
         # more complicated (especially loading) but lets the parquet compression work much better.
         dsets = [leaf.dset for leaf in self.leaves()]
-        dset_all = datasets.concatenate_datasets(dsets)
+        dset_all = infinidata.TableView.concat(dsets)
+
+        for k, v in dset_all[0].items():
+            assert (
+                len(v.shape) < 2
+            ), f"serializing multidimensional arrays is not supported yet, got shape {v.shape} for column {k}"
+
+        df = pd.DataFrame([dset_all[0]])
+        pq_schema = pa.Schema.from_pandas(df)
+
         with open(dir / "data.parquet", "wb") as f:
-            dset_all.to_parquet(f, compression="zstd")
+            pq_writer = pq.ParquetWriter(f, pq_schema, compression="zstd")
+            with tqdm(total=len(dset_all), desc="Writing parquet", unit="rows") as pbar:
+                for batch in dset_all.batch_iter(
+                    batch_size=4096, drop_last_batch=False, threads=8, readahead=8
+                ):
+                    rows = len(batch[list(batch.keys())[0]])
+                    df_rows = []
+                    for i in range(rows):
+                        df_rows.append({k: v[i] for k, v in batch.items()})
+                    pq_writer.write_table(
+                        pa.Table.from_pandas(pd.DataFrame(df_rows), schema=pq_schema)
+                    )
+                    pbar.update(rows)
+            pq_writer.close()
 
     def _empty_from_summary(self, root, node_json):
         """Fill in everything in a node based on the JSON representation (with centers) except the
@@ -608,7 +638,7 @@ class CapTree:
 
         out._empty_from_summary(out, summary["structure"])
 
-        dset_full = Dataset.from_parquet(str(dir / "data.parquet")).with_format("numpy")
+        dset_full = load_pq_to_infinidata(dir / "data.parquet")
 
         leaf_ranges = []
         leaf_idx = 0
@@ -620,7 +650,7 @@ class CapTree:
         assert leaf_ranges[-1][1] == len(dset_full)
 
         for i, leaf in enumerate(out.leaves()):
-            leaf.dset = dset_full.select(range(*leaf_ranges[i]))
+            leaf.dset = dset_full.new_view(slice(*leaf_ranges[i]))
 
         out._fixup_traversal_arrays()
 
@@ -655,7 +685,7 @@ def test_tree_invariants(vecs):
     vecs_set = set(tuple(vec) for vec in vecs)
     hyp.assume(len(vecs_set) == len(vecs))
 
-    dset = Dataset.from_dict({"clip_embedding": vecs}).with_format("numpy")
+    dset = infinidata.TableView({"clip_embedding": vecs})
     tree = CapTree(dset, batch_size=32, k=4, iters=64)
     tree._check_invariants()
     tree.split_rec()
@@ -684,7 +714,7 @@ def test_tree_sample_in_bounds(vecs, max_cos_distance):
     vecs = vecs[1:]
     vecs_set = set(tuple(vec) for vec in vecs)
 
-    dset = Dataset.from_dict({"clip_embedding": vecs}).with_format("numpy")
+    dset = infinidata.TableView({"clip_embedding": vecs})
     tree = CapTree(dset, batch_size=32, k=4, iters=16)
     tree.split_rec()
     print(f"items: {len(tree)} max depth: {tree.depth()}")
@@ -712,7 +742,7 @@ def test_tree_sample_finds_all(vecs):
     """Test that sampling retrieves all vectors in the tree when sampling from tiny caps centered
     on each vector."""
 
-    dset = Dataset.from_dict({"clip_embedding": vecs}).with_format("numpy")
+    dset = infinidata.TableView({"clip_embedding": vecs})
     tree = CapTree(dset, batch_size=32, k=4, iters=16)
     tree.split_rec()
 
@@ -738,7 +768,7 @@ def test_tree_sample_finds_all(vecs):
 def test_tree_save_load(vecs):
     """Test that saving and loading a tree preserves the tree structure and vectors."""
 
-    dset = Dataset.from_dict({"clip_embedding": vecs}).with_format("numpy")
+    dset = infinidata.TableView({"clip_embedding": vecs})
     tree = CapTree(dset, batch_size=32, k=4, iters=16)
     tree.split_rec()
     tree_vecs_set = set(tuple(row["clip_embedding"]) for row in tree.items())
@@ -769,12 +799,17 @@ def main():
     parser.add_argument("--save-dir", type=Path, required=True)
     args = parser.parse_args()
 
+    if args.save_dir.exists():
+        print(f"Save dir {args.save_dir} exists, exiting")
+        exit(1)
+
     get_timestamp = lambda: datetime.utcnow().isoformat()
     print(f"Time at start: {get_timestamp()}")
 
-    dset_all = load_pq_dir(args.pq_dir)
-    dset_split = dset_all.train_test_split(test_size=0.01, seed=19900515)
-    dset = dset_split["train"]
+    dset_all = load_pq_dir_to_infinidata(args.pq_dir).shuffle(seed=19900515)
+    print(f"Loaded dataset with {len(dset_all)} rows")
+    dset = dset_all.new_view(slice(0, int(len(dset_all) * 0.99)))
+    print(f"Train set size: {len(dset)}")
     print(f"Time after split: {get_timestamp()}")
 
     if args.read_dup_blacklist is not None:
@@ -788,17 +823,11 @@ def main():
         print(f"Found {len(blacklist)} blacklisted images")
         pre_count = len(dset)
         blacklist = set(blacklist)
-        dset = dset.filter(
-            lambda name: name not in blacklist, input_columns="name", num_proc=16
-        )
+        dset = dset.remove_matching_strings("name", blacklist)
         print(f"Removed {pre_count - len(dset)} blacklisted images")
         print(f"Time after blacklist: {get_timestamp()}")
     if args.subset is not None:
-        dset = dset.select(range(args.subset))
-
-    if args.save_dir.exists():
-        print(f"Save dir {args.save_dir} exists, exiting")
-        exit(1)
+        dset = dset.new_view(slice(args.subset))
 
     print(f"Time after subset/before building tree: {get_timestamp()}")
 
@@ -810,6 +839,12 @@ def main():
         True if args.write_dup_blacklist is not None else False,
     )
     tree.split_rec()
+
+    print(f"Time after building tree: {get_timestamp()}")
+
+    tree.shuffle_leaves()
+
+    print(f"Time after shuffling: {get_timestamp()}")
 
     if args.paranoid:
         # This is a pretty slow check, but I don't 100% trust the code
