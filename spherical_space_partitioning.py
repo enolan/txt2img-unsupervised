@@ -262,6 +262,7 @@ class CapTree:
     ):
         assert len(dset) > 0, "CapTree must be initialized with a non-empty dataset"
         self.dset = dset
+        self.dset_thin = dset.select_columns({"clip_embedding"})
         self.len = len(dset)
         self.batch_size = batch_size
         self.k = k
@@ -283,10 +284,9 @@ class CapTree:
     def split_once(self):
         """Split this cap into children."""
 
-        dset_thin = self.dset.select_columns({"clip_embedding"})
-        centroids = find_k_means(dset_thin, self.batch_size, self.k, self.iters)
+        centroids = find_k_means(self.dset_thin, self.batch_size, self.k, self.iters)
         assignments, max_distances = assign_centroids(
-            dset_thin, centroids, self.batch_size
+            self.dset_thin, centroids, self.batch_size
         )
         self.children = [
             CapTree(
@@ -506,7 +506,7 @@ class CapTree:
         if len(self.children) == 0:
             # leaf
             distances = cosine_distance_many_to_one(
-                self.dset[:]["clip_embedding"], center
+                self.dset_thin[:]["clip_embedding"], center
             )
             valid_distances_mask = distances <= max_cos_distance
             valid_idxs = np.arange(len(self.dset))[valid_distances_mask]
@@ -651,6 +651,7 @@ class CapTree:
 
         for i, leaf in enumerate(out.leaves()):
             leaf.dset = dset_full.new_view(slice(*leaf_ranges[i]))
+            leaf.dset_thin = leaf.dset.select_columns({"clip_embedding"})
 
         out._fixup_traversal_arrays()
 
