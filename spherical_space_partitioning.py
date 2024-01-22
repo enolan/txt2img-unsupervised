@@ -501,10 +501,11 @@ class CapTree:
         for leaf in self.leaves():
             leaf.dset = leaf.dset.shuffle()
 
-    def sample_in_cap(self, center, max_cos_distance):
+    def sample_in_cap(self, center, max_cos_distance, visited=[], path=[]):
         """Sample uniformly from the vectors in this cap that are inside the input cap."""
         if len(self.children) == 0:
             # leaf
+            visited.append(path + ["leaf"])
             distances = cosine_distance_many_to_one(
                 self.dset_thin[:]["clip_embedding"], center
             )
@@ -518,6 +519,7 @@ class CapTree:
                 return self.dset[random_idx]
         else:
             # inner node
+            visited.append(path + ["node"])
             rng = jax.random.PRNGKey(np.random.randint(0, 2**32))
             sizes = np.array([len(child) for child in self.children])
             assert np.all(sizes > 0)
@@ -537,7 +539,7 @@ class CapTree:
                 if np.all(sizes == 0):
                     return None
                 inner_sample = self.children[sampled_child].sample_in_cap(
-                    center, max_cos_distance
+                    center, max_cos_distance, visited=visited, path=path + [int(sampled_child)]
                 )
                 if inner_sample is None:
                     sizes[sampled_child] = 0
