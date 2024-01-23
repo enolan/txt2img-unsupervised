@@ -31,8 +31,8 @@ def find_k_means(dset, batch_size, k, iters):
     # This is a spherical k-means, using cosine similarity inside of euclidean distance. We assume
     # all vectors have unit norm.
 
-    assert len(dset) > k
-    assert batch_size > k
+    assert len(dset) >= k
+    assert batch_size >= k
 
     # Initialize centroids
     tqdm.write(f"Initializing centroids with {k} random samples")
@@ -223,7 +223,9 @@ def sample_overlapping_caps_weighted(
     overlapping_caps_mask = caps_overlap_v(
         center1, max_cos_distance1, centers, max_cos_distances
     )
-    assert overlapping_caps_mask.shape == (len(centers),)
+    assert overlapping_caps_mask.shape == (
+        len(centers),
+    ), f"{overlapping_caps_mask.shape}, {len(centers)}"
 
     logits = jnp.where(overlapping_caps_mask, jnp.log(weights), -1e6)
     assert logits.shape == (len(centers),)
@@ -255,6 +257,7 @@ class CapTree:
         batch_size,
         k,
         iters,
+        max_leaf_size=None,
         dup_check=False,
         center=None,
         max_cos_distance=2.0,
@@ -266,6 +269,11 @@ class CapTree:
         self.len = len(dset)
         self.batch_size = batch_size
         self.k = k
+        if max_leaf_size is None:
+            self.max_leaf_size = k**2
+        else:
+            self.max_leaf_size = max_leaf_size
+            assert self.max_leaf_size >= k, "max_leaf_size must be at least k"
         self.iters = iters
         self.dup_check = dup_check
         if center is None:
@@ -320,7 +328,7 @@ class CapTree:
         """Split this cap and all children recursively until each leaf has at most k^2 vectors."""
         assert self.children == [], "Can only split once"
 
-        if len(self) > self.k**2:
+        if len(self) > self.max_leaf_size:
             self.split_once()
             for child in tqdm(self.children, desc="Splitting children", leave=None):
                 child.split_rec()
@@ -381,11 +389,12 @@ class CapTree:
             "total_vectors": len(self),
             "batch_size": self.batch_size,
             "k": self.k,
+            "max_leaf_size": self.max_leaf_size,
             "iters": self.iters,
             "dup_check": self.dup_check,
             "depth": self.depth(),
-            "max_leaf_size": self.max_leaf_size(),
-            "min_leaf_size": self.min_leaf_size(),
+            "largest_leaf_size": self.largest_leaf_size(),
+            "smallest_leaf_size": self.smallest_leaf_size(),
             "mean_depth": np.mean(list(self.leaf_depths())),
         }
 
@@ -405,19 +414,20 @@ class CapTree:
                 for depth in child.leaf_depths():
                     yield depth + 1
 
-    def max_leaf_size(self):
-        """Maximum number of vectors in a leaf."""
+    def largest_leaf_size(self):
+        """Number of vectors in the largest leaf. This is different from the max_leaf_size, which
+        is a limit."""
         if len(self.children) == 0:
             return len(self)
         else:
-            return max(child.max_leaf_size() for child in self.children)
+            return max(child.largest_leaf_size() for child in self.children)
 
-    def min_leaf_size(self):
+    def smallest_leaf_size(self):
         """Minimum number of vectors in a leaf."""
         if len(self.children) == 0:
             return len(self)
         else:
-            return min(child.min_leaf_size() for child in self.children)
+            return min(child.smallest_leaf_size() for child in self.children)
 
     def _check_invariants(self):
         """Check invariants of the tree."""
@@ -503,6 +513,7 @@ class CapTree:
 
     def sample_in_cap(self, center, max_cos_distance, visited=[], path=[]):
         """Sample uniformly from the vectors in this cap that are inside the input cap."""
+        assert center.shape == self.center.shape
         if len(self.children) == 0:
             # leaf
             visited.append(path + ["leaf"])
@@ -539,7 +550,10 @@ class CapTree:
                 if np.all(sizes == 0):
                     return None
                 inner_sample = self.children[sampled_child].sample_in_cap(
-                    center, max_cos_distance, visited=visited, path=path + [int(sampled_child)]
+                    center,
+                    max_cos_distance,
+                    visited=visited,
+                    path=path + [int(sampled_child)],
                 )
                 if inner_sample is None:
                     sizes[sampled_child] = 0
@@ -589,6 +603,7 @@ class CapTree:
         dset."""
         self.batch_size = root.batch_size
         self.k = root.k
+        self.max_leaf_size = root.max_leaf_size
         self.iters = root.iters
         self.dup_check = root.dup_check
         self.found_duplicates = root.found_duplicates
@@ -623,7 +638,7 @@ class CapTree:
             self.child_cap_centers = self.child_cap_max_cos_distances = None
 
     @classmethod
-    def load_from_disk(cls, dir):
+    def load_from_disk(cls, dir, save_cache=True):
         """Load a tree from disk."""
         with open(dir / "structure.json", "r") as f:
             summary = json.load(f)
@@ -632,6 +647,7 @@ class CapTree:
 
         out.batch_size = summary["batch_size"]
         out.k = summary["k"]
+        out.max_leaf_size = summary["max_leaf_size"]
         out.iters = summary["iters"]
         out.dup_check = summary["dup_check"]
         out.found_duplicates = []
@@ -640,7 +656,7 @@ class CapTree:
 
         out._empty_from_summary(out, summary["structure"])
 
-        dset_full = load_pq_to_infinidata(dir / "data.parquet")
+        dset_full = load_pq_to_infinidata(dir / "data.parquet", save_cache=save_cache)
 
         leaf_ranges = []
         leaf_idx = 0
@@ -794,6 +810,7 @@ def main():
     parser.add_argument("--subset", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument("--k", type=int, default=64)
+    parser.add_argument("--max-leaf-size", type=int, default=None)
     parser.add_argument("--k-means-iters", type=int, default=200)
     parser.add_argument("--summary-file", type=Path, default=None)
     parser.add_argument("--write-dup-blacklist", type=Path, default=None)
@@ -835,11 +852,12 @@ def main():
     print(f"Time after subset/before building tree: {get_timestamp()}")
 
     tree = CapTree(
-        dset,
-        args.batch_size,
-        args.k,
-        args.k_means_iters,
-        True if args.write_dup_blacklist is not None else False,
+        dset=dset,
+        batch_size=args.batch_size,
+        k=args.k,
+        max_leaf_size=args.max_leaf_size,
+        iters=args.k_means_iters,
+        dup_check=True if args.write_dup_blacklist is not None else False,
     )
     tree.split_rec()
 
@@ -854,7 +872,7 @@ def main():
         tree._check_invariants()
 
     # minimum possible depth, given branching factor is k and leaves can have at most k^2 vectors
-    min_depth = int(np.ceil(np.log(len(dset)) / np.log(args.k**2)))
+    min_depth = int(np.ceil(np.log(len(dset)) / np.log(args.max_leaf_size)))
     print(f"Tree depth: {tree.depth()}, minimum possible depth: {min_depth}")
 
     if args.summary_file is not None:

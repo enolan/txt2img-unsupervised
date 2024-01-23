@@ -29,7 +29,7 @@ def load_pq_dir_to_infinidata(dir_path):
     return out
 
 
-def load_pq_to_infinidata(path):
+def load_pq_to_infinidata(path, save_cache=True):
     """Load a parquet file into a list of TableViews."""
     # Our caching scheme is to use the hash of the path and the mtime of the file
     path = path.resolve()
@@ -59,5 +59,6 @@ def load_pq_to_infinidata(path):
             assert tvs_rows == pq_file.metadata.num_rows
             tv = infinidata.TableView.concat(tvs)
             assert len(tv) == pq_file.metadata.num_rows
-            tv.save_to_disk(cache_dir, cache_path.name)
+            if save_cache:
+                tv.save_to_disk(cache_dir, cache_path.name)
             return tv
