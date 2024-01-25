@@ -700,9 +700,10 @@ def _unit_vecs(draw, shape):
 @given(
     _unit_vecs(
         st.tuples(st.integers(1, 1024), st.integers(2, 4)),
-    )
+    ),
+    st.random_module(),
 )
-def test_tree_invariants(vecs):
+def test_tree_invariants(vecs, _rand):
     """Test that the tree invariants hold for any set of vectors."""
 
     vecs_set = set(tuple(vec) for vec in vecs)
