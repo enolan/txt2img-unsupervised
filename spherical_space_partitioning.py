@@ -190,13 +190,16 @@ def test_assign_centroids():
 
 def cosine_distance(x, y):
     """Cosine distance between x and y. Assumes x and y are unit vectors."""
-    return 1 - jnp.dot(x, y)
+    assert x.shape == y.shape
+    return jnp.clip(1 - jnp.dot(x, y), 0, 2)
 
 
 @partial(jax.jit, inline=True)
 def cosine_distance_many_to_one(xs, y):
     """Cosine distance between each x in xs and y. Assumes xs and y are unit vectors."""
-    return 1 - jnp.dot(xs, y)
+    assert len(xs.shape) == 2
+    assert y.shape == xs.shape[1:]
+    return jnp.clip(1 - jnp.dot(xs, y), 0, 2)
 
 
 def caps_overlap(center1, max_cos_distance1, center2, max_cos_distance2):
