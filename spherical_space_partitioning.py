@@ -36,13 +36,15 @@ def find_k_means(dset, batch_size, k, iters):
 
     # Initialize centroids
     tqdm.write(f"Initializing centroids with {k} random samples")
-    centroids = dset.shuffle()[:k]["clip_embedding"]
+    centroids = dset.shuffle(seed=np.random.randint(0, 2**63 - 1))[:k][
+        "clip_embedding"
+    ]
 
     # To make batch sizes even, we drop the last batch if it's smaller than batch_size, since
     # shuffling means we can see every example either way.
     drop_last_batch = len(dset) > batch_size
 
-    dset_iter = dset.shuffle().batch_iter(
+    dset_iter = dset.shuffle(seed=np.random.randint(0, 2**63 - 1)).batch_iter(
         batch_size=batch_size, drop_last_batch=drop_last_batch, threads=8, readahead=8
     )
 
@@ -53,7 +55,9 @@ def find_k_means(dset, batch_size, k, iters):
             try:
                 batch = next(dset_iter)
             except StopIteration:
-                dset_iter = dset.shuffle().batch_iter(
+                dset_iter = dset.shuffle(
+                    seed=np.random.randint(0, 2**63 - 1)
+                ).batch_iter(
                     batch_size=batch_size,
                     drop_last_batch=drop_last_batch,
                     threads=8,
