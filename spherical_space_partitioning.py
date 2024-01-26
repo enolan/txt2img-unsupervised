@@ -326,13 +326,14 @@ class CapTree:
 
         if len(self.children) == 1:
             # There may be very rare cases where this isn't caused by duplicate vectors, but in
-            # general it is. It happens when there are more than k^2 duplicates and causes an
-            # infinite loop if not caught.
+            # general it is. It happens when there are more than max_leaf_size duplicates and
+            # causes an infinite loop if not caught.
             tqdm.write("found node with only one child, probably duplicate vectors")
             self.children[0]._check_for_duplicates(force=True)
 
     def split_rec(self):
-        """Split this cap and all children recursively until each leaf has at most k^2 vectors."""
+        """Split this cap and all children recursively until each leaf has at most max_leaf_size
+        vectors."""
         assert self.children == [], "Can only split once"
 
         if len(self) > self.max_leaf_size:
