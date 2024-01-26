@@ -1182,7 +1182,7 @@ def main():
         tree._check_invariants()
 
     # minimum possible depth, given branching factor is k and leaves can have at most k^2 vectors
-    min_depth = int(np.ceil(np.log(len(dset)) / np.log(args.max_leaf_size)))
+    min_depth = int(np.ceil(np.log(len(dset)) / np.log(tree.max_leaf_size)))
     print(f"Tree depth: {tree.depth()}, minimum possible depth: {min_depth}")
 
     if args.summary_file is not None:
