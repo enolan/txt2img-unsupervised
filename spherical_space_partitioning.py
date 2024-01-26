@@ -313,6 +313,7 @@ def cosine_distance_many_to_one(xs, y):
     return jnp.clip(1 - jnp.dot(xs, y), 0, 2)
 
 
+@partial(jax.jit, inline=True)
 def caps_overlap(center1, max_cos_distance1, center2, max_cos_distance2):
     """Check if two caps overlap."""
     return (
@@ -351,6 +352,28 @@ def sample_overlapping_caps_weighted(
     selected = jax.random.categorical(rng, logits)
     assert selected.shape == ()
     return selected, overlapping_caps_mask
+
+
+@jax.jit
+def cap_contains_cap(
+    outer_center, outer_max_cos_distance, inner_center, inner_max_cos_distance
+):
+    """Check if a cap contains the entirety of another cap. Conservative, returns False if the
+    decision is marginal with potential numerical error."""
+    max_inner_cap_distance = (
+        cosine_distance(outer_center, inner_center) + inner_max_cos_distance
+    )
+    return max_inner_cap_distance <= outer_max_cos_distance
+
+
+@jax.jit
+def cap_contains_cap_v(
+    outer_center, outer_max_cos_distance, inner_centers, inner_max_cos_distances
+):
+    """Check if a cap contains the entirety of any of a set of caps. Returns an array of bools."""
+    return jax.vmap(cap_contains_cap, in_axes=(None, None, 0, 0))(
+        outer_center, outer_max_cos_distance, inner_centers, inner_max_cos_distances
+    )
 
 
 def find_nearest_centroid(x, centroids):
@@ -842,6 +865,99 @@ class CapTree:
                 if np.all(sizes == 0):
                     return None
 
+    def count_in_cap(self, query_center, query_max_cos_distance, visited=[], path=[]):
+        """Count the number of vectors in this cap that are inside the input cap."""
+        assert query_center.shape == self.center.shape
+        if cap_contains_cap(
+            query_center, query_max_cos_distance, self.center, self.max_cos_distance
+        ):
+            # If this cap is contained in the query cap then all its vectors are in the query cap.
+            visited.append(path + ["contained"])
+            return self.len
+        elif caps_overlap(
+            query_center, query_max_cos_distance, self.center, self.max_cos_distance
+        ):
+            # If this cap overlaps the query cap, we have to check the contents of this cap.
+            if len(self.children) == 0:
+                # leaf
+                visited.append(path + ["overlapping leaf"])
+                distances = cosine_distance_many_to_one(
+                    self.dset_thin[:]["clip_embedding"], query_center
+                )
+                valid_distances_mask = distances <= query_max_cos_distance
+                return np.sum(valid_distances_mask)
+            else:
+                # inner node
+                visited.append(path + ["overlapping node"])
+
+                subtrees_contained = cap_contains_cap_v(
+                    query_center,
+                    query_max_cos_distance,
+                    self.child_cap_centers,
+                    self.child_cap_max_cos_distances,
+                )
+                subtrees_contained_idxs = np.arange(len(self.children))[
+                    subtrees_contained
+                ]
+                for i in subtrees_contained_idxs:
+                    visited.append(path + [int(i), "contained"])
+                subtrees_contained = [self.children[i] for i in subtrees_contained_idxs]
+                contained_vecs_cnt = sum(
+                    [subtree.len for subtree in subtrees_contained]
+                )
+
+                subtrees_overlapping = caps_overlap_v(
+                    query_center,
+                    query_max_cos_distance,
+                    self.child_cap_centers,
+                    self.child_cap_max_cos_distances,
+                )
+                subtrees_overlapping_idxs = np.arange(len(self.children))[
+                    subtrees_overlapping
+                ]
+
+                # All contained caps are also overlapping, so we remove them from the overlapping
+                # set so we don't double count.
+                subtrees_overlapping_and_not_contained = []
+                subtrees_contained_idxs_set = set(subtrees_contained_idxs)
+                for i in subtrees_overlapping_idxs:
+                    if i not in subtrees_contained_idxs_set:
+                        subtrees_overlapping_and_not_contained.append(i)
+                overlapping_vecs_cnt = 0
+                for i in subtrees_overlapping_and_not_contained:
+                    # This recursive case duplicates some work, since we already checked if the
+                    # subtree is contained in the query cap as well as whether it overlaps.
+                    # Optimize if profiling shows it's a problem.
+                    overlapping_vecs_cnt += self.children[i].count_in_cap(
+                        query_center,
+                        query_max_cos_distance,
+                        visited=visited,
+                        path=path + [int(i)],
+                    )
+
+                return contained_vecs_cnt + overlapping_vecs_cnt
+        else:
+            # This cap is completely outside the query cap.
+            visited.append(path + ["empty"])
+            return 0
+
+
+    def __getitem__(self, idx):
+        """Get a vector by index. There is no meaningful ordering."""
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"index {idx} out of range")
+        if len(self.children) == 0:
+            return self.dset[idx]
+        else:
+            seen_so_far = 0
+            for child in self.children:
+                if idx < seen_so_far + len(child):
+                    return child[idx - seen_so_far]
+                else:
+                    seen_so_far += len(child)
+            assert False, "this should be unreachable"
+
+
     def save_to_disk(self, dir):
         """Save the tree to disk."""
         dir.mkdir(exist_ok=False, parents=True)
@@ -1034,8 +1150,9 @@ def test_tree_invariants(vecs, outlier_removal_level, _rand):
         st.tuples(st.integers(2, 1025), st.integers(2, 4)),
     ),
     st.floats(0, 2.0, width=32),
+    st.random_module()
 )
-def test_tree_sample_in_bounds(vecs, max_cos_distance):
+def test_tree_sample_in_bounds(vecs, max_cos_distance, _rand):
     """Test that sampling retrieves vectors in the specified cap."""
 
     query_center = vecs[0]
@@ -1064,9 +1181,10 @@ def test_tree_sample_in_bounds(vecs, max_cos_distance):
 @given(
     _unit_vecs(
         st.tuples(st.integers(1, 1024), st.integers(2, 4)),
-    )
+    ),
+    st.random_module(),
 )
-def test_tree_sample_finds_all(vecs):
+def test_tree_sample_finds_all(vecs, _rand):
     """Test that sampling retrieves all vectors in the tree when sampling from tiny caps centered
     on each vector."""
 
