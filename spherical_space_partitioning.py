@@ -145,6 +145,7 @@ def assign_centroids(dset, centroids, batch_size, n_distances=0):
             assert distances.shape == (this_batch_size,)
 
             nearest_centroids = np.array(nearest_centroids)
+            distances = np.array(distances)
 
             # Add the indices of the vectors in this batch to the appropriate sublists in
             # nearest_centroids
