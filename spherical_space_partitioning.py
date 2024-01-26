@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from functools import partial
 from hypothesis import given, strategies as st
 from pathlib import Path
+from sortedcontainers import SortedList
 from tqdm import tqdm
 from tqdm.contrib import tenumerate
 from txt2img_unsupervised.load_pq_dir import (
@@ -109,38 +110,21 @@ def find_nearest_centroids_and_average_variance(xs, nearest_centroids):
     return nearest_centroids, jnp.mean(distances)
 
 
-def assign_centroids(dset, centroids, batch_size):
-    """Assign each CLIP embedding to its nearest centroid and compute the greatest cosine distance
-    for each centroid."""
+def assign_centroids(dset, centroids, batch_size, n_distances=0):
+    """Assign each CLIP embedding to its nearest centroid and compute the n highest overall cosine
+    distances along with the associated vectors and centroids."""
     assert centroids.shape[1] == dset[0]["clip_embedding"].shape[0]
 
     tqdm.write(f"Assigning {len(dset)} examples to {len(centroids)} centroids.")
 
-    @partial(jax.jit, donate_argnums=(2,))
-    def nearest_centroids_and_max_distances(xs, centroids, max_distances):
-        nearest_centroids, distances = jax.vmap(
-            find_nearest_centroid, in_axes=(0, None)
-        )(xs, centroids)
+    @jax.jit
+    def nearest_centroids_and_distances(xs, centroids):
+        return jax.vmap(find_nearest_centroid, in_axes=(0, None))(xs, centroids)
 
-        # (len(xs), len(centroids)) array of distances or zeros
-        distances = jnp.where(
-            jnp.arange(len(centroids)) == nearest_centroids[:, None],
-            distances[:, None],
-            0,
-        )
-        assert distances.shape == (len(xs), len(centroids))
-
-        # tack on the existing max distances
-        distances = jnp.concatenate((distances, max_distances[None, :]), axis=0)
-        assert distances.shape == (len(xs) + 1, len(centroids))
-
-        # take the max distance for each centroid
-        max_distances = jnp.max(distances, axis=0)
-        assert max_distances.shape == (len(centroids),)
-
-        return nearest_centroids, max_distances
-
-    max_distances = jnp.zeros(len(centroids), dtype=np.float32)
+    # each element of high_distances is a SortedList containing tuples of cosine distance and index
+    # into dset
+    high_distances = [SortedList() for _ in range(len(centroids))]
+    # each element of centroid_assignments is a list of indices into dset
     centroid_assignments = [[] for _ in range(len(centroids))]
 
     with tqdm(
@@ -153,22 +137,52 @@ def assign_centroids(dset, centroids, batch_size):
         ):
             this_batch_size = len(batch["clip_embedding"])
 
-            nearest_centroids, max_distances = nearest_centroids_and_max_distances(
-                batch["clip_embedding"], centroids, max_distances
+            nearest_centroids, distances = nearest_centroids_and_distances(
+                batch["clip_embedding"], centroids
             )
 
             assert nearest_centroids.shape == (this_batch_size,)
-            assert max_distances.shape == (len(centroids),)
+            assert distances.shape == (this_batch_size,)
 
             nearest_centroids = np.array(nearest_centroids)
 
+            # Add the indices of the vectors in this batch to the appropriate sublists in
+            # nearest_centroids
             for i in range(this_batch_size):
                 centroid_assignments[nearest_centroids[i]].append(
                     batch_idx * batch_size + i
                 )
+
+            for i in range(len(centroids)):
+                # For each centroid, update high_distances by adding any distances that are higher
+                # than the current lowest value in high_distances[i], or, if there are fewer than
+                # n_distances in the SortedList, all of the distances.
+                threshold = (
+                    high_distances[i][0][0]
+                    if len(high_distances[i]) >= n_distances
+                    else 0
+                )
+
+                this_indices = np.arange(this_batch_size)[nearest_centroids == i]
+
+                this_distances = distances[this_indices]
+                this_distances_idxs_above_threshold = this_distances >= threshold
+
+                distances_to_add = this_distances[this_distances_idxs_above_threshold]
+                indices_to_add = this_indices[this_distances_idxs_above_threshold]
+
+                high_distances[i].update(
+                    zip(distances_to_add, batch_idx * batch_size + indices_to_add)
+                )
+
+                # Delete all but the n_distances highest distances
+                del high_distances[i][:-n_distances]
+
             pbar.update(this_batch_size)
-    max_distances = np.array(max_distances)
-    return centroid_assignments, max_distances
+
+    assert len(centroid_assignments) == len(high_distances) == len(centroids)
+    assert sum(len(cluster) for cluster in centroid_assignments) == len(dset)
+    return centroid_assignments, high_distances
 
 
 def test_assign_centroids():
@@ -178,14 +192,110 @@ def test_assign_centroids():
     vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
     dset = infinidata.TableView({"clip_embedding": vecs})
 
-    assignments, max_distances = assign_centroids(dset, centroids, 2)
+    assignments, high_distances = assign_centroids(dset, centroids, 2, n_distances=2)
 
     assert assignments == [[0, 1], [2, 3]]
 
-    distance_0 = cosine_distance(centroids[0], vecs[0])
-    distance_1 = cosine_distance(centroids[1], vecs[2])
-    assert np.isclose(max_distances[0], distance_0)
-    assert np.isclose(max_distances[1], distance_1)
+    assert np.isclose(high_distances[0][0][0], cosine_distance(centroids[0], vecs[1]))
+    assert high_distances[0][0][1] == 1
+
+    assert np.isclose(high_distances[0][1][0], cosine_distance(centroids[0], vecs[0]))
+    assert high_distances[0][1][1] == 0
+
+    assert np.isclose(high_distances[1][0][0], cosine_distance(centroids[1], vecs[2]))
+    assert np.isclose(high_distances[1][1][0], cosine_distance(centroids[1], vecs[3]))
+    # They have the same distance, so they can appear in either order
+    assert high_distances[1][0][1] in [2, 3]
+    assert high_distances[1][1][1] in [2, 3]
+
+
+def test_assign_centroids_top_2():
+    centroids = np.array([[1, 0], [0, 1]], dtype=np.float32)
+    vecs = np.array(
+        [[1, -0.2], [1, 0.1], [0.9, 0], [1, 0.3], [-0.3, 1], [0.1, 1]],
+        dtype=np.float32,
+    )
+    vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+    dset = infinidata.TableView({"clip_embedding": vecs})
+
+    assignments, high_distances = assign_centroids(dset, centroids, 2, n_distances=2)
+
+    assert assignments == [[0, 1, 2, 3], [4, 5]]
+
+    # The most distant vector for centroid 0 is vecs[3], followed by vecs[0]
+    assert high_distances[0][1][0] == cosine_distance(centroids[0], vecs[3])
+    assert high_distances[0][1][1] == 3
+
+    assert high_distances[0][0][0] == cosine_distance(centroids[0], vecs[0])
+    assert high_distances[0][0][1] == 0
+
+    # The most distant vector for centroid 1 is vecs[4], followed by vecs[5]
+    assert high_distances[1][1][0] == cosine_distance(centroids[1], vecs[4])
+    assert high_distances[1][1][1] == 4
+
+    assert high_distances[1][0][0] == cosine_distance(centroids[1], vecs[5])
+    assert high_distances[1][0][1] == 5
+
+
+@st.composite
+def _unit_vecs(draw, shape):
+    """Strategy for drawing unique unit vectors."""
+    vecs = draw(
+        hyp_np.arrays(
+            np.float32, shape, elements=st.floats(-1.0, 1.0, width=32), unique=True
+        )
+    )
+    hyp.assume(np.all(np.linalg.norm(vecs, axis=1) > 0))
+    vecs = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+    vecs_set = set(tuple(vec) for vec in vecs)
+    hyp.assume(len(vecs_set) == len(vecs))
+    return vecs
+
+
+@hyp.settings(
+    max_examples=500,
+    suppress_health_check=[hyp.HealthCheck.data_too_large, hyp.HealthCheck.too_slow],
+    deadline=timedelta(seconds=30),
+)
+@given(
+    _unit_vecs(
+        st.tuples(st.integers(5, 1024), st.integers(2, 4)),
+    ),
+    st.integers(1, 4),
+    st.integers(1, 10),
+    st.integers(1, 8),
+    st.random_module(),
+)
+def test_assign_centroids_high_distances(
+    vecs, n_centroids, n_distances, batch_size, _rand
+):
+    """The high distances returned by assign_centroids are correct."""
+    centroids = vecs[:n_centroids]
+    vecs = vecs[n_centroids:]
+    dset = infinidata.TableView({"clip_embedding": vecs})
+
+    assignments, high_distances = assign_centroids(
+        dset, centroids, batch_size=batch_size, n_distances=n_distances
+    )
+
+    assert len(assignments) == len(high_distances) == len(centroids)
+    for i in range(len(assignments)):
+        this_cluster_vecs = vecs[assignments[i]]
+        this_cluster_distances = cosine_distance_many_to_one(
+            this_cluster_vecs, centroids[i]
+        )
+        sorted_this_cluster_indices = np.argsort(this_cluster_distances)
+        sorted_dset_indices = np.array(assignments[i])[sorted_this_cluster_indices]
+
+        assert np.array_equal(
+            sorted_dset_indices[-n_distances:],
+            np.array([idx for _, idx in high_distances[i]]),
+        ) and np.allclose(
+            this_cluster_distances[sorted_this_cluster_indices[-n_distances:]],
+            np.array([distance for distance, _ in high_distances[i]]),
+            rtol=0,
+            atol=1e-5,
+        ), f"cluster {i} failed, actual high distances idxs: {sorted_dset_indices[-n_distances:]}, values: {this_cluster_distances[sorted_this_cluster_indices[-n_distances:]]}, returned from assign_centroids: {high_distances[i]}"
 
 
 def cosine_distance(x, y):
@@ -249,10 +359,26 @@ def find_nearest_centroid(x, centroids):
     return nearest, distances[nearest]
 
 
+@jax.jit
+def find_max_cosine_distance(x, xs, old_max):
+    """Find the maximum cosine distance between x and any vector in xs or old_max if it's greater.
+    Assumes x and xs are unit vectors."""
+    distances = cosine_distance_many_to_one(xs, x)
+    return jnp.maximum(old_max, jnp.max(distances))
+
+
 class CapTree:
     """A tree of spherical caps containing unit vectors at the leaves. We split a cap into k
     children by running k-means on the unit vectors in the cap. Each centroid and the vectors
-    assigned to it becomes a child cap."""
+    assigned to it becomes a child cap. Then, we remove vectors from each cluster starting from the
+    one with the highest cosine distance to its centroid until we've removed len(self)/k vectors.
+    If the overall highest cosine distance has not decreased by at least outlier_removal_level -
+    interpreted as a fraction - we put everything back and keep the original k-means clusters.
+    Otherwise, we put those vectors into their own cluster. The idea here is to reduce the spatial
+    size of the k-means clusters by removing outliers, which should speed up queries by reducing
+    the number of clusters that search has to visit. This is at the expense, of course, of making
+    a single really big cluster. We then repeat the split process recursively until each leaf has
+    at most max_leaf_size vectors."""
 
     # I'd really love to live in a world where "what is the dot product of x and y?" is a question
     # with only one answer, but alas we do not live in that world.
@@ -265,6 +391,7 @@ class CapTree:
         k,
         iters,
         max_leaf_size=None,
+        outlier_removal_level=0,
         dup_check=False,
         center=None,
         max_cos_distance=2.0,
@@ -281,6 +408,8 @@ class CapTree:
         else:
             self.max_leaf_size = max_leaf_size
             assert self.max_leaf_size >= k, "max_leaf_size must be at least k"
+        self.outlier_removal_level = outlier_removal_level
+        assert self.outlier_removal_level >= 0 and self.outlier_removal_level <= 1
         self.iters = iters
         self.dup_check = dup_check
         if center is None:
@@ -300,9 +429,21 @@ class CapTree:
         """Split this cap into children."""
 
         centroids = find_k_means(self.dset_thin, self.batch_size, self.k, self.iters)
-        assignments, max_distances = assign_centroids(
-            self.dset_thin, centroids, self.batch_size
+        max_outliers_removed = int(self.len / self.k)
+        assignments, high_distances = assign_centroids(
+            self.dset_thin,
+            centroids,
+            self.batch_size,
+            n_distances=max_outliers_removed + 1,
         )
+        centroids, assignments, max_distances = self._remove_outliers(
+            centroids,
+            assignments,
+            high_distances,
+            max_outliers_removed,
+            batch_size=4096,
+        )
+        assert len(assignments) == len(max_distances) == len(centroids)
         self.children = [
             CapTree(
                 self.dset.new_view(np.array(assignments[i])),
@@ -330,6 +471,137 @@ class CapTree:
             # causes an infinite loop if not caught.
             tqdm.write("found node with only one child, probably duplicate vectors")
             self.children[0]._check_for_duplicates(force=True)
+
+    def _remove_outliers(
+        self, centroids, assignments, high_distances, max_outliers_removed, batch_size
+    ):
+        """Remove outliers from the clusters. assignments is a list of lists of indices, each inner
+        list contains the indices assigned to a particular cluster. high_distances is a list of
+        SortedLists of (cosine distance, index) pairs, one for each cluster. The new outlier
+        cluster will have at most max_outliers_removed vectors in it. Return the new centroids,
+        assignments, and max distances."""
+        assert len(assignments) == len(high_distances)
+        assert len(assignments) > 0
+        assert max_outliers_removed >= 0 and max_outliers_removed < len(self)
+
+        # We need to save the original max distances in case we end up not making an outlier
+        # cluster.
+        original_max_distances = []
+        for i in range(len(assignments)):
+            if len(assignments[i]) > 0:
+                original_max_distances.append(high_distances[i][-1][0])
+            else:
+                tqdm.write(f"WARNING: empty cluster: {i}")
+                original_max_distances.append(0)
+
+        # aggregate the high distances from each cluster
+        high_distances_for_agg = [
+            [(distance, cluster_idx, idx) for distance, idx in cluster]
+            for cluster_idx, cluster in enumerate(high_distances)
+        ]
+        assert len(high_distances_for_agg) == len(assignments)
+        assert sum(len(cluster) for cluster in high_distances_for_agg) <= sum(
+            len(cluster_assignments) for cluster_assignments in assignments
+        )
+        high_distances_all = SortedList(
+            [item for cluster in high_distances_for_agg for item in cluster]
+        )
+        assert len(high_distances_all) == sum(
+            len(cluster) for cluster in high_distances_for_agg
+        )
+
+        # remove outliers
+        max_distance = high_distances_all[-1][0]
+        target_max_distance = max_distance * (1 - self.outlier_removal_level)
+        removed_vectors = []
+        while len(removed_vectors) < max_outliers_removed:
+            # Find the highest cosine distance vector
+            highest_cos_distance, cluster_idx, idx = high_distances_all.pop(-1)
+            high_distances[cluster_idx].remove((highest_cos_distance, idx))
+            removed_vectors.append(idx)
+
+        # return new clusters
+        if (
+            len(removed_vectors) == 0
+            or high_distances_all[-1][0] >= target_max_distance
+        ):
+            # We didn't remove any vectors, or we didn't remove enough vectors to get the max
+            # distance below the target. In either case, we don't make an outlier cluster and
+            # return the original ones.
+
+            # TODO if we only shrunk one cluster, do we abort and return the original clusters?
+            return (
+                centroids,
+                assignments,
+                [
+                    original_max_distances[cluster_idx]
+                    for cluster_idx in range(len(assignments))
+                ],
+            )
+        else:
+            # We removed enough vectors to get the max distance below the target. We make an
+            # outlier cluster and return the new clusters.
+
+            # We find the outlier centroid by averaging a sample of the removed vectors.
+            outlier_dset = self.dset_thin.new_view(np.array(removed_vectors))
+            outlier_centroid = np.mean(
+                outlier_dset.shuffle(seed=np.random.randint(0, 2**63 - 1)).new_view(
+                    slice(16384)
+                )[:]["clip_embedding"],
+                axis=0,
+            )
+            outlier_centroid_norm = np.linalg.norm(outlier_centroid)
+            if outlier_centroid_norm > 0:
+                outlier_centroid /= outlier_centroid_norm
+            else:
+                tqdm.write("WARNING: outlier centroid has norm <= 0")
+                outlier_centroid = np.zeros_like(outlier_centroid)
+                outlier_centroid[0] = 1.0
+            assert outlier_centroid.shape == centroids.shape[1:]
+
+            # Compute the maximum cosine distance for the outlier cluster
+            outlier_max_cos_distance = 0
+            with tqdm(desc="Finding outlier max cos distance", leave=False) as pbar:
+                for batch in outlier_dset.batch_iter(
+                    batch_size=batch_size, drop_last_batch=False, threads=8, readahead=8
+                ):
+                    outlier_max_cos_distance = find_max_cosine_distance(
+                        outlier_centroid,
+                        batch["clip_embedding"],
+                        outlier_max_cos_distance,
+                    )
+                    pbar.update(len(batch["clip_embedding"]))
+
+            # Generate new clusters with the outliers removed
+            outlier_set = set(removed_vectors)
+            filtered_clusters = [[] for _ in range(len(assignments))]
+
+            for cluster_idx, cluster in enumerate(assignments):
+                for idx in cluster:
+                    if idx not in outlier_set:
+                        filtered_clusters[cluster_idx].append(idx)
+
+            # remove any clusters that are now empty
+            new_assignments = []
+            new_max_distances = []
+            new_centroids = []
+            for cluster_idx in range(len(filtered_clusters)):
+                if len(filtered_clusters[cluster_idx]) > 0:
+                    new_assignments.append(filtered_clusters[cluster_idx])
+                    new_max_distances.append(high_distances[cluster_idx][-1][0])
+                    new_centroids.append(centroids[cluster_idx])
+                else:
+                    assert len(high_distances[cluster_idx]) == 0
+            new_assignments.append(removed_vectors)
+            new_max_distances.append(outlier_max_cos_distance)
+            new_centroids = np.stack(new_centroids + [outlier_centroid], axis=0)
+            assert new_centroids.shape == (len(new_assignments), centroids.shape[1])
+            assert len(new_assignments) == len(new_max_distances) == len(new_centroids)
+            assert sum(len(cluster) for cluster in new_assignments) == sum(
+                len(cluster) for cluster in assignments
+            )
+
+            return new_centroids, new_assignments, new_max_distances
 
     def split_rec(self):
         """Split this cap and all children recursively until each leaf has at most max_leaf_size
@@ -469,7 +741,6 @@ class CapTree:
         for subtree in tqdm(
             self.children, leave=False, desc="Checking subtree invariants"
         ):
-            assert subtree.max_cos_distance <= self.max_cos_distance + self.EPSILON
             assert (
                 cosine_distance(self.center, subtree.center)
                 <= self.max_cos_distance + self.EPSILON
@@ -684,16 +955,41 @@ class CapTree:
         return out
 
 
-@st.composite
-def _unit_vecs(draw, shape):
-    """Strategy for drawing unique unit vectors."""
-    vecs = draw(
-        hyp_np.arrays(
-            np.float32, shape, elements=st.floats(-1.0, 1.0, width=32), unique=True
-        )
+@hyp.settings(
+    max_examples=500,
+    suppress_health_check=[hyp.HealthCheck.data_too_large, hyp.HealthCheck.too_slow],
+    deadline=timedelta(seconds=30),
+)
+@given(
+    _unit_vecs(
+        st.tuples(st.integers(4, 1024), st.integers(2, 4)),
     )
-    hyp.assume(np.all(np.linalg.norm(vecs, axis=1) > 0))
-    return vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+)
+def test_remove_outliers_with_level_1_doesnt_make_outlier_cluster(vecs):
+    """Test that setting outlier_removal_level to 1 causes no outlier removal."""
+    dset = infinidata.TableView({"clip_embedding": vecs})
+    tree = CapTree(dset, batch_size=32, k=4, iters=16, outlier_removal_level=1)
+    tree.split_once()
+    # There should mostly be 4 clusters but occassionally we'll end up with fewer. If it makes an
+    # outlier cluster, there will mostly be 5, though we can still end up with less.
+    assert (
+        len(tree.children) <= 4
+    ), f"Got more than 4 children: {len(tree.children)}. Centers: {tree.child_cap_centers}, max cos distances: {tree.child_cap_max_cos_distances}, values: {[child.dset[:]['clip_embedding'] for child in tree.children]}, distances: {[cosine_distance_many_to_one(child.dset[:]['clip_embedding'], child.center) for child in tree.children]}"
+
+
+def test_remove_outliers_with_level_0_makes_outlier_cluster():
+    """Test that it makes an outlier cluter when outlier_removal_level is 0."""
+    # There are various weird degenerate cases where it shouldn't make a cluster even when
+    # outlier_removal_level is 0, so this is a regular unit test and not a hypothesis test.
+    vecs = np.random.normal(size=(64, 4)).astype(np.float32)
+    vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+    dset = infinidata.TableView({"clip_embedding": vecs})
+
+    tree = CapTree(dset, batch_size=32, k=4, iters=16, outlier_removal_level=0)
+    tree._check_invariants()
+    tree.split_once()
+    assert len(tree.children) == 5, f"Only got {len(tree.children)} children"
+    tree._check_invariants()
 
 
 @hyp.settings(
@@ -705,16 +1001,19 @@ def _unit_vecs(draw, shape):
     _unit_vecs(
         st.tuples(st.integers(1, 1024), st.integers(2, 4)),
     ),
+    st.floats(0.0, 1.0),
     st.random_module(),
 )
-def test_tree_invariants(vecs, _rand):
+def test_tree_invariants(vecs, outlier_removal_level, _rand):
     """Test that the tree invariants hold for any set of vectors."""
 
     vecs_set = set(tuple(vec) for vec in vecs)
     hyp.assume(len(vecs_set) == len(vecs))
 
     dset = infinidata.TableView({"clip_embedding": vecs})
-    tree = CapTree(dset, batch_size=32, k=4, iters=64)
+    tree = CapTree(
+        dset, batch_size=32, k=4, iters=64, outlier_removal_level=outlier_removal_level
+    )
     tree._check_invariants()
     tree.split_rec()
     tree._check_invariants()
@@ -819,6 +1118,7 @@ def main():
     parser.add_argument("--subset", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument("--k", type=int, default=64)
+    parser.add_argument("--outlier-removal-level", type=float, default=1)
     parser.add_argument("--max-leaf-size", type=int, default=None)
     parser.add_argument("--k-means-iters", type=int, default=200)
     parser.add_argument("--summary-file", type=Path, default=None)
@@ -864,6 +1164,7 @@ def main():
         dset=dset,
         batch_size=args.batch_size,
         k=args.k,
+        outlier_removal_level=args.outlier_removal_level,
         max_leaf_size=args.max_leaf_size,
         iters=args.k_means_iters,
         dup_check=True if args.write_dup_blacklist is not None else False,
