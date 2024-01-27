@@ -1175,7 +1175,7 @@ def test_tree_subtrees_in_cap_sizes_are_correct(
         st.tuples(st.integers(2, 1025), st.integers(2, 4)),
     ),
     st.floats(0, 2.0, width=32),
-    st.random_module()
+    st.random_module(),
 )
 def test_tree_sample_in_bounds(vecs, max_cos_distance, _rand):
     """Test that sampling retrieves vectors in the specified cap."""
