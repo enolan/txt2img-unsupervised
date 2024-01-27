@@ -316,12 +316,14 @@ def cosine_distance_many_to_one(xs, y):
 @partial(jax.jit, inline=True)
 def caps_overlap(center1, max_cos_distance1, center2, max_cos_distance2):
     """Check if two caps overlap."""
-    return (
-        cosine_distance(center1, center2)
-        <= max_cos_distance1 + max_cos_distance2 + CapTree.EPSILON
-    )
+    # Cosine distances don't add linearly, so we have to do this calculation in radians.
+    centers_angular_distance = jnp.arccos(jnp.dot(center1, center2))
+    angular_radius_1 = jnp.arccos(1 - max_cos_distance1)
+    angular_radius_2 = jnp.arccos(1 - max_cos_distance2)
+    return centers_angular_distance <= angular_radius_1 + angular_radius_2
 
 
+@jax.jit
 def caps_overlap_v(center1, max_cost_distance1, centers, max_cos_distances):
     """Check if a cap overlaps with any of a set of caps. Returns an array of bools."""
     return jax.vmap(caps_overlap, in_axes=(None, None, 0, 0))(
@@ -330,40 +332,16 @@ def caps_overlap_v(center1, max_cost_distance1, centers, max_cos_distances):
 
 
 @jax.jit
-def sample_overlapping_caps_weighted(
-    rng, center1, max_cos_distance1, centers, max_cos_distances, weights
-):
-    """Given a query cap and a set of target caps plus a set of weights for the targets, sample
-    from the subset of the targets that overlap the query with probability proportional to the
-    weights."""
-    assert len(centers) == len(max_cos_distances) == len(weights)
-    assert len(centers) > 0
-
-    overlapping_caps_mask = caps_overlap_v(
-        center1, max_cos_distance1, centers, max_cos_distances
-    )
-    assert overlapping_caps_mask.shape == (
-        len(centers),
-    ), f"{overlapping_caps_mask.shape}, {len(centers)}"
-
-    logits = jnp.where(overlapping_caps_mask, jnp.log(weights), -1e6)
-    assert logits.shape == (len(centers),)
-
-    selected = jax.random.categorical(rng, logits)
-    assert selected.shape == ()
-    return selected, overlapping_caps_mask
-
-
-@jax.jit
 def cap_contains_cap(
     outer_center, outer_max_cos_distance, inner_center, inner_max_cos_distance
 ):
     """Check if a cap contains the entirety of another cap. Conservative, returns False if the
     decision is marginal with potential numerical error."""
-    max_inner_cap_distance = (
-        cosine_distance(outer_center, inner_center) + inner_max_cos_distance
-    )
-    return max_inner_cap_distance <= outer_max_cos_distance
+    # Cosine distances don't add linearly, so we have to do this calculation in radians.
+    caps_angular_distance = jnp.arccos(jnp.dot(outer_center, inner_center))
+    outer_angular_radius = jnp.arccos(1 - outer_max_cos_distance)
+    inner_angular_radius = jnp.arccos(1 - inner_max_cos_distance)
+    return caps_angular_distance + inner_angular_radius <= outer_angular_radius
 
 
 @jax.jit
@@ -814,66 +792,19 @@ class CapTree:
         for leaf in self.leaves():
             leaf.dset = leaf.dset.shuffle()
 
-    def sample_in_cap(self, center, max_cos_distance, visited=[], path=[]):
-        """Sample uniformly from the vectors in this cap that are inside the input cap."""
-        assert center.shape == self.center.shape
-        if len(self.children) == 0:
-            # leaf
-            visited.append(path + ["leaf"])
-            distances = cosine_distance_many_to_one(
-                self.dset_thin[:]["clip_embedding"], center
-            )
-            valid_distances_mask = distances <= max_cos_distance
-            valid_idxs = np.arange(len(self.dset))[valid_distances_mask]
-            if len(valid_idxs) == 0:
-                return None
-            else:
-                random_valid_idx = np.random.randint(len(valid_idxs))
-                random_idx = int(valid_idxs[random_valid_idx])
-                return self.dset[random_idx]
-        else:
-            # inner node
-            visited.append(path + ["node"])
-            rng = jax.random.PRNGKey(np.random.randint(0, 2**32))
-            sizes = np.array([len(child) for child in self.children])
-            assert np.all(sizes > 0)
-            while True:
-                # Loop until we eliminate all children from consideration (setting their sizes to
-                # 0) or we find a sample.
-                sub_rng, rng = jax.random.split(rng)
-                sampled_child, overlapping_caps_mask = sample_overlapping_caps_weighted(
-                    sub_rng,
-                    center,
-                    max_cos_distance + self.EPSILON,
-                    self.child_cap_centers,
-                    self.child_cap_max_cos_distances,
-                    sizes,
-                )
-                sizes = np.where(overlapping_caps_mask, sizes, 0)
-                if np.all(sizes == 0):
-                    return None
-                inner_sample = self.children[sampled_child].sample_in_cap(
-                    center,
-                    max_cos_distance,
-                    visited=visited,
-                    path=path + [int(sampled_child)],
-                )
-                if inner_sample is None:
-                    sizes[sampled_child] = 0
-                else:
-                    return inner_sample
-                if np.all(sizes == 0):
-                    return None
-
-    def count_in_cap(self, query_center, query_max_cos_distance, visited=[], path=[]):
-        """Count the number of vectors in this cap that are inside the input cap."""
+    def _subtrees_in_cap(
+        self, query_center, query_max_cos_distance, visited=[], path=[]
+    ):
+        """Find all the subtrees that are either fully contained in the input cap or are leaves and
+        have vectors that are in the input cap. Returns a list of paths to subtrees and matching
+        vector counts."""
         assert query_center.shape == self.center.shape
         if cap_contains_cap(
             query_center, query_max_cos_distance, self.center, self.max_cos_distance
         ):
             # If this cap is contained in the query cap then all its vectors are in the query cap.
             visited.append(path + ["contained"])
-            return self.len
+            return [(path, len(self))]
         elif caps_overlap(
             query_center, query_max_cos_distance, self.center, self.max_cos_distance
         ):
@@ -885,10 +816,16 @@ class CapTree:
                     self.dset_thin[:]["clip_embedding"], query_center
                 )
                 valid_distances_mask = distances <= query_max_cos_distance
-                return np.sum(valid_distances_mask)
+                valid_distances_cnt = np.sum(valid_distances_mask)
+                return (
+                    [(path, int(valid_distances_cnt))]
+                    if valid_distances_cnt > 0
+                    else []
+                )
             else:
                 # inner node
                 visited.append(path + ["overlapping node"])
+                res = []
 
                 subtrees_contained = cap_contains_cap_v(
                     query_center,
@@ -900,11 +837,8 @@ class CapTree:
                     subtrees_contained
                 ]
                 for i in subtrees_contained_idxs:
-                    visited.append(path + [int(i), "contained"])
-                subtrees_contained = [self.children[i] for i in subtrees_contained_idxs]
-                contained_vecs_cnt = sum(
-                    [subtree.len for subtree in subtrees_contained]
-                )
+                    visited.append(path + [i, "contained"])
+                    res.append((path + [i], len(self.children[i])))
 
                 subtrees_overlapping = caps_overlap_v(
                     query_center,
@@ -923,24 +857,74 @@ class CapTree:
                 for i in subtrees_overlapping_idxs:
                     if i not in subtrees_contained_idxs_set:
                         subtrees_overlapping_and_not_contained.append(i)
-                overlapping_vecs_cnt = 0
                 for i in subtrees_overlapping_and_not_contained:
                     # This recursive case duplicates some work, since we already checked if the
                     # subtree is contained in the query cap as well as whether it overlaps.
                     # Optimize if profiling shows it's a problem.
-                    overlapping_vecs_cnt += self.children[i].count_in_cap(
-                        query_center,
-                        query_max_cos_distance,
-                        visited=visited,
-                        path=path + [int(i)],
+                    res.extend(
+                        self.children[i]._subtrees_in_cap(
+                            query_center,
+                            query_max_cos_distance,
+                            visited=visited,
+                            path=path + [i],
+                        )
                     )
 
-                return contained_vecs_cnt + overlapping_vecs_cnt
+                return res
         else:
             # This cap is completely outside the query cap.
             visited.append(path + ["empty"])
-            return 0
+            return []
 
+    def sample_in_cap(self, query_center, query_max_cos_distance, visited=[]):
+        matching_subtrees = self._subtrees_in_cap(
+            query_center, query_max_cos_distance, visited=visited
+        )
+        if len(matching_subtrees) == 0:
+            return None
+        else:
+            total_cnt = sum(cnt for _, cnt in matching_subtrees)
+            idx = np.random.randint(total_cnt)
+
+            # Find the path to the subtree containing the sample
+            cnt_so_far = 0
+            for i, (_path, cnt) in enumerate(matching_subtrees):
+                cnt_so_far += cnt
+                if idx < cnt_so_far:
+                    break
+
+            idx_in_subtree = idx - (cnt_so_far - cnt)
+
+            # Find the subtree object
+            tgt_subtree_path, tgt_subtree_size = matching_subtrees[i]
+            cur_subtree = self
+            for step in tgt_subtree_path:
+                cur_subtree = cur_subtree.children[step]
+
+            sampling_subtree = cur_subtree
+            assert len(sampling_subtree) >= tgt_subtree_size
+
+            if len(sampling_subtree.children) == 0:
+                # We're sampling from a leaf
+                if len(sampling_subtree) == tgt_subtree_size:
+                    # All the vectors in the leaf are within the query cap.
+                    sampled = sampling_subtree.dset[idx_in_subtree]
+                    return sampled
+                else:
+                    # We need to check the vectors in the leaf.
+                    distances = cosine_distance_many_to_one(
+                        sampling_subtree.dset_thin[:]["clip_embedding"], query_center
+                    )
+                    valid_distances_mask = distances <= query_max_cos_distance
+                    valid_distances_idxs = np.arange(len(sampling_subtree.dset))[
+                        valid_distances_mask
+                    ]
+                    assert len(valid_distances_idxs) == tgt_subtree_size
+                    return sampling_subtree.dset[valid_distances_idxs[idx_in_subtree]]
+            else:
+                # We're sampling from an inner node
+                assert len(sampling_subtree) == tgt_subtree_size
+                return sampling_subtree[idx_in_subtree]
 
     def __getitem__(self, idx):
         """Get a vector by index. There is no meaningful ordering."""
@@ -956,7 +940,6 @@ class CapTree:
                 else:
                     seen_so_far += len(child)
             assert False, "this should be unreachable"
-
 
     def save_to_disk(self, dir):
         """Save the tree to disk."""
@@ -1143,6 +1126,48 @@ def test_tree_invariants(vecs, outlier_removal_level, _rand):
 @hyp.settings(
     deadline=timedelta(seconds=30),
     max_examples=500,
+    suppress_health_check=[hyp.HealthCheck.data_too_large, hyp.HealthCheck.too_slow],
+)
+@given(
+    _unit_vecs(st.tuples(st.integers(1, 1024), st.integers(2, 4))),
+    st.integers(3, 8),
+    st.floats(0.0, 2.0),
+    st.booleans(),
+    st.random_module(),
+)
+def test_tree_subtrees_in_cap_sizes_are_correct(
+    vecs, k, max_cos_distance, do_split, _rand
+):
+    """Test that _subtrees_in_cap returns subtrees with the correct sizes."""
+
+    dset = infinidata.TableView({"clip_embedding": vecs})
+    tree = CapTree(dset, batch_size=32, k=k, iters=16)
+    if do_split:
+        tree.split_rec()
+
+    north = np.zeros_like(vecs[0])
+    north[0] = 1.0
+
+    matching_subtrees = tree._subtrees_in_cap(north, max_cos_distance)
+
+    # This tests that the sizes it returned are correct, but not that it returns all the subtrees
+    # that match. Have to rely on other tests to cover that.
+    for path, size in matching_subtrees:
+        cur_subtree = tree
+        for step in path:
+            cur_subtree = cur_subtree.children[step]
+        subtree_vecs = [row["clip_embedding"] for row in cur_subtree.items()]
+        subtree_vecs = np.stack(subtree_vecs, axis=0)
+        distances = cosine_distance_many_to_one(subtree_vecs, north)
+        valid_distances_mask = distances <= max_cos_distance
+        assert size == np.sum(
+            valid_distances_mask
+        ), f"bad size for subtree {path}. leaf: {len(cur_subtree.children) == 0}, distances: {distances}"
+
+
+@hyp.settings(
+    deadline=timedelta(seconds=30),
+    max_examples=500,
     suppress_health_check=[hyp.HealthCheck.data_too_large],
 )
 @given(
@@ -1162,7 +1187,6 @@ def test_tree_sample_in_bounds(vecs, max_cos_distance, _rand):
     dset = infinidata.TableView({"clip_embedding": vecs})
     tree = CapTree(dset, batch_size=32, k=4, iters=16)
     tree.split_rec()
-    print(f"items: {len(tree)} max depth: {tree.depth()}")
 
     sample = tree.sample_in_cap(query_center, max_cos_distance)
     if sample is not None:
@@ -1192,10 +1216,13 @@ def test_tree_sample_finds_all(vecs, _rand):
     tree = CapTree(dset, batch_size=32, k=4, iters=16)
     tree.split_rec()
 
+    tol = 0.00001
+
     for vec in vecs:
-        sample = tree.sample_in_cap(vec, 0.00001)
+        sample = tree.sample_in_cap(vec, tol)
+        assert sample is not None
         distance = cosine_distance(sample["clip_embedding"], vec)
-        assert distance <= 0.00001
+        assert distance <= tol
         # Hypothesis sometimes generates vectors that are *very* close together, so even with a
         # very small cap we can sample a different vector.
         # np.testing.assert_array_equal(sample["clip_embedding"], vec)
