@@ -314,43 +314,24 @@ def cosine_distance_many_to_one(xs, y):
 
 
 @partial(jax.jit, inline=True)
-def caps_overlap(center1, max_cos_distance1, center2, max_cos_distance2):
-    """Check if two caps overlap."""
-    # Cosine distances don't add linearly, so we have to do this calculation in radians.
-    centers_angular_distance = jnp.arccos(jnp.dot(center1, center2))
-    angular_radius_1 = jnp.arccos(1 - max_cos_distance1)
-    angular_radius_2 = jnp.arccos(1 - max_cos_distance2)
-    return centers_angular_distance <= angular_radius_1 + angular_radius_2
-
-
-@jax.jit
-def caps_overlap_v(center1, max_cost_distance1, centers, max_cos_distances):
-    """Check if a cap overlaps with any of a set of caps. Returns an array of bools."""
-    return jax.vmap(caps_overlap, in_axes=(None, None, 0, 0))(
-        center1, max_cost_distance1, centers, max_cos_distances
+def cap_intersection_status(center_a, max_cos_distance_a, center_b, max_cos_distance_b):
+    """Calculate whether cap a contains cap b, or they intersect, or neither."""
+    assert center_a.shape == center_b.shape
+    assert max_cos_distance_a.shape == max_cos_distance_b.shape == ()
+    centers_angular_distance = jnp.arccos(jnp.dot(center_a, center_b))
+    angular_radius_a = jnp.arccos(1 - max_cos_distance_a)
+    angular_radius_b = jnp.arccos(1 - max_cos_distance_b)
+    return (
+        centers_angular_distance + angular_radius_b <= angular_radius_a,
+        centers_angular_distance <= angular_radius_a + angular_radius_b
     )
 
 
 @jax.jit
-def cap_contains_cap(
-    outer_center, outer_max_cos_distance, inner_center, inner_max_cos_distance
-):
-    """Check if a cap contains the entirety of another cap. Conservative, returns False if the
-    decision is marginal with potential numerical error."""
-    # Cosine distances don't add linearly, so we have to do this calculation in radians.
-    caps_angular_distance = jnp.arccos(jnp.dot(outer_center, inner_center))
-    outer_angular_radius = jnp.arccos(1 - outer_max_cos_distance)
-    inner_angular_radius = jnp.arccos(1 - inner_max_cos_distance)
-    return caps_angular_distance + inner_angular_radius <= outer_angular_radius
-
-
-@jax.jit
-def cap_contains_cap_v(
-    outer_center, outer_max_cos_distance, inner_centers, inner_max_cos_distances
-):
-    """Check if a cap contains the entirety of any of a set of caps. Returns an array of bools."""
-    return jax.vmap(cap_contains_cap, in_axes=(None, None, 0, 0))(
-        outer_center, outer_max_cos_distance, inner_centers, inner_max_cos_distances
+def cap_intersection_status_one_to_many(center_a, max_cos_distance_a, centers_b, max_cos_distances_b):
+    """Calculate whether cap a contains any of the caps in b, or they intersect, or neither."""
+    return jax.vmap(cap_intersection_status, in_axes=(None, None, 0, 0))(
+        center_a, max_cos_distance_a, centers_b, max_cos_distances_b
     )
 
 
@@ -793,21 +774,25 @@ class CapTree:
             leaf.dset = leaf.dset.shuffle()
 
     def _subtrees_in_cap(
-        self, query_center, query_max_cos_distance, visited=[], path=[]
+        self, query_center, query_max_cos_distance, visited=[], path=[], assume_incomplete_intersection=False
     ):
         """Find all the subtrees that are either fully contained in the input cap or are leaves and
         have vectors that are in the input cap. Returns a list of paths to subtrees and matching
         vector counts."""
         assert query_center.shape == self.center.shape
-        if cap_contains_cap(
-            query_center, query_max_cos_distance, self.center, self.max_cos_distance
-        ):
+        if assume_incomplete_intersection:
+            # In the recursive case, we already know that this cap intersects the query cap but is
+            # not contained in it, or we wouldn't have done the recursive call.
+            query_contains_self, query_intersects_self = False, True
+        else:
+            query_contains_self, query_intersects_self = cap_intersection_status(
+                query_center, query_max_cos_distance, self.center, self.max_cos_distance
+            )
+        if query_contains_self:
             # If this cap is contained in the query cap then all its vectors are in the query cap.
             visited.append(path + ["contained"])
             return [(path, len(self))]
-        elif caps_overlap(
-            query_center, query_max_cos_distance, self.center, self.max_cos_distance
-        ):
+        elif query_intersects_self:
             # If this cap overlaps the query cap, we have to check the contents of this cap.
             if len(self.children) == 0:
                 # leaf
@@ -827,7 +812,7 @@ class CapTree:
                 visited.append(path + ["overlapping node"])
                 res = []
 
-                subtrees_contained = cap_contains_cap_v(
+                subtrees_contained, subtrees_overlapping = cap_intersection_status_one_to_many(
                     query_center,
                     query_max_cos_distance,
                     self.child_cap_centers,
@@ -840,12 +825,6 @@ class CapTree:
                     visited.append(path + [i, "contained"])
                     res.append((path + [i], len(self.children[i])))
 
-                subtrees_overlapping = caps_overlap_v(
-                    query_center,
-                    query_max_cos_distance,
-                    self.child_cap_centers,
-                    self.child_cap_max_cos_distances,
-                )
                 subtrees_overlapping_idxs = np.arange(len(self.children))[
                     subtrees_overlapping
                 ]
@@ -858,15 +837,13 @@ class CapTree:
                     if i not in subtrees_contained_idxs_set:
                         subtrees_overlapping_and_not_contained.append(i)
                 for i in subtrees_overlapping_and_not_contained:
-                    # This recursive case duplicates some work, since we already checked if the
-                    # subtree is contained in the query cap as well as whether it overlaps.
-                    # Optimize if profiling shows it's a problem.
                     res.extend(
                         self.children[i]._subtrees_in_cap(
                             query_center,
                             query_max_cos_distance,
                             visited=visited,
                             path=path + [i],
+                            assume_incomplete_intersection=True,
                         )
                     )
 
