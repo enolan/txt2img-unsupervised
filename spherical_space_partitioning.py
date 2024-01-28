@@ -903,6 +903,127 @@ class CapTree:
                 assert len(sampling_subtree) == tgt_subtree_size
                 return sampling_subtree[idx_in_subtree]
 
+    def sample_in_cap_approx(
+        self,
+        query_center,
+        query_max_cos_distance,
+        density_estimate_samples=8,
+        assume_incomplete_intersection=False,
+        visited=[],
+        path=[],
+    ):
+        """Approximate method for sampling from a cap. This is much faster than the exact method
+        but biased against choosing caps where a small fraction of the vectors are in the query
+        cap. Bias reduces as density_estimate_samples increases."""
+        assert density_estimate_samples > 0
+        if assume_incomplete_intersection:
+            query_contains_self, query_intersects_self = False, True
+        else:
+            query_contains_self, query_intersects_self = cap_intersection_status(
+                query_center, query_max_cos_distance, self.center, self.max_cos_distance
+            )
+        if query_contains_self:
+            # If the query cap contains this cap, we can just sample from this cap.
+            visited.append(path + ["contained"])
+            return self[np.random.randint(len(self))]
+        elif query_intersects_self:
+            # If the query cap intersects this cap but doesn't fully contain it, we sample from the
+            # subset of the vectors in this cap that are in the query cap.
+            if len(self.children) == 0:
+                # If it's a leaf we fall back to exact sampling.
+                visited.append(path + ["overlapping leaf"])
+                return self.sample_in_cap(query_center, query_max_cos_distance)
+            else:
+                # If it's a node we estimate the density of vectors inside the query cap for each
+                # child.
+                visited.append(path + ["overlapping node"])
+                # If we can compute geometrically that a child is fully contained then its density
+                # is 1, if it doesn't intersect at all then its density is 0, and if it intersects
+                # but is not fully contained then we estimate the density by sampling.
+                (
+                    subtrees_contained,
+                    subtrees_overlapping,
+                ) = cap_intersection_status_one_to_many(
+                    query_center,
+                    query_max_cos_distance,
+                    self.child_cap_centers,
+                    self.child_cap_max_cos_distances,
+                )
+                subtrees_contained_idxs = np.arange(len(self.children))[
+                    subtrees_contained
+                ]
+                subtrees_overlapping_idxs = np.arange(len(self.children))[
+                    subtrees_overlapping & ~subtrees_contained
+                ]
+
+                densities = np.zeros(len(self.children))
+                densities[subtrees_contained_idxs] = 1.0
+                sizes = np.array([len(child) for child in self.children])
+
+                for i in subtrees_overlapping_idxs:
+                    sampled_vecs = []
+                    for _ in range(density_estimate_samples):
+                        sampled_vecs.append(
+                            self.children[i][np.random.randint(sizes[i])][
+                                "clip_embedding"
+                            ]
+                        )
+                    sampled_vecs = np.stack(sampled_vecs, axis=0)
+                    in_cap = (
+                        cosine_distance_many_to_one(sampled_vecs, query_center)
+                        <= query_max_cos_distance
+                    )
+                    densities[i] = np.mean(in_cap)
+
+                densities = np.array(densities)
+                estimated_matching_sizes = densities * sizes
+                # print(f"Estimated densities: {densities}, sizes: {estimated_sizes}")
+                if np.sum(estimated_matching_sizes) == 0:
+                    # Either the query cap is empty or it matches very few vectors in this node. We
+                    # loop over any overlapping children (assuming their densities are equal),
+                    # weighted by the sizes of the subtrees, and sample from them, returning the
+                    # first match. If there are no overlapping children or none match we return None.
+                    if len(subtrees_overlapping_idxs) > 0:
+                        visited.append(path + ["estimated 0 matches, looping"])
+                        candidate_sizes = sizes[subtrees_overlapping_idxs].astype(
+                            np.float64
+                        )
+                        # print(f"candidate_sizes: {candidate_sizes}")
+                        candidates = np.random.choice(
+                            subtrees_overlapping_idxs,
+                            size=len(subtrees_overlapping_idxs),
+                            replace=False,
+                            p=candidate_sizes / np.sum(candidate_sizes),
+                        )
+                        # print(f"candidates: {candidates}")
+                        for i in candidates:
+                            sampled = self.children[i].sample_in_cap_approx(
+                                query_center,
+                                query_max_cos_distance,
+                                density_estimate_samples=density_estimate_samples,
+                                assume_incomplete_intersection=True,
+                                visited=visited,
+                                path=path + [i],
+                            )
+                            if sampled is not None:
+                                return sampled
+                    return None
+                else:
+                    subtree_idx = np.random.choice(
+                        np.arange(len(self.children)), p=densities / np.sum(densities)
+                    )
+                    return self.children[subtree_idx].sample_in_cap_approx(
+                        query_center,
+                        query_max_cos_distance,
+                        density_estimate_samples=density_estimate_samples,
+                        assume_incomplete_intersection=True,
+                        visited=visited,
+                        path=path + [subtree_idx],
+                    )
+        else:
+            visited.append(path + ["empty"])
+            return None
+
     def __getitem__(self, idx):
         """Get a vector by index. There is no meaningful ordering."""
         if idx < 0 or idx >= len(self):
@@ -1204,6 +1325,68 @@ def test_tree_sample_finds_all(vecs, _rand):
         # very small cap we can sample a different vector.
         # np.testing.assert_array_equal(sample["clip_embedding"], vec)
 
+
+@hyp.settings(
+    deadline=timedelta(seconds=30),
+    max_examples=500,
+    suppress_health_check=[hyp.HealthCheck.data_too_large],
+)
+@given(
+    _unit_vecs(
+        st.tuples(st.integers(2, 1025), st.integers(2, 4)),
+    ),
+    st.floats(0, 2.0, width=32),
+    st.random_module(),
+)
+def test_tree_sample_approx_in_bounds(vecs, max_cos_distance, _rand):
+    """Test that sampling retrieves vectors in the specified cap."""
+
+    query_center = vecs[0]
+    vecs = vecs[1:]
+    vecs_set = set(tuple(vec) for vec in vecs)
+
+    dset = infinidata.TableView({"clip_embedding": vecs})
+    tree = CapTree(dset, batch_size=32, k=4, iters=16)
+    tree.split_rec()
+
+    sample = tree.sample_in_cap_approx(query_center, max_cos_distance)
+    if sample is not None:
+        assert (
+            cosine_distance(sample["clip_embedding"], query_center)
+            <= max_cos_distance + tree.EPSILON
+        )
+        assert tuple(sample["clip_embedding"]) in vecs_set
+
+
+@hyp.settings(
+    deadline=timedelta(seconds=30),
+    max_examples=500,
+    suppress_health_check=[hyp.HealthCheck.data_too_large],
+)
+@given(
+    _unit_vecs(
+        st.tuples(st.integers(1, 1024), st.integers(2, 4)),
+    ),
+    st.random_module(),
+)
+def test_tree_sample_approx_finds_all(vecs, _rand):
+    """Test that sampling retrieves all vectors in the tree when sampling from tiny caps centered
+    on each vector."""
+
+    dset = infinidata.TableView({"clip_embedding": vecs})
+    tree = CapTree(dset, batch_size=32, k=4, iters=16)
+    tree.split_rec()
+
+    tol = 0.00001
+
+    for vec in vecs:
+        sample = tree.sample_in_cap_approx(vec, tol)
+        assert sample is not None
+        distance = cosine_distance(sample["clip_embedding"], vec)
+        assert distance <= tol
+        # Hypothesis sometimes generates vectors that are *very* close together, so even with a
+        # very small cap we can sample a different vector.
+        # np.testing.assert_array_equal(sample["clip_embedding"], vec)
 
 @hyp.settings(
     deadline=timedelta(seconds=30),
