@@ -323,12 +323,14 @@ def cap_intersection_status(center_a, max_cos_distance_a, center_b, max_cos_dist
     angular_radius_b = jnp.arccos(1 - max_cos_distance_b)
     return (
         centers_angular_distance + angular_radius_b <= angular_radius_a,
-        centers_angular_distance <= angular_radius_a + angular_radius_b
+        centers_angular_distance <= angular_radius_a + angular_radius_b,
     )
 
 
 @jax.jit
-def cap_intersection_status_one_to_many(center_a, max_cos_distance_a, centers_b, max_cos_distances_b):
+def cap_intersection_status_one_to_many(
+    center_a, max_cos_distance_a, centers_b, max_cos_distances_b
+):
     """Calculate whether cap a contains any of the caps in b, or they intersect, or neither."""
     return jax.vmap(cap_intersection_status, in_axes=(None, None, 0, 0))(
         center_a, max_cos_distance_a, centers_b, max_cos_distances_b
@@ -774,7 +776,12 @@ class CapTree:
             leaf.dset = leaf.dset.shuffle()
 
     def _subtrees_in_cap(
-        self, query_center, query_max_cos_distance, visited=[], path=[], assume_incomplete_intersection=False
+        self,
+        query_center,
+        query_max_cos_distance,
+        visited=[],
+        path=[],
+        assume_incomplete_intersection=False,
     ):
         """Find all the subtrees that are either fully contained in the input cap or are leaves and
         have vectors that are in the input cap. Returns a list of paths to subtrees and matching
@@ -812,7 +819,10 @@ class CapTree:
                 visited.append(path + ["overlapping node"])
                 res = []
 
-                subtrees_contained, subtrees_overlapping = cap_intersection_status_one_to_many(
+                (
+                    subtrees_contained,
+                    subtrees_overlapping,
+                ) = cap_intersection_status_one_to_many(
                     query_center,
                     query_max_cos_distance,
                     self.child_cap_centers,
@@ -1387,6 +1397,7 @@ def test_tree_sample_approx_finds_all(vecs, _rand):
         # Hypothesis sometimes generates vectors that are *very* close together, so even with a
         # very small cap we can sample a different vector.
         # np.testing.assert_array_equal(sample["clip_embedding"], vec)
+
 
 @hyp.settings(
     deadline=timedelta(seconds=30),
