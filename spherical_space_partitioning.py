@@ -15,6 +15,7 @@ import tempfile
 
 from datasets import Dataset
 from datetime import datetime, timedelta
+from einops import rearrange, reduce
 from functools import partial
 from hypothesis import given, strategies as st
 from pathlib import Path
@@ -997,7 +998,7 @@ class CapTree:
                 # If we can't find any positive samples we have to revert to exact sampling, so we
                 # try pretty hard to find at least one.
                 if len(subtrees_overlapping_idxs) > 0:
-                    positive_samples = np.zeros(
+                    positive_samples = jnp.zeros(
                         len(subtrees_overlapping_idxs), dtype=np.int32
                     )
                     total_samples = 0
@@ -1011,18 +1012,43 @@ class CapTree:
                         samples_this_iter = max(
                             total_samples * 3, density_estimate_samples
                         )
+                        sampled_vecs = np.zeros(
+                            (
+                                samples_this_iter * len(subtrees_overlapping_idxs),
+                                self.center.shape[0],
+                            ),
+                            dtype=np.float32,
+                        )
+                        sampled_vecs_cur = 0
                         for j, i in enumerate(subtrees_overlapping_idxs):
                             sample_idxs = np.random.randint(
                                 sizes[i], size=samples_this_iter
                             )
-                            sampled_vecs = self.children[i].dset_thin[sample_idxs][
+                            sampled_vecs[
+                                sampled_vecs_cur : sampled_vecs_cur + samples_this_iter
+                            ] = self.children[i].dset_thin[sample_idxs][
                                 "clip_embedding"
                             ]
-                            in_cap = (
-                                cosine_distance_many_to_one(sampled_vecs, query_center)
-                                <= query_max_cos_distance
-                            )
-                            positive_samples[j] += np.sum(in_cap)
+                            sampled_vecs_cur += samples_this_iter
+
+                        in_cap = (
+                            cosine_distance_many_to_one(sampled_vecs, query_center)
+                            <= query_max_cos_distance
+                        )
+                        in_cap_by_subtree = rearrange(
+                            in_cap,
+                            "(t n) -> t n",
+                            t=len(subtrees_overlapping_idxs),
+                            n=samples_this_iter,
+                        )
+                        positive_samples_this_iter = reduce(
+                            in_cap_by_subtree, "t n -> t", "sum", n=samples_this_iter
+                        )
+                        # print(f"positive_samples_this_iter: {positive_samples_this_iter}")
+                        assert (
+                            positive_samples_this_iter.shape == positive_samples.shape
+                        )
+                        positive_samples = positive_samples + positive_samples_this_iter
                         total_samples += samples_this_iter
                     densities[subtrees_overlapping_idxs] = (
                         positive_samples / total_samples
