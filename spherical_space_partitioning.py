@@ -804,9 +804,8 @@ class CapTree:
             if len(self.children) == 0:
                 # leaf
                 visited.append(path + ["overlapping leaf"])
-                distances = cosine_distance_many_to_one(
-                    self.dset_thin[:]["clip_embedding"], query_center
-                )
+                vecs = self.dset_thin[:]["clip_embedding"]
+                distances = cosine_distance_many_to_one(vecs, query_center)
                 valid_distances_mask = distances <= query_max_cos_distance
                 valid_distances_cnt = np.sum(valid_distances_mask)
                 return (
