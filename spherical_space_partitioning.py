@@ -1020,7 +1020,7 @@ class CapTree:
                     return None
                 else:
                     subtree_idx = np.random.choice(
-                        np.arange(len(self.children)), p=densities / np.sum(densities)
+                        np.arange(len(self.children)), p=estimated_matching_sizes / np.sum(estimated_matching_sizes)
                     )
                     return self.children[subtree_idx].sample_in_cap_approx(
                         query_center,
