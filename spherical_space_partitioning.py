@@ -448,8 +448,6 @@ class CapTree:
             [child.max_cos_distance for child in self.children]
         )
 
-        self.dset = None
-
         if len(self.children) == 1:
             # There may be very rare cases where this isn't caused by duplicate vectors, but in
             # general it is. It happens when there are more than max_leaf_size duplicates and
@@ -697,8 +695,8 @@ class CapTree:
     def _check_invariants(self):
         """Check invariants of the tree."""
         assert len(self) > 0
+        assert len(self) == len(self.dset)
         if len(self.children) > 0:
-            assert self.dset is None
             assert sum(len(child) for child in self.children) == len(self)
             assert (
                 self.child_cap_centers.shape[0]
@@ -712,8 +710,6 @@ class CapTree:
                     == self.children[i].max_cos_distance
                 )
         else:
-            assert self.dset is not None
-            assert self.len == len(self.dset)
             assert self.center.shape == self.dset[0]["clip_embedding"].shape
             assert self.child_cap_centers == self.child_cap_max_cos_distances == None
 
@@ -1020,11 +1016,7 @@ class CapTree:
                             sample_idxs = np.random.randint(
                                 sizes[i], size=samples_this_iter
                             )
-                            for sample_idx in sample_idxs:
-                                sampled_vecs.append(
-                                    self.children[i][sample_idx]["clip_embedding"]
-                                )
-                            sampled_vecs = np.stack(sampled_vecs, axis=0)
+                            sampled_vecs = self.children[i].dset_thin[sample_idxs]["clip_embedding"]
                             in_cap = (
                                 cosine_distance_many_to_one(sampled_vecs, query_center)
                                 <= query_max_cos_distance
@@ -1068,18 +1060,7 @@ class CapTree:
 
     def __getitem__(self, idx):
         """Get a vector by index. There is no meaningful ordering."""
-        if idx < 0 or idx >= self.len:
-            raise IndexError(f"index {idx} out of range")
-        if len(self.children) == 0:
-            return self.dset[idx]
-        else:
-            seen_so_far = 0
-            for child in self.children:
-                if idx < seen_so_far + child.len:
-                    return child[idx - seen_so_far]
-                else:
-                    seen_so_far += child.len
-            assert False, "this should be unreachable"
+        return self.dset[idx]
 
     def save_to_disk(self, dir):
         """Save the tree to disk."""
@@ -1156,6 +1137,16 @@ class CapTree:
         else:
             self.child_cap_centers = self.child_cap_max_cos_distances = None
 
+    def _fixup_inner_dsets(self):
+        """Fill in the dsets of the children of this tree with the appropriate slices of this
+        tree's dset. Assumes this dset is ordered with the children's dsets concatenated."""
+        cur_idx = 0
+        for child in self.children:
+            child.dset = self.dset.new_view(slice(cur_idx, cur_idx + len(child)))
+            child.dset_thin = child.dset.select_columns({"clip_embedding"})
+            cur_idx += len(child)
+            child._fixup_inner_dsets()
+
     @classmethod
     def load_from_disk(cls, dir, save_cache=True):
         """Load a tree from disk."""
@@ -1175,20 +1166,9 @@ class CapTree:
 
         out._empty_from_summary(out, summary["structure"])
 
-        dset_full = load_pq_to_infinidata(dir / "data.parquet", save_cache=save_cache)
+        out.dset = load_pq_to_infinidata(dir / "data.parquet", save_cache=save_cache)
 
-        leaf_ranges = []
-        leaf_idx = 0
-
-        for leaf in out.leaves():
-            leaf_ranges.append((leaf_idx, leaf_idx + len(leaf)))
-            leaf_idx += len(leaf)
-
-        assert leaf_ranges[-1][1] == len(dset_full)
-
-        for i, leaf in enumerate(out.leaves()):
-            leaf.dset = dset_full.new_view(slice(*leaf_ranges[i]))
-            leaf.dset_thin = leaf.dset.select_columns({"clip_embedding"})
+        out._fixup_inner_dsets()
 
         out._fixup_traversal_arrays()
 
