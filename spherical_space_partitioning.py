@@ -942,7 +942,7 @@ class CapTree:
         self,
         query_center,
         query_max_cos_distance,
-        density_estimate_samples=32,
+        density_estimate_samples=8,
         assume_incomplete_intersection=False,
         visited=[],
         path=[],
@@ -1001,6 +1001,14 @@ class CapTree:
                     positive_samples = jnp.zeros(
                         len(subtrees_overlapping_idxs), dtype=np.int32
                     )
+                    # We do the same number of total samples regardless of how many subtrees we're
+                    # sampling in.
+                    base_samples_per_subtree = (
+                        density_estimate_samples
+                        * (self.k + 1)
+                        // len(subtrees_overlapping_idxs)
+                    )
+
                     total_samples = 0
 
                     while (
@@ -1010,7 +1018,7 @@ class CapTree:
                         # Sampling three times as many vectors as we have sampled before each round
                         # means the total sample count quadruples each iteration
                         samples_this_iter = max(
-                            total_samples * 3, density_estimate_samples
+                            total_samples * 3, base_samples_per_subtree
                         )
                         sampled_vecs = np.zeros(
                             (
