@@ -836,26 +836,55 @@ class CapTree:
                     res.append((path + [i], len(self.children[i])))
 
                 subtrees_overlapping_idxs = np.arange(len(self.children))[
-                    subtrees_overlapping
+                    subtrees_overlapping & ~subtrees_contained
                 ]
 
-                # All contained caps are also overlapping, so we remove them from the overlapping
-                # set so we don't double count.
-                subtrees_overlapping_and_not_contained = []
-                subtrees_contained_idxs_set = set(subtrees_contained_idxs)
+                # If any of the overlapping but not fully contained subtrees are leaves, we
+                # aggregate their vectors and check them all at once. GPU like big job all at once.
+                # GPU hate many small job.
+                leaf_vectors = []
+                leaf_vector_lens = []
+                leaf_subtrees = np.zeros(len(self.children), dtype=bool)
                 for i in subtrees_overlapping_idxs:
-                    if i not in subtrees_contained_idxs_set:
-                        subtrees_overlapping_and_not_contained.append(i)
-                for i in subtrees_overlapping_and_not_contained:
-                    res.extend(
-                        self.children[i]._subtrees_in_cap(
-                            query_center,
-                            query_max_cos_distance,
-                            visited=visited,
-                            path=path + [i],
-                            assume_incomplete_intersection=True,
+                    if len(self.children[i].children) == 0:
+                        leaf_vectors.append(
+                            self.children[i].dset_thin[:]["clip_embedding"]
                         )
+                        leaf_vector_lens.append((i, len(self.children[i])))
+                        leaf_subtrees[i] = True
+                        visited.append(path + [i, "overlapping leaf (aggregated)"])
+                if len(leaf_vectors) > 0:
+                    leaf_vectors = np.concatenate(leaf_vectors, axis=0)
+                    leaf_distances = cosine_distance_many_to_one(
+                        leaf_vectors, query_center
                     )
+                    leaf_valid_distances_mask = leaf_distances <= query_max_cos_distance
+                    leaf_valid_distances_cnt = np.sum(leaf_valid_distances_mask)
+                    if leaf_valid_distances_cnt > 0:
+                        len_so_far = 0
+                        for i, len_i in leaf_vector_lens:
+                            res.append(
+                                (
+                                    path + [i],
+                                    np.sum(
+                                        leaf_valid_distances_mask[
+                                            len_so_far : len_so_far + len_i
+                                        ]
+                                    ),
+                                )
+                            )
+                            len_so_far += len_i
+                for i in subtrees_overlapping_idxs:
+                    if not leaf_subtrees[i]:
+                        res.extend(
+                            self.children[i]._subtrees_in_cap(
+                                query_center,
+                                query_max_cos_distance,
+                                visited=visited,
+                                path=path + [i],
+                                assume_incomplete_intersection=True,
+                            )
+                        )
 
                 return res
         else:
