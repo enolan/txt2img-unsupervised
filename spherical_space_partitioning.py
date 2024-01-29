@@ -1012,7 +1012,6 @@ class CapTree:
                             total_samples * 3, density_estimate_samples
                         )
                         for j, i in enumerate(subtrees_overlapping_idxs):
-                            sampled_vecs = []
                             sample_idxs = np.random.randint(
                                 sizes[i], size=samples_this_iter
                             )
