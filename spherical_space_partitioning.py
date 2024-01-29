@@ -917,7 +917,7 @@ class CapTree:
         self,
         query_center,
         query_max_cos_distance,
-        density_estimate_samples=8,
+        density_estimate_samples=32,
         assume_incomplete_intersection=False,
         visited=[],
         path=[],
@@ -966,26 +966,46 @@ class CapTree:
                     subtrees_overlapping & ~subtrees_contained
                 ]
 
-                densities = np.zeros(len(self.children))
+                densities = np.zeros(len(self.children), dtype=np.float32)
                 densities[subtrees_contained_idxs] = 1.0
                 sizes = np.array([len(child) for child in self.children])
 
-                for i in subtrees_overlapping_idxs:
-                    sampled_vecs = []
-                    for _ in range(density_estimate_samples):
-                        sampled_vecs.append(
-                            self.children[i][np.random.randint(sizes[i])][
-                                "clip_embedding"
-                            ]
-                        )
-                    sampled_vecs = np.stack(sampled_vecs, axis=0)
-                    in_cap = (
-                        cosine_distance_many_to_one(sampled_vecs, query_center)
-                        <= query_max_cos_distance
+                # If we can't find any positive samples we have to revert to exact sampling, so we
+                # try pretty hard to find at least one.
+                if len(subtrees_overlapping_idxs) > 0:
+                    positive_samples = np.zeros(
+                        len(subtrees_overlapping_idxs), dtype=np.int32
                     )
-                    densities[i] = np.mean(in_cap)
+                    total_samples = 0
 
-                densities = np.array(densities)
+                    while (
+                        np.sum(positive_samples) < 1
+                        and total_samples < density_estimate_samples * 4**3
+                    ):
+                        # Sampling three times as many vectors as we have sampled before each round
+                        # means the total sample count quadruples each iteration
+                        samples_this_iter = max(
+                            total_samples * 3, density_estimate_samples
+                        )
+                        for j, i in enumerate(subtrees_overlapping_idxs):
+                            sampled_vecs = []
+                            for _ in range(samples_this_iter):
+                                sampled_vecs.append(
+                                    self.children[i][np.random.randint(sizes[i])][
+                                        "clip_embedding"
+                                    ]
+                                )
+                            sampled_vecs = np.stack(sampled_vecs, axis=0)
+                            in_cap = (
+                                cosine_distance_many_to_one(sampled_vecs, query_center)
+                                <= query_max_cos_distance
+                            )
+                            positive_samples[j] += np.sum(in_cap)
+                        total_samples += samples_this_iter
+                    densities[subtrees_overlapping_idxs] = (
+                        positive_samples / total_samples
+                    )
+
                 estimated_matching_sizes = densities * sizes
                 if np.sum(estimated_matching_sizes) == 0:
                     # Either the query cap is empty or it matches very few vectors in this node. We
@@ -997,7 +1017,9 @@ class CapTree:
                         return self.sample_in_cap(
                             query_center, query_max_cos_distance, visited=visited
                         )
-                    return None
+                    else:
+                        visited.append(path + ["computed 0 matches geometrically"])
+                        return None
                 else:
                     subtree_idx = np.random.choice(
                         np.arange(len(self.children)),
