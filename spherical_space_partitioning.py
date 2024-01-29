@@ -1015,7 +1015,9 @@ class CapTree:
                             sample_idxs = np.random.randint(
                                 sizes[i], size=samples_this_iter
                             )
-                            sampled_vecs = self.children[i].dset_thin[sample_idxs]["clip_embedding"]
+                            sampled_vecs = self.children[i].dset_thin[sample_idxs][
+                                "clip_embedding"
+                            ]
                             in_cap = (
                                 cosine_distance_many_to_one(sampled_vecs, query_center)
                                 <= query_max_cos_distance
@@ -1138,7 +1140,8 @@ class CapTree:
 
     def _fixup_inner_dsets(self):
         """Fill in the dsets of the children of this tree with the appropriate slices of this
-        tree's dset. Assumes this dset is ordered with the children's dsets concatenated."""
+        tree's dset. Assumes this dset is ordered with the children's dsets concatenated.
+        """
         cur_idx = 0
         for child in self.children:
             child.dset = self.dset.new_view(slice(cur_idx, cur_idx + len(child)))
