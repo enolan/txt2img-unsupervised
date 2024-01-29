@@ -991,12 +991,17 @@ class CapTree:
                     # Either the query cap is empty or it matches very few vectors in this node. We
                     # fall back to exact sampling.
                     if len(subtrees_overlapping_idxs) > 0:
-                        visited.append(path + ["estimated 0 matches, falling back to exact mode"])
-                        return self.sample_in_cap(query_center, query_max_cos_distance, visited=visited)
+                        visited.append(
+                            path + ["estimated 0 matches, falling back to exact mode"]
+                        )
+                        return self.sample_in_cap(
+                            query_center, query_max_cos_distance, visited=visited
+                        )
                     return None
                 else:
                     subtree_idx = np.random.choice(
-                        np.arange(len(self.children)), p=estimated_matching_sizes / np.sum(estimated_matching_sizes)
+                        np.arange(len(self.children)),
+                        p=estimated_matching_sizes / np.sum(estimated_matching_sizes),
                     )
                     return self.children[subtree_idx].sample_in_cap_approx(
                         query_center,
