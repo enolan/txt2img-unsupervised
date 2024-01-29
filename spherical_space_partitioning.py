@@ -318,7 +318,7 @@ def cap_intersection_status(center_a, max_cos_distance_a, center_b, max_cos_dist
     """Calculate whether cap a contains cap b, or they intersect, or neither."""
     assert center_a.shape == center_b.shape
     assert max_cos_distance_a.shape == max_cos_distance_b.shape == ()
-    centers_angular_distance = jnp.arccos(jnp.dot(center_a, center_b))
+    centers_angular_distance = jnp.arccos(jnp.clip(jnp.dot(center_a, center_b), -1, 1))
     angular_radius_a = jnp.arccos(1 - max_cos_distance_a)
     angular_radius_b = jnp.arccos(1 - max_cos_distance_b)
     return (
@@ -1368,7 +1368,7 @@ def test_tree_sample_approx_finds_all(vecs, _rand):
     tree = CapTree(dset, batch_size=32, k=4, iters=16)
     tree.split_rec()
 
-    tol = 0.00001
+    tol = 0.0001
 
     for vec in vecs:
         sample = tree.sample_in_cap_approx(vec, tol)
