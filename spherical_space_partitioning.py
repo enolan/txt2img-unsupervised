@@ -798,7 +798,7 @@ class CapTree:
         if query_contains_self:
             # If this cap is contained in the query cap then all its vectors are in the query cap.
             visited.append(path + ["contained"])
-            return [(path, len(self))]
+            return [(path, self.len)]
         elif query_intersects_self:
             # If this cap overlaps the query cap, we have to check the contents of this cap.
             if len(self.children) == 0:
@@ -832,7 +832,7 @@ class CapTree:
                 ]
                 for i in subtrees_contained_idxs:
                     visited.append(path + [i, "contained"])
-                    res.append((path + [i], len(self.children[i])))
+                    res.append((path + [i], self.children[i].len))
 
                 subtrees_overlapping_idxs = np.arange(len(self.children))[
                     subtrees_overlapping & ~subtrees_contained
@@ -849,7 +849,7 @@ class CapTree:
                         leaf_vectors.append(
                             self.children[i].dset_thin[:]["clip_embedding"]
                         )
-                        leaf_vector_lens.append((i, len(self.children[i])))
+                        leaf_vector_lens.append((i, self.children[i].len))
                         leaf_subtrees[i] = True
                         visited.append(path + [i, "overlapping leaf (aggregated)"])
                 if len(leaf_vectors) > 0:
@@ -917,11 +917,11 @@ class CapTree:
                 cur_subtree = cur_subtree.children[step]
 
             sampling_subtree = cur_subtree
-            assert len(sampling_subtree) >= tgt_subtree_size
+            assert sampling_subtree.len >= tgt_subtree_size
 
             if len(sampling_subtree.children) == 0:
                 # We're sampling from a leaf
-                if len(sampling_subtree) == tgt_subtree_size:
+                if sampling_subtree.len == tgt_subtree_size:
                     # All the vectors in the leaf are within the query cap.
                     sampled = sampling_subtree.dset[idx_in_subtree]
                     return sampled
@@ -963,7 +963,7 @@ class CapTree:
         if query_contains_self:
             # If the query cap contains this cap, we can just sample from this cap.
             visited.append(path + ["contained"])
-            return self[np.random.randint(len(self))]
+            return self[np.random.randint(self.len)]
         elif query_intersects_self:
             # If the query cap intersects this cap but doesn't fully contain it, we sample from the
             # subset of the vectors in this cap that are in the query cap.
@@ -996,7 +996,7 @@ class CapTree:
 
                 densities = np.zeros(len(self.children), dtype=np.float32)
                 densities[subtrees_contained_idxs] = 1.0
-                sizes = np.array([len(child) for child in self.children])
+                sizes = np.array([child.len for child in self.children])
 
                 # If we can't find any positive samples we have to revert to exact sampling, so we
                 # try pretty hard to find at least one.
@@ -1017,11 +1017,12 @@ class CapTree:
                         )
                         for j, i in enumerate(subtrees_overlapping_idxs):
                             sampled_vecs = []
-                            for _ in range(samples_this_iter):
+                            sample_idxs = np.random.randint(
+                                sizes[i], size=samples_this_iter
+                            )
+                            for sample_idx in sample_idxs:
                                 sampled_vecs.append(
-                                    self.children[i][np.random.randint(sizes[i])][
-                                        "clip_embedding"
-                                    ]
+                                    self.children[i][sample_idx]["clip_embedding"]
                                 )
                             sampled_vecs = np.stack(sampled_vecs, axis=0)
                             in_cap = (
@@ -1067,17 +1068,17 @@ class CapTree:
 
     def __getitem__(self, idx):
         """Get a vector by index. There is no meaningful ordering."""
-        if idx < 0 or idx >= len(self):
+        if idx < 0 or idx >= self.len:
             raise IndexError(f"index {idx} out of range")
         if len(self.children) == 0:
             return self.dset[idx]
         else:
             seen_so_far = 0
             for child in self.children:
-                if idx < seen_so_far + len(child):
+                if idx < seen_so_far + child.len:
                     return child[idx - seen_so_far]
                 else:
-                    seen_so_far += len(child)
+                    seen_so_far += child.len
             assert False, "this should be unreachable"
 
     def save_to_disk(self, dir):
