@@ -987,36 +987,12 @@ class CapTree:
 
                 densities = np.array(densities)
                 estimated_matching_sizes = densities * sizes
-                # print(f"Estimated densities: {densities}, sizes: {estimated_sizes}")
                 if np.sum(estimated_matching_sizes) == 0:
                     # Either the query cap is empty or it matches very few vectors in this node. We
-                    # loop over any overlapping children (assuming their densities are equal),
-                    # weighted by the sizes of the subtrees, and sample from them, returning the
-                    # first match. If there are no overlapping children or none match we return None.
+                    # fall back to exact sampling.
                     if len(subtrees_overlapping_idxs) > 0:
-                        visited.append(path + ["estimated 0 matches, looping"])
-                        candidate_sizes = sizes[subtrees_overlapping_idxs].astype(
-                            np.float64
-                        )
-                        # print(f"candidate_sizes: {candidate_sizes}")
-                        candidates = np.random.choice(
-                            subtrees_overlapping_idxs,
-                            size=len(subtrees_overlapping_idxs),
-                            replace=False,
-                            p=candidate_sizes / np.sum(candidate_sizes),
-                        )
-                        # print(f"candidates: {candidates}")
-                        for i in candidates:
-                            sampled = self.children[i].sample_in_cap_approx(
-                                query_center,
-                                query_max_cos_distance,
-                                density_estimate_samples=density_estimate_samples,
-                                assume_incomplete_intersection=True,
-                                visited=visited,
-                                path=path + [i],
-                            )
-                            if sampled is not None:
-                                return sampled
+                        visited.append(path + ["estimated 0 matches, falling back to exact mode"])
+                        return self.sample_in_cap(query_center, query_max_cos_distance, visited=visited)
                     return None
                 else:
                     subtree_idx = np.random.choice(
