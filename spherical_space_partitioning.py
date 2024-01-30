@@ -1517,6 +1517,7 @@ def main():
     parser.add_argument("--read-dup-blacklist", type=Path, default=None)
     parser.add_argument("--paranoid", action="store_true")
     parser.add_argument("--save-dir", type=Path, required=True)
+    parser.add_argument("--thin", action="store_true")
     args = parser.parse_args()
 
     if args.save_dir.exists():
@@ -1527,6 +1528,8 @@ def main():
     print(f"Time at start: {get_timestamp()}")
 
     dset_all = load_pq_dir_to_infinidata(args.pq_dir).shuffle(seed=19900515)
+    if args.thin:
+        dset_all = dset_all.select_columns({"clip_embedding"})
     print(f"Loaded dataset with {len(dset_all)} rows")
     dset = dset_all.new_view(slice(0, int(len(dset_all) * 0.99)))
     print(f"Train set size: {len(dset)}")
