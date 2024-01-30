@@ -315,6 +315,27 @@ def cosine_distance_many_to_one(xs, y):
 
 
 @partial(jax.jit, inline=True)
+def vector_in_cap(v, cap_center, max_cos_distance):
+    """Check if v is in the cap defined by cap_center and max_cos_distance."""
+    assert len(v.shape) == 1
+    assert v.shape == cap_center.shape
+    assert max_cos_distance.shape == ()
+    return cosine_distance(v, cap_center) <= max_cos_distance
+
+
+@jax.jit
+def vectors_in_cap(vs, cap_center, max_cos_distance):
+    """Check which vectors in vs are in the cap defined by cap_center and max_cos_distance."""
+    assert len(vs.shape) == 2
+    assert len(cap_center.shape) == 1
+    assert vs.shape[1] == cap_center.shape[0]
+    assert max_cos_distance.shape == ()
+    return jax.vmap(vector_in_cap, in_axes=(0, None, None))(
+        vs, cap_center, max_cos_distance
+    )
+
+
+@partial(jax.jit, inline=True)
 def cap_intersection_status(center_a, max_cos_distance_a, center_b, max_cos_distance_b):
     """Calculate whether cap a contains cap b, or they intersect, or neither."""
     assert center_a.shape == center_b.shape
@@ -802,8 +823,9 @@ class CapTree:
                 # leaf
                 visited.append(path + ["overlapping leaf"])
                 vecs = self.dset_thin[:]["clip_embedding"]
-                distances = cosine_distance_many_to_one(vecs, query_center)
-                valid_distances_mask = distances <= query_max_cos_distance
+                valid_distances_mask = vectors_in_cap(
+                    vecs, query_center, query_max_cos_distance
+                )
                 valid_distances_cnt = np.sum(valid_distances_mask)
                 return (
                     [(path, int(valid_distances_cnt))]
@@ -851,10 +873,9 @@ class CapTree:
                         visited.append(path + [i, "overlapping leaf (aggregated)"])
                 if len(leaf_vectors) > 0:
                     leaf_vectors = np.concatenate(leaf_vectors, axis=0)
-                    leaf_distances = cosine_distance_many_to_one(
-                        leaf_vectors, query_center
+                    leaf_valid_distances_mask = vectors_in_cap(
+                        leaf_vectors, query_center, query_max_cos_distance
                     )
-                    leaf_valid_distances_mask = leaf_distances <= query_max_cos_distance
                     leaf_valid_distances_cnt = np.sum(leaf_valid_distances_mask)
                     if leaf_valid_distances_cnt > 0:
                         len_so_far = 0
@@ -924,10 +945,11 @@ class CapTree:
                     return sampled
                 else:
                     # We need to check the vectors in the leaf.
-                    distances = cosine_distance_many_to_one(
-                        sampling_subtree.dset_thin[:]["clip_embedding"], query_center
+                    valid_distances_mask = vectors_in_cap(
+                        sampling_subtree.dset_thin[:]["clip_embedding"],
+                        query_center,
+                        query_max_cos_distance,
                     )
-                    valid_distances_mask = distances <= query_max_cos_distance
                     valid_distances_idxs = np.arange(len(sampling_subtree.dset))[
                         valid_distances_mask
                     ]
@@ -1039,9 +1061,8 @@ class CapTree:
                             ]
                             sampled_vecs_cur += samples_this_iter
 
-                        in_cap = (
-                            cosine_distance_many_to_one(sampled_vecs, query_center)
-                            <= query_max_cos_distance
+                        in_cap = vectors_in_cap(
+                            sampled_vecs, query_center, query_max_cos_distance
                         )
                         in_cap_by_subtree = rearrange(
                             in_cap,
