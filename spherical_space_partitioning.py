@@ -1081,14 +1081,17 @@ class CapTree:
                         np.arange(len(self.children)),
                         p=estimated_matching_sizes / np.sum(estimated_matching_sizes),
                     )
-                    return self.children[subtree_idx].sample_in_cap_approx(
-                        query_center,
-                        query_max_cos_distance,
-                        density_estimate_samples=density_estimate_samples,
-                        assume_incomplete_intersection=True,
-                        visited=visited,
-                        path=path + [subtree_idx],
-                    )
+                    if subtrees_contained[subtree_idx]:
+                        return self.children[subtree_idx][np.random.randint(sizes[subtree_idx])]
+                    else:
+                        return self.children[subtree_idx].sample_in_cap_approx(
+                            query_center,
+                            query_max_cos_distance,
+                            density_estimate_samples=density_estimate_samples,
+                            assume_incomplete_intersection=True,
+                            visited=visited,
+                            path=path + [subtree_idx],
+                        )
         else:
             visited.append(path + ["empty"])
             return None
