@@ -1103,7 +1103,9 @@ class CapTree:
                         p=estimated_matching_sizes / np.sum(estimated_matching_sizes),
                     )
                     if subtrees_contained[subtree_idx]:
-                        return self.children[subtree_idx][np.random.randint(sizes[subtree_idx])]
+                        return self.children[subtree_idx][
+                            np.random.randint(sizes[subtree_idx])
+                        ]
                     else:
                         return self.children[subtree_idx].sample_in_cap_approx(
                             query_center,
