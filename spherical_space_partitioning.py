@@ -330,9 +330,72 @@ def vectors_in_cap(vs, cap_center, max_cos_distance):
     assert len(cap_center.shape) == 1
     assert vs.shape[1] == cap_center.shape[0]
     assert max_cos_distance.shape == ()
+    print(f"Tracing vectors_in_cap for shape {vs.shape}")
     return jax.vmap(vector_in_cap, in_axes=(0, None, None))(
         vs, cap_center, max_cos_distance
     )
+
+
+def vectors_in_cap_even_batch(
+    vs, cap_center, max_cos_distance, max_batch_size_log_sqrt2=31
+):
+    """A version of vectors in cap that pads vs up to a power of sqrt(2). Reduces the number of
+    versions of the function that need to be compiled."""
+    assert len(vs.shape) == 2
+    assert len(cap_center.shape) == 1
+    assert vs.shape[1] == cap_center.shape[0]
+    assert (type(max_cos_distance) is float) or max_cos_distance.shape == ()
+    batch_sizes = np.round(np.sqrt(2) ** np.arange(max_batch_size_log_sqrt2)).astype(
+        np.int32
+    )
+
+    out = np.zeros(len(vs), dtype=np.bool_)
+    cur = 0
+    while cur < len(vs):
+        # Most of the time this will complete in one GPU call, but if it doesn't, we loop until
+        # we've done all the calculations.
+        this_batch_size_idx = np.ceil(
+            np.log(len(vs) - cur) / np.log(np.sqrt(2))
+        ).astype(np.int32)
+        this_batch_size_idx = min(this_batch_size_idx, max_batch_size_log_sqrt2 - 1)
+        this_batch_size = batch_sizes[this_batch_size_idx]
+
+        if len(vs) - cur < this_batch_size:
+            # If the data remaining is less than the selected batch size, we pad with zeros.
+            this_batch = np.zeros((this_batch_size, vs.shape[1]), dtype=vs.dtype)
+            this_batch[: len(vs) - cur] = vs[cur:]
+            batch_len_unpadded = len(vs) - cur
+        else:
+            # Otherwise we can use the data as is, slicing to the batch size.
+            this_batch = vs[cur : cur + this_batch_size]
+            batch_len_unpadded = this_batch_size
+
+        out[cur : cur + batch_len_unpadded] = vectors_in_cap(
+            this_batch, cap_center, max_cos_distance
+        )[:batch_len_unpadded]
+        cur += this_batch_size
+
+    return out
+
+
+@hyp.settings(
+    deadline=timedelta(seconds=30),
+    suppress_health_check=[hyp.HealthCheck.data_too_large],
+    max_examples=500,
+)
+@given(_unit_vecs(st.tuples(st.integers(2, 256), st.integers(2, 4))))
+def test_vectors_in_cap_even_batch(vecs):
+    """Test that vectors_in_cap_even_batch is equivalent to vectors_in_cap."""
+    cap_center = vecs[0]
+    max_cos_distance = 0.5
+    vecs = vecs[1:]
+
+    out_even_batch = vectors_in_cap_even_batch(
+        vecs, cap_center, max_cos_distance, max_batch_size_log_sqrt2=10
+    )
+    out_classic = vectors_in_cap(vecs, cap_center, max_cos_distance)
+
+    np.testing.assert_allclose(out_even_batch, out_classic)
 
 
 @partial(jax.jit, inline=True)
@@ -823,7 +886,7 @@ class CapTree:
                 # leaf
                 visited.append(path + ["overlapping leaf"])
                 vecs = self.dset_thin[:]["clip_embedding"]
-                valid_distances_mask = vectors_in_cap(
+                valid_distances_mask = vectors_in_cap_even_batch(
                     vecs, query_center, query_max_cos_distance
                 )
                 valid_distances_cnt = np.sum(valid_distances_mask)
@@ -873,7 +936,7 @@ class CapTree:
                         visited.append(path + [i, "overlapping leaf (aggregated)"])
                 if len(leaf_vectors) > 0:
                     leaf_vectors = np.concatenate(leaf_vectors, axis=0)
-                    leaf_valid_distances_mask = vectors_in_cap(
+                    leaf_valid_distances_mask = vectors_in_cap_even_batch(
                         leaf_vectors, query_center, query_max_cos_distance
                     )
                     leaf_valid_distances_cnt = np.sum(leaf_valid_distances_mask)
@@ -945,7 +1008,7 @@ class CapTree:
                     return sampled
                 else:
                     # We need to check the vectors in the leaf.
-                    valid_distances_mask = vectors_in_cap(
+                    valid_distances_mask = vectors_in_cap_even_batch(
                         sampling_subtree.dset_thin[:]["clip_embedding"],
                         query_center,
                         query_max_cos_distance,
@@ -1061,7 +1124,7 @@ class CapTree:
                             ]
                             sampled_vecs_cur += samples_this_iter
 
-                        in_cap = vectors_in_cap(
+                        in_cap = vectors_in_cap_even_batch(
                             sampled_vecs, query_center, query_max_cos_distance
                         )
                         in_cap_by_subtree = rearrange(
