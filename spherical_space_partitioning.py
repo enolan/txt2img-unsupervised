@@ -943,16 +943,13 @@ class CapTree:
                     if leaf_valid_distances_cnt > 0:
                         len_so_far = 0
                         for i, len_i in leaf_vector_lens:
-                            res.append(
-                                (
-                                    path + [i],
-                                    np.sum(
-                                        leaf_valid_distances_mask[
-                                            len_so_far : len_so_far + len_i
-                                        ]
-                                    ),
-                                )
+                            match_cnt = np.sum(
+                                leaf_valid_distances_mask[
+                                    len_so_far : len_so_far + len_i
+                                ]
                             )
+                            if match_cnt > 0:
+                                res.append((path + [i], match_cnt))
                             len_so_far += len_i
                 for i in subtrees_overlapping_idxs:
                     if not leaf_subtrees[i]:
