@@ -34,7 +34,6 @@ def find_k_means(dset, batch_size, k, iters):
     # all vectors have unit norm.
 
     assert len(dset) >= k
-    assert batch_size >= k
 
     # Initialize centroids
     tqdm.write(f"Initializing centroids with {k} random samples")
