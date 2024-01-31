@@ -922,19 +922,35 @@ class CapTree:
                 # If any of the overlapping but not fully contained subtrees are leaves, we
                 # aggregate their vectors and check them all at once. GPU like big job all at once.
                 # GPU hate many small job.
-                leaf_vectors = []
                 leaf_vector_lens = []
+                leaf_dsets = []
                 leaf_subtrees = np.zeros(len(self.children), dtype=bool)
+                leaf_vector_cnt = 0
                 for i in subtrees_overlapping_idxs:
+                    # Plan the vectors we'll test
                     if len(self.children[i].children) == 0:
-                        leaf_vectors.append(
-                            self.children[i].dset_thin[:]["clip_embedding"]
-                        )
+                        leaf_vector_cnt += self.children[i].len
                         leaf_vector_lens.append((i, self.children[i].len))
+                        leaf_dsets.append(self.children[i].dset_thin)
                         leaf_subtrees[i] = True
                         visited.append(path + [i, "overlapping leaf (aggregated)"])
-                if len(leaf_vectors) > 0:
-                    leaf_vectors = np.concatenate(leaf_vectors, axis=0)
+                # Get the vectors from infinidata. Infinidata is relatively slow and this is a
+                # bottleneck, so we fetch in parallel.
+                if leaf_vector_cnt > 0:
+                    leaf_vectors = np.empty(
+                        (leaf_vector_cnt, query_center.shape[0]), dtype=np.float32
+                    )
+                    write_idx = 0
+                    for batch in infinidata.TableView.batch_iter_concat(
+                        leaf_dsets,
+                        batch_size=2048,
+                        threads=8,
+                        readahead=8,
+                    ):
+                        arr = batch["clip_embedding"]
+                        leaf_vectors[write_idx : write_idx + len(arr)] = arr
+                        write_idx += len(arr)
+                    assert write_idx == leaf_vector_cnt
                     leaf_valid_distances_mask = vectors_in_cap_even_batch(
                         leaf_vectors, query_center, query_max_cos_distance
                     )
@@ -1457,7 +1473,7 @@ def test_tree_sample_finds_all(vecs, _rand):
     tree = CapTree(dset, batch_size=32, k=4, iters=16)
     tree.split_rec()
 
-    tol = 0.00001
+    tol = 0.0001
 
     for vec in vecs:
         sample = tree.sample_in_cap(vec, tol)

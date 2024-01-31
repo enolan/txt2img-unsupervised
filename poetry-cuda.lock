@@ -1051,7 +1051,7 @@ description = ""
 optional = false
 python-versions = ">=3.8"
 files = [
-    {file = "infinidata-0.1.0-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:113205a2dc60403d7728ed8535d22e4f26ab150067a32e00257edc3becd4d72d"},
+    {file = "infinidata-0.1.0-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:eced5a33b5936343270ba2a8035a1a92b3f16b5fffbe2432ae31eac4d9299fca"},
 ]
 
 [package.source]
