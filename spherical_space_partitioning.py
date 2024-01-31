@@ -361,7 +361,7 @@ def vectors_in_cap_even_batch(
 
         if len(vs) - cur < this_batch_size:
             # If the data remaining is less than the selected batch size, we pad with zeros.
-            this_batch = np.zeros((this_batch_size, vs.shape[1]), dtype=vs.dtype)
+            this_batch = np.empty((this_batch_size, vs.shape[1]), dtype=vs.dtype)
             this_batch[: len(vs) - cur] = vs[cur:]
             batch_len_unpadded = len(vs) - cur
         else:
