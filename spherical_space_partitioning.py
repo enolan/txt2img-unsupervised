@@ -1588,10 +1588,10 @@ def main():
     print(f"Time at start: {get_timestamp()}")
 
     dset_all = load_pq_dir_to_infinidata(args.pq_dir).shuffle(seed=19900515)
-    if args.thin:
-        dset_all = dset_all.select_columns({"clip_embedding"})
     print(f"Loaded dataset with {len(dset_all)} rows")
     dset = dset_all.new_view(slice(0, int(len(dset_all) * 0.99)))
+    if args.thin:
+        dset = dset.select_columns({"clip_embedding"})
     print(f"Train set size: {len(dset)}")
     print(f"Time after split: {get_timestamp()}")
 
