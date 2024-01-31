@@ -405,10 +405,9 @@ def cap_intersection_status(center_a, max_cos_distance_a, center_b, max_cos_dist
     centers_angular_distance = jnp.arccos(jnp.clip(jnp.dot(center_a, center_b), -1, 1))
     angular_radius_a = jnp.arccos(1 - max_cos_distance_a)
     angular_radius_b = jnp.arccos(1 - max_cos_distance_b)
-    return (
-        centers_angular_distance + angular_radius_b <= angular_radius_a,
-        centers_angular_distance <= angular_radius_a + angular_radius_b,
-    )
+    contained = centers_angular_distance + angular_radius_b <= angular_radius_a
+    intersect = centers_angular_distance <= angular_radius_a + angular_radius_b
+    return (contained, intersect & ~contained)
 
 
 @jax.jit
@@ -916,7 +915,7 @@ class CapTree:
                     res.append((path + [i], self.children[i].len))
 
                 subtrees_overlapping_idxs = np.arange(len(self.children))[
-                    subtrees_overlapping & ~subtrees_contained
+                    subtrees_overlapping
                 ]
 
                 # If any of the overlapping but not fully contained subtrees are leaves, we
@@ -1085,7 +1084,7 @@ class CapTree:
                     subtrees_contained
                 ]
                 subtrees_overlapping_idxs = np.arange(len(self.children))[
-                    subtrees_overlapping & ~subtrees_contained
+                    subtrees_overlapping
                 ]
 
                 densities = np.zeros(len(self.children), dtype=np.float32)
