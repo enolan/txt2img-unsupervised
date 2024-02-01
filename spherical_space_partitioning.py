@@ -89,9 +89,15 @@ def find_k_means(dset, batch_size, k, iters):
                 centroids[nearest_centroid] = (1 - lr) * centroids[
                     nearest_centroid
                 ] + lr * batch["clip_embedding"][i]
-                centroids[nearest_centroid] /= np.linalg.norm(
-                    centroids[nearest_centroid]
-                )
+                # normalize the centroid location to put it back on the unit sphere
+                norm = np.linalg.norm(centroids[nearest_centroid])
+                if norm > 0:
+                    centroids[nearest_centroid] /= norm
+                else:
+                    # This should be very rare
+                    tqdm.write("WARNING: centroid is the zero vector, reinitializing")
+                    centroids[nearest_centroid] = batch["clip_embedding"][i]
+                    per_center_counts[nearest_centroid] = 1
 
             pbar.update(1)
 
@@ -114,6 +120,7 @@ def assign_centroids(dset, centroids, batch_size, n_distances=0):
     """Assign each CLIP embedding to its nearest centroid and compute the n highest overall cosine
     distances along with the associated vectors and centroids."""
     assert centroids.shape[1] == dset[0]["clip_embedding"].shape[0]
+    assert np.all(~np.isnan(centroids))
 
     tqdm.write(f"Assigning {len(dset)} examples to {len(centroids)} centroids.")
 
@@ -183,6 +190,8 @@ def assign_centroids(dset, centroids, batch_size, n_distances=0):
 
     assert len(centroid_assignments) == len(high_distances) == len(centroids)
     assert sum(len(cluster) for cluster in centroid_assignments) == len(dset)
+    for i in range(len(centroids)):
+        assert len(high_distances[i]) == min(n_distances, len(centroid_assignments[i]))
     return centroid_assignments, high_distances
 
 
@@ -239,17 +248,27 @@ def test_assign_centroids_top_2():
 
 
 @st.composite
+def _unit_vec_tuple(draw, dim):
+    """Strategy for drawing unit vectors. Returns a tuple so that it can go in a set for uniqueness."""
+    vec = draw(st.lists(st.floats(-1, 1, width=32), min_size=dim, max_size=dim))
+    vec = np.array(vec, dtype=np.float32)
+    norm = np.linalg.norm(vec)
+    hyp.assume(norm > 0)
+    vec /= norm
+    return tuple(vec)
+
+
+@st.composite
 def _unit_vecs(draw, shape):
     """Strategy for drawing unique unit vectors."""
+    shape = draw(shape)
     vecs = draw(
-        hyp_np.arrays(
-            np.float32, shape, elements=st.floats(-1.0, 1.0, width=32), unique=True
-        )
+        st.sets(_unit_vec_tuple(shape[1]), min_size=shape[0], max_size=shape[0])
     )
-    hyp.assume(np.all(np.linalg.norm(vecs, axis=1) > 0))
-    vecs = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
-    vecs_set = set(tuple(vec) for vec in vecs)
-    hyp.assume(len(vecs_set) == len(vecs))
+    vecs = list(vecs)
+    vecs = draw(st.permutations(vecs))
+    vecs = np.array(vecs, dtype=np.float32)
+    assert vecs.shape == shape
     return vecs
 
 
@@ -1313,7 +1332,11 @@ class CapTree:
 
 @hyp.settings(
     max_examples=500,
-    suppress_health_check=[hyp.HealthCheck.data_too_large, hyp.HealthCheck.too_slow],
+    suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
+        hyp.HealthCheck.too_slow,
+        hyp.HealthCheck.filter_too_much,
+    ],
     deadline=timedelta(seconds=30),
 )
 @given(
@@ -1351,24 +1374,34 @@ def test_remove_outliers_with_level_0_makes_outlier_cluster():
 @hyp.settings(
     deadline=timedelta(seconds=30),
     max_examples=500,
-    suppress_health_check=[hyp.HealthCheck.data_too_large],
+    suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
+        hyp.HealthCheck.filter_too_much,
+    ],
 )
 @given(
     _unit_vecs(
         st.tuples(st.integers(1, 1024), st.integers(2, 4)),
     ),
+    st.integers(3, 8),
+    st.integers(3, 16),
     st.floats(0.0, 1.0),
     st.random_module(),
 )
-def test_tree_invariants(vecs, outlier_removal_level, _rand):
+def test_tree_invariants(vecs, k, max_leaf_size, outlier_removal_level, _rand):
     """Test that the tree invariants hold for any set of vectors."""
-
+    hyp.assume(k <= max_leaf_size)
     vecs_set = set(tuple(vec) for vec in vecs)
     hyp.assume(len(vecs_set) == len(vecs))
 
     dset = infinidata.TableView({"clip_embedding": vecs})
     tree = CapTree(
-        dset, batch_size=32, k=4, iters=64, outlier_removal_level=outlier_removal_level
+        dset,
+        batch_size=32,
+        k=k,
+        iters=4,
+        max_leaf_size=max_leaf_size,
+        outlier_removal_level=outlier_removal_level,
     )
     tree._check_invariants()
     tree.split_rec()
@@ -1382,7 +1415,11 @@ def test_tree_invariants(vecs, outlier_removal_level, _rand):
 @hyp.settings(
     deadline=timedelta(seconds=30),
     max_examples=500,
-    suppress_health_check=[hyp.HealthCheck.data_too_large, hyp.HealthCheck.too_slow],
+    suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
+        hyp.HealthCheck.too_slow,
+        hyp.HealthCheck.filter_too_much,
+    ],
 )
 @given(
     _unit_vecs(st.tuples(st.integers(1, 1024), st.integers(2, 4))),
@@ -1424,7 +1461,54 @@ def test_tree_subtrees_in_cap_sizes_are_correct(
 @hyp.settings(
     deadline=timedelta(seconds=30),
     max_examples=500,
-    suppress_health_check=[hyp.HealthCheck.data_too_large],
+    suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
+        hyp.HealthCheck.too_slow,
+        hyp.HealthCheck.filter_too_much,
+    ],
+)
+@given(
+    _unit_vecs(st.tuples(st.integers(4, 1024), st.integers(2, 4))),
+    st.integers(1, 1),
+    st.integers(3, 8),
+    st.floats(0.0, 2.0),
+    st.booleans(),
+    st.integers(1, 1024),
+    st.random_module(),
+)
+def test_tree_subtrees_in_caps_sizes_are_correct(
+    vecs, num_queries, k, max_cos_distance, do_split, batch_size, _rand
+):
+    """Test that _subtrees_in_caps returns subtrees with the correct sizes."""
+    queries = vecs[:num_queries]
+    dset = infinidata.TableView({"clip_embedding": vecs[num_queries:]})
+    tree = CapTree(dset, batch_size=32, k=k, iters=4, max_leaf_size=k + 1)
+    if do_split:
+        tree.split_rec()
+
+    matching_subtrees_all = tree._subtrees_in_caps(
+        queries, np.array([max_cos_distance] * num_queries), batch_size=batch_size
+    )
+    assert len(matching_subtrees_all) == num_queries
+    for i, matching_subtrees in enumerate(matching_subtrees_all):
+        for path, size in matching_subtrees:
+            cur_subtree = tree
+            for step in path:
+                cur_subtree = cur_subtree.children[step]
+            subtree_vecs = cur_subtree.dset[:]["clip_embedding"]
+            vecs_in_cap = vectors_in_cap(subtree_vecs, queries[i], max_cos_distance)
+            assert size == np.sum(
+                vecs_in_cap
+            ), f"bad size for subtree {path}, query {i}. leaf: {len(cur_subtree.children) == 0}"
+
+
+@hyp.settings(
+    deadline=timedelta(seconds=30),
+    max_examples=500,
+    suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
+        hyp.HealthCheck.filter_too_much,
+    ],
 )
 @given(
     _unit_vecs(
@@ -1456,7 +1540,10 @@ def test_tree_sample_in_bounds(vecs, max_cos_distance, _rand):
 @hyp.settings(
     deadline=timedelta(seconds=30),
     max_examples=500,
-    suppress_health_check=[hyp.HealthCheck.data_too_large],
+    suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
+        hyp.HealthCheck.filter_too_much,
+    ],
 )
 @given(
     _unit_vecs(
@@ -1487,7 +1574,10 @@ def test_tree_sample_finds_all(vecs, _rand):
 @hyp.settings(
     deadline=timedelta(seconds=30),
     max_examples=500,
-    suppress_health_check=[hyp.HealthCheck.data_too_large],
+    suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
+        hyp.HealthCheck.filter_too_much,
+    ],
 )
 @given(
     _unit_vecs(
@@ -1519,7 +1609,10 @@ def test_tree_sample_approx_in_bounds(vecs, max_cos_distance, _rand):
 @hyp.settings(
     deadline=timedelta(seconds=30),
     max_examples=500,
-    suppress_health_check=[hyp.HealthCheck.data_too_large],
+    suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
+        hyp.HealthCheck.filter_too_much,
+    ],
 )
 @given(
     _unit_vecs(
@@ -1550,7 +1643,10 @@ def test_tree_sample_approx_finds_all(vecs, _rand):
 @hyp.settings(
     deadline=timedelta(seconds=30),
     max_examples=500,
-    suppress_health_check=[hyp.HealthCheck.data_too_large],
+    suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
+        hyp.HealthCheck.filter_too_much,
+    ],
 )
 @given(
     _unit_vecs(
