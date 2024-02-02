@@ -14,13 +14,13 @@ import spherical_space_partitioning
 def gen_params(used_params):
     attempts = 0
     while True:
-        k = random.choice([8, 16, 32, 64])
+        k = random.choice([64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384])
         outlier_removal_level = random.uniform(0.0, 1.0)
-        iters = random.choice([8, 16, 32, 64, 128])
-        batch_size = random.choice([128, 256, 512, 1024, 2048, 4096, 8192])
+        iters = random.choice([8, 16, 32, 64, 128, 256])
+        batch_size = random.choice([2048, 4096, 8192, 16384, 32768])
         while True:
             max_leaf_size = random.choice(
-                [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+                [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
             )
             if max_leaf_size >= k:
                 break
@@ -39,12 +39,13 @@ def gen_params(used_params):
             raise Exception("Too many attempts to generate params")
 
 
+def params_to_path(params):
+    return (Path("sweep-captrees") / f"{params['k']}-{params['outlier_removal_level']:.4f}-{params['iters']}-{params['batch_size']}-{params['max_leaf_size']}")
+
+
 def build_tree(params):
     # Build the tree
-    save_dir = (
-        Path("sweep-captrees")
-        / f"{params['k']}-{params['outlier_removal_level']:.4f}-{params['iters']}-{params['batch_size']}-{params['max_leaf_size']}"
-    )
+    save_dir = params_to_path(params)
     cmdline = [
         "python",
         "spherical_space_partitioning.py",
@@ -54,6 +55,7 @@ def build_tree(params):
         "1_000_000",
         "--read-dup-blacklist",
         "dup-blacklist.json",
+        "--thin",
         "--k",
         str(params["k"]),
         "--outlier-removal-level",
@@ -88,12 +90,12 @@ def run_benchmarks(captree, vecs):
     # Run benchmarks
     print("Running benchmarks...")
     results_all = {}
-    for i, v in tqdm(enumerate(vecs), unit="vectors", total=len(vecs)):
-        for max_cos_distance in tqdm([0.2, 0.5], unit="max_cos_distances", leave=False):
+    for i, v in tqdm(enumerate(vecs), unit="vectors", total=len(vecs), leave=None):
+        for max_cos_distance in tqdm(np.linspace(0, 2.0, 21), unit="max_cos_distances", leave=False):
             results = []
-            for _ in tqdm(range(10), unit="trials", leave=False):
+            for _ in tqdm(range(5), unit="trials", leave=False):
                 start = time.monotonic()
-                captree.sample_in_cap(v, max_cos_distance)
+                captree.sample_in_cap_approx(v, max_cos_distance)
                 end = time.monotonic()
                 elapsed = end - start
                 results.append(elapsed)
@@ -102,36 +104,47 @@ def run_benchmarks(captree, vecs):
     return results_all
 
 
-def main():
-    used_params = set()
-    try:
-        with open("sweep-captrees/results.json", "r") as f:
-            for line in f:
-                params = json.loads(line)["params"]
-                used_params.add(
-                    (
-                        params["k"],
-                        params["outlier_removal_level"],
-                        params["iters"],
-                        params["batch_size"],
-                        params["max_leaf_size"],
-                    )
-                )
-    except FileNotFoundError:
-        pass
-    print(f"Used params: {used_params}")
+def mk_test_vecs():
     vecs = np.random.default_rng(69_420).standard_normal((8, 768), dtype=np.float32)
     vecs /= np.linalg.norm(vecs, axis=-1, keepdims=True)
+    return vecs
 
-    while True:
-        params = gen_params(used_params)
-        print(f"Params: {params}")
-        captree, build_time = build_tree(params)
-        results_all = run_benchmarks(captree, vecs)
-        print(f"Results: {results_all}")
-        with open("sweep-captrees/results.json", "a") as f:
-            json.dump({"params": params, "results": results_all, "build_time": build_time}, f)
-            f.write("\n")
+
+def main():
+    # used_params = set()
+    # try:
+    #     with open("sweep-captrees/results-2024-01-30.json", "r") as f:
+    #         for line in f:
+    #             params = json.loads(line)["params"]
+    #             used_params.add(
+    #                 (
+    #                     params["k"],
+    #                     params["outlier_removal_level"],
+    #                     params["iters"],
+    #                     params["batch_size"],
+    #                     params["max_leaf_size"],
+    #                 )
+    #             )
+    # except FileNotFoundError:
+    #     pass
+    # print(f"Used params: {used_params}")
+    vecs = mk_test_vecs()[:2]
+    tree = spherical_space_partitioning.CapTree.load_from_disk(
+        Path("sweep-captrees/64-0.3144-8-2048-4096"), save_cache=True
+    )
+    results = run_benchmarks(tree, vecs)
+    print(results)
+
+    # while True:
+    #     params = gen_params(used_params)
+    #     print(f"Params: {params}")
+    #     captree, build_time = build_tree(params)
+    #     results_all = run_benchmarks(captree, vecs)
+    #     print(f"Results: {results_all}")
+    #     with open("sweep-captrees/results-2024-01-30.json", "a") as f:
+    #         json.dump({"params": params, "results": results_all, "build_time": build_time}, f)
+    #         f.write("\n")
+    #         f.flush()
 
 
 if __name__ == "__main__":

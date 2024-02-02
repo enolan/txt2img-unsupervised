@@ -274,7 +274,7 @@ def _unit_vecs(draw, shape):
 
 @hyp.settings(
     max_examples=500,
-    suppress_health_check=[hyp.HealthCheck.data_too_large, hyp.HealthCheck.too_slow],
+    suppress_health_check=[hyp.HealthCheck.data_too_large, hyp.HealthCheck.too_slow, hyp.HealthCheck.filter_too_much],
     deadline=timedelta(seconds=30),
 )
 @given(
@@ -341,7 +341,7 @@ def vector_in_cap(v, cap_center, max_cos_distance):
     return cosine_distance(v, cap_center) <= max_cos_distance
 
 
-@jax.jit
+@partial(jax.jit, inline=True)
 def vectors_in_cap(vs, cap_center, max_cos_distance):
     """Check which vectors in vs are in the cap defined by cap_center and max_cos_distance."""
     assert len(vs.shape) == 2
@@ -352,6 +352,25 @@ def vectors_in_cap(vs, cap_center, max_cos_distance):
     return jax.vmap(vector_in_cap, in_axes=(0, None, None))(
         vs, cap_center, max_cos_distance
     )
+
+
+@jax.jit
+def vectors_in_caps(vs, cap_centers, max_cos_distances):
+    """Check which vectors in vs are in the caps defined by cap_centers and max_cos_distances.
+    Returns a boolean array of shape (len(vs), len(cap_centers))."""
+    assert len(vs.shape) == 2
+    assert len(cap_centers.shape) == 2
+    assert vs.shape[1] == cap_centers.shape[1]
+    assert len(max_cos_distances.shape) == 1
+    assert cap_centers.shape[0] == max_cos_distances.shape[0]
+    print(f"Tracing vectors_in_caps for shapes {vs.shape}, {cap_centers.shape}")
+
+    res = jax.vmap(vectors_in_cap, in_axes=(None, 0, 0))(
+        vs, cap_centers, max_cos_distances
+    )
+    res = rearrange(res, "c v -> v c")
+    assert res.shape == (len(vs), len(cap_centers)), f"res.shape: {res.shape}"
+    return res
 
 
 def vectors_in_cap_even_batch(
@@ -398,7 +417,7 @@ def vectors_in_cap_even_batch(
 
 @hyp.settings(
     deadline=timedelta(seconds=30),
-    suppress_health_check=[hyp.HealthCheck.data_too_large],
+    suppress_health_check=[hyp.HealthCheck.data_too_large, hyp.HealthCheck.filter_too_much],
     max_examples=500,
 )
 @given(_unit_vecs(st.tuples(st.integers(2, 256), st.integers(2, 4))))
@@ -429,13 +448,23 @@ def cap_intersection_status(center_a, max_cos_distance_a, center_b, max_cos_dist
     return (contained, intersect & ~contained)
 
 
-@jax.jit
+@partial(jax.jit, inline=True)
 def cap_intersection_status_one_to_many(
     center_a, max_cos_distance_a, centers_b, max_cos_distances_b
 ):
     """Calculate whether cap a contains any of the caps in b, or they intersect, or neither."""
     return jax.vmap(cap_intersection_status, in_axes=(None, None, 0, 0))(
         center_a, max_cos_distance_a, centers_b, max_cos_distances_b
+    )
+
+
+@jax.jit
+def cap_intersection_status_many_to_many(
+    centers_a, max_cos_distances_a, centers_b, max_cos_distances_b
+):
+    """Calculate whether each cap in a contains any of the caps in b, or they intersect, or neither."""
+    return jax.vmap(cap_intersection_status_one_to_many, in_axes=(0, 0, None, None))(
+        centers_a, max_cos_distances_a, centers_b, max_cos_distances_b
     )
 
 
@@ -487,6 +516,7 @@ class CapTree:
         assert len(dset) > 0, "CapTree must be initialized with a non-empty dataset"
         self.dset = dset
         self.dset_thin = dset.select_columns({"clip_embedding"})
+        self.dsets_contiguous = True
         self.len = len(dset)
         self.batch_size = batch_size
         self.k = k
@@ -508,6 +538,7 @@ class CapTree:
         self.child_cap_centers = None
         self.child_cap_max_cos_distances = None
         self.found_duplicates = found_duplicates
+        self.ready_for_queries = False
 
     def __len__(self):
         return self.len
@@ -545,6 +576,8 @@ class CapTree:
             for i in range(len(centroids))
             if len(assignments[i]) > 0
         ]
+        self.ready_for_queries = False
+        self.dsets_contiguous = False
         self.child_cap_centers = np.array([child.center for child in self.children])
         self.child_cap_max_cos_distances = np.array(
             [child.max_cos_distance for child in self.children]
@@ -825,6 +858,29 @@ class CapTree:
                 np.testing.assert_array_equal(
                     thicc_batch["clip_embedding"], thin_batch["clip_embedding"]
                 )
+            if self.dsets_contiguous:
+                for child_idx, child in enumerate(self.children):
+                    assert child.dsets_contiguous
+                    child_start_idx = self.child_start_idxs[child_idx]
+                    child_stop_idx = self.child_start_idxs[child_idx] + len(child)
+                    parent_sliced_view = self.dset.new_view(
+                        slice(child_start_idx, child_stop_idx)
+                    )
+
+                    for parent_batch, child_batch in zip(
+                        parent_sliced_view.batch_iter(
+                            self.batch_size, drop_last_batch=False
+                        ),
+                        child.dset.batch_iter(self.batch_size, drop_last_batch=False),
+                    ):
+                        assert list(parent_batch.keys()) == list(child_batch.keys())
+                        for k in parent_batch.keys():
+                            assert np.array_equal(parent_batch[k], child_batch[k])
+            if self.ready_for_queries:
+                assert self.dsets_contiguous
+                for child in self.children:
+                    assert child.ready_for_queries
+
         else:
             assert self.center.shape == self.dset[0]["clip_embedding"].shape
             assert self.child_cap_centers == self.child_cap_max_cos_distances == None
@@ -1226,9 +1282,428 @@ class CapTree:
             visited.append(path + ["empty"])
             return None
 
+    def sample_in_caps_approx(
+        self,
+        query_centers,
+        query_max_cos_distances,
+        density_estimate_samples=8,
+        batch_size=4096,
+    ):
+        """Sample from multiple caps at once. Much better throughput than calling
+        sample_in_cap_approx repeatedly. Returns a numpy array of indices into the dataset, where
+        -1 indicates the cap was empty. The distribution of returned indices is biased against caps
+        that contain few matching vectors, and becomes less biased as density_estimate_samples
+        increases.
+        """
+        assert (
+            self.ready_for_queries
+        ), "Load tree from disk or call tree.prepare_for_queries."
+        assert len(query_centers.shape) == 2
+        assert query_centers.shape[1] == self.center.shape[0]
+        assert len(query_max_cos_distances.shape) == 1
+        assert len(query_max_cos_distances) == len(query_centers)
+
+        if len(self.children) == 0:
+            return self.sample_in_caps(
+                query_centers, query_max_cos_distances, batch_size=batch_size
+            )
+
+        query_cnt = len(query_centers)
+        sizes = np.array([child.len for child in self.children])
+
+        query_centers = jnp.array(query_centers, dtype=jnp.float32)
+        query_max_cos_distances = jnp.array(query_max_cos_distances, dtype=jnp.float32)
+
+        # Do geometric tests to find the caps that are fully contained in the query caps, as well
+        # as the ones that intersect but do not contain them.
+        contained, intersecting = cap_intersection_status_many_to_many(
+            query_centers,
+            query_max_cos_distances,
+            self.child_cap_centers,
+            self.child_cap_max_cos_distances,
+        )
+
+        assert contained.shape == intersecting.shape == (query_cnt, len(self.children))
+        contained, intersecting = np.array(contained), np.array(intersecting)
+
+        densities = np.zeros((query_cnt, len(self.children)), dtype=np.float32)
+        densities[contained] = 1.0
+
+        # For the intersecting caps, we attempt to estimate the density of matching vectors in the
+        # subtrees by sampling.
+        subtrees_to_sample = jnp.any(intersecting, axis=0)
+        assert subtrees_to_sample.shape == (len(self.children),)
+        subtrees_to_sample_idxs = np.arange(len(self.children))[subtrees_to_sample]
+
+        # Gather density_estimate_samples samples for each subtree that intersects any of the query
+        # caps.
+        sampled_vecs = np.full(
+            (
+                len(subtrees_to_sample_idxs),
+                density_estimate_samples,
+                self.center.shape[0],
+            ),
+            -1,
+            dtype=np.float32,
+        )
+        positive_samples = np.zeros(
+            (query_cnt, len(subtrees_to_sample_idxs), density_estimate_samples),
+            dtype=bool,
+        )
+        sampled_idxs = np.full(
+            (len(subtrees_to_sample_idxs), density_estimate_samples),
+            -1,
+            dtype=np.int64,
+        )
+        for i, j in enumerate(subtrees_to_sample_idxs):
+            # Choose the vectors we're sampling from each subtree
+            sampled_idxs_this = np.random.randint(
+                sizes[j], size=density_estimate_samples
+            )
+            sampled_by_index_array = self.children[j].dset_thin[sampled_idxs_this][
+                "clip_embedding"
+            ]
+            sampled_vecs[i] = sampled_by_index_array
+            sampled_idxs[i, :] = sampled_idxs_this
+        assert not np.any(sampled_idxs == -1)
+        sampled_vecs = jnp.array(sampled_vecs)
+
+        for i, j in enumerate(subtrees_to_sample_idxs):
+            # Iterate over the subtrees we need to sample from and do the calculation
+            query_caps_to_test = jnp.arange(query_cnt)[intersecting[:, j]]
+            in_caps = vectors_in_caps(
+                sampled_vecs[i],
+                query_centers[query_caps_to_test],
+                query_max_cos_distances[query_caps_to_test],
+            )
+            assert in_caps.shape == (density_estimate_samples, len(query_caps_to_test))
+            matching_cnts = jnp.sum(in_caps, axis=0)
+            assert matching_cnts.shape == (
+                len(query_caps_to_test),
+            ), f"{matching_cnts.shape}"
+            positive_samples[query_caps_to_test, i] = in_caps.T
+            densities[query_caps_to_test, j] = matching_cnts / density_estimate_samples
+
+        estimated_matching_sizes = densities * sizes
+        assert estimated_matching_sizes.shape == (query_cnt, len(self.children))
+
+        # Find the queries that at this point have 0 estimated matching vectors but are not
+        # eliminated by the geometric test. We fall back to exact sampling for those. They match
+        # a very small fraction of the dataset, or none of it.
+        zero_estimated_matches = np.sum(estimated_matching_sizes, axis=1) == 0
+        need_exact = zero_estimated_matches & np.any(intersecting, axis=1)
+        assert need_exact.shape == (query_cnt,)
+        need_exact_cnt = np.sum(need_exact)
+        assert zero_estimated_matches.shape == need_exact.shape == (query_cnt,)
+
+        if need_exact_cnt > 0:
+            contained_for_exact = contained[need_exact]
+            intersecting_for_exact = intersecting[need_exact]
+            exact_results = self.sample_in_caps(
+                query_centers=query_centers[need_exact, :],
+                query_max_cos_distances=query_max_cos_distances[need_exact],
+                batch_size=batch_size,
+                mask=(contained_for_exact, intersecting_for_exact),
+            )
+            exact_idxs = np.arange(query_cnt)[need_exact]
+        else:
+            exact_results = np.array([], dtype=np.int64)
+            exact_idxs = np.array([], dtype=np.int64)
+        assert exact_results.shape == exact_idxs.shape == (need_exact_cnt,)
+        assert (
+            exact_results.dtype == exact_idxs.dtype == np.int64
+        ), f"{exact_results.dtype}, {exact_idxs.dtype}"
+
+        known_empty = np.all(~intersecting & ~contained, axis=1)
+        assert known_empty.shape == (query_cnt,)
+        assert not np.any(known_empty & need_exact)
+
+        # For the queries that we didn't fall back for, we sample from the distribution estimated
+        # based on the sizes and the sampled vectors.
+
+        # First we sample which subtree to sample from for each query.
+        approximate_query_idxs = np.arange(query_cnt)[~need_exact & ~known_empty]
+        sampled_subtrees = np.full((query_cnt,), -1, dtype=np.int64)
+        for i in approximate_query_idxs:
+            sampled_subtrees[i] = np.random.choice(
+                np.arange(len(self.children)),
+                p=estimated_matching_sizes[i] / np.sum(estimated_matching_sizes[i]),
+            )
+
+        # Sample within the subtrees. If the subtree we chose is one which we sampled from for
+        # density estimation, we use one of the samples we already have, otherwise we sample from
+        # the subtree by generating an index.
+
+        # Map from subtree index to index in sampled_vecs
+        subtree_to_sampled_vecs = {}
+        for i, j in enumerate(subtrees_to_sample_idxs):
+            subtree_to_sampled_vecs[j] = i
+
+        sampled_idxs_out = np.full((query_cnt,), -1, dtype=np.int64)
+        for i in approximate_query_idxs:
+            if contained[i, sampled_subtrees[i]]:
+                # If we chose a subtree that is fully contained in the query we sample an index
+                # index that subtree uniformly
+                sampled_idxs_out[i] = self.child_start_idxs[
+                    sampled_subtrees[i]
+                ] + np.random.randint(sizes[sampled_subtrees[i]])
+            else:
+                # If it's not fully contained we sample from the matching vectors we sampled for
+                # density estimation.
+                positive_samples_this_subtree = positive_samples[
+                    i, subtree_to_sampled_vecs[sampled_subtrees[i]]
+                ]
+                positive_samples_idxs = np.arange(density_estimate_samples)[
+                    positive_samples_this_subtree
+                ]
+                sampled_idxs_this_subtree = sampled_idxs[
+                    subtree_to_sampled_vecs[sampled_subtrees[i]]
+                ]
+                sampled_idx_in_samples = np.random.choice(positive_samples_idxs)
+                sampled_idxs_out[i] = (
+                    self.child_start_idxs[sampled_subtrees[i]]
+                    + sampled_idxs_this_subtree[sampled_idx_in_samples]
+                )
+
+        sampled_idxs_out[need_exact] = exact_results
+        return sampled_idxs_out
+
+    def sample_in_caps(
+        self, query_centers, query_max_cos_distances, batch_size=8192, mask=None
+    ):
+        """Exact method for sampling from multiple caps at once. Returns a numpy array of indices.
+        -1 indicates the cap was empty."""
+        assert self.ready_for_queries
+        assert len(query_centers.shape) == 2
+        assert query_centers.shape[1] == self.center.shape[0]
+        assert len(query_max_cos_distances.shape) == 1
+        assert len(query_max_cos_distances) == len(query_centers)
+
+        matching_subtrees_all = self._subtrees_in_caps(
+            query_centers, query_max_cos_distances, batch_size=batch_size, mask=mask
+        )
+
+        assert len(matching_subtrees_all) == len(query_centers)
+
+        out = np.full(len(query_centers), -1, dtype=np.int64)
+
+        for query, matching_subtrees in enumerate(matching_subtrees_all):
+            # If there are matches, we pick one, otherwise we leave it as -1
+            if len(matching_subtrees) > 0:
+                total_matches = sum(cnt for _, cnt in matching_subtrees)
+                assert total_matches > 0
+
+                # Sample uniformly from the matching vectors
+                sampled_idx = np.random.randint(total_matches)
+                cur = 0
+                for path, cnt in matching_subtrees:
+                    cur += cnt
+                    if sampled_idx < cur:
+                        break
+                idx_in_subtree = sampled_idx - (cur - cnt)
+
+                # Find the start index of the subtree we're sampling from
+                subtree_start = 0
+                subtree = self
+                for step in path:
+                    subtree_start += subtree.child_start_idxs[step]
+                    subtree = subtree.children[step]
+                if len(subtree) == cnt:
+                    # If the entire subtree matches we just sample from it
+                    out[query] = subtree_start + idx_in_subtree
+                else:
+                    # Otherwise, we need to check the vectors in the subtree. This is redundant,
+                    # since we did this in _subtrees_in_caps. Rewrite this if necessary. Hopefully
+                    # exact sampling that returns matches is really rare and it doesn't matter.
+                    valid_distances_mask = vectors_in_cap_even_batch(
+                        subtree.dset_thin[:]["clip_embedding"],
+                        query_centers[query],
+                        query_max_cos_distances[query],
+                    )
+                    valid_distances_idxs = np.arange(len(subtree.dset))[
+                        valid_distances_mask
+                    ]
+                    assert len(valid_distances_idxs) == cnt
+                    out[query] = subtree_start + valid_distances_idxs[idx_in_subtree]
+
+        return out
+
+    def _subtrees_in_caps(
+        self, query_centers, query_max_cos_distances, batch_size, mask=None
+    ):
+        """Find all the subtrees that are either fully contained in the input caps or are leaves and
+        have vectors that are in the input caps. Returns a list of paths to subtrees and matching
+        vector counts."""
+        out = [[] for _ in range(len(query_centers))]
+
+        if len(self.children) > 0:
+            # For a node, we use the geometric test, then check the children that intersect the
+            # query caps but don't contain them, recursively.
+            if mask is None:
+                contained, intersecting = cap_intersection_status_many_to_many(
+                    query_centers,
+                    query_max_cos_distances,
+                    self.child_cap_centers,
+                    self.child_cap_max_cos_distances,
+                )
+            else:
+                contained, intersecting = mask
+
+            assert (
+                contained.shape
+                == intersecting.shape
+                == (len(query_centers), len(self.children))
+            )
+            contained, intersecting = np.array(contained), np.array(intersecting)
+
+            # Record the paths to the subtrees that are fully contained in the query caps.
+            for i in range(len(query_centers)):
+                for j in range(len(self.children)):
+                    if contained[i, j]:
+                        out[i].append(([j], self.children[j].len))
+
+            # For the subtrees that intersect but aren't contained in the query caps, we need to
+            # check inside them.
+            subtrees_to_check = np.any(intersecting, axis=0)
+            assert subtrees_to_check.shape == (len(self.children),)
+            # A list of (leaf_idx, leaf_size, query_mask) tuples to be tested later
+            leaves_to_check = []
+            for i in np.arange(len(self.children))[subtrees_to_check]:
+                queries_this_subtree = np.arange(len(query_centers))[intersecting[:, i]]
+                assert len(queries_this_subtree) > 0
+                if len(self.children[i].children) == 0:
+                    # We check any leaves here without recursing to take advantage of infinidata's
+                    # batch_iter_concat and provide larger batches to the GPU.
+                    leaves_to_check.append(
+                        (i, self.children[i].len, intersecting[:, i])
+                    )
+                else:
+                    matching_subtrees = self.children[i]._subtrees_in_caps(
+                        query_centers[queries_this_subtree],
+                        query_max_cos_distances[queries_this_subtree],
+                        mask=None,
+                        batch_size=batch_size,
+                    )
+                    assert len(matching_subtrees) == len(queries_this_subtree)
+                    for j, k in enumerate(queries_this_subtree):
+                        out[k].extend(
+                            ([i] + path, cnt) for path, cnt in matching_subtrees[j]
+                        )
+
+            if len(leaves_to_check) > 0:
+                leaf_match_cnts = np.zeros(
+                    (len(leaves_to_check), len(query_centers)), dtype=np.int64
+                )
+                dsets = [self.children[i].dset_thin for i, _, _ in leaves_to_check]
+                leaf_sizes = [size for _, size, _ in leaves_to_check]
+                leaf_idx = 0  # Which leaf we're processing
+                idx_in_leaf = 0  # Index in that leaf
+                # Caps that need to be checked for the current batch
+                queries_in_batch = np.zeros(len(query_centers), dtype=bool)
+                for batch_idx, batch in enumerate(
+                    infinidata.TableView.batch_iter_concat(
+                        dsets,
+                        batch_size=batch_size,
+                        threads=8,
+                        readahead=8,
+                    )
+                ):
+                    batch = jnp.array(batch["clip_embedding"])
+                    queries_in_batch[:] = False
+                    # list of (leaf index, row count) pairs used to assign results to leaves
+                    leaf_assignments = []
+                    idx_in_batch = 0
+                    # Loop over leaves within the batch, collecting which caps we need to check for
+                    # the batch
+                    while idx_in_batch < len(batch):
+                        queries_in_batch |= leaves_to_check[leaf_idx][2]
+                        rows_used = min(
+                            # rest of the batch
+                            len(batch) - idx_in_batch,
+                            # rest of the leaf
+                            leaf_sizes[leaf_idx] - idx_in_leaf,
+                        )
+                        idx_in_batch += rows_used
+                        idx_in_leaf += rows_used
+                        leaf_assignments.append((leaf_idx, rows_used))
+                        if idx_in_leaf == leaf_sizes[leaf_idx]:
+                            idx_in_leaf = 0
+                            leaf_idx += 1
+                        assert (
+                            leaf_idx == len(leaf_sizes) and idx_in_batch == len(batch)
+                        ) or idx_in_leaf <= leaf_sizes[leaf_idx]
+                    query_idxs_in_batch = np.arange(len(query_centers))[
+                        queries_in_batch
+                    ]
+                    # Check the batch
+                    in_caps = vectors_in_caps(
+                        batch,
+                        query_centers[queries_in_batch],
+                        query_max_cos_distances[queries_in_batch],
+                    )
+                    assert in_caps.shape == (len(batch), len(query_idxs_in_batch))
+                    in_caps = np.array(in_caps)
+
+                    # Use leaf_assignments to update the correct counts
+                    cur = 0
+                    for assigned_leaf_idx, rows_used in leaf_assignments:
+                        in_caps_this_leaf = in_caps[cur : cur + rows_used]
+                        cur += rows_used
+                        for i, query_idx in enumerate(query_idxs_in_batch):
+                            leaf_match_cnts[assigned_leaf_idx, query_idx] += np.sum(
+                                in_caps_this_leaf[:, i]
+                            )
+                for i, (subtree, _len, queries) in enumerate(leaves_to_check):
+                    query_idxs = np.arange(len(query_centers))[queries]
+                    for query_idx in query_idxs:
+                        if leaf_match_cnts[i, query_idx] > 0:
+                            out[query_idx].append(
+                                ([subtree], leaf_match_cnts[i, query_idx])
+                            )
+        else:
+            # For a leaf, we check the vectors in the leaf against the query caps.
+            in_caps = vectors_in_caps(
+                self.dset_thin[:]["clip_embedding"],
+                query_centers,
+                query_max_cos_distances,
+            )
+            assert in_caps.shape == (len(self.dset), len(query_centers))
+            for i in range(len(query_centers)):
+                valid_distances_idxs = np.arange(len(self.dset))[in_caps[:, i]]
+                if len(valid_distances_idxs) > 0:
+                    out[i].append(([], len(valid_distances_idxs)))
+
+        return out
+
     def __getitem__(self, idx):
         """Get a vector by index. There is no meaningful ordering."""
         return self.dset[idx]
+
+    def prepare_for_queries(self):
+        """Prepare the tree for fast querying. This is unnecessary if the tree was loaded from
+        disk. Note that loading from disk yields a tree that is much faster to query that building
+        one and then calling this function, since this only mucks with the indices in RAM and does
+        not actually move anything around."""
+        # Make the dsets contiguous so that each child's dset is a slice of this tree's dset and
+        # those slices are in order.
+        if not self.ready_for_queries:
+            for child in self.children:
+                child.prepare_for_queries()
+
+            if len(self.children) > 0:
+                if not self.dsets_contiguous:
+                    self.dset = infinidata.TableView.concat(
+                        [child.dset for child in self.children]
+                    )
+                    self.dset_thin = self.dset.select_columns({"clip_embedding"})
+                    self.child_start_idxs = np.cumsum(
+                        [0] + [len(child) for child in self.children]
+                    )
+            else:
+                self.child_start_idxs = None
+            self.ready_for_queries = True
+        else:
+            print("Tree already ready for queries, skipping prep.")
 
     def save_to_disk(self, dir):
         """Save the tree to disk."""
@@ -1276,6 +1751,9 @@ class CapTree:
         self.dup_check = root.dup_check
         self.found_duplicates = root.found_duplicates
 
+        self.ready_for_queries = False
+        self.is_contiguous = False
+
         self.len = node_json["len"]
         assert (
             "center" in node_json
@@ -1309,12 +1787,14 @@ class CapTree:
         """Fill in the dsets of the children of this tree with the appropriate slices of this
         tree's dset. Assumes this dset is ordered with the children's dsets concatenated.
         """
+        self.child_start_idxs = np.cumsum([0] + [len(child) for child in self.children])
         cur_idx = 0
         for child in self.children:
             child.dset = self.dset.new_view(slice(cur_idx, cur_idx + len(child)))
             child.dset_thin = child.dset.select_columns({"clip_embedding"})
             cur_idx += len(child)
             child._fixup_inner_dsets()
+        self.dsets_contiguous = True
 
     @classmethod
     def load_from_disk(cls, dir, save_cache=True):
@@ -1336,10 +1816,12 @@ class CapTree:
         out._empty_from_summary(out, summary["structure"])
 
         out.dset = load_pq_to_infinidata(dir / "data.parquet", save_cache=save_cache)
+        out.dset_thin = out.dset.select_columns({"clip_embedding"})
 
         out._fixup_inner_dsets()
 
         out._fixup_traversal_arrays()
+        out.prepare_for_queries()
 
         return out
 
@@ -1400,9 +1882,13 @@ def test_remove_outliers_with_level_0_makes_outlier_cluster():
     st.integers(3, 8),
     st.integers(3, 16),
     st.floats(0.0, 1.0),
+    st.booleans(),
+    st.booleans(),
     st.random_module(),
 )
-def test_tree_invariants(vecs, k, max_leaf_size, outlier_removal_level, _rand):
+def test_tree_invariants(
+    vecs, k, max_leaf_size, outlier_removal_level, do_split, do_query_prep, _rand
+):
     """Test that the tree invariants hold for any set of vectors."""
     hyp.assume(k <= max_leaf_size)
     vecs_set = set(tuple(vec) for vec in vecs)
@@ -1417,8 +1903,11 @@ def test_tree_invariants(vecs, k, max_leaf_size, outlier_removal_level, _rand):
         max_leaf_size=max_leaf_size,
         outlier_removal_level=outlier_removal_level,
     )
-    tree._check_invariants()
-    tree.split_rec()
+    if do_split:
+        tree.split_rec()
+    if do_query_prep:
+        tree.prepare_for_queries()
+
     tree._check_invariants()
 
     # check that the elements in the tree are the ones we put in
@@ -1482,38 +1971,117 @@ def test_tree_subtrees_in_cap_sizes_are_correct(
     ],
 )
 @given(
-    _unit_vecs(st.tuples(st.integers(4, 1024), st.integers(2, 4))),
-    st.integers(1, 1),
+    _unit_vecs(st.tuples(st.integers(2, 1024), st.integers(2, 4))),
+    st.integers(1, 4).flatmap(
+        lambda num_queries: st.tuples(
+            st.just(num_queries),
+            hyp_np.arrays(np.float64, (num_queries,), elements=st.floats(0.01, 2.0)),
+        )
+    ),
     st.integers(3, 8),
-    st.floats(0.0, 2.0),
     st.booleans(),
     st.integers(1, 1024),
     st.random_module(),
 )
-def test_tree_subtrees_in_caps_sizes_are_correct(
-    vecs, num_queries, k, max_cos_distance, do_split, batch_size, _rand
+def test_tree_subtrees_in_caps_sizes_are_correct(  # TODO unfuck git history
+    vecs, query_info, k, do_split, batch_size, _rand
 ):
     """Test that _subtrees_in_caps returns subtrees with the correct sizes."""
+    num_queries, max_cos_distances = query_info
+    hyp.assume(num_queries < len(vecs))
     queries = vecs[:num_queries]
     dset = infinidata.TableView({"clip_embedding": vecs[num_queries:]})
-    tree = CapTree(dset, batch_size=32, k=k, iters=4, max_leaf_size=k + 1)
+    tree = CapTree(dset, batch_size=32, k=k, iters=4, max_leaf_size=k + 4)
     if do_split:
         tree.split_rec()
 
     matching_subtrees_all = tree._subtrees_in_caps(
-        queries, np.array([max_cos_distance] * num_queries), batch_size=batch_size
+        queries, max_cos_distances, batch_size=batch_size
     )
     assert len(matching_subtrees_all) == num_queries
     for i, matching_subtrees in enumerate(matching_subtrees_all):
-        for path, size in matching_subtrees:
+        max_cos_distance_narrow = max_cos_distances[i] - 0.01
+        max_cos_distance_wide = max_cos_distances[i] + 0.01
+        for match_num, (path, size) in enumerate(matching_subtrees):
             cur_subtree = tree
             for step in path:
                 cur_subtree = cur_subtree.children[step]
+
+            if len(cur_subtree.children) == 0:
+                assert size <= len(cur_subtree)
+            else:
+                assert size == len(cur_subtree)
+
             subtree_vecs = cur_subtree.dset[:]["clip_embedding"]
-            vecs_in_cap = vectors_in_cap(subtree_vecs, queries[i], max_cos_distance)
-            assert size == np.sum(
-                vecs_in_cap
-            ), f"bad size for subtree {path}, query {i}. leaf: {len(cur_subtree.children) == 0}"
+            cosine_distances = cosine_distance_many_to_one(subtree_vecs, queries[i])
+            vecs_in_cap_narrow = cosine_distances <= max_cos_distance_narrow
+            vecs_in_cap_wide = cosine_distances <= max_cos_distance_wide
+            assert size <= np.sum(vecs_in_cap_wide)
+            assert size >= np.sum(vecs_in_cap_narrow)
+        total_matches = sum(size for _, size in matching_subtrees)
+        all_cosine_distances = cosine_distance_many_to_one(
+            tree.dset[:]["clip_embedding"], queries[i]
+        )
+        assert total_matches <= np.sum(all_cosine_distances <= max_cos_distance_wide)
+        assert total_matches >= np.sum(all_cosine_distances <= max_cos_distance_narrow)
+
+
+@hyp.settings(
+    deadline=timedelta(seconds=30),
+    max_examples=500,
+    suppress_health_check=[hyp.HealthCheck.filter_too_much],
+)
+@given(
+    _unit_vecs(st.tuples(st.integers(1, 1024), st.integers(2, 4))),
+    st.integers(3, 8),
+    st.floats(0.0, 1.0),
+    st.booleans(),
+    st.integers(1, 4),
+    st.integers(1, 1024),
+    st.random_module(),
+)
+def test_tree_subtrees_in_caps_finds_all_at_2(
+    vecs, k, outlier_removal_level, do_split, n_queries, batch_size, _rand
+):
+    """Test that _subtrees_in_caps finds all vectors when max_cos_distance is 2."""
+    dset = infinidata.TableView({"clip_embedding": vecs})
+    tree = CapTree(
+        dset, batch_size=32, k=k, iters=4, outlier_removal_level=outlier_removal_level
+    )
+
+    # Make n orthogonal axis aligned query vectors
+    hyp.assume(n_queries < vecs.shape[1])
+    query_centers = np.zeros((n_queries, vecs.shape[1]), dtype=np.float32)
+    max_cos_distances = np.full(n_queries, 2.0, dtype=np.float32)
+    for i in range(n_queries):
+        query_centers[i, i] = 1.0
+    np.testing.assert_allclose(np.linalg.norm(query_centers, axis=1), 1.0)
+
+    if do_split:
+        tree.split_rec()
+
+    matching_subtrees_all = tree._subtrees_in_caps(
+        query_centers, max_cos_distances, batch_size=batch_size
+    )
+    assert len(matching_subtrees_all) == n_queries
+
+    for i, matching_subtrees in enumerate(matching_subtrees_all):
+        matching_subtrees = sorted(matching_subtrees)
+        assert np.sum([size for _, size in matching_subtrees]) == len(vecs)
+        if len(matching_subtrees) == 1:
+            # This happens when the top level is a leaf
+            path, size = matching_subtrees[0]
+            assert path == []
+            assert size == len(vecs)
+        else:
+            # This happens when the top level is a node. Due to floating point error, it doesn't always
+            # find the smallest set of subtrees that cover all the vectors, but it should always find
+            # all the vectors.
+            for path, size in matching_subtrees:
+                cur_subtree = tree
+                for step in path:
+                    cur_subtree = cur_subtree.children[step]
+                assert size == len(cur_subtree), f"bad size for subtree {path}"
 
 
 @hyp.settings(
@@ -1656,6 +2224,194 @@ def test_tree_sample_approx_finds_all(vecs, _rand):
 
 @hyp.settings(
     deadline=timedelta(seconds=30),
+    max_examples=2000,
+    suppress_health_check=[
+        hyp.HealthCheck.filter_too_much,
+    ],
+)
+@given(
+    _unit_vecs(st.tuples(st.integers(1, 1024), st.integers(2, 4))),
+    st.integers(3, 8),
+    st.integers(1, 4),
+    st.random_module(),
+)
+def test_tree_sample_batch_finds_all(vecs, k, batch_size, _rand):
+    """Test that exact sampling finds all vectors in the tree when sampling from tiny caps centered
+    on them."""
+
+    dset = infinidata.TableView({"clip_embedding": vecs})
+    tree = CapTree(dset, batch_size=32, k=k, max_leaf_size=2 * k, iters=4)
+    tree.split_rec()
+    tree.prepare_for_queries()
+
+    tol = 0.0001
+
+    vec_idx = 0
+
+    while vec_idx < len(vecs):
+        vecs_this_batch = vecs[vec_idx : vec_idx + batch_size]
+        samples = tree.sample_in_caps(
+            vecs_this_batch, np.repeat(tol, len(vecs_this_batch))
+        )
+
+        for i in range(len(vecs_this_batch)):
+            sample_idx = samples[i]
+            assert sample_idx != -1
+            sample_vec = tree[sample_idx]["clip_embedding"]
+            vec = vecs_this_batch[i]
+            distance = cosine_distance(sample_vec, vec)
+            assert distance <= tol
+            # Hypothesis sometimes generates vectors that are *very* close together, so even with a
+            # very small cap we can sample a different vector.
+            # np.testing.assert_array_equal(sample["clip_embedding"], vec)
+        vec_idx += len(vecs_this_batch)
+
+
+@hyp.settings(
+    deadline=timedelta(seconds=30),
+    max_examples=500,
+    suppress_health_check=[
+        hyp.HealthCheck.filter_too_much,
+    ],
+)
+@given(
+    st.tuples(st.integers(2, 4), st.integers(1, 4)).flatmap(
+        lambda d_and_num_queries: st.tuples(
+            _unit_vecs(st.tuples(st.integers(1, 1024), st.just(d_and_num_queries[0]))),
+            _unit_vecs(
+                st.tuples(st.just(d_and_num_queries[1]), st.just(d_and_num_queries[0]))
+            ),
+            hyp_np.arrays(
+                np.float64, (d_and_num_queries[1],), elements=st.floats(0.01, 2.0)
+            ),
+        )
+    ),
+    st.integers(3, 8),
+    st.random_module(),
+)
+def test_tree_sample_batch_in_bounds(vecs_and_queries, k, _rand):
+    """Test that exact sampling retrieves vectors in the specified caps."""
+
+    vecs, query_centers, max_cos_distances = vecs_and_queries
+    vecs_set = set(tuple(vec) for vec in vecs)
+    dset = infinidata.TableView({"clip_embedding": vecs})
+    tree = CapTree(dset, batch_size=32, k=k, iters=4, max_leaf_size=2 * k)
+    tree.split_rec()
+    tree.prepare_for_queries()
+
+    max_cos_distances = max_cos_distances.astype(np.float32)
+    samples = tree.sample_in_caps(query_centers, max_cos_distances)
+
+    for i in range(len(query_centers)):
+        sample_idx = samples[i]
+        if sample_idx != -1:
+            sample_vec = tree[sample_idx]["clip_embedding"]
+            assert cosine_distance(sample_vec, query_centers[i]) <= max_cos_distances[i]
+            assert tuple(sample_vec) in vecs_set
+        else:
+            assert (
+                cosine_distance_many_to_one(vecs, query_centers[i]).min()
+                > max_cos_distances[i]
+            )
+
+
+@hyp.settings(
+    deadline=timedelta(seconds=30),
+    max_examples=2000,
+    suppress_health_check=[
+        hyp.HealthCheck.filter_too_much,
+    ],
+)
+@given(
+    _unit_vecs(st.tuples(st.integers(1, 1024), st.integers(2, 4))),
+    st.integers(3, 8),
+    st.integers(1, 4),
+    st.random_module(),
+)
+def test_tree_sample_batch_approx_finds_all(vecs, k, batch_size, _rand):
+    """Test that approximate sampling finds all vectors in the tree when sampling from tiny caps
+    centered on them."""
+
+    dset = infinidata.TableView({"clip_embedding": vecs})
+    tree = CapTree(dset, batch_size=32, k=k, max_leaf_size=2 * k, iters=4)
+    tree.split_rec()
+    tree.prepare_for_queries()
+
+    # Need a high tolerance since otherwise it falls back to exact sampling which defeats the
+    # purpose of this test
+    tol = 0.1
+
+    vec_idx = 0
+
+    while vec_idx < len(vecs):
+        vecs_this_batch = vecs[vec_idx : vec_idx + batch_size]
+        samples = tree.sample_in_caps_approx(
+            vecs_this_batch, np.repeat(tol, len(vecs_this_batch))
+        )
+
+        for i in range(len(vecs_this_batch)):
+            sample_idx = samples[i]
+            assert sample_idx != -1
+            sample_vec = tree[sample_idx]["clip_embedding"]
+            vec = vecs_this_batch[i]
+            distance = cosine_distance(sample_vec, vec)
+            assert distance <= tol
+            # Hypothesis sometimes generates vectors that are *very* close together, so even with a
+            # very small cap we can sample a different vector.
+            # np.testing.assert_array_equal(sample["clip_embedding"], vec)
+        vec_idx += len(vecs_this_batch)
+
+
+@hyp.settings(
+    deadline=timedelta(seconds=30),
+    max_examples=500,
+    suppress_health_check=[
+        hyp.HealthCheck.filter_too_much,
+    ],
+)
+@given(
+    st.tuples(st.integers(2, 4), st.integers(1, 4)).flatmap(
+        lambda d_and_num_queries: st.tuples(
+            _unit_vecs(st.tuples(st.integers(1, 1024), st.just(d_and_num_queries[0]))),
+            _unit_vecs(
+                st.tuples(st.just(d_and_num_queries[1]), st.just(d_and_num_queries[0]))
+            ),
+            hyp_np.arrays(
+                np.float64, (d_and_num_queries[1],), elements=st.floats(0.01, 2.0)
+            ),
+        )
+    ),
+    st.integers(3, 8),
+    st.random_module(),
+)
+def test_tree_sample_batch_approx_in_bounds(vecs_and_queries, k, _rand):
+    """Test that approximate sampling retrieves vectors in the specified caps."""
+
+    vecs, query_centers, max_cos_distances = vecs_and_queries
+    vecs_set = set(tuple(vec) for vec in vecs)
+    dset = infinidata.TableView({"clip_embedding": vecs})
+    tree = CapTree(dset, batch_size=32, k=k, iters=4, max_leaf_size=2 * k)
+    tree.split_rec()
+    tree.prepare_for_queries()
+
+    max_cos_distances = max_cos_distances.astype(np.float32)
+    samples = tree.sample_in_caps_approx(query_centers, max_cos_distances)
+
+    for i in range(len(query_centers)):
+        sample_idx = samples[i]
+        if sample_idx != -1:
+            sample_vec = tree[sample_idx]["clip_embedding"]
+            assert cosine_distance(sample_vec, query_centers[i]) <= max_cos_distances[i] + 0.01
+            assert tuple(sample_vec) in vecs_set
+        else:
+            assert (
+                cosine_distance_many_to_one(vecs, query_centers[i]).min()
+                > max_cos_distances[i]
+            )
+
+
+@hyp.settings(
+    deadline=timedelta(seconds=30),
     max_examples=500,
     suppress_health_check=[
         hyp.HealthCheck.data_too_large,
@@ -1671,7 +2427,7 @@ def test_tree_save_load(vecs):
     """Test that saving and loading a tree preserves the tree structure and vectors."""
 
     dset = infinidata.TableView({"clip_embedding": vecs})
-    tree = CapTree(dset, batch_size=32, k=4, iters=16)
+    tree = CapTree(dset, batch_size=32, k=4, iters=16, max_leaf_size=8)
     tree.split_rec()
     tree_vecs_set = set(tuple(row["clip_embedding"]) for row in tree.items())
 
