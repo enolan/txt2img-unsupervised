@@ -554,7 +554,9 @@ class CapTree:
             # There may be very rare cases where this isn't caused by duplicate vectors, but in
             # general it is. It happens when there are more than max_leaf_size duplicates and
             # causes an infinite loop if not caught.
-            tqdm.write("found node with only one child, probably duplicate vectors")
+            tqdm.write(
+                f"found node with only one child, probably duplicate vectors. node len {len(self)}"
+            )
             self.children[0]._check_for_duplicates(force=True)
 
     def _remove_outliers(
@@ -707,14 +709,17 @@ class CapTree:
             assert self.children == [], "Can only check for duplicates in leaves"
 
             vecs_dict = {}
-            for row in tqdm(self.dset, desc="Deduplicating", leave=None):
-                k = row["clip_embedding"].tobytes()
-                if k in vecs_dict:
-                    vecs_dict[k].append(row)
+            for i, row in enumerate(tqdm(self.dset, desc="Deduplicating", leave=None)):
+                v = row["clip_embedding"]
+                if not np.any(np.isnan(v)):
+                    k = v.tobytes()
+                    vecs_dict.setdefault(k, []).append(row)
                 else:
-                    vecs_dict[k] = [row]
+                    tqdm.write(f"WARNING: found NaN in vector {i}")
             if len(self.dset) > len(vecs_dict):
-                tqdm.write(f"Found {len(self.dset) - len(vecs_dict)} duplicates")
+                tqdm.write(
+                    f"Found {len(self.dset) - len(vecs_dict)} duplicates/nan vectors"
+                )
                 self.found_duplicates.extend(
                     [row["name"] for row in rows]
                     for rows in vecs_dict.values()
@@ -728,6 +733,7 @@ class CapTree:
                         [rows[0][col] for rows in vecs_dict.values()]
                     )
                 self.dset = infinidata.TableView(dset_dict)
+                self.dset_thin = self.dset.select_columns({"clip_embedding"})
                 tqdm.write(f"New leaf size: {len(self.dset)}")
 
     def _to_summary_inner(self, centers=False):
@@ -810,6 +816,14 @@ class CapTree:
                 assert (
                     self.child_cap_max_cos_distances[i]
                     == self.children[i].max_cos_distance
+                )
+            for thicc_batch, thin_batch in zip(
+                self.dset.batch_iter(self.batch_size, drop_last_batch=False),
+                self.dset_thin.batch_iter(self.batch_size, drop_last_batch=False),
+            ):
+                assert list(thin_batch.keys()) == ["clip_embedding"]
+                np.testing.assert_array_equal(
+                    thicc_batch["clip_embedding"], thin_batch["clip_embedding"]
                 )
         else:
             assert self.center.shape == self.dset[0]["clip_embedding"].shape
