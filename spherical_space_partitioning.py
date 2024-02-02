@@ -274,7 +274,11 @@ def _unit_vecs(draw, shape):
 
 @hyp.settings(
     max_examples=500,
-    suppress_health_check=[hyp.HealthCheck.data_too_large, hyp.HealthCheck.too_slow, hyp.HealthCheck.filter_too_much],
+    suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
+        hyp.HealthCheck.too_slow,
+        hyp.HealthCheck.filter_too_much,
+    ],
     deadline=timedelta(seconds=30),
 )
 @given(
@@ -417,7 +421,10 @@ def vectors_in_cap_even_batch(
 
 @hyp.settings(
     deadline=timedelta(seconds=30),
-    suppress_health_check=[hyp.HealthCheck.data_too_large, hyp.HealthCheck.filter_too_much],
+    suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
+        hyp.HealthCheck.filter_too_much,
+    ],
     max_examples=500,
 )
 @given(_unit_vecs(st.tuples(st.integers(2, 256), st.integers(2, 4))))
@@ -2401,7 +2408,10 @@ def test_tree_sample_batch_approx_in_bounds(vecs_and_queries, k, _rand):
         sample_idx = samples[i]
         if sample_idx != -1:
             sample_vec = tree[sample_idx]["clip_embedding"]
-            assert cosine_distance(sample_vec, query_centers[i]) <= max_cos_distances[i] + 0.01
+            assert (
+                cosine_distance(sample_vec, query_centers[i])
+                <= max_cos_distances[i] + 0.01
+            )
             assert tuple(sample_vec) in vecs_set
         else:
             assert (
