@@ -377,6 +377,36 @@ def vectors_in_caps(vs, cap_centers, max_cos_distances):
     return res
 
 
+def vectors_in_caps_padded(vs, cap_centers, max_cos_distances):
+    """Compute vectors in caps, padding the dimension up to powers of two."""
+    assert len(vs.shape) == 2
+    assert len(cap_centers.shape) == 2
+    assert vs.shape[1] == cap_centers.shape[1]
+    assert len(max_cos_distances.shape) == 1
+    assert cap_centers.shape[0] == max_cos_distances.shape[0]
+
+    vs_dim_padded = 2 ** np.ceil(np.log2(vs.shape[0])).astype(np.int32)
+    caps_dim_padded = 2 ** np.ceil(np.log2(cap_centers.shape[0])).astype(np.int32)
+
+    if vs_dim_padded == vs.shape[0] and caps_dim_padded == cap_centers.shape[0]:
+        return vectors_in_caps(vs, cap_centers, max_cos_distances)
+
+    vs_padded = jnp.pad(vs, ((0, vs_dim_padded - vs.shape[0]), (0, 0)), mode="empty")
+    cap_centers_padded = jnp.pad(
+        cap_centers, ((0, caps_dim_padded - cap_centers.shape[0]), (0, 0)), mode="empty"
+    )
+    max_cos_distances_padded = jnp.pad(
+        max_cos_distances, (0, caps_dim_padded - cap_centers.shape[0]), mode="empty"
+    )
+
+    assert vs_padded.shape == (vs_dim_padded, vs.shape[1])
+    assert cap_centers_padded.shape == (caps_dim_padded, cap_centers.shape[1])
+    assert max_cos_distances_padded.shape == (caps_dim_padded,)
+
+    res = vectors_in_caps(vs_padded, cap_centers_padded, max_cos_distances_padded)
+    return res[: vs.shape[0], : cap_centers.shape[0]]
+
+
 def vectors_in_cap_even_batch(
     vs, cap_center, max_cos_distance, max_batch_size_log_sqrt2=31
 ):
@@ -1643,7 +1673,7 @@ class CapTree:
                         queries_in_batch
                     ]
                     # Check the batch
-                    in_caps = vectors_in_caps(
+                    in_caps = vectors_in_caps_padded(
                         batch,
                         query_centers[queries_in_batch],
                         query_max_cos_distances[queries_in_batch],
