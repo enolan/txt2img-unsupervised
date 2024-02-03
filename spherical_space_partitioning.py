@@ -398,16 +398,22 @@ def vectors_in_caps_padded(vs, cap_centers, max_cos_distances):
     vs_dim_padded = 2 ** np.ceil(np.log2(vs.shape[0])).astype(np.int32)
     caps_dim_padded = 2 ** np.ceil(np.log2(cap_centers.shape[0])).astype(np.int32)
 
-    if vs_dim_padded == vs.shape[0] and caps_dim_padded == cap_centers.shape[0]:
-        return vectors_in_caps(vs, cap_centers, max_cos_distances)
-
-    vs_padded = np.pad(vs, ((0, vs_dim_padded - vs.shape[0]), (0, 0)), mode="empty")
-    cap_centers_padded = np.pad(
-        cap_centers, ((0, caps_dim_padded - cap_centers.shape[0]), (0, 0)), mode="empty"
-    )
-    max_cos_distances_padded = np.pad(
-        max_cos_distances, (0, caps_dim_padded - cap_centers.shape[0]), mode="empty"
-    )
+    if vs_dim_padded != vs.shape[0]:
+        vs_padded = np.pad(vs, ((0, vs_dim_padded - vs.shape[0]), (0, 0)), mode="empty")
+    else:
+        vs_padded = vs
+    if caps_dim_padded != cap_centers.shape[0]:
+        cap_centers_padded = np.pad(
+            cap_centers,
+            ((0, caps_dim_padded - cap_centers.shape[0]), (0, 0)),
+            mode="empty",
+        )
+        max_cos_distances_padded = np.pad(
+            max_cos_distances, (0, caps_dim_padded - cap_centers.shape[0]), mode="empty"
+        )
+    else:
+        cap_centers_padded = cap_centers
+        max_cos_distances_padded = max_cos_distances
 
     assert vs_padded.shape == (vs_dim_padded, vs.shape[1])
     assert cap_centers_padded.shape == (caps_dim_padded, cap_centers.shape[1])
