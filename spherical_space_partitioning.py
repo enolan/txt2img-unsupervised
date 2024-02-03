@@ -259,6 +259,7 @@ def _unit_vec_tuple(draw, dim):
     norm = np.linalg.norm(vec)
     hyp.assume(norm > 0)
     vec /= norm
+    hyp.assume(np.allclose(np.linalg.norm(vec), 1, rtol=0, atol=1e-5))
     return tuple(vec.astype(np.float32))
 
 
@@ -278,7 +279,6 @@ def _unit_vecs(draw, shape):
     vecs = draw(st.permutations(vecs))
     vecs = np.array(vecs, dtype=np.float32)
     assert vecs.shape == shape
-    np.testing.assert_allclose(np.linalg.norm(vecs, axis=1), 1, rtol=0, atol=1e-2)
     return vecs
 
 
