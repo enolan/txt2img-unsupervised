@@ -1700,11 +1700,16 @@ class CapTree:
                     cur = 0
                     for assigned_leaf_idx, rows_used in leaf_assignments:
                         in_caps_this_leaf = in_caps[cur : cur + rows_used]
+                        assert in_caps_this_leaf.shape == (
+                            rows_used,
+                            len(query_idxs_in_batch),
+                        )
+                        match_cnts_by_query = np.sum(in_caps_this_leaf, axis=0)
+                        assert match_cnts_by_query.shape == (len(query_idxs_in_batch),)
+                        leaf_match_cnts[
+                            assigned_leaf_idx, query_idxs_in_batch
+                        ] += match_cnts_by_query
                         cur += rows_used
-                        for i, query_idx in enumerate(query_idxs_in_batch):
-                            leaf_match_cnts[assigned_leaf_idx, query_idx] += np.sum(
-                                in_caps_this_leaf[:, i]
-                            )
                 for i, (subtree, _len, queries) in enumerate(leaves_to_check):
                     query_idxs = np.arange(len(query_centers))[queries]
                     for query_idx in query_idxs:
