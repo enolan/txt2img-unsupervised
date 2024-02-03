@@ -1735,13 +1735,14 @@ class CapTree:
                     self.child_start_idxs = np.cumsum(
                         [0] + [len(child) for child in self.children]
                     )
+                    self.dsets_contiguous = True
             else:
                 self.child_start_idxs = None
             self.ready_for_queries = True
         else:
             print("Tree already ready for queries, skipping prep.")
 
-    def save_to_disk(self, dir):
+    def save_to_disk(self, dir, thin=False):
         """Save the tree to disk."""
         dir.mkdir(exist_ok=False, parents=True)
         summary = self.to_summary(centers=True)
@@ -1750,7 +1751,10 @@ class CapTree:
 
         # We concatenate all the leaves into one big dataset before saving to disk. This is a bit
         # more complicated (especially loading) but lets the parquet compression work much better.
-        dsets = [leaf.dset for leaf in self.leaves()]
+        if thin:
+            dsets = [leaf.dset_thin for leaf in self.leaves()]
+        else:
+            dsets = [leaf.dset for leaf in self.leaves()]
         dset_all = infinidata.TableView.concat(dsets)
 
         for k, v in dset_all[0].items():
@@ -2509,8 +2513,6 @@ def main():
     dset_all = load_pq_dir_to_infinidata(args.pq_dir).shuffle(seed=19900515)
     print(f"Loaded dataset with {len(dset_all)} rows")
     dset = dset_all.new_view(slice(0, int(len(dset_all) * 0.99)))
-    if args.thin:
-        dset = dset.select_columns({"clip_embedding"})
     print(f"Train set size: {len(dset)}")
     print(f"Time after split: {get_timestamp()}")
 
@@ -2579,7 +2581,7 @@ def main():
     print(f"Time at end: {get_timestamp()}")
 
     print(f"Saving to {args.save_dir}")
-    tree.save_to_disk(args.save_dir)
+    tree.save_to_disk(args.save_dir, thin=args.thin)
 
 
 if __name__ == "__main__":
