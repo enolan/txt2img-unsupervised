@@ -99,6 +99,10 @@ def find_k_means(dset, batch_size, k, iters):
                     centroids[nearest_centroid] = batch["clip_embedding"][i]
                     per_center_counts[nearest_centroid] = 1
 
+            centroids_set = set(tuple(centroid) for centroid in centroids)
+            assert len(centroids_set) == k, "Centroids are not unique"
+            assert np.all(~np.isnan(centroids)), "Centroids contain NaNs"
+
             pbar.update(1)
 
     tqdm.write(f"Done finding centroids, final batch avg variance: {avg_variance}")
@@ -250,12 +254,12 @@ def test_assign_centroids_top_2():
 @st.composite
 def _unit_vec_tuple(draw, dim):
     """Strategy for drawing unit vectors. Returns a tuple so that it can go in a set for uniqueness."""
-    vec = draw(st.lists(st.floats(-1, 1, width=32), min_size=dim, max_size=dim))
-    vec = np.array(vec, dtype=np.float32)
+    vec = draw(st.lists(st.floats(-1, 1, width=64), min_size=dim, max_size=dim))
+    vec = np.array(vec, dtype=np.float64)
     norm = np.linalg.norm(vec)
     hyp.assume(norm > 0)
     vec /= norm
-    return tuple(vec)
+    return tuple(vec.astype(np.float32))
 
 
 @st.composite
@@ -266,9 +270,15 @@ def _unit_vecs(draw, shape):
         st.sets(_unit_vec_tuple(shape[1]), min_size=shape[0], max_size=shape[0])
     )
     vecs = list(vecs)
+    vecs_dedup_quantized = {
+        np.clip(vec * 2**15, -1 * 2**15, 2**15 - 1).astype(np.int16).tobytes()
+        for vec in np.array(vecs)
+    }
+    hyp.assume(len(vecs_dedup_quantized) == len(vecs))
     vecs = draw(st.permutations(vecs))
     vecs = np.array(vecs, dtype=np.float32)
     assert vecs.shape == shape
+    np.testing.assert_allclose(np.linalg.norm(vecs, axis=1), 1, rtol=0, atol=1e-2)
     return vecs
 
 
@@ -784,7 +794,13 @@ class CapTree:
             for i, row in enumerate(tqdm(self.dset, desc="Deduplicating", leave=None)):
                 v = row["clip_embedding"]
                 if not np.any(np.isnan(v)):
-                    k = v.tobytes()
+                    # Near duplicates can be just as bad as exact ones, so we quantize the values
+                    # for the dict key.
+                    k = (
+                        np.clip(v * 2**15, -1 * 2**15, 2**15 - 1)
+                        .astype(np.int16)
+                        .tobytes()
+                    )
                     vecs_dict.setdefault(k, []).append(row)
                 else:
                     tqdm.write(f"WARNING: found NaN in vector {i}")
@@ -793,14 +809,14 @@ class CapTree:
                     f"Found {len(self.dset) - len(vecs_dict)} duplicates/nan vectors"
                 )
                 self.found_duplicates.extend(
-                    [row["name"] for row in rows]
+                    [row["name"] if "name" in row else "🤷" for row in rows]
                     for rows in vecs_dict.values()
                     if len(rows) > 1
                 )
 
                 # Creat a new, deduplicated Dataset
                 dset_dict = {}
-                for col in self.dset.column_names:
+                for col in self.dset[0].keys():
                     dset_dict[col] = np.array(
                         [rows[0][col] for rows in vecs_dict.values()]
                     )
