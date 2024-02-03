@@ -2085,7 +2085,10 @@ def test_tree_subtrees_in_caps_sizes_are_correct(  # TODO unfuck git history
 @hyp.settings(
     deadline=timedelta(seconds=30),
     max_examples=500,
-    suppress_health_check=[hyp.HealthCheck.filter_too_much],
+    suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
+        hyp.HealthCheck.filter_too_much,
+    ],
 )
 @given(
     _unit_vecs(st.tuples(st.integers(1, 1024), st.integers(2, 4))),
@@ -2282,6 +2285,7 @@ def test_tree_sample_approx_finds_all(vecs, _rand):
     deadline=timedelta(seconds=30),
     max_examples=2000,
     suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
         hyp.HealthCheck.filter_too_much,
     ],
 )
@@ -2327,6 +2331,7 @@ def test_tree_sample_batch_finds_all(vecs, k, batch_size, _rand):
     deadline=timedelta(seconds=30),
     max_examples=500,
     suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
         hyp.HealthCheck.filter_too_much,
     ],
 )
@@ -2375,6 +2380,7 @@ def test_tree_sample_batch_in_bounds(vecs_and_queries, k, _rand):
     deadline=timedelta(seconds=30),
     max_examples=2000,
     suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
         hyp.HealthCheck.filter_too_much,
     ],
 )
@@ -2422,6 +2428,7 @@ def test_tree_sample_batch_approx_finds_all(vecs, k, batch_size, _rand):
     deadline=timedelta(seconds=30),
     max_examples=500,
     suppress_health_check=[
+        hyp.HealthCheck.data_too_large,
         hyp.HealthCheck.filter_too_much,
     ],
 )
