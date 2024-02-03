@@ -391,11 +391,11 @@ def vectors_in_caps_padded(vs, cap_centers, max_cos_distances):
     if vs_dim_padded == vs.shape[0] and caps_dim_padded == cap_centers.shape[0]:
         return vectors_in_caps(vs, cap_centers, max_cos_distances)
 
-    vs_padded = jnp.pad(vs, ((0, vs_dim_padded - vs.shape[0]), (0, 0)), mode="empty")
-    cap_centers_padded = jnp.pad(
+    vs_padded = np.pad(vs, ((0, vs_dim_padded - vs.shape[0]), (0, 0)), mode="empty")
+    cap_centers_padded = np.pad(
         cap_centers, ((0, caps_dim_padded - cap_centers.shape[0]), (0, 0)), mode="empty"
     )
-    max_cos_distances_padded = jnp.pad(
+    max_cos_distances_padded = np.pad(
         max_cos_distances, (0, caps_dim_padded - cap_centers.shape[0]), mode="empty"
     )
 
@@ -404,6 +404,8 @@ def vectors_in_caps_padded(vs, cap_centers, max_cos_distances):
     assert max_cos_distances_padded.shape == (caps_dim_padded,)
 
     res = vectors_in_caps(vs_padded, cap_centers_padded, max_cos_distances_padded)
+    # This sort of slicing is really slow on GPU so we ship the result back to CPU.
+    res = np.array(res)
     return res[: vs.shape[0], : cap_centers.shape[0]]
 
 
@@ -1348,9 +1350,6 @@ class CapTree:
         query_cnt = len(query_centers)
         sizes = np.array([child.len for child in self.children])
 
-        query_centers = jnp.array(query_centers, dtype=jnp.float32)
-        query_max_cos_distances = jnp.array(query_max_cos_distances, dtype=jnp.float32)
-
         # Do geometric tests to find the caps that are fully contained in the query caps, as well
         # as the ones that intersect but do not contain them.
         contained, intersecting = cap_intersection_status_many_to_many(
@@ -1407,7 +1406,7 @@ class CapTree:
 
         for i, j in enumerate(subtrees_to_sample_idxs):
             # Iterate over the subtrees we need to sample from and do the calculation
-            query_caps_to_test = jnp.arange(query_cnt)[intersecting[:, j]]
+            query_caps_to_test = np.arange(query_cnt)[intersecting[:, j]]
             in_caps = vectors_in_caps(
                 sampled_vecs[i],
                 query_centers[query_caps_to_test],
