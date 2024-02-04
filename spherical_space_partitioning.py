@@ -421,10 +421,26 @@ def vectors_in_caps(
         return mask, cumsum
 
 
+def pad_to_multiple(arr, x):
+    """Pad arr to a multiple of x along its 0th dimension. Returns the padded array and the amount
+    of padding added."""
+    pad = x - (len(arr) % x) if len(arr) % x != 0 else 0
+    if pad != 0:
+        padded_arr = np.pad(
+            arr, tuple([(0, pad)] + [(0, 0) for dim in arr.shape[1:]]), mode="constant"
+        )
+    else:
+        padded_arr = arr
+    assert padded_arr.shape[0] % x == 0
+    assert padded_arr.shape[0] - pad == arr.shape[0]
+    assert padded_arr.shape[1:] == arr.shape[1:]
+    return padded_arr, pad
+
+
 def vectors_in_caps_padded(
     vs, cap_centers, max_cos_distances, need_cumsum=False, need_bools=True
 ):
-    """Compute vectors in caps, padding the dimension up to powers of two."""
+    """Compute vectors in caps, padding the dimension up to multiples of small powers of two."""
     assert len(vs.shape) == 2
     assert len(cap_centers.shape) == 2
     assert vs.shape[1] == cap_centers.shape[1]
@@ -432,29 +448,12 @@ def vectors_in_caps_padded(
     assert cap_centers.shape[0] == max_cos_distances.shape[0]
     assert need_cumsum or need_bools
 
-    vs_dim_padded = 2 ** np.ceil(np.log2(vs.shape[0])).astype(np.int32)
-    caps_dim_padded = 2 ** np.ceil(np.log2(cap_centers.shape[0])).astype(np.int32)
-
-    if vs_dim_padded != vs.shape[0]:
-        vs_padded = np.pad(vs, ((0, vs_dim_padded - vs.shape[0]), (0, 0)), mode="empty")
-    else:
-        vs_padded = vs
-    if caps_dim_padded != cap_centers.shape[0]:
-        cap_centers_padded = np.pad(
-            cap_centers,
-            ((0, caps_dim_padded - cap_centers.shape[0]), (0, 0)),
-            mode="empty",
-        )
-        max_cos_distances_padded = np.pad(
-            max_cos_distances, (0, caps_dim_padded - cap_centers.shape[0]), mode="empty"
-        )
-    else:
-        cap_centers_padded = cap_centers
-        max_cos_distances_padded = max_cos_distances
-
-    assert vs_padded.shape == (vs_dim_padded, vs.shape[1])
-    assert cap_centers_padded.shape == (caps_dim_padded, cap_centers.shape[1])
-    assert max_cos_distances_padded.shape == (caps_dim_padded,)
+    vs_padded, vs_pad = pad_to_multiple(vs, 16)
+    cap_centers_padded, cap_centers_pad = pad_to_multiple(cap_centers, 64)
+    max_cos_distances_padded, max_cos_distances_pad = pad_to_multiple(
+        max_cos_distances, 64
+    )
+    assert cap_centers_pad == max_cos_distances_pad
 
     res = vectors_in_caps(
         vs_padded,
@@ -583,24 +582,11 @@ def cap_intersection_status_many_to_many_padded(
     """Run cap_intersection_status_many_to_many, padding the dimensions up to multiples of 8."""
     assert centers_a.shape[0] == max_cos_distances_a.shape[0]
     assert centers_b.shape[0] == max_cos_distances_b.shape[0]
-    pad_a = 8 - centers_a.shape[0] % 8
-    pad_b = 8 - centers_b.shape[0] % 8
-    if pad_a != 8:
-        centers_a_padded = np.pad(centers_a, ((0, pad_a), (0, 0)), mode="empty")
-        max_cos_distances_a_padded = np.pad(
-            max_cos_distances_a, (0, pad_a), mode="empty"
-        )
-    else:
-        centers_a_padded = centers_a
-        max_cos_distances_a_padded = max_cos_distances_a
-    if pad_b != 8:
-        centers_b_padded = np.pad(centers_b, ((0, pad_b), (0, 0)), mode="empty")
-        max_cos_distances_b_padded = np.pad(
-            max_cos_distances_b, (0, pad_b), mode="empty"
-        )
-    else:
-        centers_b_padded = centers_b
-        max_cos_distances_b_padded = max_cos_distances_b
+    centers_a_padded, pad_a = pad_to_multiple(centers_a, 8)
+    centers_b_padded, pad_b = pad_to_multiple(centers_b, 8)
+    max_cos_distances_a_padded, _ = pad_to_multiple(max_cos_distances_a, 8)
+    max_cos_distances_b_padded, _ = pad_to_multiple(max_cos_distances_b, 8)
+
     contained, intersecting = cap_intersection_status_many_to_many(
         centers_a_padded,
         max_cos_distances_a_padded,
@@ -608,6 +594,7 @@ def cap_intersection_status_many_to_many_padded(
         max_cos_distances_b_padded,
     )
     contained, intersecting = np.array(contained), np.array(intersecting)
+
     contained = contained[: centers_a.shape[0], : centers_b.shape[0]]
     intersecting = intersecting[: centers_a.shape[0], : centers_b.shape[0]]
     return contained, intersecting
