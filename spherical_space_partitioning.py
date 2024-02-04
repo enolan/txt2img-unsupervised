@@ -404,7 +404,7 @@ def vectors_in_caps(
     assert len(max_cos_distances.shape) == 1
     assert cap_centers.shape[0] == max_cos_distances.shape[0]
     assert need_cumsum or need_bools
-    print(f"Tracing vectors_in_caps for shapes {vs.shape}, {cap_centers.shape}")
+    print(f"Tracing vectors_in_caps for vs {vs.shape[0]}, caps {cap_centers.shape[0]}")
 
     mask = jax.vmap(vectors_in_cap, in_axes=(None, 0, 0))(
         vs, cap_centers, max_cos_distances
