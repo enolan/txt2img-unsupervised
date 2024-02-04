@@ -389,32 +389,48 @@ def vectors_in_cap(vs, cap_center, max_cos_distance):
     )
 
 
-@jax.jit
-def vectors_in_caps(vs, cap_centers, max_cos_distances):
+@partial(jax.jit, static_argnames=("need_cumsum", "need_bools"))
+def vectors_in_caps(
+    vs, cap_centers, max_cos_distances, need_cumsum=False, need_bools=True
+):
     """Check which vectors in vs are in the caps defined by cap_centers and max_cos_distances.
-    Returns a boolean array of shape (len(vs), len(cap_centers))."""
+    If need_cumsum is True returns a cumulative sum over the vectors, if need_bools is True returns
+    a bool mask. If both are, returns a tuple.
+    mask and cumsum both have shape (len(vs), len(cap_centers))
+    """
     assert len(vs.shape) == 2
     assert len(cap_centers.shape) == 2
     assert vs.shape[1] == cap_centers.shape[1]
     assert len(max_cos_distances.shape) == 1
     assert cap_centers.shape[0] == max_cos_distances.shape[0]
+    assert need_cumsum or need_bools
     print(f"Tracing vectors_in_caps for shapes {vs.shape}, {cap_centers.shape}")
 
-    res = jax.vmap(vectors_in_cap, in_axes=(None, 0, 0))(
+    mask = jax.vmap(vectors_in_cap, in_axes=(None, 0, 0))(
         vs, cap_centers, max_cos_distances
     )
-    res = rearrange(res, "c v -> v c")
-    assert res.shape == (len(vs), len(cap_centers)), f"res.shape: {res.shape}"
-    return res
+    mask = rearrange(mask, "c v -> v c")
+    assert mask.shape == (len(vs), len(cap_centers)), f"mask.shape: {mask.shape}"
+    if need_cumsum:
+        cumsum = jnp.cumsum(mask, axis=0)
+    if need_cumsum and not need_bools:
+        return cumsum
+    elif need_bools and not need_cumsum:
+        return mask
+    else:
+        return mask, cumsum
 
 
-def vectors_in_caps_padded(vs, cap_centers, max_cos_distances):
+def vectors_in_caps_padded(
+    vs, cap_centers, max_cos_distances, need_cumsum=False, need_bools=True
+):
     """Compute vectors in caps, padding the dimension up to powers of two."""
     assert len(vs.shape) == 2
     assert len(cap_centers.shape) == 2
     assert vs.shape[1] == cap_centers.shape[1]
     assert len(max_cos_distances.shape) == 1
     assert cap_centers.shape[0] == max_cos_distances.shape[0]
+    assert need_cumsum or need_bools
 
     vs_dim_padded = 2 ** np.ceil(np.log2(vs.shape[0])).astype(np.int32)
     caps_dim_padded = 2 ** np.ceil(np.log2(cap_centers.shape[0])).astype(np.int32)
@@ -440,10 +456,24 @@ def vectors_in_caps_padded(vs, cap_centers, max_cos_distances):
     assert cap_centers_padded.shape == (caps_dim_padded, cap_centers.shape[1])
     assert max_cos_distances_padded.shape == (caps_dim_padded,)
 
-    res = vectors_in_caps(vs_padded, cap_centers_padded, max_cos_distances_padded)
+    res = vectors_in_caps(
+        vs_padded,
+        cap_centers_padded,
+        max_cos_distances_padded,
+        need_cumsum=need_cumsum,
+        need_bools=need_bools,
+    )
     # This sort of slicing is really slow on GPU so we ship the result back to CPU.
-    res = np.array(res)
-    return res[: vs.shape[0], : cap_centers.shape[0]]
+    if need_cumsum != need_bools:
+        return np.array(res)[: vs.shape[0], : cap_centers.shape[0]]
+    elif need_cumsum and need_bools:
+        mask, cumsum = np.array(res[0]), np.array(res[1])
+        return (
+            mask[: vs.shape[0], : cap_centers.shape[0]],
+            cumsum[: vs.shape[0], : cap_centers.shape[0]],
+        )
+    else:
+        assert False, "This should be unreachable"
 
 
 def vectors_in_cap_even_batch(
@@ -480,8 +510,8 @@ def vectors_in_cap_even_batch(
             this_batch = vs[cur : cur + this_batch_size]
             batch_len_unpadded = this_batch_size
 
-        out[cur : cur + batch_len_unpadded] = vectors_in_cap(
-            this_batch, cap_center, max_cos_distance
+        out[cur : cur + batch_len_unpadded] = np.array(
+            vectors_in_cap(this_batch, cap_center, max_cos_distance)
         )[:batch_len_unpadded]
         cur += this_batch_size
 
@@ -539,9 +569,48 @@ def cap_intersection_status_many_to_many(
     centers_a, max_cos_distances_a, centers_b, max_cos_distances_b
 ):
     """Calculate whether each cap in a contains any of the caps in b, or they intersect, or neither."""
+    print(
+        f"Tracing cap_intersection_status_many_to_many for shapes {centers_a.shape}, {centers_b.shape}"
+    )
     return jax.vmap(cap_intersection_status_one_to_many, in_axes=(0, 0, None, None))(
         centers_a, max_cos_distances_a, centers_b, max_cos_distances_b
     )
+
+
+def cap_intersection_status_many_to_many_padded(
+    centers_a, max_cos_distances_a, centers_b, max_cos_distances_b
+):
+    """Run cap_intersection_status_many_to_many, padding the dimensions up to multiples of 8."""
+    assert centers_a.shape[0] == max_cos_distances_a.shape[0]
+    assert centers_b.shape[0] == max_cos_distances_b.shape[0]
+    pad_a = 8 - centers_a.shape[0] % 8
+    pad_b = 8 - centers_b.shape[0] % 8
+    if pad_a != 8:
+        centers_a_padded = np.pad(centers_a, ((0, pad_a), (0, 0)), mode="empty")
+        max_cos_distances_a_padded = np.pad(
+            max_cos_distances_a, (0, pad_a), mode="empty"
+        )
+    else:
+        centers_a_padded = centers_a
+        max_cos_distances_a_padded = max_cos_distances_a
+    if pad_b != 8:
+        centers_b_padded = np.pad(centers_b, ((0, pad_b), (0, 0)), mode="empty")
+        max_cos_distances_b_padded = np.pad(
+            max_cos_distances_b, (0, pad_b), mode="empty"
+        )
+    else:
+        centers_b_padded = centers_b
+        max_cos_distances_b_padded = max_cos_distances_b
+    contained, intersecting = cap_intersection_status_many_to_many(
+        centers_a_padded,
+        max_cos_distances_a_padded,
+        centers_b_padded,
+        max_cos_distances_b_padded,
+    )
+    contained, intersecting = np.array(contained), np.array(intersecting)
+    contained = contained[: centers_a.shape[0], : centers_b.shape[0]]
+    intersecting = intersecting[: centers_a.shape[0], : centers_b.shape[0]]
+    return contained, intersecting
 
 
 def find_nearest_centroid(x, centroids):
@@ -1052,7 +1121,7 @@ class CapTree:
 
         # Do geometric tests to find the caps that are fully contained in the query caps, as well
         # as the ones that intersect but do not contain them.
-        contained, intersecting = cap_intersection_status_many_to_many(
+        contained, intersecting = cap_intersection_status_many_to_many_padded(
             query_centers,
             query_max_cos_distances,
             self.child_cap_centers,
@@ -1107,7 +1176,7 @@ class CapTree:
         for i, j in enumerate(subtrees_to_sample_idxs):
             # Iterate over the subtrees we need to sample from and do the calculation
             query_caps_to_test = np.arange(query_cnt)[intersecting[:, j]]
-            in_caps = vectors_in_caps(
+            in_caps = vectors_in_caps_padded(
                 sampled_vecs[i],
                 query_centers[query_caps_to_test],
                 query_max_cos_distances[query_caps_to_test],
@@ -1276,7 +1345,7 @@ class CapTree:
             # For a node, we use the geometric test, then check the children that intersect the
             # query caps but don't contain them, recursively.
             if mask is None:
-                contained, intersecting = cap_intersection_status_many_to_many(
+                contained, intersecting = cap_intersection_status_many_to_many_padded(
                     query_centers,
                     query_max_cos_distances,
                     self.child_cap_centers,
@@ -1293,10 +1362,9 @@ class CapTree:
             contained, intersecting = np.array(contained), np.array(intersecting)
 
             # Record the paths to the subtrees that are fully contained in the query caps.
-            for i in range(len(query_centers)):
-                for j in range(len(self.children)):
-                    if contained[i, j]:
-                        out[i].append(([j], self.children[j].len))
+            contained_query_idxs, contained_subtree_idxs = np.nonzero(contained)
+            for i, j in zip(contained_query_idxs, contained_subtree_idxs):
+                out[i].append(([j], self.children[j].len))
 
             # For the subtrees that intersect but aren't contained in the query caps, we need to
             # check inside them.
@@ -1372,35 +1440,39 @@ class CapTree:
                         queries_in_batch
                     ]
                     # Check the batch
-                    in_caps = vectors_in_caps_padded(
+                    in_caps_cumsum = vectors_in_caps_padded(
                         batch,
                         query_centers[queries_in_batch],
                         query_max_cos_distances[queries_in_batch],
+                        need_cumsum=True,
+                        need_bools=False,
                     )
-                    assert in_caps.shape == (len(batch), len(query_idxs_in_batch))
-                    in_caps = np.array(in_caps)
+                    assert in_caps_cumsum.shape == (
+                        len(batch),
+                        len(query_idxs_in_batch),
+                    )
+                    in_caps_cumsum = np.array(in_caps_cumsum)
 
                     # Use leaf_assignments to update the correct counts
                     cur = 0
                     for assigned_leaf_idx, rows_used in leaf_assignments:
-                        in_caps_this_leaf = in_caps[cur : cur + rows_used]
-                        assert in_caps_this_leaf.shape == (
-                            rows_used,
-                            len(query_idxs_in_batch),
-                        )
-                        match_cnts_by_query = np.sum(in_caps_this_leaf, axis=0)
-                        assert match_cnts_by_query.shape == (len(query_idxs_in_batch),)
+                        # Use the difference in the cumulative sum to get the number of matches
+                        # this is marginally faster that sending the boolen array to the CPU and
+                        # doing a sum over a slice.
+                        match_cnts_by_query_cumsum = in_caps_cumsum[
+                            cur + rows_used - 1
+                        ] - (in_caps_cumsum[cur - 1] if cur > 0 else 0)
                         leaf_match_cnts[
                             assigned_leaf_idx, query_idxs_in_batch
-                        ] += match_cnts_by_query
+                        ] += match_cnts_by_query_cumsum
                         cur += rows_used
                 for i, (subtree, _len, queries) in enumerate(leaves_to_check):
                     query_idxs = np.arange(len(query_centers))[queries]
-                    for query_idx in query_idxs:
-                        if leaf_match_cnts[i, query_idx] > 0:
-                            out[query_idx].append(
-                                ([subtree], leaf_match_cnts[i, query_idx])
-                            )
+                    matching_leaves = leaf_match_cnts[i, query_idxs] > 0
+                    for query_idx in query_idxs[matching_leaves]:
+                        out[query_idx].append(
+                            ([subtree], leaf_match_cnts[i, query_idx])
+                        )
         else:
             # For a leaf, we check the vectors in the leaf against the query caps.
             in_caps = vectors_in_caps(
