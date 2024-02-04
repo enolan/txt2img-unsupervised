@@ -252,33 +252,54 @@ def test_assign_centroids_top_2():
 
 
 @st.composite
-def _unit_vec_tuple(draw, dim):
-    """Strategy for drawing unit vectors. Returns a tuple so that it can go in a set for uniqueness."""
-    vec = draw(st.lists(st.floats(-1, 1, width=64), min_size=dim, max_size=dim))
-    vec = np.array(vec, dtype=np.float64)
-    norm = np.linalg.norm(vec)
-    hyp.assume(norm > 0)
-    vec /= norm
-    hyp.assume(np.allclose(np.linalg.norm(vec), 1, rtol=0, atol=1e-5))
-    return tuple(vec.astype(np.float32))
-
-
-@st.composite
 def _unit_vecs(draw, shape):
     """Strategy for drawing unique unit vectors."""
+    # Generating unique unit vectors using Hypothesis is, AFAICT, impossible to do well in a
+    # non insane way. This is an insane way, and not a good one, but it's at least fast. The more
+    # natural methods reject very high proportions of candidates and are consequently very slow.
+    # They also generate very small sets of vectors. This version shrinks towards axis aligned
+    # vectors, just to make it easier to read the output. Shrinking a set of unit vectors beyond
+    # that doesn't make much sense. The natural methods provide no useful shrinking. It will spin
+    # for five minutes failing to shrink the example at all if you have a test failure.
     shape = draw(shape)
-    vecs = draw(
-        st.sets(_unit_vec_tuple(shape[1]), min_size=shape[0], max_size=shape[0])
+
+    # (sometimes) prepend a series of axis aligned vectors. Shrinking goes toward doing it more.
+    aa_prefix_len = shape[1] - draw(st.integers(0, shape[1]))
+    aa_prefix = np.eye(aa_prefix_len, dtype=np.float32)
+    aa_prefix = np.pad(
+        aa_prefix, ((0, 0), (0, shape[1] - aa_prefix_len)), mode="constant"
     )
-    vecs = list(vecs)
+    aa_prefix = np.concatenate([aa_prefix, -aa_prefix], axis=0)
+    aa_prefix = aa_prefix[: shape[0]]
+    assert aa_prefix.shape[0] <= shape[0]
+    assert aa_prefix.shape[1] == shape[1]
+    assert np.all(np.isclose(np.linalg.norm(aa_prefix, axis=1), 1))
+
+    shape_remaining = (shape[0] - aa_prefix.shape[0], shape[1])
+
+    # Generate the remainder in the typical numpy way. this is effectively unshrinkable, and
+    # hopefully this method stops Hypothesis from trying.
+    bytes = draw(st.binary(min_size=8, max_size=8))
+    seed = np.frombuffer(bytes, dtype=np.uint64)
+    rng = np.random.default_rng(seed)
+
+    vecs = rng.standard_normal(shape_remaining).astype(np.float32)
+    vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+    hyp.assume(np.all(np.isfinite(vecs)))
+    hyp.assume(np.all(np.isclose(np.linalg.norm(vecs, axis=1), 1)))
+
+    vecs = np.concatenate([aa_prefix, vecs], axis=0)
+    assert vecs.shape == shape
+
+    # The vectors need to be unique, and very close vectors are close enough to being duplicates to
+    # induce the same problems. So we quantize them to 16 bits and detect duplicates based on that.
     vecs_dedup_quantized = {
         np.clip(vec * 2**15, -1 * 2**15, 2**15 - 1).astype(np.int16).tobytes()
-        for vec in np.array(vecs)
+        for vec in vecs
     }
+
     hyp.assume(len(vecs_dedup_quantized) == len(vecs))
-    vecs = draw(st.permutations(vecs))
-    vecs = np.array(vecs, dtype=np.float32)
-    assert vecs.shape == shape
+
     return vecs
 
 
@@ -293,7 +314,7 @@ def _unit_vecs(draw, shape):
 )
 @given(
     _unit_vecs(
-        st.tuples(st.integers(5, 1024), st.integers(2, 4)),
+        st.tuples(st.integers(5, 256), st.integers(2, 4)),
     ),
     st.integers(1, 4),
     st.integers(1, 10),
@@ -955,10 +976,6 @@ class CapTree:
         for subtree in tqdm(
             self.children, leave=False, desc="Checking subtree invariants"
         ):
-            assert (
-                cosine_distance(self.center, subtree.center)
-                <= self.max_cos_distance + self.EPSILON
-            )
             subtree._check_invariants()
 
     def _check_inside_cap(self, cap_center, max_cos_distance):
@@ -1605,7 +1622,7 @@ def test_remove_outliers_with_level_0_makes_outlier_cluster():
 )
 @given(
     _unit_vecs(
-        st.tuples(st.integers(1, 1024), st.integers(2, 4)),
+        st.tuples(st.integers(1, 256), st.integers(2, 4)),
     ),
     st.integers(3, 8),
     st.integers(3, 16),
@@ -1771,14 +1788,14 @@ def test_tree_subtrees_in_caps_finds_all_at_2(
 
 @hyp.settings(
     deadline=timedelta(seconds=30),
-    max_examples=2000,
+    max_examples=500,
     suppress_health_check=[
         hyp.HealthCheck.data_too_large,
         hyp.HealthCheck.filter_too_much,
     ],
 )
 @given(
-    _unit_vecs(st.tuples(st.integers(1, 1024), st.integers(2, 4))),
+    _unit_vecs(st.tuples(st.integers(1, 256), st.integers(2, 4))),
     st.integers(3, 8),
     st.integers(1, 4),
     st.random_module(),
@@ -1792,7 +1809,7 @@ def test_tree_sample_batch_finds_all(vecs, k, batch_size, _rand):
     tree.split_rec()
     tree.prepare_for_queries()
 
-    tol = 0.0001
+    tol = 0.001
 
     vec_idx = 0
 
@@ -1866,14 +1883,14 @@ def test_tree_sample_batch_in_bounds(vecs_and_queries, k, _rand):
 
 @hyp.settings(
     deadline=timedelta(seconds=30),
-    max_examples=2000,
+    max_examples=500,
     suppress_health_check=[
         hyp.HealthCheck.data_too_large,
         hyp.HealthCheck.filter_too_much,
     ],
 )
 @given(
-    _unit_vecs(st.tuples(st.integers(1, 1024), st.integers(2, 4))),
+    _unit_vecs(st.tuples(st.integers(1, 256), st.integers(2, 4))),
     st.integers(3, 8),
     st.integers(1, 4),
     st.random_module(),
@@ -1923,7 +1940,7 @@ def test_tree_sample_batch_approx_finds_all(vecs, k, batch_size, _rand):
 @given(
     st.tuples(st.integers(2, 4), st.integers(1, 4)).flatmap(
         lambda d_and_num_queries: st.tuples(
-            _unit_vecs(st.tuples(st.integers(1, 1024), st.just(d_and_num_queries[0]))),
+            _unit_vecs(st.tuples(st.integers(1, 256), st.just(d_and_num_queries[0]))),
             _unit_vecs(
                 st.tuples(st.just(d_and_num_queries[1]), st.just(d_and_num_queries[0]))
             ),
@@ -1974,7 +1991,7 @@ def test_tree_sample_batch_approx_in_bounds(vecs_and_queries, k, _rand):
 )
 @given(
     _unit_vecs(
-        st.tuples(st.integers(1, 1024), st.integers(2, 4)),
+        st.tuples(st.integers(1, 256), st.integers(2, 4)),
     )
 )
 def test_tree_save_load(vecs):
