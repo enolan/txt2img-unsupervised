@@ -944,6 +944,97 @@ class CapTree:
         else:
             return 1 + max(child.depth() for child in self.children)
 
+    def delete_idxs(self, idxs):
+        """Delete the entries at the specified indices from the tree. Input should be a numpy
+        array. Returns True if the tree would be empty after this operation, False otherwise.
+        Since captrees can't be empty, caller is responsible for handling this case. Doing this
+        repeatedly with small sets of indices is very inefficient, it's best to do large batches.
+        Otherwise you'll have a really big stack of TableViews."""
+
+        assert isinstance(idxs, np.ndarray)
+        assert len(idxs.shape) == 1
+        assert self.dsets_contiguous
+
+        if len(idxs) == 0:
+            return False
+        assert idxs.min() >= 0
+        assert idxs.max() < len(self)
+
+        if len(self) == len(idxs):
+            return True
+
+        start_len = len(self)
+
+        if len(self.children) == 0:
+            sorted_idxs = np.sort(idxs)
+            # Build a list of slices, containing the contiguous regions we're keeping.
+            slices = []
+
+            start = 0
+            for idx in sorted_idxs:
+                if idx > start:
+                    slices.append(slice(start, idx))
+                start = idx + 1
+            if start < len(self):
+                slices.append(slice(start, len(self)))
+
+            # We try to avoid making a bunch of new views if we can. Each slice is a whole
+            # TableView, but if you're doing index arrays you can have as many of those in the same
+            # TableView as you like. The factor of 16 is totally made up.
+            if len(slices) * 16 < (len(self.dset) - len(sorted_idxs)):
+                dsets = [self.dset.new_view(s) for s in slices]
+                self.dset = infinidata.TableView.concat(dsets)
+                self.dset_thin = self.dset.select_columns({"clip_embedding"})
+            else:
+                idxs_to_keep = np.ones(len(self), dtype=np.bool_)
+                idxs_to_keep[sorted_idxs] = False
+                idxs_to_keep = np.arange(len(self))[idxs_to_keep]
+                self.dset = self.dset.new_view(idxs_to_keep)
+                self.dset_thin = self.dset_thin.new_view(idxs_to_keep)
+            self.len = len(self.dset)
+            assert len(self.dset) == len(self.dset_thin) == len(self)
+            assert len(self) == start_len - len(sorted_idxs)
+        else:
+            children_to_delete = []
+            for i, child in enumerate(self.children):
+                child_idxs_to_delete_mask = (idxs >= self.child_start_idxs[i]) & (
+                    idxs < self.child_start_idxs[i + 1]
+                )
+                child_idxs_to_delete = (
+                    idxs[child_idxs_to_delete_mask] - self.child_start_idxs[i]
+                )
+                if np.any(child_idxs_to_delete_mask):
+                    child_start_len = len(child)
+                    child_start_dset_len = len(child.dset)
+                    assert child_start_len == child_start_dset_len
+                    if child.delete_idxs(child_idxs_to_delete):
+                        children_to_delete.append(i)
+                    else:
+                        assert len(child) == child_start_len - len(child_idxs_to_delete)
+                        assert len(child.dset) == child_start_dset_len - len(
+                            child_idxs_to_delete
+                        )
+            if len(children_to_delete) == len(self.children):
+                assert (
+                    False
+                ), "We somehow deleted all the children despite having fewer indices to delete than are in this subtree"
+            if len(children_to_delete) > 0:
+                deleted_so_far = 0
+                for child_idx in children_to_delete:
+                    del self.children[child_idx - deleted_so_far]
+                    deleted_so_far += 1
+                self.child_cap_centers = np.array(
+                    [child.center for child in self.children]
+                )
+                self.child_cap_max_cos_distances = np.array(
+                    [child.max_cos_distance for child in self.children]
+                )
+            self.dsets_contiguous = False
+            self._make_contiguous()
+        self.len = len(self.dset)
+        assert len(self) == start_len - len(idxs)
+        return False
+
     def leaf_depths(self):
         """Generator of the depths of the leaves of the tree."""
         if len(self.children) == 0:
@@ -1476,6 +1567,19 @@ class CapTree:
         """Get a vector by index. There is no meaningful ordering."""
         return self.dset[idx]
 
+    def _make_contiguous(self):
+        """Make the dset of this tree contain the dsets of the children in order. Not recursive."""
+        if len(self.children) > 0:
+            if not self.dsets_contiguous:
+                self.dset = infinidata.TableView.concat(
+                    [child.dset for child in self.children]
+                )
+                self.dset_thin = self.dset.select_columns({"clip_embedding"})
+                self.child_start_idxs = np.cumsum(
+                    [0] + [len(child) for child in self.children]
+                )
+        self.dsets_contiguous = True
+
     def prepare_for_queries(self):
         """Prepare the tree for fast querying. This is unnecessary if the tree was loaded from
         disk. Note that loading from disk yields a tree that is much faster to query that building
@@ -1486,19 +1590,7 @@ class CapTree:
         if not self.ready_for_queries:
             for child in self.children:
                 child.prepare_for_queries()
-
-            if len(self.children) > 0:
-                if not self.dsets_contiguous:
-                    self.dset = infinidata.TableView.concat(
-                        [child.dset for child in self.children]
-                    )
-                    self.dset_thin = self.dset.select_columns({"clip_embedding"})
-                    self.child_start_idxs = np.cumsum(
-                        [0] + [len(child) for child in self.children]
-                    )
-                    self.dsets_contiguous = True
-            else:
-                self.child_start_idxs = None
+            self._make_contiguous()
             self.ready_for_queries = True
         else:
             print("Tree already ready for queries, skipping prep.")
@@ -2066,3 +2158,55 @@ def test_tree_save_load(vecs):
         tree2._check_invariants()
         tree2_vecs_set = set(tuple(row["clip_embedding"]) for row in tree2.items())
         assert tree_vecs_set == tree2_vecs_set
+
+
+@hyp.settings(
+    deadline=timedelta(seconds=30),
+    max_examples=500,
+)
+@given(
+    st.integers(1, 256).flatmap(
+        lambda n_vecs: st.tuples(
+            _unit_vecs(st.tuples(st.integers(n_vecs, 256), st.integers(2, 4))),
+            st.sets(st.integers(0, n_vecs - 1), min_size=1, max_size=n_vecs),
+        )
+    ),
+    st.booleans(),
+    st.random_module(),
+)
+def test_tree_delete_idxs(vecs_and_idxs, do_split, _rand):
+    """Test that deleting indices from a tree leaves a valid tree with the correct stuff removed."""
+    vecs, idxs_to_delete = vecs_and_idxs
+    vecs_set = set(tuple(vec) for vec in vecs)
+    assert len(vecs) == len(vecs_set)
+
+    dset = infinidata.TableView({"clip_embedding": vecs})
+    tree = CapTree(dset, batch_size=32, k=3, iters=4, max_leaf_size=4)
+
+    if do_split:
+        tree.split_rec()
+    tree.prepare_for_queries()
+
+    # The meaning of indices passed to delete_idxs is relative to their order in the tree, not
+    # their order in any original dataset, so to predict which rows should be deleted we need to
+    # look at the dataset after the tree's built.
+    vecs_from_tree = tree.dset[:]["clip_embedding"]
+    vecs_set_after_delete = vecs_set - set(
+        tuple(vecs_from_tree[i]) for i in idxs_to_delete
+    )
+
+    assert len(vecs_set_after_delete) == len(vecs) - len(idxs_to_delete)
+
+    tree._check_invariants()
+    should_delete = tree.delete_idxs(np.array(list(idxs_to_delete)))
+
+    if not should_delete:
+        assert len(tree) == len(vecs) - len(idxs_to_delete)
+        tree._check_invariants()
+        vecs_from_modified_tree = set(
+            tuple(row["clip_embedding"]) for row in tree.items()
+        )
+        assert len(vecs_from_modified_tree) == len(tree)
+        assert vecs_from_modified_tree == vecs_set_after_delete
+    else:
+        assert len(idxs_to_delete) == len(vecs)
