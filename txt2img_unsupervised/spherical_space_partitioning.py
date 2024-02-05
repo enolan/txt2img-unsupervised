@@ -1414,7 +1414,7 @@ class CapTree:
                     if len(valid_distances_idxs) == 0:
                         tqdm.write(
                             f"WARNING: _subtrees_in_caps found {cnt} matches but sample_in_caps "
-                            +"found 0. Returning none."
+                            + "found 0. Returning none."
                         )
                         return -1
                     elif len(valid_distances_idxs) != cnt:
@@ -1627,7 +1627,9 @@ class CapTree:
             for child in self.children:
                 child.prepare_for_queries()
             self._make_contiguous()
-            self.threadpool = concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count())
+            self.threadpool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=os.cpu_count()
+            )
             self.ready_for_queries = True
         else:
             print("Tree already ready for queries, skipping prep.")
