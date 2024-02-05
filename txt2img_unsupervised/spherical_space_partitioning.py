@@ -1403,8 +1403,21 @@ class CapTree:
                     valid_distances_idxs = np.arange(len(subtree.dset))[
                         valid_distances_mask
                     ]
-                    assert len(valid_distances_idxs) == cnt
-                    out[query] = subtree_start + valid_distances_idxs[idx_in_subtree]
+                    if len(valid_distances_idxs) != cnt:
+                        tqdm.write(
+                            f"WARNING: _subtrees_in_caps says there are {cnt} matches but when I "
+                            + f"checked there were {len(valid_distances_idxs)}. Sampling from the remainder."
+                        )
+                        out[query] = (
+                            subtree_start
+                            + valid_distances_idxs[
+                                np.random.randint(len(valid_distances_idxs))
+                            ]
+                        )
+                    else:
+                        out[query] = (
+                            subtree_start + valid_distances_idxs[idx_in_subtree]
+                        )
 
         return out
 
