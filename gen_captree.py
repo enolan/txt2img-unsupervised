@@ -35,11 +35,8 @@ def main():
     get_timestamp = lambda: datetime.utcnow().isoformat()
     print(f"Time at start: {get_timestamp()}")
 
-    dset_all = load_pq_dir_to_infinidata(args.pq_dir).shuffle(seed=19900515)
-    print(f"Loaded dataset with {len(dset_all)} rows")
-    dset = dset_all.new_view(slice(0, int(len(dset_all) * 0.99)))
-    print(f"Train set size: {len(dset)}")
-    print(f"Time after split: {get_timestamp()}")
+    dset = load_pq_dir_to_infinidata(args.pq_dir)
+    print(f"Loaded dataset with {len(dset)} rows")
 
     if args.read_dup_blacklist is not None:
         with open(args.read_dup_blacklist, "r") as f:
@@ -72,10 +69,6 @@ def main():
     tree.split_rec()
 
     print(f"Time after building tree: {get_timestamp()}")
-
-    tree.shuffle_leaves()
-
-    print(f"Time after shuffling: {get_timestamp()}")
 
     if args.paranoid:
         # This is a pretty slow check, but I don't 100% trust the code
