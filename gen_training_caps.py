@@ -6,18 +6,24 @@ here is that at inference time, users can generate images with the constraint th
 embeddings will be within a cap.
 """
 
+import argparse
 import hypothesis as hyp
 import hypothesis.extra.numpy as hyp_np
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from datetime import timedelta
 from functools import partial
 from hypothesis import given, strategies as st
+from infinidata import TableView
+from pathlib import Path
 from tqdm import tqdm
 
-from txt2img_unsupervised.spherical_space_partitioning import _unit_vecs
+from txt2img_unsupervised.spherical_space_partitioning import _unit_vecs, CapTree
 
 
 @partial(jax.jit, inline=True)
@@ -122,54 +128,226 @@ def gen_slerp_caps(ps, rng):
 
 
 def gen_training_examples_from_tree(captree, rng, batch_size, stop_after=None):
-    """Iterate over a tree and sample caps, then sample images within those caps."""
+    """Iterate over a tree and sample caps, then sample images within those caps. Modifies the
+    captree, removing images as it goes."""
     assert batch_size > 0
     assert batch_size % 2 == 0
 
-    cap_centers = []
-    max_cos_distances = []
-    sampled_idxs = []
+    sampled_rows = []
 
-    dset_idx = 0
     with tqdm(
-        unit="caps", total=len(captree) // 2 if stop_after is None else stop_after
+        unit="caps", total=len(captree) - 2 if stop_after is None else stop_after
     ) as pbar:
-        for batch in captree.dset_thin.shuffle().batch_iter(
-            batch_size=batch_size, drop_last_batch=False
-        ):
-            embeds = batch["clip_embedding"]
+        while len(captree) > 2 and (stop_after is None or pbar.n < stop_after):
+            dset_idx = 0
 
-            rng, rng2 = jax.random.split(rng)
-            this_cap_centers, this_max_cos_distances = gen_slerp_caps(embeds, rng2)
-            this_cap_centers, this_max_cos_distances = np.array(
-                this_cap_centers
-            ), np.array(this_max_cos_distances)
+            rng, shuf_rng = jax.random.split(rng)
+            dset_shuffle_mapping = np.array(
+                jax.random.choice(
+                    shuf_rng, len(captree), shape=(len(captree),), replace=False
+                )
+            ).astype(np.int64)
+            shuffle_inverse = np.argsort(dset_shuffle_mapping)
+            shuffled_dset = captree.dset_thin.new_view(dset_shuffle_mapping)
 
-            this_sampled_idxs = (
-                captree.sample_in_caps_approx(
+            # We track stuff sampled this iteration through the dataset separately from stuff that
+            # is part of the global sample, since deduplication is done at the end of each
+            # iteration.
+            sampled_idxs_this_run = []
+            sampled_cap_centers_this_run = []
+            sampled_max_cos_distances_this_run = []
+
+            for batch in shuffled_dset.batch_iter(
+                batch_size=batch_size, drop_last_batch=False, readahead=1
+            ):
+                embeds = batch["clip_embedding"]
+                if len(embeds) % 2 != 0:
+                    embeds = embeds[:-1]
+                this_batch_size = len(embeds)
+
+                rng, rng2 = jax.random.split(rng)
+                this_cap_centers, this_max_cos_distances = gen_slerp_caps(embeds, rng2)
+                this_cap_centers, this_max_cos_distances = np.array(
+                    this_cap_centers
+                ), np.array(this_max_cos_distances)
+
+                # The vectors from the dset that we used to generate the caps
+                cap_sources_a = shuffle_inverse[
+                    np.arange(this_batch_size)[::2] + dset_idx
+                ]
+                cap_sources_b = shuffle_inverse[
+                    np.arange(this_batch_size)[1::2] + dset_idx
+                ]
+                assert (
+                    cap_sources_a.shape
+                    == cap_sources_b.shape
+                    == (embeds.shape[0] // 2,)
+                )
+
+                this_sampled_idxs = captree.sample_in_caps_approx(
                     this_cap_centers,
                     this_max_cos_distances,
                     density_estimate_samples=512,
                 )
-                + dset_idx
+
+                empty_cap_mask = this_sampled_idxs == -1
+
+                # Did we sample a vector that was used to generate the corresponding cap?
+                sample_self_mask = (this_sampled_idxs == cap_sources_a) | (
+                    this_sampled_idxs == cap_sources_b
+                )
+                assert sample_self_mask.shape == empty_cap_mask.shape
+
+                usable_mask = ~empty_cap_mask & ~sample_self_mask
+
+                _unique_idxs, unique_idxs_idxs = np.unique(
+                    this_sampled_idxs[usable_mask], return_index=True
+                )
+
+                sampled_idxs_this_run.append(
+                    this_sampled_idxs[usable_mask][unique_idxs_idxs]
+                )
+                sampled_cap_centers_this_run.append(
+                    this_cap_centers[usable_mask][unique_idxs_idxs]
+                )
+                sampled_max_cos_distances_this_run.append(
+                    this_max_cos_distances[usable_mask][unique_idxs_idxs]
+                )
+                pbar.update(len(unique_idxs_idxs))
+                pbar.set_postfix(
+                    {
+                        "hit%": np.mean(usable_mask) * 100,
+                        "empty%": np.mean(empty_cap_mask) * 100,
+                        "self%": np.mean(sample_self_mask) * 100,
+                        "batch dup%": (
+                            100
+                            * (np.count_nonzero(usable_mask) - len(unique_idxs_idxs))
+                            / np.count_nonzero(usable_mask)
+                        )
+                        if np.count_nonzero(usable_mask) > 0
+                        else "NaN",
+                        "median max cos distance": np.median(
+                            this_max_cos_distances[usable_mask][unique_idxs_idxs]
+                        ),
+                    }
+                )
+                dset_idx += this_batch_size
+
+                if stop_after is not None and pbar.n >= stop_after:
+                    break
+            tqdm.write(
+                "Completed pass through dataset, removing sampled images and reshuffling."
+            )
+            sampled_idxs_this_run_arr = np.concatenate(sampled_idxs_this_run)
+            sampled_cap_centers_this_run_arr = np.concatenate(
+                sampled_cap_centers_this_run
+            )
+            sampled_max_cos_distances_this_run_arr = np.concatenate(
+                sampled_max_cos_distances_this_run
+            )
+            assert (
+                sampled_idxs_this_run_arr.shape[0]
+                == sampled_cap_centers_this_run_arr.shape[0]
+                == sampled_max_cos_distances_this_run_arr.shape[0]
             )
 
-            match_mask = this_sampled_idxs != -1
+            unique_idxs, unique_idxs_idxs = np.unique(
+                sampled_idxs_this_run_arr, return_index=True
+            )
 
-            cap_centers.append(this_cap_centers[match_mask])
-            max_cos_distances.append(this_max_cos_distances[match_mask])
-            sampled_idxs.append(this_sampled_idxs[match_mask])
-            pbar.update(np.count_nonzero(match_mask))
-            pbar.set_postfix({"hit rate": np.mean(match_mask)})
-            dset_idx += batch_size
+            unique_pct = (
+                f"{100 * len(unique_idxs_idxs) / len(sampled_idxs_this_run_arr):.2f}"
+                if len(sampled_idxs_this_run_arr) > 0
+                else "NaN"
+            )
+            tqdm.write(
+                f"Unique results: {len(unique_idxs_idxs)} = {unique_pct}% of total"
+            )
+            sampled_rows_orig = captree.dset.new_view(unique_idxs)
+            sampled_rows_merged = []
+            for rows_orig_batch_idx, rows_orig_batch in enumerate(
+                sampled_rows_orig.batch_iter(
+                    batch_size=batch_size, drop_last_batch=False, readahead=8, threads=8
+                )
+            ):
+                start_idx = rows_orig_batch_idx * batch_size
+                stop_idx = start_idx + len(rows_orig_batch["clip_embedding"])
+                cap_centers_this_batch = sampled_cap_centers_this_run_arr[
+                    unique_idxs_idxs
+                ][start_idx:stop_idx]
+                cap_max_cos_distances_this_batch = (
+                    sampled_max_cos_distances_this_run_arr[unique_idxs_idxs][
+                        start_idx:stop_idx
+                    ]
+                )
+                assert (
+                    rows_orig_batch["clip_embedding"].shape[0]
+                    == cap_centers_this_batch.shape[0]
+                    == cap_max_cos_distances_this_batch.shape[0]
+                )
+                new_dict = {
+                    "cap_center": cap_centers_this_batch,
+                    "cap_max_cos_distance": cap_max_cos_distances_this_batch,
+                } | rows_orig_batch
+                sampled_rows_merged.append(TableView(new_dict))
 
-            if stop_after is not None and pbar.n >= stop_after:
-                break
+            if len(sampled_rows_merged) > 0:
+                sampled_rows.append(TableView.concat(sampled_rows_merged))
+            captree.delete_idxs(unique_idxs)
+            tqdm.write(f"Rows remaining in captree: {len(captree)}")
+            pbar.n = sum(len(tv) for tv in sampled_rows)
+            pbar.refresh()
 
-    cap_centers, max_cos_distances, sampled_idxs = (
-        np.concatenate(cap_centers),
-        np.concatenate(max_cos_distances),
-        np.concatenate(sampled_idxs),
+    return TableView.concat(sampled_rows)
+
+
+def save_training_data(dset, out_path):
+    """Save the generated data to a parquet file."""
+    df = pd.DataFrame([dset[0]])
+    pq_schema = pa.Schema.from_pandas(df)
+
+    with open(out_path, "wb") as f:
+        pq_writer = pq.ParquetWriter(f, pq_schema, compression="zstd")
+        with tqdm(total=len(dset), desc="Writing parquet", unit="rows") as pbar:
+            for batch in dset.batch_iter(
+                batch_size=8192, drop_last_batch=False, readahead=8, threads=8
+            ):
+                rows = len(batch["clip_embedding"])
+                df_rows = []
+                for i in range(rows):
+                    df_rows.append({k: v[i] for k, v in batch.items()})
+                pq_writer.write_table(
+                    pa.Table.from_pandas(pd.DataFrame(df_rows), schema=pq_schema)
+                )
+                pbar.update(rows)
+        pq_writer.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate training data for the CLIP cap conditioned model."
     )
-    print(f"Unique results: {len(np.unique(sampled_idxs))} / {len(sampled_idxs)}")
-    return cap_centers, max_cos_distances, sampled_idxs
+    parser.add_argument("--tree-path", type=Path, required=True)
+    parser.add_argument("--batch-size", type=int, default=8192)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--stop-after", type=int, default=None)
+    args = parser.parse_args()
+
+    tree = CapTree.load_from_disk(args.tree_path, save_cache=True)
+    if args.seed is not None:
+        rng = jax.random.PRNGKey(args.seed)
+    else:
+        rng = jax.random.PRNGKey(np.random.randint(0, 2**32))
+    if args.out.exists():
+        print(f"Output path {args.out} exists, exiting")
+        exit(1)
+
+    caps_dset = gen_training_examples_from_tree(
+        tree, rng, args.batch_size, stop_after=args.stop_after
+    )
+    save_training_data(caps_dset, args.out)
+
+
+if __name__ == "__main__":
+    main()
