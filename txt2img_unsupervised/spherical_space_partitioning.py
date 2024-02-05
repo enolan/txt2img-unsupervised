@@ -1081,16 +1081,27 @@ class CapTree:
                     self.child_cap_max_cos_distances[i]
                     == self.children[i].max_cos_distance
                 )
-            for thicc_batch, thin_batch in zip(
-                self.dset.batch_iter(self.batch_size, drop_last_batch=False),
-                self.dset_thin.batch_iter(self.batch_size, drop_last_batch=False),
+            for thicc_batch, thin_batch in tqdm(
+                zip(
+                    self.dset.batch_iter(
+                        self.batch_size, drop_last_batch=False, readahead=8, threads=8
+                    ),
+                    self.dset_thin.batch_iter(
+                        self.batch_size, drop_last_batch=False, readahead=8, threads=8
+                    ),
+                ),
+                total=len(self.dset) // self.batch_size + 1,
+                desc="Checking dset/dset_thin equality",
+                leave=False,
             ):
                 assert list(thin_batch.keys()) == ["clip_embedding"]
                 np.testing.assert_array_equal(
                     thicc_batch["clip_embedding"], thin_batch["clip_embedding"]
                 )
             if self.dsets_contiguous:
-                for child_idx, child in enumerate(self.children):
+                for child_idx, child in enumerate(
+                    tqdm(self.children, desc="Checking dset contiguity", leave=False)
+                ):
                     assert child.dsets_contiguous
                     child_start_idx = self.child_start_idxs[child_idx]
                     child_stop_idx = self.child_start_idxs[child_idx] + len(child)
@@ -1100,9 +1111,17 @@ class CapTree:
 
                     for parent_batch, child_batch in zip(
                         parent_sliced_view.batch_iter(
-                            self.batch_size, drop_last_batch=False
+                            self.batch_size,
+                            drop_last_batch=False,
+                            readahead=8,
+                            threads=8,
                         ),
-                        child.dset.batch_iter(self.batch_size, drop_last_batch=False),
+                        child.dset.batch_iter(
+                            self.batch_size,
+                            drop_last_batch=False,
+                            readahead=8,
+                            threads=8,
+                        ),
                     ):
                         assert list(parent_batch.keys()) == list(child_batch.keys())
                         for k in parent_batch.keys():
