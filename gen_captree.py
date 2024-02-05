@@ -1,14 +1,12 @@
 import argparse
-import datetime
 import json
 import numpy as np
 
+from datetime import datetime
 from pathlib import Path
 
-from txt2img_unsupervised.spherical_space_partitioning import (
-    CapTree,
-    load_pq_dir_to_infinidata,
-)
+from txt2img_unsupervised.load_pq_dir import load_pq_dir_to_infinidata
+from txt2img_unsupervised.spherical_space_partitioning import CapTree
 
 
 def main():
