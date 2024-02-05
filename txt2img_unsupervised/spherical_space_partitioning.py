@@ -967,6 +967,9 @@ class CapTree:
 
         if len(self.children) == 0:
             sorted_idxs = np.sort(idxs)
+            assert len(np.unique(sorted_idxs)) == len(
+                sorted_idxs
+            ), "indices to delete must be unique"
             # Build a list of slices, containing the contiguous regions we're keeping.
             slices = []
 
