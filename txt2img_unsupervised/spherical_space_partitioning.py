@@ -2,6 +2,7 @@
 to enable efficient sampling from arbitrary caps."""
 
 import base64
+import concurrent.futures
 import hypothesis as hyp
 import hypothesis.extra.numpy as hyp_np
 import infinidata
@@ -9,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import json
 import numpy as np
+import os
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -1370,7 +1372,10 @@ class CapTree:
 
         out = np.full(len(query_centers), -1, dtype=np.int64)
 
-        for query, matching_subtrees in enumerate(matching_subtrees_all):
+        # processing matches at the end can be a bottleneck, so we do it in parallel with threads.
+        # fetching leaf vectors from the dset and calling jax both release the GIL for a while,
+        # though neither are super efficient about it.
+        def process_match(query_num, matching_subtrees):
             # If there are matches, we pick one, otherwise we leave it as -1
             if len(matching_subtrees) > 0:
                 total_matches = sum(cnt for _, cnt in matching_subtrees)
@@ -1393,34 +1398,49 @@ class CapTree:
                     subtree = subtree.children[step]
                 if len(subtree) == cnt:
                     # If the entire subtree matches we just sample from it
-                    out[query] = subtree_start + idx_in_subtree
+                    return subtree_start + idx_in_subtree
                 else:
                     # Otherwise, we need to check the vectors in the subtree. This is redundant,
-                    # since we did this in _subtrees_in_caps. Rewrite this if necessary. Hopefully
-                    # exact sampling that returns matches is really rare and it doesn't matter.
+                    # since we did this in _subtrees_in_caps. Not sure if this is worse than saving
+                    # the matching vector masks in _subtrees_in_caps.
                     valid_distances_mask = vectors_in_cap_even_batch(
                         subtree.dset_thin[:]["clip_embedding"],
-                        query_centers[query],
-                        query_max_cos_distances[query],
+                        query_centers[query_num],
+                        query_max_cos_distances[query_num],
                     )
                     valid_distances_idxs = np.arange(len(subtree.dset))[
                         valid_distances_mask
                     ]
-                    if len(valid_distances_idxs) != cnt:
+                    if len(valid_distances_idxs) == 0:
                         tqdm.write(
-                            f"WARNING: _subtrees_in_caps says there are {cnt} matches but when I "
-                            + f"checked there were {len(valid_distances_idxs)}. Sampling from the remainder."
+                            f"WARNING: _subtrees_in_caps found {cnt} matches but sample_in_caps "
+                            +"found 0. Returning none."
                         )
-                        out[query] = (
+                        return -1
+                    elif len(valid_distances_idxs) != cnt:
+                        tqdm.write(
+                            f"WARNING: _subtrees_in_caps found {cnt} matches but sample_in_caps "
+                            + f"found {len(valid_distances_idxs)}. Sampling from those."
+                        )
+                        return (
                             subtree_start
                             + valid_distances_idxs[
                                 np.random.randint(len(valid_distances_idxs))
                             ]
                         )
+                    elif len(valid_distances_idxs) == cnt:
+                        return subtree_start + valid_distances_idxs[idx_in_subtree]
                     else:
-                        out[query] = (
-                            subtree_start + valid_distances_idxs[idx_in_subtree]
-                        )
+                        assert False, "unreachable"
+            else:
+                return -1
+
+        futs = {
+            self.threadpool.submit(process_match, i, matching_subtrees): i
+            for i, matching_subtrees in enumerate(matching_subtrees_all)
+        }
+        for f in concurrent.futures.as_completed(futs):
+            out[futs[f]] = f.result()
 
         return out
 
@@ -1607,6 +1627,7 @@ class CapTree:
             for child in self.children:
                 child.prepare_for_queries()
             self._make_contiguous()
+            self.threadpool = concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count())
             self.ready_for_queries = True
         else:
             print("Tree already ready for queries, skipping prep.")
