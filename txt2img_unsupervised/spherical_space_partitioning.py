@@ -1611,11 +1611,10 @@ class CapTree:
                 query_max_cos_distances,
             )
             assert in_caps.shape == (len(self.dset), len(query_centers))
-            for i in range(len(query_centers)):
-                valid_distances_idxs = np.arange(len(self.dset))[in_caps[:, i]]
-                if len(valid_distances_idxs) > 0:
-                    out[i].append(([], len(valid_distances_idxs)))
-
+            matching_cnts = np.asarray(np.sum(in_caps, axis=0))
+            matching_subtrees = np.arange(len(query_centers))[matching_cnts > 0]
+            for subtree_idx in matching_subtrees:
+                out[subtree_idx].append(([], matching_cnts[subtree_idx]))
         return out
 
     def __getitem__(self, idx):
