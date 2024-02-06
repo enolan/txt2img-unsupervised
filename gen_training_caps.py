@@ -127,7 +127,14 @@ def gen_slerp_caps(ps, rng):
     return interp_pts, max_cos_distances
 
 
-def gen_training_examples_from_tree(captree, rng, batch_size, stop_after=None):
+def gen_training_examples_from_tree(
+    captree,
+    rng,
+    batch_size,
+    inner_batch_size=4096,
+    stop_after=None,
+    density_estimate_samples=512,
+):
     """Iterate over a tree and sample caps, then sample images within those caps. Modifies the
     captree, removing images as it goes."""
     assert batch_size > 0
@@ -187,7 +194,8 @@ def gen_training_examples_from_tree(captree, rng, batch_size, stop_after=None):
                 this_sampled_idxs = captree.sample_in_caps_approx(
                     this_cap_centers,
                     this_max_cos_distances,
-                    density_estimate_samples=512,
+                    density_estimate_samples=density_estimate_samples,
+                    batch_size=inner_batch_size,
                 )
 
                 empty_cap_mask = this_sampled_idxs == -1
@@ -266,8 +274,15 @@ def gen_training_examples_from_tree(captree, rng, batch_size, stop_after=None):
             sampled_rows_orig = captree.dset.new_view(unique_idxs)
             sampled_rows_merged = []
             for rows_orig_batch_idx, rows_orig_batch in enumerate(
-                sampled_rows_orig.batch_iter(
-                    batch_size=batch_size, drop_last_batch=False, readahead=8, threads=8
+                tqdm(
+                    sampled_rows_orig.batch_iter(
+                        batch_size=batch_size,
+                        drop_last_batch=False,
+                        readahead=8,
+                        threads=8,
+                    ),
+                    total=len(sampled_rows_orig) // batch_size,
+                    desc="building merged tableview",
                 )
             ):
                 start_idx = rows_orig_batch_idx * batch_size
@@ -332,6 +347,8 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--stop-after", type=int, default=None)
+    parser.add_argument("--density-estimate-samples", type=int, default=512)
+    parser.add_argument("--sample-inner-batch-size", type=int, default=4096)
     args = parser.parse_args()
 
     tree = CapTree.load_from_disk(args.tree_path, save_cache=True)
@@ -344,7 +361,12 @@ def main():
         exit(1)
 
     caps_dset = gen_training_examples_from_tree(
-        tree, rng, args.batch_size, stop_after=args.stop_after
+        tree,
+        rng,
+        args.batch_size,
+        stop_after=args.stop_after,
+        density_estimate_samples=args.density_estimate_samples,
+        inner_batch_size=args.sample_inner_batch_size,
     )
     save_training_data(caps_dset, args.out)
 
