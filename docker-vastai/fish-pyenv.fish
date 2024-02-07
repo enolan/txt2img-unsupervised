@@ -1,2 +1,2 @@
-set -gx PATH $PATH $HOME/.pyenv/bin $HOME/.pyenv/shims
+set -gx PATH $HOME/.pyenv/bin $HOME/.pyenv/shims $PATH
 set -gx PYENV_ROOT $HOME/.pyenv
