@@ -547,7 +547,7 @@ def _setup_comparison_test(
     name: str,
 ) -> Tuple[Path, Path, LDMAutoencoder, FrozenDict[str, Any]]:
     """Load stuff to compare Flax & Torch behavior."""
-    src_dir = Path(__file__).parent
+    src_dir = Path(__file__).parent.parent
     path_prefix = src_dir / f"test-images/{name}"
     cfg = OmegaConf.load(
         src_dir / "vendor/latent-diffusion/models/first_stage_models/vq-f4/config.yaml"

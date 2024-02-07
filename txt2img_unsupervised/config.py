@@ -104,10 +104,14 @@ def test_modelconfig_roundtrip_from_json() -> None:
         "ff_dim": 2048,
         "dropout": 0.1,
         "n_layers": 6,
-        "seq_len": 2048,
+        "image_tokens": 2048,
         "use_biases": true,
         "activations_dtype": "float32",
-        "activation_function": "relu"}"""
+        "activation_function": "relu",
+        "clip_cap_count": null,
+        "clip_caps": false,
+        "clip_conditioning": false
+        }"""
     cfg = ModelConfig.from_json_dict(json.loads(json_str))
     assert ModelConfig.to_json_dict(cfg) == json.loads(json_str)
 
@@ -120,7 +124,7 @@ def test_modelconfig_roundtrip_from_object() -> None:
         ff_dim=2048,
         dropout=0.1,
         n_layers=6,
-        seq_len=42,
+        image_tokens=42,
         use_biases=True,
         activations_dtype=jnp.bfloat16,
         activation_function=jax.nn.gelu,
@@ -196,6 +200,7 @@ def test_trainingconfig_roundtrip_from_json() -> None:
         "learning_rate": 1e-4,
         "batch_size": 4,
         "epochs": 100,
+        "training_images": 0,
         "triangle_schedule": true,
         "gradient_accumulation_steps": 1,
         "gradient_clipping": "None"}"""
