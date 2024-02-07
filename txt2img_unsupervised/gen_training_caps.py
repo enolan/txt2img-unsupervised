@@ -23,7 +23,7 @@ from infinidata import TableView
 from pathlib import Path
 from tqdm import tqdm
 
-from txt2img_unsupervised.spherical_space_partitioning import _unit_vecs, CapTree
+from .spherical_space_partitioning import _unit_vecs, CapTree
 
 
 @partial(jax.jit, inline=True)
@@ -134,12 +134,14 @@ def gen_training_examples_from_tree(
     inner_batch_size=4096,
     stop_after=None,
     density_estimate_samples=512,
+    with_replacement=False,
 ):
     """Iterate over a tree and sample caps, then sample images within those caps. Modifies the
     captree, removing images as it goes."""
     assert batch_size > 0
     assert batch_size % 2 == 0
-
+    if with_replacement:
+        assert stop_after is not None
     sampled_rows = []
 
     with tqdm(
@@ -244,7 +246,9 @@ def gen_training_examples_from_tree(
                 if stop_after is not None and pbar.n >= stop_after:
                     break
             tqdm.write(
-                "Completed pass through dataset, removing sampled images and reshuffling."
+                "Complete pass through dataset, reshuffling"
+                if with_replacement
+                else "Completed pass through dataset, removing sampled images and reshuffling."
             )
             sampled_idxs_this_run_arr = np.concatenate(sampled_idxs_this_run)
             sampled_cap_centers_this_run_arr = np.concatenate(
@@ -308,7 +312,8 @@ def gen_training_examples_from_tree(
 
             if len(sampled_rows_merged) > 0:
                 sampled_rows.append(TableView.concat(sampled_rows_merged))
-            captree.delete_idxs(unique_idxs)
+            if not with_replacement:
+                captree.delete_idxs(unique_idxs)
             tqdm.write(f"Rows remaining in captree: {len(captree)}")
             pbar.n = sum(len(tv) for tv in sampled_rows)
             pbar.refresh()
@@ -349,6 +354,7 @@ def main():
     parser.add_argument("--stop-after", type=int, default=None)
     parser.add_argument("--density-estimate-samples", type=int, default=512)
     parser.add_argument("--sample-inner-batch-size", type=int, default=4096)
+    parser.add_argument("--replacement", action="store_true")
     args = parser.parse_args()
 
     tree = CapTree.load_from_disk(args.tree_path, save_cache=True)
@@ -367,6 +373,7 @@ def main():
         stop_after=args.stop_after,
         density_estimate_samples=args.density_estimate_samples,
         inner_batch_size=args.sample_inner_batch_size,
+        with_replacement=args.replacement,
     )
     save_training_data(caps_dset, args.out)
 
