@@ -23,8 +23,8 @@ class ModelConfig:
     activation_function: Callable[[jax.Array], jax.Array]
     activations_dtype: jnp.dtype = jnp.float32
     clip_conditioning: bool = False
-    clip_cones: bool = False
-    clip_cone_count: int = None
+    clip_caps: bool = False
+    clip_cap_count: int = None
 
     @staticmethod
     def from_json_dict(dict: dict[str, Any]) -> "ModelConfig":
