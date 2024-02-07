@@ -53,7 +53,7 @@ def main():
         print(f"Removed {pre_count - len(dset)} blacklisted images")
         print(f"Time after blacklist: {get_timestamp()}")
     if args.subset is not None:
-        dset = dset.new_view(slice(args.subset))
+        dset = dset.shuffle().new_view(slice(args.subset))
 
     print(f"Time after subset/before building tree: {get_timestamp()}")
 
