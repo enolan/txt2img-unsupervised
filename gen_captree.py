@@ -63,7 +63,6 @@ def main():
         outlier_removal_level=args.outlier_removal_level,
         max_leaf_size=args.max_leaf_size,
         iters=args.k_means_iters,
-        dup_check=True if args.write_dup_blacklist is not None else False,
     )
     tree.split_rec()
 
