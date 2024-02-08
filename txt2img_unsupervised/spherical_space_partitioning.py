@@ -873,36 +873,52 @@ class CapTree:
             assert self.children == [], "Can only check for duplicates in leaves"
 
             vecs_dict = {}
-            for i, row in enumerate(tqdm(self.dset, desc="Deduplicating", leave=None)):
-                v = row["clip_embedding"]
-                if not np.any(np.isnan(v)):
-                    # Near duplicates can be just as bad as exact ones, so we quantize the values
-                    # for the dict key.
-                    k = (
-                        np.clip(v * 2**15, -1 * 2**15, 2**15 - 1)
-                        .astype(np.int16)
-                        .tobytes()
+            for batch_idx, batch in enumerate(
+                tqdm(
+                    self.dset.batch_iter(
+                        batch_size=4096, drop_last_batch=False, threads=8, readahead=8
+                    ),
+                    desc="Deduplicating",
+                    leave=None,
+                    total=len(self.dset) // 4096
+                    + (1 if len(self.dset) % 4096 != 0 else 0),
+                )
+            ):
+                clips = batch["clip_embedding"]
+                nans = np.any(np.isnan(clips), axis=1)
+                assert nans.shape == (len(clips),)
+                for i in np.arange(len(clips))[nans]:
+                    tqdm.write(
+                        f"WARNING: found NaN in CLIP embedding for {self.dset[i]['name']}"
                     )
-                    vecs_dict.setdefault(k, []).append(row)
-                else:
-                    tqdm.write(f"WARNING: found NaN in vector {i}")
+                # Near duplicates can be just as bad as exact ones, so we quantize the values
+                # for the dict key.
+                keys = [
+                    vec.tobytes() if ~nans[i] else "NaN"
+                    for i, vec in enumerate(
+                        np.clip(clips * 2**15, -1 * 2**15, 2**15 - 1).astype(
+                            np.int16
+                        )
+                    )
+                ]
+                for i, key in enumerate(keys):
+                    vecs_dict.setdefault(key, []).append(batch_idx * 4096 + i)
             if len(self.dset) > len(vecs_dict):
                 tqdm.write(
                     f"Found {len(self.dset) - len(vecs_dict)} duplicates/nan vectors"
                 )
                 self.found_duplicates.extend(
-                    [row["name"] if "name" in row else "🤷" for row in rows]
-                    for rows in vecs_dict.values()
-                    if len(rows) > 1
+                    [
+                        self.dset[idx]["name"] if "name" in self.dset[idx] else "🤷"
+                        for idx in idxs
+                    ]
+                    for key, idxs in vecs_dict.items()
+                    if len(idxs) > 1 or key == "NaN"
                 )
 
-                # Creat a new, deduplicated Dataset
-                dset_dict = {}
-                for col in self.dset[0].keys():
-                    dset_dict[col] = np.array(
-                        [rows[0][col] for rows in vecs_dict.values()]
-                    )
-                self.dset = infinidata.TableView(dset_dict)
+                # Create a new deduplicated TableView
+                unique_idxs = np.stack([idxs[0] for idxs in vecs_dict.values()])
+                self.dset = self.dset.new_view(unique_idxs)
                 self.dset_thin = self.dset.select_columns({"clip_embedding"})
                 tqdm.write(f"New leaf size: {len(self.dset)}")
 

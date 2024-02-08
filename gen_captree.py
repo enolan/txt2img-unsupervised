@@ -21,7 +21,6 @@ def main():
     parser.add_argument("--max-leaf-size", type=int, default=None)
     parser.add_argument("--k-means-iters", type=int, default=200)
     parser.add_argument("--summary-file", type=Path, default=None)
-    parser.add_argument("--write-dup-blacklist", type=Path, default=None)
     parser.add_argument("--read-dup-blacklist", type=Path, default=None)
     parser.add_argument("--paranoid", action="store_true")
     parser.add_argument("--save-dir", type=Path, required=True)
@@ -84,17 +83,11 @@ def main():
     if len(tree.found_duplicates) > 0:
         dup_set_count = len(tree.found_duplicates)
         dup_total_count = sum(len(dup_set) for dup_set in tree.found_duplicates)
-        if args.write_dup_blacklist is None:
-            print(
-                f"Found {dup_set_count} sets of duplicates, containing {dup_total_count} total images! You should rerun and generate a blacklist with --write-dup-blacklist!"
-            )
-            print("Counts will be wrong and sampling will be non-uniform!")
-        else:
-            print(
-                f"Found {len(tree.found_duplicates)} sets of duplicates, containing {dup_total_count} total images. writing to {args.write_dup_blacklist}"
-            )
-            with open(args.write_dup_blacklist, "w") as f:
-                json.dump(tree.found_duplicates, f, indent=2)
+        print(
+            f"Found {dup_set_count} sets of duplicates, containing {dup_total_count} total "
+            + "images! You should generate a blacklist with dedup_by_clip.py and rerun. "
+            + "Otherwise sampling will be non-uniform!"
+        )
 
     print(f"Time at end: {get_timestamp()}")
 
