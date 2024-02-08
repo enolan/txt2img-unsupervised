@@ -82,8 +82,8 @@ def find_k_means(dset, batch_size, k, iters):
 
             # Update centroids
             for i in range(this_batch_size):
-                per_center_counts[nearest_centroids[i]] += 1
                 nearest_centroid = nearest_centroids[i]
+                per_center_counts[nearest_centroid] += 1
                 lr = 1 / per_center_counts[nearest_centroid]
                 centroids[nearest_centroid] = (1 - lr) * centroids[
                     nearest_centroid
@@ -796,9 +796,9 @@ class CapTree:
             # We find the outlier centroid by averaging a sample of the removed vectors.
             outlier_dset = self.dset_thin.new_view(np.array(removed_vectors))
             outlier_centroid = np.mean(
-                outlier_dset.shuffle(seed=np.random.randint(0, 2**63 - 1)).new_view(
-                    slice(16384)
-                )[:]["clip_embedding"],
+                outlier_dset.shuffle(seed=np.random.randint(0, 2**63 - 1))[:16384][
+                    "clip_embedding"
+                ],
                 axis=0,
             )
             outlier_centroid_norm = np.linalg.norm(outlier_centroid)
