@@ -703,6 +703,7 @@ class CapTree:
                 center=centroids[i],
                 max_cos_distance=max_distances[i],
                 found_duplicates=self.found_duplicates,
+                max_leaf_size=self.max_leaf_size,
             )
             for i in range(len(centroids))
             if len(assignments[i]) > 0
