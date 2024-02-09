@@ -1559,7 +1559,7 @@ class CapTree:
                         readahead=8,
                     )
                 ):
-                    batch = jnp.array(batch["clip_embedding"])
+                    batch = jax.device_put(batch["clip_embedding"])
                     queries_in_batch[:] = False
                     # list of (leaf index, row count) pairs used to assign results to leaves
                     leaf_assignments = []
