@@ -119,6 +119,11 @@ def find_nearest_centroids_and_average_variance(xs, nearest_centroids):
     return nearest_centroids, jnp.mean(distances)
 
 
+@jax.jit
+def nearest_centroids_and_distances(xs, centroids):
+    return jax.vmap(find_nearest_centroid, in_axes=(0, None))(xs, centroids)
+
+
 def assign_centroids(dset, centroids, batch_size, n_distances=0):
     """Assign each CLIP embedding to its nearest centroid and compute the n highest overall cosine
     distances along with the associated vectors and centroids."""
@@ -126,10 +131,6 @@ def assign_centroids(dset, centroids, batch_size, n_distances=0):
     assert np.all(~np.isnan(centroids))
 
     tqdm.write(f"Assigning {len(dset)} examples to {len(centroids)} centroids.")
-
-    @jax.jit
-    def nearest_centroids_and_distances(xs, centroids):
-        return jax.vmap(find_nearest_centroid, in_axes=(0, None))(xs, centroids)
 
     # each element of high_distances is a SortedList containing tuples of cosine distance and index
     # into dset
