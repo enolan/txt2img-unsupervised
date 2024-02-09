@@ -1173,9 +1173,9 @@ class CapTree:
     def _check_inside_cap(self, cap_center, max_cos_distance):
         """Check that all vectors in this node are inside the given cap."""
         if len(self.children) == 0:
-            distances = cosine_distance_many_to_one(
+            distances = np.asarray(cosine_distance_many_to_one(
                 self.dset[:]["clip_embedding"], cap_center
-            )
+            ))
             assert distances.shape == (len(self),)
             valid_distances_mask = distances <= max_cos_distance + self.EPSILON
             invalid_distances = distances[~valid_distances_mask]
