@@ -336,9 +336,15 @@ def test_assign_centroids_high_distances(
     assert len(assignments) == len(high_distances) == len(centroids)
     for i in range(len(assignments)):
         this_cluster_vecs = vecs[assignments[i]]
+        assert len(high_distances[i]) == min(n_distances, len(assignments[i]))
+        # There's a problem when the dataset has multiple vectors with the same cosine distance to
+        # the centroid. The results of the argsort can have different ordering than the
+        # high_distances. For some reason this doesn't happen unless you ship the cluster
+        # differences back to the CPU before the argsort. 🤷
         this_cluster_distances = cosine_distance_many_to_one(
             this_cluster_vecs, centroids[i]
         )
+        assert len(this_cluster_distances) == len(assignments[i])
         sorted_this_cluster_indices = np.argsort(this_cluster_distances)
         sorted_dset_indices = np.array(assignments[i])[sorted_this_cluster_indices]
 
@@ -350,7 +356,7 @@ def test_assign_centroids_high_distances(
             np.array([distance for distance, _ in high_distances[i]]),
             rtol=0,
             atol=1e-5,
-        ), f"cluster {i} failed, actual high distances idxs: {sorted_dset_indices[-n_distances:]}, values: {this_cluster_distances[sorted_this_cluster_indices[-n_distances:]]}, returned from assign_centroids: {high_distances[i]}"
+        ), f"cluster {i} failed, centroid: {centroids[i]}, actual high distances idxs: {sorted_dset_indices[-n_distances:]}, values: {this_cluster_distances[sorted_this_cluster_indices[-n_distances:]]}, returned from assign_centroids: {high_distances[i]}"
 
 
 def cosine_distance(x, y):
