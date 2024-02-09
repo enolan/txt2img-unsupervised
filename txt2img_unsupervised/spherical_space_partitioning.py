@@ -447,7 +447,7 @@ def vectors_in_caps_padded(
     assert cap_centers.shape[0] == max_cos_distances.shape[0]
     assert need_cumsum or need_bools
 
-    vs_padded, vs_pad = pad_to_multiple(vs, 32)
+    vs_padded, vs_pad = pad_to_multiple(vs, 64)
     cap_centers_padded, cap_centers_pad = pad_to_multiple(cap_centers, 64)
     max_cos_distances_padded, max_cos_distances_pad = pad_to_multiple(
         max_cos_distances, 64
