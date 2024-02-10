@@ -1,26 +1,36 @@
 import json
-import numpy as np
 import random
+import shutil
 import subprocess
 import time
 
 from pathlib import Path
-from tqdm import tqdm
-from tqdm.contrib import tenumerate
-
-import spherical_space_partitioning
 
 
 def gen_params(used_params):
     attempts = 0
     while True:
-        k = random.choice([64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384])
+        k = random.choice([64, 128, 256, 512])
         outlier_removal_level = random.uniform(0.0, 1.0)
-        iters = random.choice([8, 16, 32, 64, 128, 256])
-        batch_size = random.choice([2048, 4096, 8192, 16384, 32768])
+        iters = random.choice([64])
+        batch_size = random.choice([4096])
         while True:
             max_leaf_size = random.choice(
-                [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
+                [
+                    64,
+                    128,
+                    256,
+                    512,
+                    1024,
+                    2048,
+                    4096,
+                    8192,
+                    16384,
+                    32768,
+                    65536,
+                    131072,
+                    262144,
+                ]
             )
             if max_leaf_size >= k:
                 break
@@ -40,7 +50,9 @@ def gen_params(used_params):
 
 
 def params_to_path(params):
-    return (Path("sweep-captrees") / f"{params['k']}-{params['outlier_removal_level']:.4f}-{params['iters']}-{params['batch_size']}-{params['max_leaf_size']}")
+    return Path("sweep-captrees") / "-".join(
+        f"{k}={v}" for k, v in sorted(params.items())
+    )
 
 
 def build_tree(params):
@@ -48,14 +60,14 @@ def build_tree(params):
     save_dir = params_to_path(params)
     cmdline = [
         "python",
-        "spherical_space_partitioning.py",
+        "gen_captree.py",
         "--pq-dir",
         "/home/enolan/datasets/preprocessed/128x128-randomcrops",
-        "--subset",
-        "1_000_000",
         "--read-dup-blacklist",
-        "dup-blacklist.json",
+        "dup-blacklist-new.json",
         "--thin",
+        "--subset",
+        "200_000", # FIXME: Remove this
         "--k",
         str(params["k"]),
         "--outlier-removal-level",
@@ -78,74 +90,76 @@ def build_tree(params):
     end = time.monotonic()
     print("Tree built")
 
-    # Load the tree
-    captree = spherical_space_partitioning.CapTree.load_from_disk(
-        save_dir, save_cache=False
-    )
-    print("Tree loaded.")
-    return captree, end - start
+    return save_dir, end - start
 
 
-def run_benchmarks(captree, vecs):
-    # Run benchmarks
-    print("Running benchmarks...")
-    results_all = {}
-    for i, v in tqdm(enumerate(vecs), unit="vectors", total=len(vecs), leave=None):
-        for max_cos_distance in tqdm(np.linspace(0, 2.0, 21), unit="max_cos_distances", leave=False):
-            results = []
-            for _ in tqdm(range(5), unit="trials", leave=False):
-                start = time.monotonic()
-                captree.sample_in_cap_approx(v, max_cos_distance)
-                end = time.monotonic()
-                elapsed = end - start
-                results.append(elapsed)
-            results_all.setdefault(i, {})[max_cos_distance] = results
-    print("Benchmarks done.")
-    return results_all
+def gen_examples(tree_path, k):
+    # Generate the cap-image pairs
+    out_path = tree_path.parent / f"{tree_path.name}-examples.parquet"
+    cmdline = [
+        "python",
+        "-m",
+        "txt2img_unsupervised.gen_training_caps",
+        "--batch-size",
+        "16384",
+        "--seed",
+        "69",
+        "--stop-after",
+        "100_000",
+        "--no-save-cache",
+        "--density-estimate-samples",
+        str(64 * 512 // k),  # Hold density estimate samples equal to k=64 samples=512
+        "--tree-path",
+        str(tree_path),
+        "--out",
+        str(out_path),
+    ]
+    print(f"Running {' '.join(cmdline)}")
+    start = time.monotonic()
+    subprocess.check_call(cmdline)
+    end = time.monotonic()
+    print(f"Examples generated in {end - start:0.2f} seconds")
 
-
-def mk_test_vecs():
-    vecs = np.random.default_rng(69_420).standard_normal((8, 768), dtype=np.float32)
-    vecs /= np.linalg.norm(vecs, axis=-1, keepdims=True)
-    return vecs
+    return out_path, end - start
 
 
 def main():
-    # used_params = set()
-    # try:
-    #     with open("sweep-captrees/results-2024-01-30.json", "r") as f:
-    #         for line in f:
-    #             params = json.loads(line)["params"]
-    #             used_params.add(
-    #                 (
-    #                     params["k"],
-    #                     params["outlier_removal_level"],
-    #                     params["iters"],
-    #                     params["batch_size"],
-    #                     params["max_leaf_size"],
-    #                 )
-    #             )
-    # except FileNotFoundError:
-    #     pass
-    # print(f"Used params: {used_params}")
-    vecs = mk_test_vecs()[:2]
-    tree = spherical_space_partitioning.CapTree.load_from_disk(
-        Path("sweep-captrees/64-0.3144-8-2048-4096"), save_cache=True
-    )
-    results = run_benchmarks(tree, vecs)
-    print(results)
-
-    # while True:
-    #     params = gen_params(used_params)
-    #     print(f"Params: {params}")
-    #     captree, build_time = build_tree(params)
-    #     results_all = run_benchmarks(captree, vecs)
-    #     print(f"Results: {results_all}")
-    #     with open("sweep-captrees/results-2024-01-30.json", "a") as f:
-    #         json.dump({"params": params, "results": results_all, "build_time": build_time}, f)
-    #         f.write("\n")
-    #         f.flush()
-
+    used_params = set()
+    try:
+        with open("sweep-captrees/results-2024-02-10.json", "r") as f:
+            for line in f:
+                params = json.loads(line)["params"]
+                used_params.add(
+                    (
+                        params["k"],
+                        params["outlier_removal_level"],
+                        params["iters"],
+                        params["batch_size"],
+                        params["max_leaf_size"],
+                    )
+                )
+    except FileNotFoundError:
+        pass
+    print(f"Used params: {used_params}")
+    while True:
+        params = gen_params(used_params)
+        print(f"Params: {params}")
+        tree_dir, build_time = build_tree(params)
+        ex_path, gen_time = gen_examples(tree_dir, params["k"])
+        with open("sweep-captrees/results-2024-02-10.json", "a") as f:
+            json.dump(
+                {
+                    "params": params,
+                    "examples_gen_time": gen_time,
+                    "tree_build_time": build_time,
+                },
+                f,
+            )
+            f.write("\n")
+            f.flush()
+        print(f"Deleting {tree_dir} and {ex_path}")
+        shutil.rmtree(tree_dir)
+        ex_path.unlink()
 
 if __name__ == "__main__":
     main()
