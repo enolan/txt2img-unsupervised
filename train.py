@@ -82,8 +82,8 @@ parser.add_argument("--ae-ckpt", type=Path, required=True)
 parser.add_argument("--activations-dtype", type=argparse_from_dict(str_to_dtype))
 parser.add_argument("--activation-function", type=argparse_from_dict(str_to_activation))
 parser.add_argument("--clip-conditioning", type=lambda x: bool(strtobool(x)))
-parser.add_argument("--clip-cones", type=lambda x: bool(strtobool(x)))
-parser.add_argument("--clip-cone-count", type=int)
+parser.add_argument("--clip-caps", type=lambda x: bool(strtobool(x)))
+parser.add_argument("--clip-cap-count", type=int)
 parser.add_argument("--resume", type=Path)
 args, _unknown = parser.parse_known_args()
 
@@ -255,16 +255,16 @@ def setup_optimizer(
 
     # We need templates to feed to checkpoint_manager.restore so we get a TrainState instead of a
     # dict
-    cos_sim_dummy = (
-        jnp.zeros((model_cfg.clip_cone_count,), dtype=jnp.float32)
-        if model_cfg.clip_cones
+    max_cos_distance_dummy = (
+        jnp.zeros((model_cfg.clip_cap_count,), dtype=jnp.float32)
+        if model_cfg.clip_caps
         else jnp.array([], dtype=jnp.float32)
     )
-    if model_cfg.clip_conditioning and not model_cfg.clip_cones:
+    if model_cfg.clip_conditioning and not model_cfg.clip_caps:
         clip_embedding_dummy = jnp.zeros((768,), dtype=jnp.float32)
-    elif model_cfg.clip_conditioning and model_cfg.clip_cones:
+    elif model_cfg.clip_conditioning and model_cfg.clip_caps:
         clip_embedding_dummy = jnp.zeros(
-            (model_cfg.clip_cone_count, 768), dtype=jnp.float32
+            (model_cfg.clip_cap_count, 768), dtype=jnp.float32
         )
     else:
         clip_embedding_dummy = jnp.zeros((0,), dtype=jnp.float32)
@@ -273,8 +273,7 @@ def setup_optimizer(
         rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
         image=jnp.zeros((model_cfg.image_tokens,), dtype=jnp.int32),
         clip_embedding=clip_embedding_dummy,
-        cos_sim_lower=cos_sim_dummy,
-        cos_sim_upper=cos_sim_dummy,
+        max_cos_distance=max_cos_distance_dummy,
     )
 
     ts_empty = TrainState.create(
@@ -299,11 +298,7 @@ mdl, my_train_state = setup_optimizer(
 
 
 loss_grad_fn = jax.value_and_grad(transformer_model.loss_batch, argnums=1)
-loss_fn = jax.jit(
-    lambda params, dropout_rng, cones_rng, batch_imgs, batch_clips: transformer_model.loss_batch(
-        mdl, params, dropout_rng, cones_rng, batch_imgs, batch_clips
-    )
-)
+loss_fn = jax.jit(partial(transformer_model.loss_batch, mdl))
 
 
 # TODO delete this, unnecessary now
@@ -311,43 +306,42 @@ loss_fn = jax.jit(
 sample_cfg = copy(model_cfg)
 sample_cfg.dropout = None
 sample_mdl = transformer_model.ImageModel(**sample_cfg.__dict__, decode=True)
-cos_sim_dummy = (
-    jnp.zeros((model_cfg.clip_cone_count,), dtype=jnp.float32)
-    if model_cfg.clip_cones
+max_cos_distance_dummy = (
+    jnp.zeros((model_cfg.clip_cap_count,), dtype=jnp.float32)
+    if model_cfg.clip_caps
     else jnp.array([], dtype=jnp.float32)
 )
-if model_cfg.clip_conditioning and not model_cfg.clip_cones:
+if model_cfg.clip_conditioning and not model_cfg.clip_caps:
     clip_embedding_dummy = jnp.zeros((768,), dtype=jnp.float32)
-elif model_cfg.clip_conditioning and model_cfg.clip_cones:
-    clip_embedding_dummy = jnp.zeros(
-        (model_cfg.clip_cone_count, 768), dtype=jnp.float32
-    )
+    max_cos_distance_dummy = jnp.zeros((0,), dtype=jnp.float32)
+elif model_cfg.clip_conditioning and model_cfg.clip_caps:
+    clip_embedding_dummy = jnp.zeros((model_cfg.clip_cap_count, 768), dtype=jnp.float32)
+    max_cos_distance_dummy = jnp.zeros((model_cfg.clip_cap_count,), dtype=jnp.float32)
 else:
     clip_embedding_dummy = jnp.zeros((0,), dtype=jnp.float32)
+    max_cos_distance_dummy = jnp.zeros((0,), dtype=jnp.float32)
 sample_params = sample_mdl.init(
     jax.random.PRNGKey(0),
     image=jnp.arange(model_cfg.image_tokens, dtype=jnp.int32),
     clip_embedding=clip_embedding_dummy,
-    cos_sim_lower=cos_sim_dummy,
-    cos_sim_upper=cos_sim_dummy,
+    max_cos_distance=max_cos_distance_dummy,
 )
 sample_cache = sample_params["cache"]
 del sample_params
-del cos_sim_dummy
 del clip_embedding_dummy
+del max_cos_distance_dummy
 
 sample_jv = jax.jit(
     jax.vmap(
-        lambda params, clip_embedding, cos_sim_lower, cos_sim_upper, rng, top_p: transformer_model.sample(
+        lambda params, clip_embedding, max_cos_distance, rng, top_p: transformer_model.sample(
             sample_mdl,
             flax.core.copy(params, {"cache": sample_cache}),
             clip_embedding,
-            cos_sim_lower,
-            cos_sim_upper,
+            max_cos_distance,
             rng,
             top_p,
         ),
-        in_axes=(None, 0, 0, 0, 0, 0),
+        in_axes=(None, 0, 0, 0, 0),
     )
 )
 
@@ -383,6 +377,7 @@ def get_clip_embeddings_to_sample(n: int, dset) -> jax.Array:
     }
 
 
+# TODO test text prompts as well as images
 sampling_clips = get_clip_embeddings_to_sample(embeddings_to_sample, test_imgs[:2048])
 
 print(f"Using {[name for name in sampling_clips['name']]} for diagnostic sampling")
@@ -404,24 +399,39 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
 
         conditioning_names = sampling_clips["name"]
 
-        if model_cfg.clip_cones:
+        if model_cfg.clip_caps:
             # One set of samples should be "semantically" similar but not necessarily a very
             # similar image, the second set should be very similar. NB this is all conjecture at
             # this point.
-            cos_sim_ranges = jnp.array([[0.15, 0.45], [0.7, 1.0]], dtype=jnp.float32)
+            max_cos_distance_choices = jnp.array([0.75, 0.4], dtype=jnp.float32)
 
-            # We fill any extra cone slots with ranges that cover all possible embeddings
-            # 🤔 is this the right way to prompt it? Alternatively, we could repeat the cone in
-            # every slot. Or some subset. In training the norm is that the conditioning information
-            # is pretty redundant, right?
-            clip_embeddings_fill = jax.random.normal(
-                jax.random.PRNGKey(20231213), (model_cfg.clip_cone_count - 1, 768)
+            samples_count = (
+                embeddings_to_sample * len(max_cos_distance_choices) * grid_size
             )
-            clip_embeddings_fill = clip_embeddings_fill / jnp.linalg.norm(
-                clip_embeddings_fill, axis=-1, keepdims=True
+            assert (samples_count % training_cfg.batch_size) % jax.device_count() == 0
+
+            # We fill any extra cap slots with ones that cover all possible embeddings - have max
+            # cosine distance 2 - and choose the centers randomly.
+            # 🤔 is this the right way to prompt it? Alternatively, we could repeat the cap in
+            # every slot.
+            cap_centers_fill = jax.random.normal(
+                jax.random.PRNGKey(20231213),
+                (
+                    embeddings_to_sample,
+                    len(max_cos_distance_choices),
+                    grid_size,
+                    model_cfg.clip_cap_count - 1,
+                    768,
+                ),
             )
-            assert clip_embeddings_fill.shape == (
-                model_cfg.clip_cone_count - 1,
+            cap_centers_fill = cap_centers_fill / jnp.linalg.norm(
+                cap_centers_fill, axis=-1, keepdims=True
+            )
+            assert cap_centers_fill.shape == (
+                embeddings_to_sample,
+                len(max_cos_distance_choices),
+                grid_size,
+                model_cfg.clip_cap_count - 1,
                 768,
             )
 
@@ -432,89 +442,78 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
             )
             clip_embeddings = rearrange(
                 clip_embeddings,
-                "clips_to_sample clip_dim -> clips_to_sample 1 clip_dim",
+                "embeddings_to_sample clip_dim -> embeddings_to_sample 1 clip_dim",
             )
-            clip_embeddings_fill = repeat(
-                clip_embeddings_fill,
-                "cones clip_dim -> clips_to_sample cones clip_dim",
-                clips_to_sample=embeddings_to_sample,
+            clip_embeddings = repeat(
+                clip_embeddings,
+                "embeddings_to_sample 1 clip_dim -> embeddings_to_sample ds g 1 clip_dim",
+                ds=len(max_cos_distance_choices),
+                g=grid_size,
             )
-            clip_embeddings = jnp.concatenate(
-                [clip_embeddings, clip_embeddings_fill], axis=1
-            )
-            assert clip_embeddings.shape == (
+
+            cap_centers = jnp.concatenate([clip_embeddings, cap_centers_fill], axis=3)
+            assert cap_centers.shape == (
                 embeddings_to_sample,
-                model_cfg.clip_cone_count,
+                len(max_cos_distance_choices),
+                grid_size,
+                model_cfg.clip_cap_count,
                 768,
             )
 
-            cos_sim_lower_fill = jnp.full(
-                (len(cos_sim_ranges), model_cfg.clip_cone_count - 1),
-                -1.0,
+            max_cos_distances_fill = jnp.full(
+                (
+                    embeddings_to_sample,
+                    len(max_cos_distance_choices),
+                    grid_size,
+                    model_cfg.clip_cap_count - 1,
+                ),
+                2,
                 dtype=jnp.float32,
             )
-            cos_sim_upper_fill = jnp.full(
-                (len(cos_sim_ranges), model_cfg.clip_cone_count - 1),
-                1.0,
-                dtype=jnp.float32,
-            )
-
-            cos_sim_lower = jnp.concatenate(
-                [cos_sim_ranges[:, 0:1], cos_sim_lower_fill], axis=1
-            )
-            cos_sim_upper = jnp.concatenate(
-                [cos_sim_ranges[:, 1:2], cos_sim_upper_fill], axis=1
-            )
-            assert (
-                cos_sim_lower.shape
-                == cos_sim_upper.shape
-                == (len(cos_sim_ranges), model_cfg.clip_cone_count)
-            )
-
-            samples_count = embeddings_to_sample * len(cos_sim_ranges) * grid_size
-            assert (samples_count % training_cfg.batch_size) % jax.device_count() == 0
-
-            clip_embeds_rep = repeat(
-                clip_embeddings,
-                "clips_to_sample cones clip_dim -> (clips_to_sample sims g) cones clip_dim",
-                sims=len(cos_sim_ranges),
+            max_cos_distances_cond = repeat(
+                max_cos_distance_choices,
+                "ds -> embeddings_to_sample ds g 1",
+                embeddings_to_sample=embeddings_to_sample,
                 g=grid_size,
             )
-            clip_embeds_rep = jax.device_put(
-                clip_embeds_rep, sharding.reshape(jax.device_count(), 1, 1)
+
+            max_cos_distances = jnp.concatenate(
+                [max_cos_distances_cond, max_cos_distances_fill], axis=3
+            )
+            assert max_cos_distances.shape == (
+                embeddings_to_sample,
+                len(max_cos_distance_choices),
+                grid_size,
+                model_cfg.clip_cap_count,
             )
 
-            cos_sim_lower_rep = repeat(
-                cos_sim_lower,
-                "sims cones -> (clips_to_sample sims g) cones",
-                clips_to_sample=embeddings_to_sample,
-                g=grid_size,
+            centers_for_sharding = rearrange(
+                cap_centers,
+                "embeddings_to_sample ds g c w -> (embeddings_to_sample ds g) c w",
             )
-            cos_sim_lower_rep = jax.device_put(cos_sim_lower_rep, sharding)
+            sharded_centers = jax.device_put(
+                centers_for_sharding, sharding.reshape(jax.device_count(), 1, 1)
+            )
 
-            cos_sim_upper_rep = repeat(
-                cos_sim_upper,
-                "sims cones -> (clips_to_sample sims g) cones",
-                clips_to_sample=embeddings_to_sample,
-                g=grid_size,
+            max_cos_distances_for_sharding = rearrange(
+                max_cos_distances,
+                "embeddings_to_sample ds g c -> (embeddings_to_sample ds g) c",
             )
-            cos_sim_upper_rep = jax.device_put(cos_sim_upper_rep, sharding)
+            sharded_max_cos_distances = jax.device_put(
+                max_cos_distances_for_sharding, sharding
+            )
 
             rngs = jax.random.split(ts.rng, samples_count)
             rngs = jax.device_put(rngs, sharding)
 
             assert (
-                len(clip_embeds_rep)
-                == len(cos_sim_lower_rep)
-                == len(cos_sim_upper_rep)
+                len(centers_for_sharding)
+                == len(max_cos_distances_for_sharding)
                 == len(rngs)
                 == samples_count
             )
 
-            batches = sample.batches_split(
-                training_cfg.batch_size,
-                len(clip_embeds_rep),
-            )
+            batches = sample.batches_split(training_cfg.batch_size, samples_count)
 
             sampled_codes = []
 
@@ -523,16 +522,14 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
                     sampled_codes.append(
                         sample_jv(
                             ts.params,
-                            clip_embeds_rep[:batch_size],
-                            cos_sim_lower_rep[:batch_size],
-                            cos_sim_upper_rep[:batch_size],
+                            sharded_centers[:batch_size],
+                            sharded_max_cos_distances[:batch_size],
                             rngs[:batch_size],
                             jnp.full(batch_size, 0.95),  # fixed top-p value
                         )
                     )
-                    clip_embeds_rep = clip_embeds_rep[batch_size:]
-                    cos_sim_lower_rep = cos_sim_lower_rep[batch_size:]
-                    cos_sim_upper_rep = cos_sim_upper_rep[batch_size:]
+                    sharded_centers = sharded_centers[batch_size:]
+                    sharded_max_cos_distances = sharded_max_cos_distances[batch_size:]
                     rngs = rngs[batch_size:]
 
                     pbar.update(batch_size)
@@ -559,9 +556,9 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
 
             grid_imgs = rearrange(
                 imgs_np,
-                "(clips_to_sample sims g) w h c -> clips_to_sample sims g w h c",
-                clips_to_sample=embeddings_to_sample,
-                sims=len(cos_sim_ranges),
+                "(embeddings_to_sample ds g) w h c -> embeddings_to_sample ds g w h c",
+                embeddings_to_sample=embeddings_to_sample,
+                ds=len(max_cos_distance_choices),
                 g=grid_size,
             )
             tqdm.write(f"Made grids of shape: {grid_imgs.shape}")
@@ -569,13 +566,11 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
             to_log = {"global_step": global_step}
 
             for i, name in enumerate(conditioning_names):
-                for j, (lower, upper) in enumerate(cos_sim_ranges):
+                for j, dist in enumerate(max_cos_distance_choices):
                     grid_pil = sample.make_grid(
                         [PIL.Image.fromarray(np.array(img)) for img in grid_imgs[i, j]],
                     )
-                    to_log[
-                        f"samples/{name}/cos_sim_{lower:.2f}_{upper:.2f}"
-                    ] = wandb.Image(grid_pil)
+                    to_log[f"samples/{name}/max_dist{dist:.2f}"] = wandb.Image(grid_pil)
 
             wandb.log(to_log)
         else:
@@ -716,16 +711,25 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
         wandb.log(to_log)
 
 
+def rearrange_batch_caps(centers, max_cos_distances, cap_count):
+    """Rearrange the data from parquet into the shape expected by the model. For reasons, parquet
+    does not support multidimensional arrays."""
+    centers = rearrange(centers, "b (n c) -> b n c", n=cap_count, c=768)
+    max_cos_distances = rearrange(max_cos_distances, "(b n) -> b n", n=cap_count)
+    return centers, max_cos_distances
+
+
 @partial(jax.jit, donate_argnums=(0,))
 def train_step(
     state: TrainState,
     batch_imgs: jax.Array,
     batch_clips: jax.Array,
+    batch_max_cos_distances: jax.Array,
 ) -> Tuple[TrainState, jax.Array, jax.Array]:
     """Compute a single optimization step."""
-    dropout_rng, cones_rng, rng2 = jax.random.split(state.rng, 3)
+    dropout_rng, rng2 = jax.random.split(state.rng, 2)
     loss, grads = loss_grad_fn(
-        mdl, state.params, dropout_rng, cones_rng, batch_imgs, batch_clips
+        mdl, state.params, dropout_rng, batch_imgs, batch_clips, batch_max_cos_distances
     )
     new_state = state.apply_gradients(
         grads=grads, rng=rng2
@@ -815,14 +819,30 @@ for epoch in trange(
                 last_checkpoint_time = datetime.datetime.now()
 
             batch_imgs = jax.device_put(batch["encoded_img"], sharding)
-            if model_cfg.clip_conditioning:
+            if model_cfg.clip_conditioning and not model_cfg.clip_caps:
                 batch_clips = jax.device_put(batch["clip_embedding"], sharding)
+                batch_max_cos_distances = jax.device_put(
+                    jnp.zeros((batch_imgs.shape[0], 0)), sharding
+                )
+            elif model_cfg.clip_conditioning and model_cfg.clip_caps:
+                batch_centers, batch_max_cos_distances = rearrange_batch_caps(
+                    batch["cap_center"],
+                    batch["cap_max_cos_distance"],
+                    model_cfg.clip_cap_count,
+                )
+                batch_clips = jax.device_put(batch_centers, sharding)
+                batch_max_cos_distances = jax.device_put(
+                    batch_max_cos_distances, sharding
+                )
             else:
                 batch_clips = jax.device_put(
                     jnp.zeros((batch_imgs.shape[0], 0)), sharding
                 )
+                batch_max_cos_distances = jax.device_put(
+                    jnp.zeros((batch_imgs.shape[0], 0)), sharding
+                )
             my_train_state, loss, norm = train_step(
-                my_train_state, batch_imgs, batch_clips
+                my_train_state, batch_imgs, batch_clips, batch_max_cos_distances
             )
             # TODO check if moving this check inside an if opt_state.notfinite_count > 0 is faster
             if not jnp.isfinite(loss):
@@ -852,16 +872,37 @@ for epoch in trange(
         total=len(test_imgs) // training_cfg.batch_size,
         desc="test batches",
     ):
-        dropout_rng, cones_rng, rng = jax.random.split(my_train_state.rng, 3)
+        dropout_rng, rng = jax.random.split(my_train_state.rng, 2)
         my_train_state = my_train_state.replace(rng=rng)
         batch_imgs = jax.device_put(batch["encoded_img"], sharding)
         if model_cfg.clip_conditioning:
-            batch_clips = jax.device_put(batch["clip_embedding"], sharding)
+            if model_cfg.clip_caps:
+                batch_cap_centers, batch_max_cos_distances = rearrange_batch_caps(
+                    batch["cap_center"],
+                    batch["cap_max_cos_distance"],
+                    model_cfg.clip_cap_count,
+                )
+                batch_clips = jax.device_put(batch_cap_centers, sharding)
+                batch_max_cos_distances = jax.device_put(
+                    batch_max_cos_distances, sharding
+                )
+            else:
+                batch_clips = jax.device_put(batch["clip_embedding"], sharding)
+                batch_max_cos_distances = jax.device_put(
+                    jnp.zeros((batch_imgs.shape[0], 0)), sharding
+                )
         else:
             batch_clips = jax.device_put(jnp.zeros((batch_imgs.shape[0], 0)), sharding)
+            batch_max_cos_distances = jax.device_put(
+                jnp.zeros((batch_imgs.shape[0], 0)), sharding
+            )
         losses.append(
             loss_fn(
-                my_train_state.params, dropout_rng, cones_rng, batch_imgs, batch_clips
+                my_train_state.params,
+                dropout_rng,
+                batch_imgs,
+                batch_clips,
+                batch_max_cos_distances,
             )
         )
     test_loss = jnp.mean(jnp.stack(losses))
