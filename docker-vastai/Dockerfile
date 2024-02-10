@@ -8,6 +8,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
 
 RUN usermod -s /bin/fish root
 
+# https://ommer-lab.com/files/latent-diffusion/vq-f4.zip
 ADD vq-f4.zip /root/vq-f4.zip
 RUN unzip /root/vq-f4.zip -d /root/vq-f4
 
@@ -15,7 +16,7 @@ RUN curl https://pyenv.run | bash
 ENV PATH="/root/.pyenv/bin:/root/.pyenv/shims:$PATH"
 RUN echo $(pyenv init) >> /root/.bashrc
 
-RUN pyenv install 3.11.5 && pyenv global 3.11.5
+RUN pyenv install 3.11.6 && pyenv global 3.11.6
 
 ADD fish-pyenv.fish /root/.config/fish/conf.d/fish-pyenv.fish
 
