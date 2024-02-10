@@ -482,44 +482,30 @@ def vectors_in_caps_padded(
 
 
 def vectors_in_cap_even_batch(
-    vs, cap_center, max_cos_distance, max_batch_size_log_sqrt2=31
+    vs, cap_center, max_cos_distance, max_batch_size=32768, pad_to=64
 ):
-    """A version of vectors in cap that pads vs up to a power of sqrt(2). Reduces the number of
+    """A version of vectors in cap that pads vs up to a multiple of pad_to. Reduces the number of
     versions of the function that need to be compiled."""
     assert len(vs.shape) == 2
     assert len(cap_center.shape) == 1
     assert vs.shape[1] == cap_center.shape[0]
     assert (type(max_cos_distance) is float) or max_cos_distance.shape == ()
-    batch_sizes = np.round(np.sqrt(2) ** np.arange(max_batch_size_log_sqrt2)).astype(
-        np.int32
-    )
+    assert max_batch_size > 0
+    assert pad_to >= 0
+    assert max_batch_size % pad_to == 0
 
     out = np.zeros(len(vs), dtype=np.bool_)
     cur = 0
     while cur < len(vs):
         # Most of the time this will complete in one GPU call, but if it doesn't, we loop until
         # we've done all the calculations.
-        this_batch_size_idx = np.ceil(
-            np.log(len(vs) - cur) / np.log(np.sqrt(2))
-        ).astype(np.int32)
-        this_batch_size_idx = min(this_batch_size_idx, max_batch_size_log_sqrt2 - 1)
-        this_batch_size = batch_sizes[this_batch_size_idx]
-
-        if len(vs) - cur < this_batch_size:
-            # If the data remaining is less than the selected batch size, we pad with zeros.
-            this_batch = np.empty((this_batch_size, vs.shape[1]), dtype=vs.dtype)
-            this_batch[: len(vs) - cur] = vs[cur:]
-            batch_len_unpadded = len(vs) - cur
-        else:
-            # Otherwise we can use the data as is, slicing to the batch size.
-            this_batch = vs[cur : cur + this_batch_size]
-            batch_len_unpadded = this_batch_size
-
-        out[cur : cur + batch_len_unpadded] = np.array(
-            vectors_in_cap(this_batch, cap_center, max_cos_distance)
-        )[:batch_len_unpadded]
-        cur += this_batch_size
-
+        vs_this_batch = vs[cur : cur + min(max_batch_size, len(vs) - cur)]
+        vs_padded, vs_padding = pad_to_multiple(vs_this_batch, pad_to)
+        out[cur : cur + len(vs_this_batch)] = np.asarray(
+            vectors_in_cap(vs_padded, cap_center, max_cos_distance)
+        )[: len(vs_this_batch)]
+        cur += len(vs_this_batch)
+    assert cur == len(vs)
     return out
 
 
@@ -539,7 +525,7 @@ def test_vectors_in_cap_even_batch(vecs):
     vecs = vecs[1:]
 
     out_even_batch = vectors_in_cap_even_batch(
-        vecs, cap_center, max_cos_distance, max_batch_size_log_sqrt2=10
+        vecs, cap_center, max_cos_distance, max_batch_size=12, pad_to=4
     )
     out_classic = vectors_in_cap(vecs, cap_center, max_cos_distance)
 
@@ -1173,9 +1159,9 @@ class CapTree:
     def _check_inside_cap(self, cap_center, max_cos_distance):
         """Check that all vectors in this node are inside the given cap."""
         if len(self.children) == 0:
-            distances = np.asarray(cosine_distance_many_to_one(
-                self.dset[:]["clip_embedding"], cap_center
-            ))
+            distances = np.asarray(
+                cosine_distance_many_to_one(self.dset[:]["clip_embedding"], cap_center)
+            )
             assert distances.shape == (len(self),)
             valid_distances_mask = distances <= max_cos_distance + self.EPSILON
             invalid_distances = distances[~valid_distances_mask]
