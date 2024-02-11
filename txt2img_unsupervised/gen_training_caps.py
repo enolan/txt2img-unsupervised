@@ -355,9 +355,10 @@ def main():
     parser.add_argument("--density-estimate-samples", type=int, default=512)
     parser.add_argument("--sample-inner-batch-size", type=int, default=4096)
     parser.add_argument("--replacement", action="store_true")
+    parser.add_argument("--no-save-cache", action="store_false", dest="save_cache")
     args = parser.parse_args()
 
-    tree = CapTree.load_from_disk(args.tree_path, save_cache=True)
+    tree = CapTree.load_from_disk(args.tree_path, save_cache=args.save_cache)
     if args.seed is not None:
         rng = jax.random.PRNGKey(args.seed)
     else:
