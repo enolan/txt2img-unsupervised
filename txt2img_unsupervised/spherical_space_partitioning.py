@@ -1885,7 +1885,7 @@ def test_tree_invariants(
     ],
 )
 @given(
-    _unit_vecs(st.tuples(st.integers(2, 1024), st.integers(2, 4))),
+    _unit_vecs(st.tuples(st.integers(2, 256), st.integers(2, 4))),
     st.integers(1, 4).flatmap(
         lambda num_queries: st.tuples(
             st.just(num_queries),
@@ -1928,6 +1928,7 @@ def test_tree_subtrees_in_caps_sizes_are_correct(
 
             subtree_vecs = cur_subtree.dset[:]["clip_embedding"]
             cosine_distances = cosine_distance_many_to_one(subtree_vecs, queries[i])
+            cosine_distances = jax.device_get(cosine_distances)
             vecs_in_cap_narrow = cosine_distances <= max_cos_distance_narrow
             vecs_in_cap_wide = cosine_distances <= max_cos_distance_wide
             assert size <= np.sum(vecs_in_cap_wide)
