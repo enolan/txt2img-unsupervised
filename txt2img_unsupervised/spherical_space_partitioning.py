@@ -14,8 +14,14 @@ import os
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import queue
 import tempfile
+import threading
+import time
+import types
+import weakref
 
+from collections import namedtuple
 from datetime import timedelta
 from einops import rearrange
 from functools import partial
@@ -1204,7 +1210,6 @@ class CapTree:
         query_centers,
         query_max_cos_distances,
         density_estimate_samples=8,
-        batch_size=4096,
     ):
         """Sample from multiple caps at once. Much better throughput than calling
         sample_in_cap_approx repeatedly. Returns a numpy array of indices into the dataset, where
@@ -1221,9 +1226,7 @@ class CapTree:
         assert len(query_max_cos_distances) == len(query_centers)
 
         if len(self.children) == 0:
-            return self.sample_in_caps(
-                query_centers, query_max_cos_distances, batch_size=batch_size
-            )
+            return self.sample_in_caps(query_centers, query_max_cos_distances)
 
         query_cnt = len(query_centers)
         sizes = np.array([child.len for child in self.children])
@@ -1316,7 +1319,6 @@ class CapTree:
             exact_results = self.sample_in_caps(
                 query_centers=query_centers[need_exact, :],
                 query_max_cos_distances=query_max_cos_distances[need_exact],
-                batch_size=batch_size,
                 mask=(contained_for_exact, intersecting_for_exact),
             )
             exact_idxs = np.arange(query_cnt)[need_exact]
@@ -1382,9 +1384,7 @@ class CapTree:
         sampled_idxs_out[need_exact] = exact_results
         return sampled_idxs_out
 
-    def sample_in_caps(
-        self, query_centers, query_max_cos_distances, batch_size=8192, mask=None
-    ):
+    def sample_in_caps(self, query_centers, query_max_cos_distances, mask=None):
         """Exact method for sampling from multiple caps at once. Returns a numpy array of indices.
         -1 indicates the cap was empty."""
         assert self.ready_for_queries
@@ -1394,10 +1394,10 @@ class CapTree:
         assert len(query_max_cos_distances) == len(query_centers)
 
         matching_subtrees_all = self._subtrees_in_caps(
-            query_centers, query_max_cos_distances, batch_size=batch_size, mask=mask
+            query_centers, query_max_cos_distances, mask=mask
         )
 
-        assert len(matching_subtrees_all) == len(query_centers)
+        assert len(matching_subtrees_all) <= len(query_centers)
 
         out = np.full(len(query_centers), -1, dtype=np.int64)
 
@@ -1466,22 +1466,131 @@ class CapTree:
 
         futs = {
             self.threadpool.submit(process_match, i, matching_subtrees): i
-            for i, matching_subtrees in enumerate(matching_subtrees_all)
+            for i, matching_subtrees in matching_subtrees_all.items()
         }
         for f in concurrent.futures.as_completed(futs):
             out[futs[f]] = f.result()
 
         return out
 
-    def _subtrees_in_caps(
-        self, query_centers, query_max_cos_distances, batch_size, mask=None
+    def _subtrees_in_caps(self, query_centers, query_max_cos_distances, mask=None):
+        # This is the main performance bottleneck when sampling. About 80% of queries go through
+        # approximate sampling, which is massively faster, but the rest need to go through exact
+        # sampling, and that's where the vast majority of our time goes. So performance
+        # considerations force us to use an annoyingly complicated design. The main performance
+        # bottleneck here is the leaf checks, so we try out best to keep the GPU saturated doing
+        # them by scheduling them asynchronosly and only reading the results at the end.
+        # The process:
+        # * Traverse the tree, using cap_intersection_status to determine which subtrees need to
+        # be traversed for which queries. For the ones that need to be traversed, recurse, but only
+        # testing the queries that are necessary for that subtree. If we're at a leaf, we enqueue
+        # the check and put a function in the result that returns the result of the check. Return
+        # a _subtrees_in_caps_result.
+        # * Traverse the result of that, resolving the deferred checks. Hopefully at this point
+        # they're all done already.
+        # * Traverse the result of that, normalizing the query indices so that they're all
+        # relative to the original input query indices. Prior to this, subtrees that checked a
+        # subset of the queries will have query indices relative to that subset.
+        # * Convert the result of that to a dict mapping query indices to the matching subtrees.
+
+        # That dict is returned to sample_in_caps, which uses it to sample from the distribution
+        # we computed.
+        start1 = time.monotonic()
+        result_waiting = self._subtrees_in_caps_inner(
+            query_centers, query_max_cos_distances, mask=mask
+        )
+        end1 = time.monotonic()
+        print(f"Took {end1 - start1:.2f} seconds to get result_waiting")
+        start2 = time.monotonic()
+        result_complete = self._resolve_subtrees_in_caps_result_deferred(result_waiting)
+        end2 = time.monotonic()
+        print(f"Took {end2 - start2:.2f} seconds for leaf checks to resolve")
+        start3 = time.monotonic()
+        result_normalize_query_idxs = self._resolve_subtrees_in_caps_result_query_idxs(
+            result_complete
+        )
+        end3 = time.monotonic()
+        print(f"Took {end3 - start3:.2f} seconds to normalize query idxs")
+        start4 = time.monotonic()
+        result_query_major = self._make_subtrees_in_caps_result_query_major(
+            result_normalize_query_idxs
+        )
+        end4 = time.monotonic()
+        print(f"Took {end4 - start4:.2f} seconds to make query major")
+        return result_query_major
+
+    # Helper types to make things clearer in _subtrees_in_caps_inner
+    # Result of the search, containing any matches at the top level in top and matches in subtrees
+    # in rec. rec is a dict mapping subtree idxs to lists of either
+    # _subtrees_in_caps_rec_entry_checked or _subtrees_in_caps_rec_entry_geometric.
+    _subtrees_in_caps_result = namedtuple("subtrees_in_caps_result", ["top", "rec"])
+    # Top level maches have a query idx and a count. They may be a function that returns the same,
+    # if the check is deferred.
+    _subtrees_in_caps_top_entry = namedtuple(
+        "subtrees_in_caps_top_entry", ["query_idx", "count"]
+    )
+    # Entries in rec, if they come from a recursive check, have the query indices that were checked
+    # (a subset of the parent's query indices) and a _subtrees_in_caps_result.
+    _subtrees_in_caps_rec_entry_checked = namedtuple(
+        "subtrees_in_caps_rec_entry_checked", ["query_idxs", "rec"]
+    )
+    # Entries in rec that come from cap intersection tests have the query index and the count.
+    _subtrees_in_caps_rec_entry_geometric = namedtuple(
+        "subtrees_in_caps_rec_entry_geometric", ["query_idx", "count"]
+    )
+
+    @classmethod
+    def pretty_print_subtrees_in_caps(cls, obj, indent=0):
+        # Pretty print the result of a call to _subtrees_in_caps_inner, before or after resolution.
+        # *so* much easier to read.
+        space = "  "
+        if isinstance(obj, cls._subtrees_in_caps_result):
+            print(f"{space * indent}subtrees_in_caps_result:")
+            if isinstance(obj.top, list):
+                if len(obj.top) > 0:
+                    print(f"{space * (indent + 1)}top:")
+                    for item in obj.top:
+                        cls.pretty_print_subtrees_in_caps(item, indent + 2)
+                else:
+                    print(f"{space * (indent + 1)}top: []")
+            elif isinstance(obj.top, types.FunctionType):
+                print(f"{space * (indent + 1)}top: func")
+            else:
+                print(f"{space * (indent + 1)}Unknown type: {obj.top}")
+            print(f"{space * (indent + 1)}rec:")
+            for k, v in sorted(obj.rec.items()):
+                print(f"{space * (indent + 2)}{k}:")
+                for item in v:
+                    cls.pretty_print_subtrees_in_caps(item, indent + 3)
+        elif isinstance(obj, cls._subtrees_in_caps_top_entry):
+            print(
+                f"{space * indent}_subtrees_in_caps_top_entry: query_idx={obj.query_idx}, count={obj.count}"
+            )
+        elif isinstance(obj, cls._subtrees_in_caps_rec_entry_checked):
+            print(
+                f"{space * indent}_subtrees_in_caps_rec_entry_checked: query_idxs={obj.query_idxs}"
+            )
+            cls.pretty_print_subtrees_in_caps(obj.rec, indent + 1)
+        elif isinstance(obj, cls._subtrees_in_caps_rec_entry_geometric):
+            print(
+                f"{space * indent}_subtrees_in_caps_rec_entry_geometric: query_idx={obj.query_idx}, count={obj.count}"
+            )
+        else:
+            print(f"{space * indent}Unknown type: {obj}")
+
+    def _subtrees_in_caps_inner(
+        self, query_centers, query_max_cos_distances, mask=None
     ):
         """Find all the subtrees that are either fully contained in the input caps or are leaves and
-        have vectors that are in the input caps. Returns a list of paths to subtrees and matching
-        vector counts."""
-        out = [[] for _ in range(len(query_centers))]
+        might have vectors that are in the input caps. For the fully contained queries the output
+        will include the number of matching vectors (all of them in that subtree). For the rest,
+        the output will include functions that when evaluated return the number. This indirection
+        allows us to check leaves asynchronously. The output is a _subtrees_in_caps_result.
+        """
+        assert self.ready_for_queries
 
         if len(self.children) > 0:
+            ret = self._subtrees_in_caps_result(top=[], rec={})
             # For a node, we use the geometric test, then check the children that intersect the
             # query caps but don't contain them, recursively.
             if mask is None:
@@ -1499,132 +1608,189 @@ class CapTree:
                 == intersecting.shape
                 == (len(query_centers), len(self.children))
             )
-            contained, intersecting = np.array(contained), np.array(intersecting)
+            contained, intersecting = jax.device_get((contained, intersecting))
 
             # Record the paths to the subtrees that are fully contained in the query caps.
             contained_query_idxs, contained_subtree_idxs = np.nonzero(contained)
             for i, j in zip(contained_query_idxs, contained_subtree_idxs):
-                out[i].append(([j], self.children[j].len))
+                ret.rec.setdefault(j, []).append(
+                    self._subtrees_in_caps_rec_entry_geometric(
+                        query_idx=i, count=self.children[j].len
+                    )
+                )
 
             # For the subtrees that intersect but aren't contained in the query caps, we need to
             # check inside them.
             subtrees_to_check = np.any(intersecting, axis=0)
             assert subtrees_to_check.shape == (len(self.children),)
-            # A list of (leaf_idx, leaf_size, query_mask) tuples to be tested later
-            leaves_to_check = []
             for i in np.arange(len(self.children))[subtrees_to_check]:
-                queries_this_subtree = np.arange(len(query_centers))[intersecting[:, i]]
-                assert len(queries_this_subtree) > 0
-                if len(self.children[i].children) == 0:
-                    # We check any leaves here without recursing to take advantage of infinidata's
-                    # batch_iter_concat and provide larger batches to the GPU.
-                    leaves_to_check.append(
-                        (i, self.children[i].len, intersecting[:, i])
+                # Find the indices of the query caps that intersect this subtree
+                query_idxs_this_subtree = np.arange(len(query_centers))[
+                    intersecting[:, i]
+                ]
+                assert len(query_idxs_this_subtree) > 0
+                query_centers_this_subtree = query_centers[query_idxs_this_subtree]
+                query_max_cos_distances_this_subtree = query_max_cos_distances[
+                    query_idxs_this_subtree
+                ]
+                # Recurse to get the geometric results and enqueue the leaf checks
+                subtree_res = self.children[i]._subtrees_in_caps_inner(
+                    query_centers_this_subtree,
+                    query_max_cos_distances_this_subtree,
+                )
+                ret.rec.setdefault(i, []).append(
+                    self._subtrees_in_caps_rec_entry_checked(
+                        query_idxs_this_subtree, subtree_res
+                    )
+                )
+
+            return ret
+        else:
+            # For a leaf, we check the vectors in the leaf against the query caps. The presumption
+            # is that if we're here, the leaf intersects the query caps but doesn't contain them.
+            # This will always be true unless the tree is very small or has never been split.
+            in_caps_f = self.leaf_checker.submit_and_return_func(
+                self.dset_thin, query_centers, query_max_cos_distances
+            )
+
+            def process_res():
+                # Wait for the leaf check to finish and process the results into match counts
+                in_caps = in_caps_f()
+                assert in_caps.shape == (len(self.dset), len(query_centers))
+                matching_cnts = np.sum(in_caps, axis=0)
+                assert matching_cnts.shape == (len(query_centers),)
+                matches = []
+                matching_queries = np.arange(len(query_centers))[matching_cnts > 0]
+                for i in matching_queries:
+                    matches.append(
+                        self._subtrees_in_caps_top_entry(
+                            query_idx=i, count=int(matching_cnts[i])
+                        )
+                    )
+                return matches
+
+            return self._subtrees_in_caps_result(top=process_res, rec={})
+
+    @classmethod
+    def _resolve_subtrees_in_caps_result_deferred(cls, res):
+        """Evaluate all the functions in a _subtrees_in_caps_result and return a new one with
+        concrete counts."""
+        out_top = []
+        if isinstance(res.top, list):
+            out_top = res.top
+        elif isinstance(res.top, types.FunctionType):
+            out_top = res.top()
+        else:
+            assert False, f"unexpected top type {type(res.top)}"
+        assert all(
+            isinstance(entry, cls._subtrees_in_caps_top_entry) for entry in out_top
+        )
+
+        out_rec = {}
+        for k, v in res.rec.items():
+            assert isinstance(v, list)
+            assert k not in out_rec
+            out_rec[k] = []
+            for entry in v:
+                if isinstance(entry, cls._subtrees_in_caps_rec_entry_checked):
+                    out_rec[k].append(
+                        cls._subtrees_in_caps_rec_entry_checked(
+                            entry.query_idxs,
+                            cls._resolve_subtrees_in_caps_result_deferred(entry.rec),
+                        )
+                    )
+                elif isinstance(entry, cls._subtrees_in_caps_rec_entry_geometric):
+                    out_rec[k].append(entry)
+                else:
+                    assert False, f"unexpected rec entry type {type(entry)}"
+        return cls._subtrees_in_caps_result(top=out_top, rec=out_rec)
+
+    @classmethod
+    def _resolve_subtrees_in_caps_result_query_idxs(cls, res, mapping=None):
+        """Return a _subtrees_in_caps_result with the same structure as res but with the query
+        indices resolved to the top level. Every query index will be relative to the top level
+        query and all query_idxs fields will be empty. Input must have all deferred processing
+        resolved already."""
+        # mapping is a numpy array of indices, which maps indices in the input to indices in the
+        # output. mapping[x] is the index in the output that corresponds to index x in the input.
+        out_top = []
+        assert isinstance(
+            res.top, list
+        ), f"unexpected top type {type(res.top)}, did you run _resolve_subtrees_in_caps_result_deferred?"
+        for entry in res.top:
+            assert isinstance(entry, cls._subtrees_in_caps_top_entry)
+            if mapping is not None:
+                out_top.append(
+                    cls._subtrees_in_caps_top_entry(
+                        query_idx=mapping[entry.query_idx], count=entry.count
+                    )
+                )
+            else:
+                out_top.append(entry)
+
+        out_rec = {}
+        for k, v in res.rec.items():
+            assert isinstance(v, list)
+            assert k not in out_rec
+            out_rec[k] = []
+            for entry in v:
+                if isinstance(entry, cls._subtrees_in_caps_rec_entry_checked):
+                    # Compose the current mapping with the mapping in the entry
+                    if mapping is not None:
+                        new_mapping = mapping[entry.query_idxs]
+                    else:
+                        new_mapping = entry.query_idxs
+                    out_rec[k].append(
+                        cls._subtrees_in_caps_rec_entry_checked(
+                            query_idxs=[],
+                            rec=cls._resolve_subtrees_in_caps_result_query_idxs(
+                                entry.rec, mapping=new_mapping
+                            ),
+                        )
+                    )
+                elif isinstance(entry, cls._subtrees_in_caps_rec_entry_geometric):
+                    if mapping is None:
+                        mapped_idx = entry.query_idx
+                    else:
+                        mapped_idx = mapping[entry.query_idx]
+                    out_rec[k].append(
+                        cls._subtrees_in_caps_rec_entry_geometric(
+                            query_idx=mapped_idx, count=entry.count
+                        )
                     )
                 else:
-                    matching_subtrees = self.children[i]._subtrees_in_caps(
-                        query_centers[queries_this_subtree],
-                        query_max_cos_distances[queries_this_subtree],
-                        mask=None,
-                        batch_size=batch_size,
-                    )
-                    assert len(matching_subtrees) == len(queries_this_subtree)
-                    for j, k in enumerate(queries_this_subtree):
-                        out[k].extend(
-                            ([i] + path, cnt) for path, cnt in matching_subtrees[j]
-                        )
+                    assert False, f"unexpected rec entry type {type(entry)}"
+        return cls._subtrees_in_caps_result(top=out_top, rec=out_rec)
 
-            if len(leaves_to_check) > 0:
-                leaf_match_cnts = np.zeros(
-                    (len(leaves_to_check), len(query_centers)), dtype=np.int64
-                )
-                dsets = [self.children[i].dset_thin for i, _, _ in leaves_to_check]
-                leaf_sizes = [size for _, size, _ in leaves_to_check]
-                leaf_idx = 0  # Which leaf we're processing
-                idx_in_leaf = 0  # Index in that leaf
-                # Caps that need to be checked for the current batch
-                queries_in_batch = np.zeros(len(query_centers), dtype=bool)
-                for batch_idx, batch in enumerate(
-                    infinidata.TableView.batch_iter_concat(
-                        dsets,
-                        batch_size=batch_size,
-                        threads=8,
-                        readahead=8,
-                    )
-                ):
-                    batch = jax.device_put(batch["clip_embedding"])
-                    queries_in_batch[:] = False
-                    # list of (leaf index, row count) pairs used to assign results to leaves
-                    leaf_assignments = []
-                    idx_in_batch = 0
-                    # Loop over leaves within the batch, collecting which caps we need to check for
-                    # the batch
-                    while idx_in_batch < len(batch):
-                        queries_in_batch |= leaves_to_check[leaf_idx][2]
-                        rows_used = min(
-                            # rest of the batch
-                            len(batch) - idx_in_batch,
-                            # rest of the leaf
-                            leaf_sizes[leaf_idx] - idx_in_leaf,
-                        )
-                        idx_in_batch += rows_used
-                        idx_in_leaf += rows_used
-                        leaf_assignments.append((leaf_idx, rows_used))
-                        if idx_in_leaf == leaf_sizes[leaf_idx]:
-                            idx_in_leaf = 0
-                            leaf_idx += 1
-                        assert (
-                            leaf_idx == len(leaf_sizes) and idx_in_batch == len(batch)
-                        ) or idx_in_leaf <= leaf_sizes[leaf_idx]
-                    query_idxs_in_batch = np.arange(len(query_centers))[
-                        queries_in_batch
-                    ]
-                    # Check the batch
-                    in_caps_cumsum = vectors_in_caps_padded(
-                        batch,
-                        query_centers[queries_in_batch],
-                        query_max_cos_distances[queries_in_batch],
-                        need_cumsum=True,
-                        need_bools=False,
-                    )
-                    assert in_caps_cumsum.shape == (
-                        len(batch),
-                        len(query_idxs_in_batch),
-                    )
-                    in_caps_cumsum = np.array(in_caps_cumsum)
-
-                    # Use leaf_assignments to update the correct counts
-                    cur = 0
-                    for assigned_leaf_idx, rows_used in leaf_assignments:
-                        # Use the difference in the cumulative sum to get the number of matches
-                        # this is marginally faster that sending the boolen array to the CPU and
-                        # doing a sum over a slice.
-                        match_cnts_by_query_cumsum = in_caps_cumsum[
-                            cur + rows_used - 1
-                        ] - (in_caps_cumsum[cur - 1] if cur > 0 else 0)
-                        leaf_match_cnts[
-                            assigned_leaf_idx, query_idxs_in_batch
-                        ] += match_cnts_by_query_cumsum
-                        cur += rows_used
-                for i, (subtree, _len, queries) in enumerate(leaves_to_check):
-                    query_idxs = np.arange(len(query_centers))[queries]
-                    matching_leaves = leaf_match_cnts[i, query_idxs] > 0
-                    for query_idx in query_idxs[matching_leaves]:
-                        out[query_idx].append(
-                            ([subtree], leaf_match_cnts[i, query_idx])
-                        )
-        else:
-            # For a leaf, we check the vectors in the leaf against the query caps.
-            in_caps = vectors_in_caps(
-                self.dset_thin[:]["clip_embedding"],
-                query_centers,
-                query_max_cos_distances,
-            )
-            assert in_caps.shape == (len(self.dset), len(query_centers))
-            matching_cnts = np.asarray(np.sum(in_caps, axis=0))
-            matching_subtrees = np.arange(len(query_centers))[matching_cnts > 0]
-            for subtree_idx in matching_subtrees:
-                out[subtree_idx].append(([], matching_cnts[subtree_idx]))
+    @classmethod
+    def _make_subtrees_in_caps_result_query_major(cls, res):
+        """Convert a _subtrees_in_caps_result to a dict of lists of results, one per query that
+        matched any vectors. Inside the lists are pairs of paths to subtrees and matching vector
+        counts. This is the format that's actually consumed by the exact sampling code. Assumes
+        input is fully resolved, with no deferred checks or query index mappings."""
+        out = {}
+        for entry in res.top:
+            assert isinstance(entry, cls._subtrees_in_caps_top_entry)
+            out.setdefault(entry.query_idx, []).append(([], entry.count))
+        for k, v in res.rec.items():
+            assert isinstance(v, list)
+            for entry in v:
+                if isinstance(entry, cls._subtrees_in_caps_rec_entry_checked):
+                    assert (
+                        len(entry.query_idxs) == 0
+                    ), "found query index mapping, did you run _resolve_subtrees_in_caps_result_query_idxs?"
+                    for (
+                        query_idx,
+                        matches,
+                    ) in cls._make_subtrees_in_caps_result_query_major(
+                        entry.rec
+                    ).items():
+                        for path, count in matches:
+                            out.setdefault(query_idx, []).append(([k] + path, count))
+                elif isinstance(entry, cls._subtrees_in_caps_rec_entry_geometric):
+                    out.setdefault(entry.query_idx, []).append(([k], entry.count))
+                else:
+                    assert False, f"unexpected rec entry type {type(entry)}"
         return out
 
     def __getitem__(self, idx):
@@ -1644,20 +1810,36 @@ class CapTree:
                 )
         self.dsets_contiguous = True
 
-    def prepare_for_queries(self):
+    def prepare_for_queries(self, leaf_checker=None, threadpool=None):
         """Prepare the tree for fast querying. This is unnecessary if the tree was loaded from
-        disk. Note that loading from disk yields a tree that is much faster to query that building
+        disk. Note that loading from disk yields a tree that is much faster to query than building
         one and then calling this function, since this only mucks with the indices in RAM and does
-        not actually move anything around."""
-        # Make the dsets contiguous so that each child's dset is a slice of this tree's dset and
-        # those slices are in order.
+        not actually move anything around. leaf_checker and threadpool should always be None,
+        they're only used in internal recursion."""
         if not self.ready_for_queries:
+            if leaf_checker is not None:
+                self.leaf_checker = leaf_checker
+            else:
+                if hasattr(self, "leaf_checker"):
+                    self.leaf_checker.shutdown()
+                # This is way less RAM than we actually have, but it still OOMs above this
+                self.leaf_checker = AsyncLeafChecker(
+                    max_inflight_vectors=256 * 1024 * 1024 // (768 * 4)
+                )
+                weakref.finalize(self, self.leaf_checker.shutdown)
+            if threadpool is not None:
+                self.threadpool = threadpool
+            else:
+                if hasattr(self, "threadpool"):
+                    self.threadpool.shutdown()
+                self.threadpool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=os.cpu_count()
+                )
             for child in self.children:
-                child.prepare_for_queries()
+                child.prepare_for_queries(
+                    leaf_checker=self.leaf_checker, threadpool=self.threadpool
+                )
             self._make_contiguous()
-            self.threadpool = concurrent.futures.ThreadPoolExecutor(
-                max_workers=os.cpu_count()
-            )
             self.ready_for_queries = True
         else:
             print("Tree already ready for queries, skipping prep.")
@@ -1786,6 +1968,229 @@ class CapTree:
         return out
 
 
+class AsyncLeafChecker:
+    """A background thread that checks the vectors in leaves against query caps. The intent is to
+    improve performance by:
+    * Aggregating the work of loading from Infinidata and sending the vectors to the GPU
+    * Doing that asynchronously
+    * Doing the work in a background thread so other tasks can continue while waiting for the
+      results.
+    * Using the GPU serially to avoid lock contention
+    """
+
+    def __init__(
+        self, max_inflight_vectors=1024 * 512, vecs_padding=64, queries_padding=64
+    ):
+        # The workqueue holds tuples of futures of padded jax arrays of vectors, the pre-padding
+        # lengths of the vector arrays, futures of padded jax arrays of cap centers and max cosine
+        # distances, their pre-padding lengths, and result queues for sending the results back.
+        self._workqueue = queue.Queue()
+        self._qsem = QuantitySemaphore(max_inflight_vectors)
+
+        # Thread pool for loading from Infinidata
+        self._loaderpool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=os.cpu_count(), thread_name_prefix="AsyncLeafLoaders"
+        )
+        # Thread pool for getting results back from GPU and sending them to the result queues.
+        self._resultpool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=os.cpu_count(), thread_name_prefix="AsyncLeafResults"
+        )
+
+        # Ensure the threads are killed when this object is gc'd.
+        self._terminate = False
+
+        self._vecs_padding = vecs_padding
+        self._queries_padding = queries_padding
+
+        self._gpu_thread = threading.Thread(
+            target=self._gpu_thread_main, daemon=True, name="AsyncLeafChecker"
+        )
+        self._gpu_thread.start()
+
+    def submit(self, leaf_dset, query_centers, query_max_cos_distances):
+        """Submit a leaf for checking and return a queue that will receive the result later."""
+        result_queue = queue.Queue()
+        assert len(query_centers) == len(query_max_cos_distances)
+        self._qsem.acquire(len(leaf_dset))
+        vecs_fut = self._loaderpool.submit(
+            lambda dset: jax.device_put(
+                pad_to_multiple(dset[:]["clip_embedding"], self._vecs_padding)[0]
+            ),
+            leaf_dset,
+        )
+
+        def caps_go(query_centers, query_max_cos_distances):
+            query_centers_padded = pad_to_multiple(
+                query_centers, self._queries_padding
+            )[0]
+            query_max_cos_distances_padded = pad_to_multiple(
+                query_max_cos_distances, self._queries_padding
+            )[0]
+            return jax.device_put(
+                (query_centers_padded, query_max_cos_distances_padded)
+            )
+
+        caps_fut = self._loaderpool.submit(
+            caps_go, query_centers, query_max_cos_distances
+        )
+
+        self._workqueue.put(
+            (
+                vecs_fut,
+                len(leaf_dset),
+                caps_fut,
+                len(query_centers),
+                result_queue,
+            )
+        )
+        return result_queue
+
+    def submit_and_wait(self, leaf_dset, query_centers, query_max_cos_distances):
+        """Submit a leaf for checking and return the result, blocking until it's ready."""
+        result_queue = self.submit(leaf_dset, query_centers, query_max_cos_distances)
+        return result_queue.get()
+
+    def submit_and_return_func(self, leaf_dset, query_centers, query_max_cos_distances):
+        """Submit a leaf for checking and return a function that will return the result, blocking
+        until it's ready."""
+        result_queue = self.submit(leaf_dset, query_centers, query_max_cos_distances)
+        result = None
+
+        def go():
+            nonlocal result
+            if result is None:
+                result = result_queue.get()
+                return result
+            else:
+                print(
+                    "WARNING: AsyncLeafChecker result function called more than once, this is "
+                    + "probably inefficient."
+                )
+                return result
+
+        return go
+
+    def _return_results(self, masks, unpadded_sizes, result_queues):
+        # Asynchronously return results. Fetching the results of multiple queries from the GPU in
+        # parallel hopefully improves performance relative to doing it one at a time. In any case
+        # device_get should release the GIL while it's waiting so we get some benefit from doing
+        # this asynchronously with other work.
+        assert len(masks) == len(result_queues)
+
+        def go(masks, unpadded_sizes, result_queues):
+            try:
+                assert len(masks) == len(unpadded_sizes)
+                unpadded_sizes = [
+                    (unpadded_sizes[i][0], unpadded_sizes[i][1])
+                    for i in range(len(unpadded_sizes))
+                ]
+                unpadded_vecs_lens, unpadded_query_lens = zip(*unpadded_sizes)
+                assert len(unpadded_vecs_lens) == len(unpadded_query_lens) == len(masks)
+                masks_np = jax.device_get(masks)
+                for i in range(len(masks)):
+                    result_queues[i].put(
+                        masks_np[i][: unpadded_vecs_lens[i], : unpadded_query_lens[i]]
+                    )
+                self._qsem.release(sum(unpadded_vecs_lens))
+            except Exception as e:
+                print(
+                    f"AsyncLeafChecker._return_results got exception {type(e).__name__}: {e}"
+                )
+                raise e
+
+        self._resultpool.submit(go, masks, unpadded_sizes, result_queues)
+
+    def _gpu_thread_main(self):
+        while not self._terminate:
+            try:
+                reqs = []
+                start_time = time.monotonic()
+                while True:
+                    # Get requests from the queue until it's empty, or 50ms have passed, in which case
+                    # we loop. The timeout is important so we can check the terminate flag.
+                    try:
+                        if len(reqs) > 0:
+                            reqs.append(self._workqueue.get_nowait())
+                        else:
+                            reqs.append(
+                                self._workqueue.get(
+                                    timeout=max(
+                                        0.05 - (time.monotonic() - start_time), 0
+                                    )
+                                )
+                            )
+                    except queue.Empty:
+                        break
+                if len(reqs) > 0:
+                    # Do the work
+                    out_masks = {}
+                    out_unpadded_sizes = {}
+                    out_queues = [r[4] for r in reqs]
+                    leaf_futs_dict = {r[0]: i for i, r in enumerate(reqs)}
+                    for fut in concurrent.futures.as_completed(leaf_futs_dict):
+                        i = leaf_futs_dict[fut]
+                        (
+                            _vecs_fut,
+                            vecs_len,
+                            caps_fut,
+                            query_len,
+                            _result_queue,
+                        ) = reqs[i]
+                        vecs = fut.result()
+                        query_centers, query_max_cos_distances = caps_fut.result()
+                        out_mask = vectors_in_caps(
+                            vecs, query_centers, query_max_cos_distances
+                        )
+                        out_masks[i] = out_mask
+                        out_unpadded_sizes[i] = (vecs_len, query_len)
+
+                    self._return_results(out_masks, out_unpadded_sizes, out_queues)
+            except Exception as e:
+                print(f"AsyncLeafChecker thread got exception: {e}")
+                raise e
+
+    def shutdown(self):
+        try:
+            print("AsyncLeafChecker shutdown")
+            self._terminate = True
+            self._loaderpool.shutdown(wait=True)
+            self._resultpool.shutdown(wait=True)
+            self._gpu_thread.join()
+        except Exception as e:
+            print(f"AsyncLeafChecker shutdown got exception: {e}")
+            raise e
+
+
+class QuantitySemaphore:
+    """A generalization of a semaphore that allows acquiring and releasing arbitrary amounts. This
+    is a Haskell QSem."""
+
+    def __init__(self, initial):
+        self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._value = initial
+        self._initial = initial
+
+    def acquire(self, amount):
+        if amount > self._initial:
+            raise ValueError("Can't acquire more than the initial amount")
+        with self._lock:
+            while self._value < amount:
+                self._condition.wait()
+            self._value -= amount
+
+    def release(self, amount):
+        with self._lock:
+            assert (
+                self._value + amount <= self._initial
+            ), f"QSem: tried to release {amount} when value was {self._value} which would exceed the initial value of {self._initial}"
+            self._value += amount
+            assert (
+                self._value <= self._initial
+            ), "QSem: can't release more than the initial amount"
+            self._condition.notify_all()
+
+
 @hyp.settings(
     max_examples=500,
     suppress_health_check=[
@@ -1894,12 +2299,9 @@ def test_tree_invariants(
     ),
     st.integers(3, 8),
     st.booleans(),
-    st.integers(1, 1024),
     st.random_module(),
 )
-def test_tree_subtrees_in_caps_sizes_are_correct(
-    vecs, query_info, k, do_split, batch_size, _rand
-):
+def test_tree_subtrees_in_caps_sizes_are_correct(vecs, query_info, k, do_split, _rand):
     """Test that _subtrees_in_caps returns subtrees with the correct sizes."""
     num_queries, max_cos_distances = query_info
     hyp.assume(num_queries < len(vecs))
@@ -1908,15 +2310,14 @@ def test_tree_subtrees_in_caps_sizes_are_correct(
     tree = CapTree(dset, batch_size=32, k=k, iters=4, max_leaf_size=k + 4)
     if do_split:
         tree.split_rec()
+    tree.prepare_for_queries()
 
-    matching_subtrees_all = tree._subtrees_in_caps(
-        queries, max_cos_distances, batch_size=batch_size
-    )
-    assert len(matching_subtrees_all) == num_queries
-    for i, matching_subtrees in enumerate(matching_subtrees_all):
+    matching_subtrees_all = tree._subtrees_in_caps(queries, max_cos_distances)
+    assert len(matching_subtrees_all) <= num_queries
+    for i, matching_subtrees in matching_subtrees_all.items():
         max_cos_distance_narrow = max_cos_distances[i] - 0.01
         max_cos_distance_wide = max_cos_distances[i] + 0.01
-        for match_num, (path, size) in enumerate(matching_subtrees):
+        for path, size in matching_subtrees:
             cur_subtree = tree
             for step in path:
                 cur_subtree = cur_subtree.children[step]
@@ -1955,11 +2356,10 @@ def test_tree_subtrees_in_caps_sizes_are_correct(
     st.floats(0.0, 1.0),
     st.booleans(),
     st.integers(1, 4),
-    st.integers(1, 1024),
     st.random_module(),
 )
 def test_tree_subtrees_in_caps_finds_all_at_2(
-    vecs, k, outlier_removal_level, do_split, n_queries, batch_size, _rand
+    vecs, k, outlier_removal_level, do_split, n_queries, _rand
 ):
     """Test that _subtrees_in_caps finds all vectors when max_cos_distance is 2."""
     dset = infinidata.TableView({"clip_embedding": vecs})
@@ -1977,13 +2377,12 @@ def test_tree_subtrees_in_caps_finds_all_at_2(
 
     if do_split:
         tree.split_rec()
+    tree.prepare_for_queries()
 
-    matching_subtrees_all = tree._subtrees_in_caps(
-        query_centers, max_cos_distances, batch_size=batch_size
-    )
+    matching_subtrees_all = tree._subtrees_in_caps(query_centers, max_cos_distances)
     assert len(matching_subtrees_all) == n_queries
 
-    for i, matching_subtrees in enumerate(matching_subtrees_all):
+    for i, matching_subtrees in matching_subtrees_all.items():
         matching_subtrees = sorted(matching_subtrees)
         assert np.sum([size for _, size in matching_subtrees]) == len(vecs)
         if len(matching_subtrees) == 1:
