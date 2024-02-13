@@ -1416,11 +1416,10 @@ class CapTree:
 
         out = np.full(len(query_centers), -1, dtype=np.int64)
 
-        # processing matches at the end can be a bottleneck, so we do it in parallel with threads.
-        # fetching leaf vectors from the dset and calling jax both release the GIL for a while,
-        # though neither are super efficient about it.
-        def process_match(query_num, matching_subtrees):
-            # If there are matches, we pick one, otherwise we leave it as -1
+        leaves_to_recheck = {}
+
+        start1 = time.monotonic()
+        for query_num, matching_subtrees in matching_subtrees_all.items():
             if len(matching_subtrees) > 0:
                 total_matches = sum(cnt for _, cnt in matching_subtrees)
                 assert total_matches > 0
@@ -1442,50 +1441,77 @@ class CapTree:
                     subtree = subtree.children[step]
                 if len(subtree) == cnt:
                     # If the entire subtree matches we just sample from it
-                    return subtree_start + idx_in_subtree
+                    out[query_num] = subtree_start + idx_in_subtree
                 else:
-                    # Otherwise, we need to check the vectors in the subtree. This is redundant,
-                    # since we did this in _subtrees_in_caps. Not sure if this is worse than saving
-                    # the matching vector masks in _subtrees_in_caps.
-                    valid_distances_mask = vectors_in_cap_even_batch(
-                        subtree.dset_thin[:]["clip_embedding"],
-                        query_centers[query_num],
-                        query_max_cos_distances[query_num],
+                    # Otherwise, enqueue a check for this query for this leaf. We'll submit the
+                    # actual check to AsyncLeafChecker after all queries are processed through this
+                    # loop, so that all queries that need the same leaf checked can be aggregated
+                    # together.
+                    leaves_to_recheck.setdefault(tuple(path), []).append(
+                        (query_num, cnt, idx_in_subtree)
                     )
-                    valid_distances_idxs = np.arange(len(subtree.dset))[
-                        valid_distances_mask
-                    ]
-                    if len(valid_distances_idxs) == 0:
-                        tqdm.write(
-                            f"WARNING: _subtrees_in_caps found {cnt} matches but sample_in_caps "
-                            + "found 0. Returning none."
-                        )
-                        return -1
-                    elif len(valid_distances_idxs) != cnt:
-                        tqdm.write(
-                            f"WARNING: _subtrees_in_caps found {cnt} matches but sample_in_caps "
-                            + f"found {len(valid_distances_idxs)}. Sampling from those."
-                        )
-                        return (
-                            subtree_start
-                            + valid_distances_idxs[
-                                np.random.randint(len(valid_distances_idxs))
-                            ]
-                        )
-                    elif len(valid_distances_idxs) == cnt:
-                        return subtree_start + valid_distances_idxs[idx_in_subtree]
-                    else:
-                        assert False, "unreachable"
-            else:
-                return -1
-
-        futs = {
-            self.threadpool.submit(process_match, i, matching_subtrees): i
-            for i, matching_subtrees in matching_subtrees_all.items()
-        }
-        for f in concurrent.futures.as_completed(futs):
-            out[futs[f]] = f.result()
-
+        end1 = time.monotonic()
+        print(f"Took {end1 - start1:.2f} seconds to enqueue checks")
+        leaves_to_recheck_funcs = {}
+        start2 = time.monotonic()
+        for path, queries in leaves_to_recheck.items():
+            subtree = self
+            for step in path:
+                subtree = subtree.children[step]
+            query_centers_this = query_centers[[q for q, _, _ in queries]]
+            query_max_cos_distances_this = query_max_cos_distances[
+                [q for q, _, _ in queries]
+            ]
+            leaves_to_recheck_funcs[path] = self.leaf_checker.submit_and_return_func(
+                AsyncLeafChecker.CheckType.MASK,
+                subtree.dset_thin,
+                query_centers_this,
+                query_max_cos_distances_this,
+            )
+        end2 = time.monotonic()
+        print(f"Took {end2 - start2:.2f} seconds to submit checks")
+        start3 = time.monotonic()
+        for path, func in leaves_to_recheck_funcs.items():
+            mask = func()
+            subtree = self
+            subtree_start = 0
+            for step in path:
+                subtree_start += subtree.child_start_idxs[step]
+                subtree = subtree.children[step]
+            assert len(subtree.children) == 0
+            queries = leaves_to_recheck[path]
+            assert mask.shape == (len(subtree.dset), len(queries))
+            assert mask.dtype == np.bool_
+            for i, (query_num, expected_positives, idx_in_subtree) in enumerate(
+                queries
+            ):
+                assert idx_in_subtree < expected_positives
+                matches = mask[:, i]
+                valid_distances_idxs = np.arange(len(subtree.dset))[matches]
+                actual_positives = len(valid_distances_idxs)
+                if actual_positives == 0:
+                    tqdm.write(
+                        f"WARNING: _subtrees_in_caps found {expected_positives} matches but "
+                        + "sample_in_caps found 0. Returning none."
+                    )
+                    out[query_num] = -1
+                elif actual_positives != expected_positives:
+                    tqdm.write(
+                        f"WARNING: _subtrees_in_caps found {expected_positives} matches but "
+                        + f"sample_in_caps found {actual_positives}. Sampling from those."
+                    )
+                    out[query_num] = (
+                        subtree_start
+                        + valid_distances_idxs[np.random.randint(actual_positives)]
+                    )
+                elif actual_positives == expected_positives:
+                    out[query_num] = (
+                        subtree_start + valid_distances_idxs[idx_in_subtree]
+                    )
+                else:
+                    assert False, "unreachable"
+        end3 = time.monotonic()
+        print(f"Took {end3 - start3:.2f} seconds to resolve checks and choose indices")
         return out
 
     def _subtrees_in_caps(self, query_centers, query_max_cos_distances, mask=None):
