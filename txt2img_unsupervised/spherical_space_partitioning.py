@@ -435,10 +435,25 @@ def vectors_in_caps(
         return mask, counts
 
 
+def round_up_to_multiple(x, multiple):
+    """Round x up to the nearest multiple of multiple."""
+    return x + multiple - 1 - (x - 1) % multiple
+
+
+def test_round_up_to_multiple():
+    assert round_up_to_multiple(0, 1) == 0
+    assert round_up_to_multiple(1, 1) == 1
+    assert round_up_to_multiple(2, 1) == 2
+    assert round_up_to_multiple(0, 8) == 0
+    assert round_up_to_multiple(1, 8) == 8
+    assert round_up_to_multiple(9, 8) == 16
+    assert round_up_to_multiple(16, 8) == 16
+
+
 def pad_to_multiple(arr, x):
     """Pad arr to a multiple of x along its 0th dimension. Returns the padded array and the amount
     of padding added."""
-    pad = x - (len(arr) % x) if len(arr) % x != 0 else 0
+    pad = round_up_to_multiple(arr.shape[0], x) - arr.shape[0]
     if pad != 0:
         padded_arr = np.pad(
             arr, tuple([(0, pad)] + [(0, 0) for dim in arr.shape[1:]]), mode="constant"
@@ -1289,6 +1304,8 @@ class CapTree:
             positive_samples[query_caps_to_test, i] = in_caps.T
             densities[query_caps_to_test, j] = matching_cnts / density_estimate_samples
 
+        del sampled_vecs
+        del in_caps
         estimated_matching_sizes = densities * sizes
         assert estimated_matching_sizes.shape == (query_cnt, len(self.children))
 
@@ -1856,9 +1873,8 @@ class CapTree:
             else:
                 if hasattr(self, "leaf_checker"):
                     self.leaf_checker.shutdown()
-                # This is way less RAM than we actually have, but it still OOMs above this
                 self.leaf_checker = AsyncLeafChecker(
-                    max_inflight_vectors=256 * 1024 * 1024 // (768 * 4)
+                    max_inflight_vectors=512 * 1024 * 1024 // (768 * 4)
                 )
                 weakref.finalize(self, self.leaf_checker.shutdown)
             if threadpool is not None:
@@ -2048,7 +2064,11 @@ class AsyncLeafChecker:
         """Submit a leaf for checking and return a queue that will receive the result later."""
         result_queue = queue.Queue()
         assert len(query_centers) == len(query_max_cos_distances)
-        self._qsem.acquire(len(leaf_dset))
+        padded_vecs_len = round_up_to_multiple(len(leaf_dset), self._vecs_padding)
+        padded_queries_len = round_up_to_multiple(
+            len(query_centers), self._queries_padding
+        )
+        self._qsem.acquire(padded_vecs_len + padded_queries_len)
         vecs_fut = self._loaderpool.submit(
             lambda dset: jax.device_put(
                 pad_to_multiple(dset[:]["clip_embedding"], self._vecs_padding)[0]
@@ -2135,7 +2155,17 @@ class AsyncLeafChecker:
                     len(unpadded_vecs_lens) == len(unpadded_query_lens) == len(results)
                 )
                 results_np = jax.device_get(results)
-                for i in range(len(results)):
+                del results
+                padded_vecs_count = sum(
+                    round_up_to_multiple(l, self._vecs_padding)
+                    for l in unpadded_vecs_lens
+                )
+                padded_queries_count = sum(
+                    round_up_to_multiple(l, self._queries_padding)
+                    for l in unpadded_query_lens
+                )
+                self._qsem.release(padded_vecs_count + padded_queries_count)
+                for i in range(len(results_np)):
                     if len(results_np[i].shape) == 1:
                         # counts
                         assert len(results_np[i]) >= unpadded_query_lens[i]
@@ -2151,7 +2181,6 @@ class AsyncLeafChecker:
                         )
                     else:
                         assert False, f"unexpected result shape {results_np[i].shape}"
-                self._qsem.release(sum(unpadded_vecs_lens))
             except Exception as e:
                 print(
                     f"AsyncLeafChecker._return_results/go got exception {type(e).__name__}: {e}"
