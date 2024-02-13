@@ -604,7 +604,7 @@ def cap_intersection_status_many_to_many_padded(
         centers_b_padded,
         max_cos_distances_b_padded,
     )
-    contained, intersecting = np.array(contained), np.array(intersecting)
+    contained, intersecting = jax.device_get((contained, intersecting))
 
     contained = contained[: centers_a.shape[0], : centers_b.shape[0]]
     intersecting = intersecting[: centers_a.shape[0], : centers_b.shape[0]]
