@@ -1613,15 +1613,42 @@ class CapTree:
             assert subtrees_to_check.shape == (len(self.children),)
 
             # Building the query cap arrays for the subtrees is surprisingly slow, so we do it in
-            # parallel.
+            # parallel, and with a cache.
+            intersectingT = intersecting.T
+            cache_lock = threading.Lock()
+            query_centers_cache = {}
+            query_max_cos_distances_cache = {}
+            query_idxs_all = np.arange(len(query_centers))
+
             def prep_query_arrays(i):
+                if np.count_nonzero(intersectingT[i]) == len(query_centers):
+                    return (query_idxs_all, query_centers, query_max_cos_distances)
+
                 query_idxs_this_subtree = np.arange(len(query_centers))[
-                    intersecting[:, i]
+                    intersectingT[i]
                 ]
+                k = query_idxs_this_subtree.tobytes()
+                with cache_lock:
+                    if k in query_centers_cache:
+                        assert k in query_max_cos_distances_cache
+                        return (
+                            query_idxs_this_subtree,
+                            query_centers_cache[k],
+                            query_max_cos_distances_cache[k],
+                        )
+                query_centers_this_subtree = query_centers[query_idxs_this_subtree]
+                query_max_cos_distances_this_subtree = query_max_cos_distances[
+                    query_idxs_this_subtree
+                ]
+                with cache_lock:
+                    query_centers_cache[k] = query_centers_this_subtree
+                    query_max_cos_distances_cache[
+                        k
+                    ] = query_max_cos_distances_this_subtree
                 return (
                     query_idxs_this_subtree,
-                    query_centers[query_idxs_this_subtree],
-                    query_max_cos_distances[query_idxs_this_subtree],
+                    query_centers_this_subtree,
+                    query_max_cos_distances_this_subtree,
                 )
 
             query_arrays_futs = {
