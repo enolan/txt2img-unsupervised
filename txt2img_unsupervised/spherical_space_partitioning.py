@@ -1626,7 +1626,7 @@ class CapTree:
 
             query_arrays_futs = {
                 self.threadpool.submit(prep_query_arrays, i): i
-                for i in range(np.count_nonzero(subtrees_to_check))
+                for i in np.arange(len(self.children))[subtrees_to_check]
             }
 
             for fut in concurrent.futures.as_completed(query_arrays_futs):
