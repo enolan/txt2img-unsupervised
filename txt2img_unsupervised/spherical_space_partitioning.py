@@ -24,6 +24,7 @@ import weakref
 from collections import namedtuple
 from datetime import timedelta
 from einops import rearrange
+from enum import Enum
 from functools import partial
 from hypothesis import given, strategies as st
 from pathlib import Path
@@ -401,21 +402,22 @@ def vectors_in_cap(vs, cap_center, max_cos_distance):
     )
 
 
-@partial(jax.jit, static_argnames=("need_cumsum", "need_bools"))
+@partial(jax.jit, static_argnames=("need_counts", "need_bools"))
 def vectors_in_caps(
-    vs, cap_centers, max_cos_distances, need_cumsum=False, need_bools=True
+    vs, cap_centers, max_cos_distances, need_counts=False, need_bools=True
 ):
     """Check which vectors in vs are in the caps defined by cap_centers and max_cos_distances.
-    If need_cumsum is True returns a cumulative sum over the vectors, if need_bools is True returns
-    a bool mask. If both are, returns a tuple.
-    mask and cumsum both have shape (len(vs), len(cap_centers))
+    If need_counts is True returns the number of matching vectors for each cap, if need_bools is
+    True returns a bool mask. If both are, returns a tuple.
+    mask has shape (len(vs), len(cap_centers))
+    counts has shape (len(cap_centers),)
     """
     assert len(vs.shape) == 2
     assert len(cap_centers.shape) == 2
     assert vs.shape[1] == cap_centers.shape[1]
     assert len(max_cos_distances.shape) == 1
     assert cap_centers.shape[0] == max_cos_distances.shape[0]
-    assert need_cumsum or need_bools
+    assert need_counts or need_bools
     print(f"Tracing vectors_in_caps for vs {vs.shape[0]}, caps {cap_centers.shape[0]}")
 
     mask = jax.vmap(vectors_in_cap, in_axes=(None, 0, 0))(
@@ -423,14 +425,14 @@ def vectors_in_caps(
     )
     mask = rearrange(mask, "c v -> v c")
     assert mask.shape == (len(vs), len(cap_centers)), f"mask.shape: {mask.shape}"
-    if need_cumsum:
-        cumsum = jnp.cumsum(mask, axis=0)
-    if need_cumsum and not need_bools:
-        return cumsum
-    elif need_bools and not need_cumsum:
+    if need_counts:
+        counts = jnp.sum(mask, axis=0)
+    if need_counts and not need_bools:
+        return counts
+    elif need_bools and not need_counts:
         return mask
     else:
-        return mask, cumsum
+        return mask, counts
 
 
 def pad_to_multiple(arr, x):
@@ -449,16 +451,13 @@ def pad_to_multiple(arr, x):
     return padded_arr, pad
 
 
-def vectors_in_caps_padded(
-    vs, cap_centers, max_cos_distances, need_cumsum=False, need_bools=True
-):
+def vectors_in_caps_padded(vs, cap_centers, max_cos_distances):
     """Compute vectors in caps, padding the dimension up to multiples of small powers of two."""
     assert len(vs.shape) == 2
     assert len(cap_centers.shape) == 2
     assert vs.shape[1] == cap_centers.shape[1]
     assert len(max_cos_distances.shape) == 1
     assert cap_centers.shape[0] == max_cos_distances.shape[0]
-    assert need_cumsum or need_bools
 
     vs_padded, vs_pad = pad_to_multiple(vs, 64)
     cap_centers_padded, cap_centers_pad = pad_to_multiple(cap_centers, 64)
@@ -471,20 +470,9 @@ def vectors_in_caps_padded(
         vs_padded,
         cap_centers_padded,
         max_cos_distances_padded,
-        need_cumsum=need_cumsum,
-        need_bools=need_bools,
     )
     # This sort of slicing is really slow on GPU so we ship the result back to CPU.
-    if need_cumsum != need_bools:
-        return np.array(res)[: vs.shape[0], : cap_centers.shape[0]]
-    elif need_cumsum and need_bools:
-        mask, cumsum = np.array(res[0]), np.array(res[1])
-        return (
-            mask[: vs.shape[0], : cap_centers.shape[0]],
-            cumsum[: vs.shape[0], : cap_centers.shape[0]],
-        )
-    else:
-        assert False, "This should be unreachable"
+    return jax.device_get(res)[: vs.shape[0], : cap_centers.shape[0]]
 
 
 def vectors_in_cap_even_batch(
@@ -1662,21 +1650,21 @@ class CapTree:
                         ),
                     )
                 )
-
             return ret
         else:
             # For a leaf, we check the vectors in the leaf against the query caps. The presumption
             # is that if we're here, the leaf intersects the query caps but doesn't contain them.
             # This will always be true unless the tree is very small or has never been split.
             in_caps_f = self.leaf_checker.submit_and_return_func(
-                self.dset_thin, query_centers, query_max_cos_distances
+                AsyncLeafChecker.CheckType.COUNTS,
+                self.dset_thin,
+                query_centers,
+                query_max_cos_distances,
             )
 
             def process_res():
                 # Wait for the leaf check to finish and process the results into match counts
-                in_caps = in_caps_f()
-                assert in_caps.shape == (len(self.dset), len(query_centers))
-                matching_cnts = np.sum(in_caps, axis=0)
+                matching_cnts = in_caps_f()
                 assert matching_cnts.shape == (len(query_centers),)
                 matches = []
                 matching_queries = np.arange(len(query_centers))[matching_cnts > 0]
@@ -2000,9 +1988,10 @@ class AsyncLeafChecker:
     def __init__(
         self, max_inflight_vectors=1024 * 512, vecs_padding=64, queries_padding=64
     ):
-        # The workqueue holds tuples of futures of padded jax arrays of vectors, the pre-padding
-        # lengths of the vector arrays, futures of padded jax arrays of cap centers and max cosine
-        # distances, their pre-padding lengths, and result queues for sending the results back.
+        # The workqueue holds tuples of check types, futures of padded jax arrays of vectors, the
+        # pre-padding lengths of the vector arrays, futures of padded jax arrays of cap centers and
+        # max cosine distances, their pre-padding lengths, and result queues for sending the
+        # results back.
         self._workqueue = queue.Queue()
         self._qsem = QuantitySemaphore(max_inflight_vectors)
 
@@ -2026,7 +2015,9 @@ class AsyncLeafChecker:
         )
         self._gpu_thread.start()
 
-    def submit(self, leaf_dset, query_centers, query_max_cos_distances):
+    CheckType = Enum("CheckType", ["MASK", "COUNTS"])
+
+    def submit(self, checktype, leaf_dset, query_centers, query_max_cos_distances):
         """Submit a leaf for checking and return a queue that will receive the result later."""
         result_queue = queue.Queue()
         assert len(query_centers) == len(query_max_cos_distances)
@@ -2055,6 +2046,7 @@ class AsyncLeafChecker:
 
         self._workqueue.put(
             (
+                checktype,
                 vecs_fut,
                 len(leaf_dset),
                 caps_fut,
@@ -2064,15 +2056,23 @@ class AsyncLeafChecker:
         )
         return result_queue
 
-    def submit_and_wait(self, leaf_dset, query_centers, query_max_cos_distances):
+    def submit_and_wait(
+        self, checktype, leaf_dset, query_centers, query_max_cos_distances
+    ):
         """Submit a leaf for checking and return the result, blocking until it's ready."""
-        result_queue = self.submit(leaf_dset, query_centers, query_max_cos_distances)
+        result_queue = self.submit(
+            checktype, leaf_dset, query_centers, query_max_cos_distances
+        )
         return result_queue.get()
 
-    def submit_and_return_func(self, leaf_dset, query_centers, query_max_cos_distances):
+    def submit_and_return_func(
+        self, checktype, leaf_dset, query_centers, query_max_cos_distances
+    ):
         """Submit a leaf for checking and return a function that will return the result, blocking
         until it's ready."""
-        result_queue = self.submit(leaf_dset, query_centers, query_max_cos_distances)
+        result_queue = self.submit(
+            checktype, leaf_dset, query_centers, query_max_cos_distances
+        )
         result = None
 
         def go():
@@ -2089,35 +2089,49 @@ class AsyncLeafChecker:
 
         return go
 
-    def _return_results(self, masks, unpadded_sizes, result_queues):
+    def _return_results(self, results, unpadded_sizes, result_queues):
         # Asynchronously return results. Fetching the results of multiple queries from the GPU in
         # parallel hopefully improves performance relative to doing it one at a time. In any case
         # device_get should release the GIL while it's waiting so we get some benefit from doing
         # this asynchronously with other work.
-        assert len(masks) == len(result_queues)
+        assert len(results) == len(result_queues)
 
-        def go(masks, unpadded_sizes, result_queues):
+        def go(results, unpadded_sizes, result_queues):
             try:
-                assert len(masks) == len(unpadded_sizes)
+                assert len(results) == len(unpadded_sizes)
                 unpadded_sizes = [
                     (unpadded_sizes[i][0], unpadded_sizes[i][1])
                     for i in range(len(unpadded_sizes))
                 ]
                 unpadded_vecs_lens, unpadded_query_lens = zip(*unpadded_sizes)
-                assert len(unpadded_vecs_lens) == len(unpadded_query_lens) == len(masks)
-                masks_np = jax.device_get(masks)
-                for i in range(len(masks)):
-                    result_queues[i].put(
-                        masks_np[i][: unpadded_vecs_lens[i], : unpadded_query_lens[i]]
-                    )
+                assert (
+                    len(unpadded_vecs_lens) == len(unpadded_query_lens) == len(results)
+                )
+                results_np = jax.device_get(results)
+                for i in range(len(results)):
+                    if len(results_np[i].shape) == 1:
+                        # counts
+                        assert len(results_np[i]) >= unpadded_query_lens[i]
+                        result_queues[i].put(results_np[i][: unpadded_query_lens[i]])
+                    elif len(results_np[i].shape) == 2:
+                        # mask
+                        assert results_np[i].shape[0] >= unpadded_vecs_lens[i]
+                        assert results_np[i].shape[1] >= unpadded_query_lens[i]
+                        result_queues[i].put(
+                            results_np[i][
+                                : unpadded_vecs_lens[i], : unpadded_query_lens[i]
+                            ]
+                        )
+                    else:
+                        assert False, f"unexpected result shape {results_np[i].shape}"
                 self._qsem.release(sum(unpadded_vecs_lens))
             except Exception as e:
                 print(
-                    f"AsyncLeafChecker._return_results got exception {type(e).__name__}: {e}"
+                    f"AsyncLeafChecker._return_results/go got exception {type(e).__name__}: {e}"
                 )
                 raise e
 
-        self._resultpool.submit(go, masks, unpadded_sizes, result_queues)
+        self._resultpool.submit(go, results, unpadded_sizes, result_queues)
 
     def _gpu_thread_main(self):
         while not self._terminate:
@@ -2142,13 +2156,14 @@ class AsyncLeafChecker:
                         break
                 if len(reqs) > 0:
                     # Do the work
-                    out_masks = {}
+                    out_results = {}
                     out_unpadded_sizes = {}
-                    out_queues = [r[4] for r in reqs]
-                    leaf_futs_dict = {r[0]: i for i, r in enumerate(reqs)}
+                    out_queues = [r[5] for r in reqs]
+                    leaf_futs_dict = {r[1]: i for i, r in enumerate(reqs)}
                     for fut in concurrent.futures.as_completed(leaf_futs_dict):
                         i = leaf_futs_dict[fut]
                         (
+                            checktype,
                             _vecs_fut,
                             vecs_len,
                             caps_fut,
@@ -2157,13 +2172,28 @@ class AsyncLeafChecker:
                         ) = reqs[i]
                         vecs = fut.result()
                         query_centers, query_max_cos_distances = caps_fut.result()
-                        out_mask = vectors_in_caps(
-                            vecs, query_centers, query_max_cos_distances
-                        )
-                        out_masks[i] = out_mask
+                        if checktype == self.CheckType.MASK:
+                            result = vectors_in_caps(
+                                vecs,
+                                query_centers,
+                                query_max_cos_distances,
+                                need_counts=False,
+                                need_bools=True,
+                            )
+                        elif checktype == self.CheckType.COUNTS:
+                            result = vectors_in_caps(
+                                vecs,
+                                query_centers,
+                                query_max_cos_distances,
+                                need_counts=True,
+                                need_bools=False,
+                            )
+                        else:
+                            assert False, f"unexpected checktype {checktype}"
+                        out_results[i] = result
                         out_unpadded_sizes[i] = (vecs_len, query_len)
 
-                    self._return_results(out_masks, out_unpadded_sizes, out_queues)
+                    self._return_results(out_results, out_unpadded_sizes, out_queues)
             except Exception as e:
                 print(f"AsyncLeafChecker thread got exception: {e}")
                 raise e
