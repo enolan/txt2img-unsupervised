@@ -18,6 +18,7 @@ import queue
 import tempfile
 import threading
 import time
+import traceback
 import types
 import weakref
 
@@ -2194,6 +2195,7 @@ class AsyncLeafChecker:
                 print(
                     f"AsyncLeafChecker._return_results/go got exception {type(e).__name__}: {e}"
                 )
+                print(traceback.format_exc())
                 raise e
 
         self._resultpool.submit(go, results, unpadded_sizes, result_queues)
