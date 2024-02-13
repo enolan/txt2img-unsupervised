@@ -1623,24 +1623,43 @@ class CapTree:
             # check inside them.
             subtrees_to_check = np.any(intersecting, axis=0)
             assert subtrees_to_check.shape == (len(self.children),)
-            for i in np.arange(len(self.children))[subtrees_to_check]:
-                # Find the indices of the query caps that intersect this subtree
+
+            # Building the query cap arrays for the subtrees is surprisingly slow, so we do it in
+            # parallel.
+            def prep_query_arrays(i):
                 query_idxs_this_subtree = np.arange(len(query_centers))[
                     intersecting[:, i]
                 ]
-                assert len(query_idxs_this_subtree) > 0
-                query_centers_this_subtree = query_centers[query_idxs_this_subtree]
-                query_max_cos_distances_this_subtree = query_max_cos_distances[
-                    query_idxs_this_subtree
-                ]
-                # Recurse to get the geometric results and enqueue the leaf checks
-                subtree_res = self.children[i]._subtrees_in_caps_inner(
+                return (
+                    query_idxs_this_subtree,
+                    query_centers[query_idxs_this_subtree],
+                    query_max_cos_distances[query_idxs_this_subtree],
+                )
+
+            query_arrays_futs = {
+                self.threadpool.submit(prep_query_arrays, i): i
+                for i in range(np.count_nonzero(subtrees_to_check))
+            }
+
+            for fut in concurrent.futures.as_completed(query_arrays_futs):
+                i = query_arrays_futs[fut]
+                (
+                    query_idxs_this_subtree,
                     query_centers_this_subtree,
                     query_max_cos_distances_this_subtree,
+                ) = fut.result()
+                assert (
+                    len(query_centers_this_subtree)
+                    == len(query_max_cos_distances_this_subtree)
+                    == len(query_idxs_this_subtree)
                 )
                 ret.rec.setdefault(i, []).append(
                     self._subtrees_in_caps_rec_entry_checked(
-                        query_idxs_this_subtree, subtree_res
+                        query_idxs=query_idxs_this_subtree,
+                        rec=self.children[i]._subtrees_in_caps_inner(
+                            query_centers_this_subtree,
+                            query_max_cos_distances_this_subtree,
+                        ),
                     )
                 )
 
