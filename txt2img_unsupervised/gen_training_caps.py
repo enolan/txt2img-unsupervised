@@ -131,7 +131,6 @@ def gen_training_examples_from_tree(
     captree,
     rng,
     batch_size,
-    inner_batch_size=4096,
     stop_after=None,
     density_estimate_samples=512,
     with_replacement=False,
@@ -197,7 +196,6 @@ def gen_training_examples_from_tree(
                     this_cap_centers,
                     this_max_cos_distances,
                     density_estimate_samples=density_estimate_samples,
-                    batch_size=inner_batch_size,
                 )
 
                 empty_cap_mask = this_sampled_idxs == -1
@@ -353,7 +351,6 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--stop-after", type=int, default=None)
     parser.add_argument("--density-estimate-samples", type=int, default=512)
-    parser.add_argument("--sample-inner-batch-size", type=int, default=4096)
     parser.add_argument("--replacement", action="store_true")
     parser.add_argument("--no-save-cache", action="store_false", dest="save_cache")
     args = parser.parse_args()
@@ -373,7 +370,6 @@ def main():
         args.batch_size,
         stop_after=args.stop_after,
         density_estimate_samples=args.density_estimate_samples,
-        inner_batch_size=args.sample_inner_batch_size,
         with_replacement=args.replacement,
     )
     save_training_data(caps_dset, args.out)

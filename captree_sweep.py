@@ -12,14 +12,11 @@ def gen_params(used_params):
     while True:
         k = random.choice([64, 128, 256, 512])
         outlier_removal_level = random.uniform(0.0, 1.0)
-        iters = random.choice([64])
+        iters = random.choice([16])
         batch_size = random.choice([4096])
         while True:
             max_leaf_size = random.choice(
                 [
-                    64,
-                    128,
-                    256,
                     512,
                     1024,
                     2048,
@@ -50,7 +47,7 @@ def gen_params(used_params):
 
 
 def params_to_path(params):
-    return Path("sweep-captrees") / "-".join(
+    return Path("/mnt/sweeps") / "-".join(
         f"{k}={v}" for k, v in sorted(params.items())
     )
 
@@ -62,12 +59,10 @@ def build_tree(params):
         "python",
         "gen_captree.py",
         "--pq-dir",
-        "/home/enolan/datasets/preprocessed/128x128-randomcrops",
+        "/mnt/datasets/128x128-randomcrops",
         "--read-dup-blacklist",
-        "dup-blacklist-new.json",
+        "dup-blacklist.json",
         "--thin",
-        "--subset",
-        "200_000", # FIXME: Remove this
         "--k",
         str(params["k"]),
         "--outlier-removal-level",
@@ -88,7 +83,7 @@ def build_tree(params):
     start = time.monotonic()
     subprocess.check_call(cmdline)
     end = time.monotonic()
-    print("Tree built")
+    print(f"Tree built in {end - start} seconds")
 
     return save_dir, end - start
 
@@ -126,7 +121,7 @@ def gen_examples(tree_path, k):
 def main():
     used_params = set()
     try:
-        with open("sweep-captrees/results-2024-02-10.json", "r") as f:
+        with open("/mnt/sweeps/results-2024-02-10.json", "r") as f:
             for line in f:
                 params = json.loads(line)["params"]
                 used_params.add(
@@ -146,7 +141,7 @@ def main():
         print(f"Params: {params}")
         tree_dir, build_time = build_tree(params)
         ex_path, gen_time = gen_examples(tree_dir, params["k"])
-        with open("sweep-captrees/results-2024-02-10.json", "a") as f:
+        with open("/mnt/sweeps/results-2024-02-10.json", "a") as f:
             json.dump(
                 {
                     "params": params,
