@@ -404,7 +404,12 @@ def vectors_in_cap(vs, cap_center, max_cos_distance):
 
 @partial(jax.jit, static_argnames=("need_counts", "need_bools"))
 def vectors_in_caps(
-    vs, cap_centers, max_cos_distances, need_counts=False, need_bools=True
+    vs,
+    cap_centers,
+    max_cos_distances,
+    need_counts=False,
+    need_bools=True,
+    unpadded_vec_count=None,
 ):
     """Check which vectors in vs are in the caps defined by cap_centers and max_cos_distances.
     If need_counts is True returns the number of matching vectors for each cap, if need_bools is
@@ -419,6 +424,8 @@ def vectors_in_caps(
     assert cap_centers.shape[0] == max_cos_distances.shape[0]
     assert need_counts or need_bools
     print(f"Tracing vectors_in_caps for vs {vs.shape[0]}, caps {cap_centers.shape[0]}")
+    if unpadded_vec_count is None:
+        unpadded_vec_count = len(vs)
 
     mask = jax.vmap(vectors_in_cap, in_axes=(None, 0, 0))(
         vs, cap_centers, max_cos_distances
@@ -426,6 +433,8 @@ def vectors_in_caps(
     mask = rearrange(mask, "c v -> v c")
     assert mask.shape == (len(vs), len(cap_centers)), f"mask.shape: {mask.shape}"
     if need_counts:
+        # ensure we don't count matches for the padding vectors
+        mask = jnp.where(jnp.arange(len(vs))[:, None] < unpadded_vec_count, mask, False)
         counts = jnp.sum(mask, axis=0)
     if need_counts and not need_bools:
         return counts
@@ -2243,12 +2252,12 @@ class AsyncLeafChecker:
                                 query_max_cos_distances,
                                 need_counts=True,
                                 need_bools=False,
+                                unpadded_vec_count=vecs_len,
                             )
                         else:
                             assert False, f"unexpected checktype {checktype}"
                         out_results[i] = result
                         out_unpadded_sizes[i] = (vecs_len, query_len)
-
                     self._return_results(out_results, out_unpadded_sizes, out_queues)
             except Exception as e:
                 print(f"AsyncLeafChecker thread got exception: {e}")
