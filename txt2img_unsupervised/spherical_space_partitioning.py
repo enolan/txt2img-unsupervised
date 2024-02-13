@@ -1313,9 +1313,9 @@ class CapTree:
             ), f"{matching_cnts.shape}"
             positive_samples[query_caps_to_test, i] = in_caps.T
             densities[query_caps_to_test, j] = matching_cnts / density_estimate_samples
+            del in_caps
 
         del sampled_vecs
-        del in_caps
         estimated_matching_sizes = densities * sizes
         assert estimated_matching_sizes.shape == (query_cnt, len(self.children))
 
