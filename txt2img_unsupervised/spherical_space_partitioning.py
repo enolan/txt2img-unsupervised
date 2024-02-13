@@ -2296,6 +2296,56 @@ class AsyncLeafChecker:
             raise e
 
 
+@hyp.settings(
+    deadline=timedelta(seconds=30),
+)
+@given(
+    st.tuples(st.integers(1, 256), st.integers(1, 256), st.integers(2, 4)).flatmap(
+        lambda x: st.tuples(
+            _unit_vecs(st.just((x[0], x[2]))),
+            _unit_vecs(st.just((x[1], x[2]))),
+            hyp_np.arrays(np.float32, (x[1],), elements=st.floats(0.0, 2.0, width=32)),
+        )
+    )
+)
+def test_async_leaf_checker_single(vals):
+    """Test the AsyncLeafChecker on a single leaf."""
+    leaf_vecs, query_centers, query_max_cos_distances = vals
+    leaf_dset = infinidata.TableView({"clip_embedding": leaf_vecs})
+    checker = AsyncLeafChecker()
+    res_async = checker.submit_and_wait(
+        AsyncLeafChecker.CheckType.COUNTS,
+        leaf_dset,
+        query_centers,
+        query_max_cos_distances,
+    )
+
+    max_cos_distances_narrow = np.maximum(0, query_max_cos_distances - 0.01)
+    max_cos_distances_wide = np.minimum(2.0, query_max_cos_distances + 0.01)
+    res_immediate_narrow = vectors_in_caps(
+        leaf_vecs,
+        query_centers,
+        max_cos_distances_narrow,
+        need_counts=True,
+        need_bools=False,
+    )
+    res_immediate_wide = vectors_in_caps(
+        leaf_vecs,
+        query_centers,
+        max_cos_distances_wide,
+        need_counts=True,
+        need_bools=False,
+    )
+    res_immediate_narrow, res_immediate_wide = jax.device_get(
+        (res_immediate_narrow, res_immediate_wide)
+    )
+    for q_idx in range(len(query_centers)):
+        assert (
+            res_immediate_narrow[q_idx] <= res_async[q_idx]
+            and res_async[q_idx] <= res_immediate_wide[q_idx]
+        )
+
+
 class QuantitySemaphore:
     """A generalization of a semaphore that allows acquiring and releasing arbitrary amounts. This
     is a Haskell QSem. Further generalized to support multiple simultaneous quantities, where the
@@ -2329,6 +2379,53 @@ class QuantitySemaphore:
                 self._values[q] <= self._initial
             ), "QSem: can't release more than the initial amount"
             self._condition.notify_all()
+
+
+@hyp.settings(
+    deadline=timedelta(seconds=30),
+)
+@given(
+    st.integers(2, 4).flatmap(
+        lambda d: st.tuples(
+            _unit_vecs(st.tuples(st.integers(1, 32), st.just(d))),
+            st.lists(
+                st.integers(1, 32).flatmap(
+                    lambda n_queries: st.tuples(
+                        _unit_vecs(st.just((n_queries, d))),
+                        hyp_np.arrays(
+                            np.float32,
+                            (n_queries,),
+                            elements=st.floats(0.0, 2.0, width=32),
+                        ),
+                    )
+                ),
+            ),
+        )
+    )
+)
+def test_async_leaf_checker_multiple(vals):
+    """Test the AsyncLeafChecker on multiple leaves simultaneously."""
+    leaf_vecs, query_blocks = vals
+    leaf_dset = infinidata.TableView({"clip_embedding": leaf_vecs})
+    checker = AsyncLeafChecker()
+    res_async = []
+    for queries, max_cos_distances in query_blocks:
+        res_async.append(
+            checker.submit_and_return_func(
+                AsyncLeafChecker.CheckType.COUNTS, leaf_dset, queries, max_cos_distances
+            )
+        )
+    res_immediate = [
+        vectors_in_caps(
+            leaf_vecs, queries, max_cos_distances, need_counts=True, need_bools=False
+        )
+        for queries, max_cos_distances in query_blocks
+    ]
+    res_immediate = jax.device_get(res_immediate)
+    res_async_done = [f() for f in res_async]
+
+    for i in range(len(res_async_done)):
+        np.testing.assert_array_equal(res_async_done[i], res_immediate[i])
 
 
 @hyp.settings(
