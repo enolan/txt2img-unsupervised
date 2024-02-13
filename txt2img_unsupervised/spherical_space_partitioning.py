@@ -2046,7 +2046,9 @@ class AsyncLeafChecker:
         # max cosine distances, their pre-padding lengths, and result queues for sending the
         # results back.
         self._workqueue = queue.Queue()
-        self._qsem = QuantitySemaphore(max_inflight_vectors)
+        self._qsem = QuantitySemaphore(
+            max_inflight_vectors, n_quantities=jax.device_count()
+        )
 
         # Thread pool for loading from Infinidata
         self._loaderpool = concurrent.futures.ThreadPoolExecutor(
@@ -2078,10 +2080,15 @@ class AsyncLeafChecker:
         padded_queries_len = round_up_to_multiple(
             len(query_centers), self._queries_padding
         )
-        self._qsem.acquire(padded_vecs_len + padded_queries_len)
+        device_idx = self._qsem.acquire(padded_vecs_len + padded_queries_len)
+        print(
+            f"Acquired {padded_vecs_len + padded_queries_len} qsem vectors for device #{device_idx}"
+        )
+        device = jax.devices()[device_idx]
         vecs_fut = self._loaderpool.submit(
             lambda dset: jax.device_put(
-                pad_to_multiple(dset[:]["clip_embedding"], self._vecs_padding)[0]
+                pad_to_multiple(dset[:]["clip_embedding"], self._vecs_padding)[0],
+                device=device,
             ),
             leaf_dset,
         )
@@ -2094,7 +2101,8 @@ class AsyncLeafChecker:
                 query_max_cos_distances, self._queries_padding
             )[0]
             return jax.device_put(
-                (query_centers_padded, query_max_cos_distances_padded)
+                (query_centers_padded, query_max_cos_distances_padded),
+                device=device,
             )
 
         caps_fut = self._loaderpool.submit(
@@ -2165,16 +2173,27 @@ class AsyncLeafChecker:
                     len(unpadded_vecs_lens) == len(unpadded_query_lens) == len(results)
                 )
                 results_np = jax.device_get(results)
+                dev_idxs = []
+                for i in range(len(results)):
+                    res = results[i]
+                    devices = res.devices()
+                    assert len(devices) == 1
+                    dev_idxs.append(devices.pop().id)
                 del results
-                padded_vecs_count = sum(
-                    round_up_to_multiple(l, self._vecs_padding)
-                    for l in unpadded_vecs_lens
-                )
-                padded_queries_count = sum(
-                    round_up_to_multiple(l, self._queries_padding)
-                    for l in unpadded_query_lens
-                )
-                self._qsem.release(padded_vecs_count + padded_queries_count)
+                for i in range(len(results_np)):
+                    padded_vecs_len = round_up_to_multiple(
+                        unpadded_vecs_lens[i], self._vecs_padding
+                    )
+                    padded_queries_len = round_up_to_multiple(
+                        unpadded_query_lens[i], self._queries_padding
+                    )
+                    print(
+                        f"Releasing {padded_vecs_len + padded_queries_len} qsem vectors for "
+                        + f"device #{dev_idxs[i]}"
+                    )
+                    self._qsem.release(
+                        padded_vecs_len + padded_queries_len, dev_idxs[i]
+                    )
                 for i in range(len(results_np)):
                     if len(results_np[i].shape) == 1:
                         # counts
@@ -2279,30 +2298,35 @@ class AsyncLeafChecker:
 
 class QuantitySemaphore:
     """A generalization of a semaphore that allows acquiring and releasing arbitrary amounts. This
-    is a Haskell QSem."""
+    is a Haskell QSem. Further generalized to support multiple simultaneous quantities, where the
+    highest value inner semaphore is acquired first. This is useful for AsyncLeafChecker on
+    multiple GPUs."""
 
-    def __init__(self, initial):
+    def __init__(self, initial, n_quantities=1):
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
-        self._value = initial
+        self._values = np.repeat(initial, n_quantities)
         self._initial = initial
+        self._n_quantities = n_quantities
 
     def acquire(self, amount):
         if amount > self._initial:
             raise ValueError("Can't acquire more than the initial amount")
         with self._lock:
-            while self._value < amount:
+            while np.all(self._values < amount):
                 self._condition.wait()
-            self._value -= amount
+            chosen_q = np.argmax(self._values)
+            self._values[chosen_q] -= amount
+            return chosen_q
 
-    def release(self, amount):
+    def release(self, amount, q):
         with self._lock:
             assert (
-                self._value + amount <= self._initial
+                self._values[q] + amount <= self._initial
             ), f"QSem: tried to release {amount} when value was {self._value} which would exceed the initial value of {self._initial}"
-            self._value += amount
+            self._values[q] += amount
             assert (
-                self._value <= self._initial
+                self._values[q] <= self._initial
             ), "QSem: can't release more than the initial amount"
             self._condition.notify_all()
 
