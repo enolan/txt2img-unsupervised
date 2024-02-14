@@ -563,7 +563,7 @@ def test_clip_caps_do_anything() -> None:
     assert not jnp.allclose(logits_all, logits_full_range, rtol=0, atol=1e-3)
 
 
-@partial(jax.jit, static_argnums=(0,))
+@partial(jax.jit, static_argnums=(0,), inline=True)
 def sample(
     mdl: ImageModel,
     params: dict[str, Any],

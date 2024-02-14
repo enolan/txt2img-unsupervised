@@ -9,8 +9,10 @@ import PIL.Image
 import torch
 import transformers
 from copy import copy
-from einops import repeat
+from einops import rearrange, repeat
 from flax.core import freeze
+from functools import partial
+from jax.experimental import mesh_utils
 from omegaconf import OmegaConf
 from pathlib import Path
 from random import randint
@@ -20,6 +22,7 @@ from typing import Tuple
 from . import ldm_autoencoder
 from .ldm_autoencoder import LDMAutoencoder
 from .transformer_model import ImageModel, ModelConfig, gpt_1_config, sample
+
 
 def can_make_grid(n: int) -> bool:
     return (n**0.5) % 1 == 0
@@ -33,20 +36,22 @@ def batches_split(batch_size: int, n: int) -> list[int]:
     return split
 
 
-sample_v = jax.jit(
-    jax.vmap(
-        lambda params, clip_embedding, cos_sim_lower, cos_sim_upper, rng: sample(
-            im_mdl,
+@partial(jax.jit, static_argnums=(0,))
+def sample_jv(mdl, params, top_p, clip_embeddings, max_cos_distances, rng):
+    return jax.vmap(
+        lambda clip_embedding, max_cos_distance, rng: sample(
+            mdl,
             params,
             clip_embedding,
-            cos_sim_lower,
-            cos_sim_upper,
+            max_cos_distance,
             rng,
-            args.top_p,
-        ),
-        in_axes=(None, 0, 0, 0, 0),
+            top_p,
+        )
+    )(
+        clip_embeddings,
+        max_cos_distances,
+        jax.random.split(rng, len(clip_embeddings)),
     )
-)
 
 
 def make_grid(
@@ -76,29 +81,27 @@ def make_grid(
 
 def parse_cond_str(s: str) -> dict:
     """Parse a string for conditioning in either of the following formats:
-    "condition" - no cones
-    "condition:0.1:0.45" - cones with cosine similarity bounds
+    "condition" - no caps
+    "condition:0.8" - caps with max cosine distances
     """
     if ":" in s:
-        cond, cos_sim_lower, cos_sim_upper = s.split(":")
-        cos_sim_lower = jnp.array(float(cos_sim_lower))
-        cos_sim_upper = jnp.array(float(cos_sim_upper))
+        cond, max_cos_distance = s.split(":")
+        max_cos_distance = jnp.array(float(max_cos_distance))
     else:
         cond = s
-        cos_sim_lower = cos_sim_upper = None
+        max_cos_distance = None
     return {
         "cond": cond,
-        "cos_sim_lower": cos_sim_lower,
-        "cos_sim_upper": cos_sim_upper,
+        "max_cos_distance": max_cos_distance,
     }
 
 
 def print_cond_debug(d: dict, name: str) -> None:
     print(
-        f"Computed CLIP embedding for {name}, shape {d['clip_embedding'].shape}, norm {jnp.linalg.norm(d['clip_embedding'])}, cos sim bounds "
+        f"Computed CLIP embedding for {name}, shape {d['clip_embedding'].shape}, norm {jnp.linalg.norm(d['clip_embedding'])}, max cosine distance: "
         + (
-            f"{d['cos_sim_lower']:.4f} - {d['cos_sim_upper']:.4f}"
-            if d["cos_sim_lower"] is not None
+            f"{d['max_cos_distance']:.4f}"
+            if d["max_cos_distance"] is not None
             else "not used"
         )
     )
@@ -115,7 +118,7 @@ def parse_cond_img(s: str, clip_mdl, clip_processor) -> dict:
     clip_embedding = clip_mdl.get_image_features(**clip_inputs)[0].astype(jnp.float32)
     clip_embedding = clip_embedding / jnp.linalg.norm(clip_embedding)
 
-    d["clip_embedding"] = clip_embedding
+    d["clip_embedding"] = jax.device_get(clip_embedding)
 
     print_cond_debug(d, f"image {path}")
 
@@ -132,10 +135,143 @@ def parse_cond_txt(s: str, clip_mdl, clip_processor) -> dict:
     clip_embedding = clip_mdl.get_text_features(**clip_inputs)[0].astype(jnp.float32)
     clip_embedding = clip_embedding / jnp.linalg.norm(clip_embedding)
 
-    d["clip_embedding"] = clip_embedding
+    d["clip_embedding"] = jax.device_get(clip_embedding)
     print_cond_debug(d, f"text {txt}")
 
     return d
+
+
+def sample_loop(
+    mdl,
+    model_cfg,
+    params,
+    ae_mdl,
+    ae_params,
+    batch_size,
+    cap_centers,
+    max_cos_distances,
+    rng,
+    top_p,
+):
+    """Sample a bunch of images and return PIL images. cap_centers should have shape
+    (n, cap_centers, 768) and max_cos_distances should have shape (n, cap_centers) where n is the
+    number of images to sample, unless clip caps is off, in which case the cap centers dimension
+    disappears from cap_centers and max_cos_distances should be None."""
+
+    assert model_cfg.clip_conditioning, "unconditioned model is deprecated"
+    assert isinstance(cap_centers, np.ndarray)
+
+    sharding = jax.sharding.PositionalSharding(
+        mesh_utils.create_device_mesh((jax.device_count(),))
+    )
+
+    if model_cfg.clip_caps:
+        assert isinstance(max_cos_distances, np.ndarray)
+        assert len(cap_centers.shape) == 3
+        assert len(max_cos_distances.shape) == 2
+        assert cap_centers.shape[0] == max_cos_distances.shape[0]
+        assert cap_centers.shape[1] == model_cfg.clip_cap_count
+        assert max_cos_distances.shape[1] == model_cfg.clip_cap_count
+    else:
+        assert max_cos_distances is None
+        assert len(cap_centers.shape) == 2
+        assert cap_centers.shape[1] == 768
+    assert batch_size % jax.device_count() == 0
+    assert (len(cap_centers) % batch_size) % jax.device_count() == 0
+
+    # Sample from the transformer model
+    batches = batches_split(batch_size, len(cap_centers))
+    sampled_codes_arrs = []
+    with tqdm(total=len(cap_centers), desc="sampling", unit="img") as pbar:
+        ctr = 0
+        for batch in batches:
+            rng, rng2 = jax.random.split(rng)
+            if model_cfg.clip_caps:
+                cap_centers_batch = cap_centers[ctr : ctr + batch]
+                cap_centers_sharded = jax.device_put(
+                    cap_centers_batch,
+                    sharding.reshape((jax.device_count(), 1, 1)),
+                )
+                max_cos_distances_batch = max_cos_distances[ctr : ctr + batch]
+                max_cos_distances_sharded = jax.device_put(
+                    max_cos_distances_batch,
+                    sharding.reshape((jax.device_count(), 1)),
+                )
+                codes = sample_jv(
+                    mdl,
+                    params,
+                    top_p,
+                    cap_centers_sharded,
+                    max_cos_distances_sharded,
+                    rng2,
+                )
+                sampled_codes_arrs.append(jax.device_get(codes))
+            else:
+                cap_centers_batch = cap_centers[ctr : ctr + batch]
+                cap_centers_sharded = jax.device_put(
+                    cap_centers_batch,
+                    sharding.reshape((jax.device_count(), 1)),
+                )
+                codes = sample_jv(
+                    mdl,
+                    params,
+                    top_p,
+                    cap_centers_sharded,
+                    jnp.zeros((batch, 0), dtype=jnp.float32),
+                    rng2,
+                )
+                sampled_codes_arrs.append(jax.device_get(codes))
+            pbar.update(batch)
+            ctr += batch
+
+    sampled_codes = np.concatenate(sampled_codes_arrs, axis=0)
+    assert sampled_codes.shape == (
+        len(cap_centers),
+        model_cfg.image_tokens,
+    ), f"{sampled_codes.shape} != {(len(cap_centers), model_cfg.image_tokens)}"
+
+    ae_res = int(model_cfg.image_tokens**0.5)
+    decoded_imgs = []
+    # Decode the sampled codes
+    with tqdm(total=len(cap_centers), desc="decoding", unit="img") as pbar:
+        ctr = 0
+        for batch in batches:
+            codes_batch = sampled_codes[ctr : ctr + batch]
+            codes_sharded = jax.device_put(
+                codes_batch,
+                sharding.reshape((jax.device_count(), 1)),
+            )
+            imgs = ldm_autoencoder.decode_jv(
+                ae_mdl, ae_params, (ae_res, ae_res), codes_sharded
+            )
+            decoded_imgs.append(jax.device_get(imgs))
+            pbar.update(batch)
+            ctr += batch
+
+    decoded_imgs = np.concatenate(decoded_imgs, axis=0)
+    assert decoded_imgs.shape[0] == len(cap_centers)
+
+    pil_imgs = []
+    for img in tqdm(decoded_imgs, desc="PILifying", unit="img"):
+        pil_imgs.append(PIL.Image.fromarray(img))
+    return pil_imgs
+
+
+def mk_filler_caps(model_cfg, n_cap_sets, n_used_caps, rng):
+    """Make caps with max cosine distance 2 and random centers to fill in all but n_used_caps cap
+    slots. These caps *should* have no effect on the output, since they don't restrict the space of
+    valid embeddings at all. Filler caps are necessary for prompting models with >1 cap slot.
+    """
+    assert model_cfg.clip_caps
+    assert n_used_caps <= model_cfg.clip_cap_count
+    centers = jax.random.normal(
+        rng, (n_cap_sets, model_cfg.clip_cap_count - n_used_caps, 768)
+    )
+    centers = centers / jnp.linalg.norm(centers, axis=-1, keepdims=True)
+    max_cos_distances = np.full(
+        (n_cap_sets, model_cfg.clip_cap_count - n_used_caps), 2, dtype=jnp.float32
+    )
+    return np.asarray(centers), max_cos_distances
 
 
 if __name__ == "__main__":
@@ -157,9 +293,9 @@ if __name__ == "__main__":
     # grids.
     if args.make_grids:
         if can_make_grid(args.n):
-            grid_imgs = [list(range(args.n))]
+            grid_img_idxs = [list(range(args.n))]
         elif args.n % 2 == 0 and can_make_grid(args.n / 2):
-            grid_imgs = [list(range(args.n // 2)), list(range(args.n // 2, args.n))]
+            grid_img_idxs = [list(range(args.n // 2)), list(range(args.n // 2, args.n))]
         else:
             print(f"Can't make grids out of {args.n} images")
             exit(1)
@@ -195,9 +331,6 @@ if __name__ == "__main__":
         )
         clip_processor = transformers.AutoProcessor.from_pretrained(clip_mdl_name)
 
-        assert (
-            args.cond_img is not None or args.cond_txt is not None
-        ), "Must specify --cond-img or --cond-txt"
         print("Computing CLIP embeddings...")
         cond_img_dicts = [
             parse_cond_img(s, clip_mdl, clip_processor) for s in (args.cond_img or [])
@@ -207,94 +340,62 @@ if __name__ == "__main__":
         ]
         cond_dicts = cond_img_dicts + cond_txt_dicts
 
-        if model_cfg.clip_cones:
+        if model_cfg.clip_caps:
             total_conds = len(cond_dicts)
             assert all(
-                [d["cos_sim_lower"] is not None for d in cond_dicts]
-            ), "Must specify cosine similarity bounds"
+                [d["max_cos_distance"] is not None for d in cond_dicts]
+            ), "Must specify max cosine distance"
             assert (
-                total_conds <= model_cfg.clip_cone_count
-            ), "Too many CLIP embeddings for the number of cones"
+                total_conds <= model_cfg.clip_cap_count
+            ), "Too many CLIP embeddings for the number of caps"
 
-            clip_embeddings_cond = jnp.stack([d["clip_embedding"] for d in cond_dicts])
-            cos_sim_lower_cond = jnp.stack([d["cos_sim_lower"] for d in cond_dicts])
-            cos_sim_upper_cond = jnp.stack([d["cos_sim_upper"] for d in cond_dicts])
+            if total_conds == 0:
+                # unconditioned sampling
+                clip_embeddings_cond = np.zeros((0, 768))
+                max_cos_distances_cond = np.zeros(0)
+            else:
+                clip_embeddings_cond = np.stack(
+                    [d["clip_embedding"] for d in cond_dicts]
+                )
+                max_cos_distances_cond = np.stack(
+                    [d["max_cos_distance"] for d in cond_dicts]
+                )
             assert clip_embeddings_cond.shape == (total_conds, 768)
-            assert cos_sim_lower_cond.shape == (total_conds,)
-            assert cos_sim_upper_cond.shape == (total_conds,)
+            assert max_cos_distances_cond.shape == (total_conds,)
 
-            fill_cones = model_cfg.clip_cone_count - total_conds
             rng, rng2 = jax.random.split(rng)
-            fill_clips = jax.random.normal(rng2, (fill_cones, 768), dtype=jnp.float32)
-            fill_clips = fill_clips / jnp.linalg.norm(
-                fill_clips, axis=-1, keepdims=True
+            fill_cap_centers, fill_max_cos_distances = mk_filler_caps(
+                model_cfg, 1, total_conds, rng2
             )
-            print(f"Fill CLIP norms: {jnp.linalg.norm(fill_clips, axis=-1)}")
-            fill_cos_sim_lower = jnp.full((fill_cones,), -1.0)
-            fill_cos_sim_upper = jnp.full((fill_cones,), 1.0)
+            fill_cap_centers = rearrange(fill_cap_centers, "1 cap clip -> cap clip")
+            fill_max_cos_distances = rearrange(fill_max_cos_distances, "1 cap -> cap")
+            print(f"Fill cap center norms: {np.linalg.norm(fill_cap_centers, axis=-1)}")
 
-            clip_embeddings = jnp.concatenate([clip_embeddings_cond, fill_clips])
-            cos_sims_lower = jnp.concatenate([cos_sim_lower_cond, fill_cos_sim_lower])
-            cos_sims_upper = jnp.concatenate([cos_sim_upper_cond, fill_cos_sim_upper])
-
-            assert clip_embeddings.shape == (model_cfg.clip_cone_count, 768)
-            assert (
-                cos_sims_lower.shape
-                == cos_sims_upper.shape
-                == (model_cfg.clip_cone_count,)
+            cap_centers = np.concatenate([clip_embeddings_cond, fill_cap_centers])
+            max_cos_distances = np.concatenate(
+                [max_cos_distances_cond, fill_max_cos_distances]
             )
+
+            assert cap_centers.shape == (model_cfg.clip_cap_count, 768)
+            assert max_cos_distances.shape == (model_cfg.clip_cap_count,)
+            cap_centers = repeat(cap_centers, "cap clip -> n cap clip", n=args.n)
+            max_cos_distances = repeat(max_cos_distances, "cap -> n cap", n=args.n)
         else:
             assert (
                 len(cond_dicts) == 1
-            ), "Can only specify one CLIP embedding without clip cones"
+            ), "Can only specify one CLIP embedding without clip caps"
             clip_embeddings = cond_dicts[0]["clip_embedding"]
             assert clip_embeddings.shape == (768,)
             assert all(
-                [d["cos_sim_lower"] is None for d in cond_dicts]
-            ), "Can't specify cosine similarity bounds without clip cones"
-            cos_sims_lower = cos_sims_upper = jnp.zeros((0,), dtype=jnp.float32)
+                [d["max_cos_distance"] is None for d in cond_dicts]
+            ), "Can't specify max cosine distance without clip caps"
+            cap_centers = repeat(clip_embeddings, "clip -> n clip", n=args.n)
+            max_cos_distances = None
 
     else:
         assert (
             args.cond_img is None and args.cond_txt is None
         ), "Can't specify --cond-img or --cond-txt without CLIP conditioning"
-
-    print("Sampling encoded images from the transformer model...")
-
-    with tqdm(total=args.n, unit="img") as pbar:
-        encoded_imgs = []
-        for batch_size in batches_split(args.batch_size, args.n):
-            rng, rng2 = jax.random.split(rng)
-            # Repeat stuff to match batch size
-            if im_mdl.clip_conditioning and not im_mdl.clip_cones:
-                clip_embeddings_v = repeat(clip_embeddings, "d -> n d", n=batch_size)
-                cos_sims_lower_v = cos_sims_upper_v = jnp.zeros(
-                    (batch_size, 0), dtype=jnp.float32
-                )
-            elif im_mdl.clip_conditioning and im_mdl.clip_cones:
-                clip_embeddings_v = repeat(
-                    clip_embeddings, "cones d -> n cones d", n=batch_size
-                )
-                cos_sims_lower_v = repeat(
-                    cos_sims_lower, "cones -> n cones", n=batch_size
-                )
-                cos_sims_upper_v = repeat(
-                    cos_sims_upper, "cones -> n cones", n=batch_size
-                )
-            else:
-                clip_embeddings = cos_sims_lower = cos_sims_upper = jnp.zeros(
-                    (batch_size, 0), dtype=jnp.float32
-                )
-            encoded_imgs.append(
-                sample_v(
-                    im_params,
-                    clip_embeddings_v,
-                    cos_sims_lower_v,
-                    cos_sims_upper_v,
-                    jax.random.split(rng2, batch_size),
-                )
-            )
-            pbar.update(batch_size)
 
     print("Loading autoencoder model...")
     ae_res = int(model_cfg.image_tokens**0.5)
@@ -307,29 +408,27 @@ if __name__ == "__main__":
         torch.load(args.autoencoder_checkpoint, map_location="cpu"), cfg=ae_cfg
     )
 
-    print("Decoding images...")
+    imgs = sample_loop(
+        mdl=im_mdl,
+        model_cfg=model_cfg,
+        params=im_params,
+        ae_mdl=ae_mdl,
+        ae_params=ae_params,
+        batch_size=args.batch_size,
+        cap_centers=cap_centers,
+        max_cos_distances=max_cos_distances,
+        rng=rng,
+        top_p=args.top_p,
+    )
+
     args.out_dir.mkdir(exist_ok=True)
 
-    decoded_imgs = []
-    with tqdm(total=args.n, unit="img") as pbar:
-        for encoded_img_batch in encoded_imgs:
-            decoded_imgs.append(
-                ldm_autoencoder.decode_jv(
-                    ae_mdl, ae_params, (ae_res, ae_res), encoded_img_batch
-                )
-            )
-            pbar.update(len(encoded_img_batch))
-    decoded_imgs = np.concatenate(decoded_imgs, axis=0)
-
     print("Saving images...")
-    imgs = []
-    for i, img in enumerate(tqdm(decoded_imgs, unit="img")):
-        img = PIL.Image.fromarray(np.array(img))
+    for i, img in enumerate(tqdm(imgs, unit="img")):
         img.save(args.out_dir / f"{i:04d}.png")
-        imgs.append(img)
 
     if args.make_grids:
-        print(f"Making {len(grid_imgs)} grids...")
-        for i, indices in enumerate(grid_imgs):
+        print(f"Making {len(grid_img_idxs)} grids...")
+        for i, indices in tqdm(enumerate(grid_img_idxs)):
             grid_imgs = [imgs[i] for i in indices]
             make_grid(grid_imgs).save(args.out_dir / f"grid_{i:04d}.png")
