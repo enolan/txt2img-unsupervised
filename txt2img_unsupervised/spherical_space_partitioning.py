@@ -1742,12 +1742,19 @@ class CapTree:
                 query_max_cos_distances,
             )
 
+            # It's important to manually drop query_centers and query_max_cos_distances, because
+            # otherwise they're part of process_res's closure and won't be deallocated until the
+            # leaves are resolved.
+            query_cnt = len(query_centers)
+            del query_centers
+            del query_max_cos_distances
+
             def process_res():
                 # Wait for the leaf check to finish and process the results into match counts
                 matching_cnts = in_caps_f()
-                assert matching_cnts.shape == (len(query_centers),)
+                assert matching_cnts.shape == (query_cnt,)
                 matches = []
-                matching_queries = np.arange(len(query_centers))[matching_cnts > 0]
+                matching_queries = np.arange(query_cnt)[matching_cnts > 0]
                 for i in matching_queries:
                     matches.append(
                         self._subtrees_in_caps_top_entry(
