@@ -2114,9 +2114,6 @@ class AsyncLeafChecker:
             len(query_centers), self._queries_padding
         )
         device_idx = self._qsem.acquire(padded_vecs_len + padded_queries_len)
-        print(
-            f"Acquired {padded_vecs_len + padded_queries_len} qsem vectors for device #{device_idx}"
-        )
         device = jax.devices()[device_idx]
         vecs_fut = self._loaderpool.submit(
             lambda dset: jax.device_put(
@@ -2219,10 +2216,6 @@ class AsyncLeafChecker:
                     )
                     padded_queries_len = round_up_to_multiple(
                         unpadded_query_lens[i], self._queries_padding
-                    )
-                    print(
-                        f"Releasing {padded_vecs_len + padded_queries_len} qsem vectors for "
-                        + f"device #{dev_idxs[i]}"
                     )
                     self._qsem.release(
                         padded_vecs_len + padded_queries_len, dev_idxs[i]
