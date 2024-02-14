@@ -1138,9 +1138,9 @@ def test_clip_caps_overfit():
 
     params_rng, sample_rng = jax.random.split(jax.random.PRNGKey(42), 2)
     # run get-test-data.sh to download this
-    dset_all = load_pq_to_infinidata(Path(__file__).parent.parent / "test-images/examples-100.pq").shuffle(
-        seed=420_69
-    )
+    dset_all = load_pq_to_infinidata(
+        Path(__file__).parent.parent / "test-images/examples-100.pq"
+    ).shuffle(seed=420_69)
     dset_train = dset_all.new_view(slice(None, -16))
     dset_test = dset_all.new_view(slice(-16, None))
 
