@@ -346,16 +346,25 @@ sample_jv = jax.jit(
 )
 
 # CLIP embeddings to use for diagnostic sampling
-embeddings_to_sample = 8
+image_prompts_to_sample = 8
 
 
-def get_clip_embeddings_to_sample(n: int, dset) -> jax.Array:
-    """Find n hopefully SFW CLIP embeddings to use for diagnostic sampling."""
-
-    # Must match model used in preprocessor
+def get_clip_mdl():
+    """Get the CLIP model and processor."""
+    # The model must match the one used in the preprocessor
     clip_mdl_name = "openai/clip-vit-large-patch14"
     clip_mdl = transformers.FlaxCLIPModel.from_pretrained(clip_mdl_name)
     clip_processor = transformers.AutoProcessor.from_pretrained(clip_mdl_name)
+    return clip_mdl, clip_processor
+
+
+clip_mdl, clip_processor = get_clip_mdl()
+
+
+def get_image_prompt_clip_embeddings(
+    clip_mdl, clip_processor, n: int, dset
+) -> jax.Array:
+    """Find n hopefully SFW CLIP embeddings to use for diagnostic sampling."""
 
     text_tokens = clip_processor.tokenizer("nsfw", return_tensors="jax", padding=True)
     nsfw_text_features = clip_mdl.get_text_features(**text_tokens)
@@ -371,16 +380,171 @@ def get_clip_embeddings_to_sample(n: int, dset) -> jax.Array:
     assert (
         len(ok_indices) >= n
     ), f"Found {len(ok_indices)} images with similarity < 0.2, expected at least {n}"
+    print(f"Using {[dset['name'][i] for i in ok_indices[:n]]} for diagnostic sampling")
     return {
         "clip_embedding": clip_embeds[ok_indices[:n]],
         "name": dset["name"][ok_indices[:n]],
     }
 
 
-# TODO test text prompts as well as images
-sampling_clips = get_clip_embeddings_to_sample(embeddings_to_sample, test_imgs[:2048])
+def get_clip_text_embeddings_to_sample(n: int) -> jax.Array:
+    """Generate some text embeddings to test the model with."""
+    prompts = [
+        "Barack Obama riding a bicycle",
+        "a painting of a cat",
+        "The Golden Gate Bridge at sunset",
+        "Samoyed puppies!",
+        "Taylor Swift in concert",
+        "Manhattan from above #dronephotography",
+        "my favorite art car from Burning Man 2018",
+        "engineering diagram of an internal combustion engine",
+    ]
+    assert n <= len(prompts), "write more prompts?"
+    text_tokens = clip_processor(prompts, return_tensors="jax", padding=True)
+    text_features = clip_mdl.get_text_features(**text_tokens)
+    text_embeds = text_features / jnp.linalg.norm(text_features, axis=1, keepdims=True)
+    assert text_embeds.shape == (len(prompts), 768)
+    return {
+        "clip_embedding": text_embeds[:n],
+        "name": np.array(prompts)[:n],
+    }
 
-print(f"Using {[name for name in sampling_clips['name']]} for diagnostic sampling")
+
+image_prompt_clips = get_image_prompt_clip_embeddings(
+    clip_mdl, clip_processor, image_prompts_to_sample, test_imgs[:2048]
+)
+text_prompt_clips = get_clip_text_embeddings_to_sample(8)
+
+del clip_mdl, clip_processor
+
+
+def mk_image_prompt_conditions(image_prompt_clips, grid_size):
+    """Make conditioning data for the image prompts."""
+    assert image_prompt_clips.shape[1] == 768
+    # Use a larger and a smaller cap. The smaller cap should generate images that are very
+    # similar to the image prompt, the larger one should generate images that are semantically
+    # similar but not necessarily visually similar.
+    if model_cfg.clip_caps:
+        max_cos_distance_choices = jnp.array([0.75, 0.4], dtype=jnp.float32)
+
+        samples_count = (
+            len(image_prompt_clips) * len(max_cos_distance_choices) * grid_size
+        )
+
+        # With more than one cap slot, we fill in the unused ones with caps that cover the entire
+        # space.
+        cap_centers_fill, cap_max_cos_distances_fill = sample.mk_filler_caps(
+            model_cfg, samples_count, 1, jax.random.PRNGKey(20240214)
+        )
+        cap_centers_fill = rearrange(
+            cap_centers_fill,
+            "(n ds g) cap clip -> n ds g cap clip",
+            n=len(image_prompt_clips),
+            ds=len(max_cos_distance_choices),
+            g=grid_size,
+        )
+        cap_max_cos_distances_fill = rearrange(
+            cap_max_cos_distances_fill,
+            "(n ds g) cap -> n ds g cap",
+            n=len(image_prompt_clips),
+            ds=len(max_cos_distance_choices),
+            g=grid_size,
+        )
+        cap_centers_cond = repeat(
+            image_prompt_clips,
+            "n clip -> n ds g 1 clip",
+            ds=len(max_cos_distance_choices),
+            g=grid_size,
+        )
+        cap_max_cos_distances_cond = repeat(
+            max_cos_distance_choices,
+            "ds -> n ds g 1",
+            n=len(image_prompt_clips),
+            g=grid_size,
+        )
+
+        cap_centers = jnp.concatenate([cap_centers_cond, cap_centers_fill], axis=3)
+        cap_max_cos_distances = jnp.concatenate(
+            [cap_max_cos_distances_cond, cap_max_cos_distances_fill], axis=3
+        )
+        assert cap_centers.shape == (
+            len(image_prompt_clips),
+            len(max_cos_distance_choices),
+            grid_size,
+            model_cfg.clip_cap_count,
+            768,
+        )
+        assert cap_max_cos_distances.shape == (
+            len(image_prompt_clips),
+            len(max_cos_distance_choices),
+            grid_size,
+            model_cfg.clip_cap_count,
+        )
+        assert np.prod(cap_centers.shape[:3]) == samples_count
+        return cap_centers, cap_max_cos_distances, max_cos_distance_choices
+    else:
+        samples_count = len(image_prompt_clips) * grid_size
+        clip_embeddings = repeat(
+            image_prompt_clips,
+            "n clip -> n g clip",
+            g=grid_size,
+        )
+        assert np.prod(clip_embeddings.shape[:2]) == samples_count
+        return clip_embeddings, None
+
+
+def mk_txt_prompt_conditions(text_prompt_clips, grid_size):
+    """Make conditioning data for the text prompts."""
+    assert text_prompt_clips.shape[1] == 768
+    samples_count = len(text_prompt_clips) * grid_size
+    if model_cfg.clip_caps:
+        cap_centers_fill, cap_max_cos_distances_fill = sample.mk_filler_caps(
+            model_cfg, samples_count, 1, jax.random.PRNGKey(20240214)
+        )
+        cap_centers_fill = rearrange(
+            cap_centers_fill,
+            "(prompt g) cap clip -> prompt g cap clip",
+            prompt=len(text_prompt_clips),
+            g=grid_size,
+        )
+        cap_max_cos_distances_fill = rearrange(
+            cap_max_cos_distances_fill,
+            "(prompt g) cap -> prompt g cap",
+            prompt=len(text_prompt_clips),
+            g=grid_size,
+        )
+
+        cap_centers_cond = repeat(
+            text_prompt_clips, "prompt clip -> prompt g 1 clip", g=grid_size
+        )
+        cap_max_cos_distances_cond = np.full(
+            (len(text_prompt_clips), grid_size, 1), 0.75
+        )
+
+        cap_centers = np.concatenate([cap_centers_cond, cap_centers_fill], axis=2)
+        cap_max_cos_distances = np.concatenate(
+            [cap_max_cos_distances_cond, cap_max_cos_distances_fill], axis=2
+        )
+
+        assert cap_centers.shape == (
+            len(text_prompt_clips),
+            grid_size,
+            model_cfg.clip_cap_count,
+            768,
+        )
+        assert cap_max_cos_distances.shape == (
+            len(text_prompt_clips),
+            grid_size,
+            model_cfg.clip_cap_count,
+        )
+        return cap_centers, cap_max_cos_distances
+    else:
+        clip_embeddings = repeat(
+            text_prompt_clips, "prompt clip -> prompt g clip", g=grid_size
+        )
+        assert clip_embeddings.shape == (len(text_prompt_clips), grid_size, 768)
+        return clip_embeddings, None
+
 
 ae_cfg = OmegaConf.load(args.ae_cfg)["model"]["params"]
 ae_mdl = LDMAutoencoder(ae_cfg)
@@ -397,268 +561,185 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
         # Create a grid of samples for each set of conditions.
         grid_size = 9
 
-        conditioning_names = sampling_clips["name"]
+        image_prompt_names = image_prompt_clips["name"]
+        text_prompt_texts = text_prompt_clips["name"]
 
         if model_cfg.clip_caps:
-            # One set of samples should be "semantically" similar but not necessarily a very
-            # similar image, the second set should be very similar. NB this is all conjecture at
-            # this point.
-            max_cos_distance_choices = jnp.array([0.75, 0.4], dtype=jnp.float32)
-
-            samples_count = (
-                embeddings_to_sample * len(max_cos_distance_choices) * grid_size
-            )
-            assert (samples_count % training_cfg.batch_size) % jax.device_count() == 0
-
-            # We fill any extra cap slots with ones that cover all possible embeddings - have max
-            # cosine distance 2 - and choose the centers randomly.
-            # 🤔 is this the right way to prompt it? Alternatively, we could repeat the cap in
-            # every slot.
-            cap_centers_fill = jax.random.normal(
-                jax.random.PRNGKey(20231213),
-                (
-                    embeddings_to_sample,
-                    len(max_cos_distance_choices),
-                    grid_size,
-                    model_cfg.clip_cap_count - 1,
-                    768,
-                ),
-            )
-            cap_centers_fill = cap_centers_fill / jnp.linalg.norm(
-                cap_centers_fill, axis=-1, keepdims=True
-            )
-            assert cap_centers_fill.shape == (
-                embeddings_to_sample,
-                len(max_cos_distance_choices),
-                grid_size,
-                model_cfg.clip_cap_count - 1,
-                768,
+            (
+                img_cap_centers,
+                img_max_cos_distances,
+                img_max_cos_distance_choices,
+            ) = mk_image_prompt_conditions(
+                image_prompt_clips["clip_embedding"], grid_size
             )
 
-            clip_embeddings = sampling_clips["clip_embedding"]
-            assert clip_embeddings.shape == (
-                embeddings_to_sample,
-                768,
+            img_centers_for_sampling = rearrange(
+                img_cap_centers,
+                "prompts ds grid cap clip -> (prompts ds grid) cap clip",
             )
-            clip_embeddings = rearrange(
-                clip_embeddings,
-                "embeddings_to_sample clip_dim -> embeddings_to_sample 1 clip_dim",
-            )
-            clip_embeddings = repeat(
-                clip_embeddings,
-                "embeddings_to_sample 1 clip_dim -> embeddings_to_sample ds g 1 clip_dim",
-                ds=len(max_cos_distance_choices),
-                g=grid_size,
+            img_max_cos_distances_for_sampling = rearrange(
+                img_max_cos_distances,
+                "prompts ds grid cap -> (prompts ds grid) cap",
             )
 
-            cap_centers = jnp.concatenate([clip_embeddings, cap_centers_fill], axis=3)
-            assert cap_centers.shape == (
-                embeddings_to_sample,
-                len(max_cos_distance_choices),
-                grid_size,
-                model_cfg.clip_cap_count,
-                768,
+            text_cap_centers, text_max_cos_distances = mk_txt_prompt_conditions(
+                text_prompt_clips["clip_embedding"], grid_size
             )
 
-            max_cos_distances_fill = jnp.full(
-                (
-                    embeddings_to_sample,
-                    len(max_cos_distance_choices),
-                    grid_size,
-                    model_cfg.clip_cap_count - 1,
-                ),
-                2,
-                dtype=jnp.float32,
+            text_centers_for_sampling = rearrange(
+                text_cap_centers,
+                "prompts grid cap clip -> (prompts grid) cap clip",
             )
-            max_cos_distances_cond = repeat(
-                max_cos_distance_choices,
-                "ds -> embeddings_to_sample ds g 1",
-                embeddings_to_sample=embeddings_to_sample,
-                g=grid_size,
+            text_max_cos_distances_for_sampling = rearrange(
+                text_max_cos_distances,
+                "prompts grid cap -> (prompts grid) cap",
             )
 
-            max_cos_distances = jnp.concatenate(
-                [max_cos_distances_cond, max_cos_distances_fill], axis=3
+            all_centers_for_sampling = np.concatenate(
+                [img_centers_for_sampling, text_centers_for_sampling], axis=0
             )
-            assert max_cos_distances.shape == (
-                embeddings_to_sample,
-                len(max_cos_distance_choices),
-                grid_size,
-                model_cfg.clip_cap_count,
-            )
-
-            centers_for_sharding = rearrange(
-                cap_centers,
-                "embeddings_to_sample ds g c w -> (embeddings_to_sample ds g) c w",
-            )
-            sharded_centers = jax.device_put(
-                centers_for_sharding, sharding.reshape(jax.device_count(), 1, 1)
+            all_max_cos_distances_for_sampling = np.concatenate(
+                [
+                    img_max_cos_distances_for_sampling,
+                    text_max_cos_distances_for_sampling,
+                ],
+                axis=0,
             )
 
-            max_cos_distances_for_sharding = rearrange(
-                max_cos_distances,
-                "embeddings_to_sample ds g c -> (embeddings_to_sample ds g) c",
+            imgs_list = sample.sample_loop(
+                mdl,
+                model_cfg,
+                ts.params,
+                ae_mdl,
+                ae_params,
+                training_cfg.batch_size,
+                all_centers_for_sampling,
+                all_max_cos_distances_for_sampling,
+                ts.rng,
+                0.95,
             )
-            sharded_max_cos_distances = jax.device_put(
-                max_cos_distances_for_sharding, sharding
+            # sample_loop returns a list of PIL image objects, but we want to rearrange them back
+            # so we make a numpy array. Numpy is *very* overeager to convert the PIL objects into
+            # pixel arrays so we use this dumb hack.
+            imgs = np.empty((len(imgs_list),), dtype=object)
+            imgs[:] = imgs_list
+            assert imgs.shape == (
+                len(all_centers_for_sampling),
+            ), f"imgs.shape {imgs.shape}"
+
+            img_imgs = imgs[: len(img_centers_for_sampling)]
+            text_imgs = imgs[len(img_centers_for_sampling) :]
+            assert len(img_imgs) == len(img_centers_for_sampling)
+            assert len(text_imgs) == len(text_centers_for_sampling)
+            img_imgs = rearrange(
+                img_imgs,
+                "(prompts ds grid)-> prompts ds grid",
+                prompts=len(image_prompt_names),
+                ds=len(img_max_cos_distance_choices),
+                grid=grid_size,
             )
-
-            rngs = jax.random.split(ts.rng, samples_count)
-            rngs = jax.device_put(rngs, sharding)
-
-            assert (
-                len(centers_for_sharding)
-                == len(max_cos_distances_for_sharding)
-                == len(rngs)
-                == samples_count
+            text_imgs = rearrange(
+                text_imgs,
+                "(prompts grid) -> prompts grid",
+                prompts=len(text_prompt_texts),
+                grid=grid_size,
             )
-
-            batches = sample.batches_split(training_cfg.batch_size, samples_count)
-
-            sampled_codes = []
-
-            with tqdm(total=samples_count, desc="sampling", unit="img") as pbar:
-                for batch_size in batches:
-                    sampled_codes.append(
-                        sample_jv(
-                            ts.params,
-                            sharded_centers[:batch_size],
-                            sharded_max_cos_distances[:batch_size],
-                            rngs[:batch_size],
-                            jnp.full(batch_size, 0.95),  # fixed top-p value
-                        )
-                    )
-                    sharded_centers = sharded_centers[batch_size:]
-                    sharded_max_cos_distances = sharded_max_cos_distances[batch_size:]
-                    rngs = rngs[batch_size:]
-
-                    pbar.update(batch_size)
 
             tqdm.write(
-                f"Sampled {len(sampled_codes)} batches of codes, 1st shape {sampled_codes[0].shape}"
+                f"Sampled grids of shapes {img_imgs.shape} and {text_imgs.shape}"
             )
-
-            ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
-
-            sampled_imgs = []
-            with tqdm(total=samples_count, desc="decoding", unit="img") as pbar:
-                for codes_batch in sampled_codes:
-                    sampled_imgs.append(
-                        ldm_autoencoder.decode_jv(
-                            ae_mdl, ae_params, mdl.output_shape_tokens(), codes_batch
-                        )
-                    )
-                    pbar.update(len(codes_batch))
-            imgs_np = np.concatenate(sampled_imgs)
-            tqdm.write(f"Decoded images, overall shape {imgs_np.shape}")
-
-            assert imgs_np.shape[0] == samples_count
-
-            grid_imgs = rearrange(
-                imgs_np,
-                "(embeddings_to_sample ds g) w h c -> embeddings_to_sample ds g w h c",
-                embeddings_to_sample=embeddings_to_sample,
-                ds=len(max_cos_distance_choices),
-                g=grid_size,
-            )
-            tqdm.write(f"Made grids of shape: {grid_imgs.shape}")
 
             to_log = {"global_step": global_step}
 
-            for i, name in enumerate(conditioning_names):
-                for j, dist in enumerate(max_cos_distance_choices):
+            for i, name in enumerate(image_prompt_names):
+                for j, dist in enumerate(img_max_cos_distance_choices):
                     grid_pil = sample.make_grid(
-                        [PIL.Image.fromarray(np.array(img)) for img in grid_imgs[i, j]],
+                        [img for img in img_imgs[i, j]],
                     )
-                    to_log[f"samples/{name}/max_dist{dist:.2f}"] = wandb.Image(grid_pil)
+                    to_log[
+                        f"samples/imgprompts/{name}/max_dist{dist:.2f}"
+                    ] = wandb.Image(grid_pil)
 
+            for i, name in enumerate(text_prompt_clips["name"]):
+                grid_pil = sample.make_grid(
+                    [img for img in text_imgs[i]],
+                )
+                to_log[f"samples/txtprompts/{name}"] = wandb.Image(grid_pil)
             wandb.log(to_log)
         else:
-            samples_count = embeddings_to_sample * grid_size
-            assert (samples_count % training_cfg.batch_size) % jax.device_count() == 0
-
-            conditioning_embeds_rep = repeat(
-                sampling_clips["clip_embedding"],
-                "clips clip_dim -> (clips g) clip_dim",
-                g=grid_size,
-                clip_dim=768,
+            img_clip_embeddings, _ = mk_image_prompt_conditions(
+                image_prompt_clips["clip_embedding"], grid_size
             )
-            conditioning_embeds_rep = jax.device_put(conditioning_embeds_rep, sharding)
-
-            cos_sim_lower_rep = jax.device_put(jnp.zeros((samples_count, 0)), sharding)
-            cos_sim_upper_rep = jax.device_put(jnp.zeros((samples_count, 0)), sharding)
-            top_ps_rep = jax.device_put(jnp.full((samples_count,), 0.95), sharding)
-
-            rngs = jax.random.split(ts.rng, samples_count)
-            rngs = jax.device_put(rngs, sharding)
-
-            assert (
-                len(conditioning_embeds_rep)
-                == len(top_ps_rep)
-                == len(cos_sim_lower_rep)
-                == len(cos_sim_upper_rep)
-                == len(rngs)
-                == samples_count
+            img_clip_embeddings_for_sampling = rearrange(
+                img_clip_embeddings,
+                "prompts grid clip -> (prompts grid) clip",
+            )
+            text_clip_embeddings, _ = mk_txt_prompt_conditions(
+                text_prompt_clips["clip_embedding"], grid_size
+            )
+            text_clip_embeddings_for_sampling = rearrange(
+                text_clip_embeddings,
+                "prompts grid clip -> (prompts grid) clip",
             )
 
-            batches = sample.batches_split(
+            all_clip_embeddings_for_sampling = np.concatenate(
+                [img_clip_embeddings_for_sampling, text_clip_embeddings_for_sampling],
+                axis=0,
+            )
+
+            imgs_list = sample.sample_loop(
+                mdl,
+                model_cfg,
+                ts.params,
+                ae_mdl,
+                ae_params,
                 training_cfg.batch_size,
-                len(conditioning_embeds_rep),
+                all_clip_embeddings_for_sampling,
+                None,
+                ts.rng,
+                0.95,
             )
 
-            sampled_codes = []
+            imgs = np.empty((len(imgs_list),), dtype=object)
+            imgs[:] = imgs_list
+            assert imgs.shape == (
+                len(all_clip_embeddings_for_sampling),
+            ), f"imgs.shape {imgs.shape}"
 
-            with tqdm(total=samples_count, desc="sampling", unit="img") as pbar:
-                for batch_size in batches:
-                    sampled_codes.append(
-                        sample_jv(
-                            ts.params,
-                            conditioning_embeds_rep[:batch_size],
-                            cos_sim_lower_rep[:batch_size],
-                            cos_sim_upper_rep[:batch_size],
-                            rngs[:batch_size],
-                            top_ps_rep[:batch_size],
-                        )
-                    )
-                    conditioning_embeds_rep = conditioning_embeds_rep[batch_size:]
-                    cos_sim_lower_rep = cos_sim_lower_rep[batch_size:]
-                    cos_sim_upper_rep = cos_sim_upper_rep[batch_size:]
-                    rngs = rngs[batch_size:]
-                    top_ps_rep = top_ps_rep[batch_size:]
-
-                    pbar.update(batch_size)
-
-            ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
-
-            sampled_imgs = []
-            with tqdm(total=samples_count, desc="decoding", unit="img") as pbar:
-                for codes_batch in sampled_codes:
-                    sampled_imgs.append(
-                        ldm_autoencoder.decode_jv(
-                            ae_mdl, ae_params, mdl.output_shape_tokens(), codes_batch
-                        )
-                    )
-                    pbar.update(len(codes_batch))
-            imgs_np = np.concatenate(sampled_imgs)
-
-            assert imgs_np.shape[0] == samples_count
-
-            grid_imgs = rearrange(
-                imgs_np,
-                "(clips g) w h c -> clips g w h c",
-                clips=embeddings_to_sample,
-                g=grid_size,
+            img_imgs = imgs[: len(img_clip_embeddings_for_sampling)]
+            text_imgs = imgs[len(img_clip_embeddings_for_sampling) :]
+            assert len(img_imgs) == len(img_clip_embeddings_for_sampling)
+            assert len(text_imgs) == len(text_clip_embeddings_for_sampling)
+            img_imgs = rearrange(
+                img_imgs,
+                "(prompts grid)-> prompts grid",
+                prompts=len(image_prompt_names),
+                grid=grid_size,
             )
-            tqdm.write(f"Made grids of shape: {grid_imgs.shape}")
-            assert grid_imgs.shape[0] == embeddings_to_sample
+            text_imgs = rearrange(
+                text_imgs,
+                "(prompts grid) -> prompts grid",
+                prompts=len(text_prompt_texts),
+                grid=grid_size,
+            )
+
+            tqdm.write(
+                f"Sampled grids of shape: {img_imgs.shape} and {text_imgs.shape}"
+            )
 
             to_log = {"global_step": global_step}
 
-            for i, name in enumerate(conditioning_names):
+            for i, name in enumerate(image_prompt_names):
                 grid_pil = sample.make_grid(
-                    [PIL.Image.fromarray(np.array(img)) for img in grid_imgs[i]],
+                    [img for img in img_imgs[i]],
                 )
-                to_log[f"samples/{name}"] = wandb.Image(grid_pil)
+                to_log[f"samples/imgprompts/{name}"] = wandb.Image(grid_pil)
+
+            for i, name in enumerate(text_prompt_clips["name"]):
+                grid_pil = sample.make_grid(
+                    [img for img in text_imgs[i]],
+                )
+                to_log[f"samples/txtprompts/{name}"] = wandb.Image(grid_pil)
 
             wandb.log(to_log)
     else:
@@ -694,8 +775,6 @@ def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
         clip_embeddings = jnp.zeros((imgs_to_sample, 0), dtype=jnp.float32)
 
         samples = sample_jv(ts.params, clip_embeddings, rngs, img_top_ps)
-
-        ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
 
         decoded = sample.decode_jv(ae_mdl, ae_params, samples)
         decoded = np.array(decoded)
