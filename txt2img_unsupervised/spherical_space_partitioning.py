@@ -1946,11 +1946,10 @@ class CapTree:
 
         # We concatenate all the leaves into one big dataset before saving to disk. This is a bit
         # more complicated (especially loading) but lets the parquet compression work much better.
-        if thin:
-            dsets = [leaf.dset_thin for leaf in self.leaves()]
-        else:
-            dsets = [leaf.dset for leaf in self.leaves()]
+        dsets = [leaf.dset for leaf in self.leaves()]
         dset_all = infinidata.TableView.concat(dsets)
+        if thin:
+            dset_all = dset_all.select_columns({"clip_embedding"})
 
         for k, v in dset_all[0].items():
             assert (
