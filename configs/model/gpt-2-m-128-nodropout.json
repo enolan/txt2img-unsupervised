@@ -1,0 +1,13 @@
+{
+  "d_model": 1280,
+  "num_heads": 20,
+  "ff_dim": 3072,
+  "dropout": null,
+  "n_layers": 36,
+  "image_tokens": 1024,
+  "use_biases": true,
+  "activations_dtype": "bfloat16",
+  "activation_function": "gelu",
+  "clip_conditioning": true,
+  "clip_caps": false
+}
