@@ -269,12 +269,21 @@ def setup_optimizer(
     else:
         clip_embedding_dummy = jnp.zeros((0,), dtype=jnp.float32)
 
+    rngs_dummy = {"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)}
+    image_dummy = jnp.zeros((model_cfg.image_tokens,), dtype=jnp.int32)
     params_empty = mdl.init(
-        rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
-        image=jnp.zeros((model_cfg.image_tokens,), dtype=jnp.int32),
+        rngs=rngs_dummy,
+        image=image_dummy,
         clip_embedding=clip_embedding_dummy,
         max_cos_distance=max_cos_distance_dummy,
     )
+    table_str = mdl.tabulate(
+        rngs=rngs_dummy,
+        image=image_dummy,
+        clip_embedding=clip_embedding_dummy,
+        max_cos_distance=max_cos_distance_dummy,
+    )
+    print(table_str)
 
     ts_empty = TrainState.create(
         apply_fn=mdl.apply, params=params_empty, tx=opt, rng=jax.random.PRNGKey(1337)
