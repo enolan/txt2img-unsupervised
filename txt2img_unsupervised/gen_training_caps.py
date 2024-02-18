@@ -131,6 +131,7 @@ def gen_training_examples_from_tree(
     captree,
     rng,
     batch_size,
+    merge_batch_size,
     stop_after=None,
     density_estimate_samples=512,
     with_replacement=False,
@@ -273,29 +274,34 @@ def gen_training_examples_from_tree(
             tqdm.write(
                 f"Unique results: {len(unique_idxs_idxs)} = {unique_pct}% of total"
             )
+
+            sampled_cap_centers_this_run_arr = sampled_cap_centers_this_run_arr[
+                unique_idxs_idxs
+            ]
+            sampled_max_cos_distances_this_run_arr = (
+                sampled_max_cos_distances_this_run_arr[unique_idxs_idxs]
+            )
             sampled_rows_orig = captree.dset.new_view(unique_idxs)
             sampled_rows_merged = []
             for rows_orig_batch_idx, rows_orig_batch in enumerate(
                 tqdm(
                     sampled_rows_orig.batch_iter(
-                        batch_size=batch_size,
+                        batch_size=merge_batch_size,
                         drop_last_batch=False,
                         readahead=8,
                         threads=8,
                     ),
-                    total=len(sampled_rows_orig) // batch_size,
+                    total=len(sampled_rows_orig) // merge_batch_size,
                     desc="building merged tableview",
                 )
             ):
-                start_idx = rows_orig_batch_idx * batch_size
+                start_idx = rows_orig_batch_idx * merge_batch_size
                 stop_idx = start_idx + len(rows_orig_batch["clip_embedding"])
                 cap_centers_this_batch = sampled_cap_centers_this_run_arr[
-                    unique_idxs_idxs
-                ][start_idx:stop_idx]
+                    start_idx:stop_idx
+                ]
                 cap_max_cos_distances_this_batch = (
-                    sampled_max_cos_distances_this_run_arr[unique_idxs_idxs][
-                        start_idx:stop_idx
-                    ]
+                    sampled_max_cos_distances_this_run_arr[start_idx:stop_idx]
                 )
                 assert (
                     rows_orig_batch["clip_embedding"].shape[0]
@@ -308,6 +314,8 @@ def gen_training_examples_from_tree(
                 } | rows_orig_batch
                 sampled_rows_merged.append(TableView(new_dict))
 
+            del sampled_cap_centers_this_run_arr
+            del sampled_max_cos_distances_this_run_arr
             if len(sampled_rows_merged) > 0:
                 sampled_rows.append(TableView.concat(sampled_rows_merged))
             if not with_replacement:
@@ -347,6 +355,7 @@ def main():
     )
     parser.add_argument("--tree-path", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=8192)
+    parser.add_argument("--merge-batch-size", type=int, default=150_000)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--stop-after", type=int, default=None)
@@ -368,6 +377,7 @@ def main():
         tree,
         rng,
         args.batch_size,
+        merge_batch_size=args.merge_batch_size,
         stop_after=args.stop_after,
         density_estimate_samples=args.density_estimate_samples,
         with_replacement=args.replacement,
