@@ -1001,30 +1001,16 @@ class CapTree:
             assert len(np.unique(sorted_idxs)) == len(
                 sorted_idxs
             ), "indices to delete must be unique"
-            # Build a list of slices, containing the contiguous regions we're keeping.
-            slices = []
 
-            start = 0
-            for idx in sorted_idxs:
-                if idx > start:
-                    slices.append(slice(start, idx))
-                start = idx + 1
-            if start < len(self):
-                slices.append(slice(start, len(self)))
-
-            # We try to avoid making a bunch of new views if we can. Each slice is a whole
-            # TableView, but if you're doing index arrays you can have as many of those in the same
-            # TableView as you like. The factor of 16 is totally made up.
-            if len(slices) * 16 < (len(self.dset) - len(sorted_idxs)):
-                dsets = [self.dset.new_view(s) for s in slices]
-                self.dset = infinidata.TableView.concat(dsets)
-                self.dset_thin = self.dset.select_columns({"clip_embedding"})
-            else:
-                idxs_to_keep = np.ones(len(self), dtype=np.bool_)
-                idxs_to_keep[sorted_idxs] = False
-                idxs_to_keep = np.arange(len(self))[idxs_to_keep]
-                self.dset = self.dset.new_view(idxs_to_keep)
-                self.dset_thin = self.dset_thin.new_view(idxs_to_keep)
+            # We could instead concatenate a bunch of slices of the TableView, which would save us
+            # some memory (in situations when we're removing relatively few items), but cost us more
+            # memory mappings. And since those are scarce (at least in Docker containers where I
+            # can't increase vm.max_map_count), we do it using an index array.
+            idxs_to_keep = np.ones(len(self), dtype=np.bool_)
+            idxs_to_keep[sorted_idxs] = False
+            idxs_to_keep = np.arange(len(self))[idxs_to_keep]
+            self.dset = self.dset.new_view(idxs_to_keep)
+            self.dset_thin = self.dset.select_columns({"clip_embedding"})
             self.len = len(self.dset)
             assert len(self.dset) == len(self.dset_thin) == len(self)
             assert len(self) == start_len - len(sorted_idxs)
