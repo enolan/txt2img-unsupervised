@@ -383,6 +383,8 @@ def main():
                 "Saving captree after taking everything out of it makes no sense dude"
             )
             exit(1)
+    else:
+        captree_save_path = None
 
     caps_dset = gen_training_examples_from_tree(
         tree,
