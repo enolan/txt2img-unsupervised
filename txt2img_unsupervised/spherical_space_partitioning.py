@@ -2073,11 +2073,13 @@ class AsyncLeafChecker:
     def __init__(
         self, max_inflight_vectors=1024 * 512, vecs_padding=64, queries_padding=64
     ):
-        # The workqueue holds tuples of check types, futures of padded jax arrays of vectors, the
-        # pre-padding lengths of the vector arrays, futures of padded jax arrays of cap centers and
-        # max cosine distances, their pre-padding lengths, and result queues for sending the
-        # results back.
-        self._workqueue = queue.Queue()
+        n_devices = jax.device_count()
+
+        # One workqueue per GPU. A workqueue holds tuples of check types, futures of padded jax
+        # arrays of vectors, the pre-padding lengths of the vector arrays, futures of padded jax
+        # arrays of cap centers and max cosine distances, their pre-padding lengths, and result
+        # queues for sending the results back.
+        self._workqueues = [queue.Queue() for _ in range(n_devices)]
         self._qsem = QuantitySemaphore(
             max_inflight_vectors, n_quantities=jax.device_count()
         )
@@ -2097,10 +2099,16 @@ class AsyncLeafChecker:
         self._vecs_padding = vecs_padding
         self._queries_padding = queries_padding
 
-        self._gpu_thread = threading.Thread(
-            target=self._gpu_thread_main, daemon=True, name="AsyncLeafChecker"
-        )
-        self._gpu_thread.start()
+        self._gpu_threads = []
+        for i in range(n_devices):
+            thread = threading.Thread(
+                target=self._gpu_thread_main,
+                args=(i,),
+                daemon=True,
+                name="AsyncLeafChecker",
+            )
+            thread.start()
+            self._gpu_threads.append(thread)
 
     CheckType = Enum("CheckType", ["MASK", "COUNTS"])
 
@@ -2138,7 +2146,7 @@ class AsyncLeafChecker:
             caps_go, query_centers, query_max_cos_distances
         )
 
-        self._workqueue.put(
+        self._workqueues[device_idx].put(
             (
                 checktype,
                 vecs_fut,
@@ -2244,7 +2252,7 @@ class AsyncLeafChecker:
 
         self._resultpool.submit(go, results, unpadded_sizes, result_queues)
 
-    def _gpu_thread_main(self):
+    def _gpu_thread_main(self, n):
         while not self._terminate:
             try:
                 reqs = []
@@ -2254,10 +2262,10 @@ class AsyncLeafChecker:
                     # we loop. The timeout is important so we can check the terminate flag.
                     try:
                         if len(reqs) > 0:
-                            reqs.append(self._workqueue.get_nowait())
+                            reqs.append(self._workqueues[n].get_nowait())
                         else:
                             reqs.append(
-                                self._workqueue.get(
+                                self._workqueues[n].get(
                                     timeout=max(
                                         0.05 - (time.monotonic() - start_time), 0
                                     )
@@ -2315,7 +2323,8 @@ class AsyncLeafChecker:
             self._terminate = True
             self._loaderpool.shutdown(wait=True)
             self._resultpool.shutdown(wait=True)
-            self._gpu_thread.join()
+            for thread in self._gpu_threads:
+                thread.join()
         except Exception as e:
             print(f"AsyncLeafChecker shutdown got exception: {e}")
             raise e
