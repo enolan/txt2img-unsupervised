@@ -1920,7 +1920,9 @@ class CapTree:
                 if hasattr(self, "leaf_checker"):
                     self.leaf_checker.shutdown()
                 self.leaf_checker = AsyncLeafChecker(
-                    max_inflight_vectors=512 * 1024 * 1024 // (768 * 4)
+                    max_inflight_vectors=2 * 1024 * 1024 * 1024 // (768 * 4),
+                    vecs_padding=256,
+                    queries_padding=256,
                 )
                 weakref.finalize(self, self.leaf_checker.shutdown)
             if threadpool is not None:
