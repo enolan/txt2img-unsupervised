@@ -1029,6 +1029,10 @@ class CapTree:
             assert len(self.dset) == len(self.dset_thin) == len(self)
             assert len(self) == start_len - len(sorted_idxs)
         else:
+            # Take to save on some memory mappings so we don't run over vm.max_map_count
+            self.dset = None
+            self.dset_thin = None
+            self.dsets_contiguous = False
             children_to_delete = []
             for i, child in enumerate(self.children):
                 child_idxs_to_delete_mask = (idxs >= self.child_start_idxs[i]) & (
@@ -1063,7 +1067,6 @@ class CapTree:
                 self.child_cap_max_cos_distances = np.array(
                     [child.max_cos_distance for child in self.children]
                 )
-            self.dsets_contiguous = False
             self._make_contiguous()
         self.len = len(self.dset)
         assert len(self) == start_len - len(idxs)
