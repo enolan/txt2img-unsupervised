@@ -2124,10 +2124,12 @@ class AsyncLeafChecker:
             len(query_centers), self._queries_padding
         )
         device_idx = self._qsem.acquire(padded_vecs_len + padded_queries_len)
+        device = jax.devices()[device_idx]
         vecs_fut = self._loaderpool.submit(
-            lambda dset: pad_to_multiple(dset[:]["clip_embedding"], self._vecs_padding)[
-                0
-            ],
+            lambda dset: jax.device_put(
+                pad_to_multiple(dset[:]["clip_embedding"], self._vecs_padding)[0],
+                device=device,
+            ),
             leaf_dset,
         )
 
@@ -2138,7 +2140,10 @@ class AsyncLeafChecker:
             query_max_cos_distances_padded = pad_to_multiple(
                 query_max_cos_distances, self._queries_padding
             )[0]
-            return (query_centers_padded, query_max_cos_distances_padded)
+            return jax.device_put(
+                (query_centers_padded, query_max_cos_distances_padded),
+                device=device,
+            )
 
         caps_fut = self._loaderpool.submit(
             caps_go, query_centers, query_max_cos_distances
@@ -2199,6 +2204,10 @@ class AsyncLeafChecker:
         def go(results, unpadded_sizes, result_queues):
             try:
                 assert len(results) == len(unpadded_sizes)
+                unpadded_sizes = [
+                    (unpadded_sizes[i][0], unpadded_sizes[i][1])
+                    for i in range(len(unpadded_sizes))
+                ]
                 unpadded_vecs_lens, unpadded_query_lens = zip(*unpadded_sizes)
                 assert (
                     len(unpadded_vecs_lens) == len(unpadded_query_lens) == len(results)
@@ -2255,54 +2264,57 @@ class AsyncLeafChecker:
                     # Get requests from the queue until it's empty, or 50ms have passed, in which case
                     # we loop. The timeout is important so we can check the terminate flag.
                     try:
-                        reqs.append(
-                            self._workqueues[n].get(
-                                timeout=max(0.05 - (time.monotonic() - start_time), 0)
+                        if len(reqs) > 0:
+                            reqs.append(self._workqueues[n].get_nowait())
+                        else:
+                            reqs.append(
+                                self._workqueues[n].get(
+                                    timeout=max(
+                                        0.05 - (time.monotonic() - start_time), 0
+                                    )
+                                )
                             )
-                        )
                     except queue.Empty:
                         break
                 if len(reqs) > 0:
                     # Do the work
-                    out_results = []
-                    out_unpadded_sizes = []
+                    out_results = {}
+                    out_unpadded_sizes = {}
                     out_queues = [r[5] for r in reqs]
-                    vecs_cpu = [r[1].result() for r in reqs]
-                    caps_cpu = [r[3].result() for r in reqs]
-                    vecs_gpu, caps_gpu = jax.device_put(
-                        (vecs_cpu, caps_cpu), device=jax.devices()[n]
-                    )
-                    assert len(vecs_gpu) == len(caps_gpu) == len(reqs)
-                    for i in range(len(reqs)):
-                        query_centers, query_max_cos_distances = caps_gpu[i]
-                        vecs = vecs_gpu[i]
-                        checktype = reqs[i][0]
-                        vecs_len = reqs[i][2]
-                        query_len = reqs[i][4]
+                    leaf_futs_dict = {r[1]: i for i, r in enumerate(reqs)}
+                    for fut in concurrent.futures.as_completed(leaf_futs_dict):
+                        i = leaf_futs_dict[fut]
+                        (
+                            checktype,
+                            _vecs_fut,
+                            vecs_len,
+                            caps_fut,
+                            query_len,
+                            _result_queue,
+                        ) = reqs[i]
+                        vecs = fut.result()
+                        query_centers, query_max_cos_distances = caps_fut.result()
                         if checktype == self.CheckType.MASK:
-                            out_results.append(
-                                vectors_in_caps(
-                                    vecs,
-                                    query_centers,
-                                    query_max_cos_distances,
-                                    need_counts=False,
-                                    need_bools=True,
-                                )
+                            result = vectors_in_caps(
+                                vecs,
+                                query_centers,
+                                query_max_cos_distances,
+                                need_counts=False,
+                                need_bools=True,
                             )
                         elif checktype == self.CheckType.COUNTS:
-                            out_results.append(
-                                vectors_in_caps(
-                                    vecs,
-                                    query_centers,
-                                    query_max_cos_distances,
-                                    need_counts=True,
-                                    need_bools=False,
-                                    unpadded_vec_count=vecs_len,
-                                )
+                            result = vectors_in_caps(
+                                vecs,
+                                query_centers,
+                                query_max_cos_distances,
+                                need_counts=True,
+                                need_bools=False,
+                                unpadded_vec_count=vecs_len,
                             )
                         else:
                             assert False, f"unexpected checktype {checktype}"
-                        out_unpadded_sizes.append((vecs_len, query_len))
+                        out_results[i] = result
+                        out_unpadded_sizes[i] = (vecs_len, query_len)
                     self._return_results(out_results, out_unpadded_sizes, out_queues)
             except Exception as e:
                 print(f"AsyncLeafChecker thread got exception: {e}")
