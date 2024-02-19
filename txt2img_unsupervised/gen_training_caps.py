@@ -362,6 +362,7 @@ def main():
     parser.add_argument("--density-estimate-samples", type=int, default=512)
     parser.add_argument("--replacement", action="store_true")
     parser.add_argument("--no-save-cache", action="store_false", dest="save_cache")
+    parser.add_argument("--save-captree-path", type=Path, default=None)
     args = parser.parse_args()
 
     tree = CapTree.load_from_disk(args.tree_path, save_cache=args.save_cache)
@@ -372,6 +373,16 @@ def main():
     if args.out.exists():
         print(f"Output path {args.out} exists, exiting")
         exit(1)
+    if args.save_captree_path is not None:
+        captree_save_path = args.save_captree_path
+        if captree_save_path.exists():
+            print(f"Captree save path {captree_save_path} exists, exiting")
+            exit(1)
+        if args.stop_after is None:
+            print(
+                "Saving captree after taking everything out of it makes no sense dude"
+            )
+            exit(1)
 
     caps_dset = gen_training_examples_from_tree(
         tree,
@@ -383,6 +394,8 @@ def main():
         with_replacement=args.replacement,
     )
     save_training_data(caps_dset, args.out)
+    if captree_save_path is not None:
+        tree.save_to_disk(captree_save_path)
 
 
 if __name__ == "__main__":
