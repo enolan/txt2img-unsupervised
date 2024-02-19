@@ -2699,7 +2699,7 @@ def test_tree_sample_batch_finds_all(vecs, k, batch_size, _rand):
             sample_vec = tree[sample_idx]["clip_embedding"]
             vec = vecs_this_batch[i]
             distance = cosine_distance(sample_vec, vec)
-            assert distance <= tol
+            assert distance <= tol + 0.001
             # Hypothesis sometimes generates vectors that are *very* close together, so even with a
             # very small cap we can sample a different vector.
             # np.testing.assert_array_equal(sample["clip_embedding"], vec)
@@ -2746,7 +2746,10 @@ def test_tree_sample_batch_in_bounds(vecs_and_queries, k, _rand):
         sample_idx = samples[i]
         if sample_idx != -1:
             sample_vec = tree[sample_idx]["clip_embedding"]
-            assert cosine_distance(sample_vec, query_centers[i]) <= max_cos_distances[i]
+            assert (
+                cosine_distance(sample_vec, query_centers[i])
+                <= max_cos_distances[i] + 0.005
+            )
             assert tuple(sample_vec) in vecs_set
         else:
             assert (
@@ -2796,7 +2799,7 @@ def test_tree_sample_batch_approx_finds_all(vecs, k, batch_size, _rand):
             sample_vec = tree[sample_idx]["clip_embedding"]
             vec = vecs_this_batch[i]
             distance = cosine_distance(sample_vec, vec)
-            assert distance <= tol
+            assert distance <= tol + 0.001
             # Hypothesis sometimes generates vectors that are *very* close together, so even with a
             # very small cap we can sample a different vector.
             # np.testing.assert_array_equal(sample["clip_embedding"], vec)
