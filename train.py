@@ -21,6 +21,7 @@ from flax.training import train_state
 from functools import partial
 from itertools import islice
 from jax.experimental import mesh_utils
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from omegaconf import OmegaConf
 from pathlib import Path
 from sys import exit
@@ -561,7 +562,7 @@ ae_mdl = LDMAutoencoder(ae_cfg)
 ae_params_torch = torch.load(args.ae_ckpt, map_location="cpu")
 
 
-def sample_and_log(ts: TrainState, global_step: int, sharding) -> None:
+def sample_and_log(ts: TrainState, global_step: int) -> None:
     """Sample from the model and log to wandb."""
 
     ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
@@ -831,17 +832,21 @@ print(
     f"Sharding batches of {training_cfg.batch_size} across {jax.device_count()} devices, {training_cfg.batch_size / jax.device_count()} per device"
 )
 assert training_cfg.batch_size % jax.device_count() == 0
+# NamedSharding is overkill for the simple batch parallelism we do, but it's necessary to get orbax
+# to save checkpoints correctly.
 devices = mesh_utils.create_device_mesh((jax.device_count(),))
-sharding = jax.sharding.PositionalSharding(devices).reshape(jax.device_count(), 1)
+mesh = Mesh(devices, axis_names=("dev",))
 my_train_state = my_train_state.replace(
-    params=jax.device_put(my_train_state.params, sharding.replicate())
+    params=jax.device_put(
+        my_train_state.params, NamedSharding(mesh, PartitionSpec(None))
+    )
 )
 
 
 last_checkpoint_time = None
 
 
-def save_checkpoint_and_sample(my_train_state, global_step, sharding) -> None:
+def save_checkpoint_and_sample(my_train_state, global_step) -> None:
     # TPU VMs run out of disk space a lot. Retrying in a loop lets me manually clean up the disk
     tqdm.write("Attempting to save checkpoint")
     while True:
@@ -854,7 +859,7 @@ def save_checkpoint_and_sample(my_train_state, global_step, sharding) -> None:
             time.sleep(60)
     tqdm.write("Saved checkpoint")
     tqdm.write("Sampling")
-    sample_and_log(my_train_state, global_step, sharding)
+    sample_and_log(my_train_state, global_step)
     tqdm.write("Done sampling")
 
 
@@ -863,6 +868,7 @@ start_epoch = global_step // batches_per_epoch
 start_step = global_step % batches_per_epoch
 tqdm.write(f"Starting at epoch {start_epoch}, step {start_step}")
 
+examples_sharding = NamedSharding(mesh, PartitionSpec("dev"))
 for epoch in trange(
     start_epoch,
     epochs_total,
@@ -903,14 +909,14 @@ for epoch in trange(
             if last_checkpoint_time is None or (
                 datetime.datetime.now() - last_checkpoint_time
             ) > datetime.timedelta(minutes=30):
-                save_checkpoint_and_sample(my_train_state, global_step, sharding)
+                save_checkpoint_and_sample(my_train_state, global_step)
                 last_checkpoint_time = datetime.datetime.now()
 
-            batch_imgs = jax.device_put(batch["encoded_img"], sharding)
+            batch_imgs = jax.device_put(batch["encoded_img"], examples_sharding)
             if model_cfg.clip_conditioning and not model_cfg.clip_caps:
-                batch_clips = jax.device_put(batch["clip_embedding"], sharding)
+                batch_clips = jax.device_put(batch["clip_embedding"], examples_sharding)
                 batch_max_cos_distances = jax.device_put(
-                    jnp.zeros((batch_imgs.shape[0], 0)), sharding
+                    jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
                 )
             elif model_cfg.clip_conditioning and model_cfg.clip_caps:
                 batch_centers, batch_max_cos_distances = rearrange_batch_caps(
@@ -918,16 +924,16 @@ for epoch in trange(
                     batch["cap_max_cos_distance"],
                     model_cfg.clip_cap_count,
                 )
-                batch_clips = jax.device_put(batch_centers, sharding)
+                batch_clips = jax.device_put(batch_centers, examples_sharding)
                 batch_max_cos_distances = jax.device_put(
-                    batch_max_cos_distances, sharding
+                    batch_max_cos_distances, examples_sharding
                 )
             else:
                 batch_clips = jax.device_put(
-                    jnp.zeros((batch_imgs.shape[0], 0)), sharding
+                    jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
                 )
                 batch_max_cos_distances = jax.device_put(
-                    jnp.zeros((batch_imgs.shape[0], 0)), sharding
+                    jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
                 )
             my_train_state, loss, norm = train_step(
                 my_train_state, batch_imgs, batch_clips, batch_max_cos_distances
@@ -962,7 +968,7 @@ for epoch in trange(
     ):
         dropout_rng, rng = jax.random.split(my_train_state.rng, 2)
         my_train_state = my_train_state.replace(rng=rng)
-        batch_imgs = jax.device_put(batch["encoded_img"], sharding)
+        batch_imgs = jax.device_put(batch["encoded_img"], examples_sharding)
         if model_cfg.clip_conditioning:
             if model_cfg.clip_caps:
                 batch_cap_centers, batch_max_cos_distances = rearrange_batch_caps(
@@ -970,19 +976,21 @@ for epoch in trange(
                     batch["cap_max_cos_distance"],
                     model_cfg.clip_cap_count,
                 )
-                batch_clips = jax.device_put(batch_cap_centers, sharding)
+                batch_clips = jax.device_put(batch_cap_centers, examples_sharding)
                 batch_max_cos_distances = jax.device_put(
-                    batch_max_cos_distances, sharding
+                    batch_max_cos_distances, examples_sharding
                 )
             else:
-                batch_clips = jax.device_put(batch["clip_embedding"], sharding)
+                batch_clips = jax.device_put(batch["clip_embedding"], examples_sharding)
                 batch_max_cos_distances = jax.device_put(
-                    jnp.zeros((batch_imgs.shape[0], 0)), sharding
+                    jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
                 )
         else:
-            batch_clips = jax.device_put(jnp.zeros((batch_imgs.shape[0], 0)), sharding)
+            batch_clips = jax.device_put(
+                jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
+            )
             batch_max_cos_distances = jax.device_put(
-                jnp.zeros((batch_imgs.shape[0], 0)), sharding
+                jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
             )
         losses.append(
             loss_fn(
@@ -999,5 +1007,5 @@ for epoch in trange(
         f"Epoch {epoch} done, train loss: {loss:.4f}, test loss {test_loss:.4f}",
         end="",
     )
-    save_checkpoint_and_sample(my_train_state, global_step, sharding)
+    save_checkpoint_and_sample(my_train_state, global_step, examples_sharding)
     last_checkpoint_time = datetime.datetime.now()

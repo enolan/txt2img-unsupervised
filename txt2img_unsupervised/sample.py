@@ -13,6 +13,7 @@ from einops import rearrange, repeat
 from flax.core import freeze
 from functools import partial
 from jax.experimental import mesh_utils
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from omegaconf import OmegaConf
 from pathlib import Path
 from random import randint
@@ -161,9 +162,9 @@ def sample_loop(
     assert model_cfg.clip_conditioning, "unconditioned model is deprecated"
     assert isinstance(cap_centers, np.ndarray)
 
-    sharding = jax.sharding.PositionalSharding(
-        mesh_utils.create_device_mesh((jax.device_count(),))
-    )
+    devices = mesh_utils.create_device_mesh((jax.device_count(),))
+    mesh = Mesh(devices, axis_names=("dev",))
+    sharding = NamedSharding(mesh, PartitionSpec("dev"))
 
     if model_cfg.clip_caps:
         assert isinstance(max_cos_distances, np.ndarray)
@@ -188,14 +189,10 @@ def sample_loop(
             rng, rng2 = jax.random.split(rng)
             if model_cfg.clip_caps:
                 cap_centers_batch = cap_centers[ctr : ctr + batch]
-                cap_centers_sharded = jax.device_put(
-                    cap_centers_batch,
-                    sharding.reshape((jax.device_count(), 1, 1)),
-                )
+                cap_centers_sharded = jax.device_put(cap_centers_batch, sharding)
                 max_cos_distances_batch = max_cos_distances[ctr : ctr + batch]
                 max_cos_distances_sharded = jax.device_put(
-                    max_cos_distances_batch,
-                    sharding.reshape((jax.device_count(), 1)),
+                    max_cos_distances_batch, sharding
                 )
                 codes = sample_jv(
                     mdl,
@@ -208,10 +205,7 @@ def sample_loop(
                 sampled_codes_arrs.append(jax.device_get(codes))
             else:
                 cap_centers_batch = cap_centers[ctr : ctr + batch]
-                cap_centers_sharded = jax.device_put(
-                    cap_centers_batch,
-                    sharding.reshape((jax.device_count(), 1)),
-                )
+                cap_centers_sharded = jax.device_put(cap_centers_batch, sharding)
                 codes = sample_jv(
                     mdl,
                     params,
@@ -237,10 +231,7 @@ def sample_loop(
         ctr = 0
         for batch in batches:
             codes_batch = sampled_codes[ctr : ctr + batch]
-            codes_sharded = jax.device_put(
-                codes_batch,
-                sharding.reshape((jax.device_count(), 1)),
-            )
+            codes_sharded = jax.device_put(codes_batch, sharding)
             imgs = ldm_autoencoder.decode_jv(
                 ae_mdl, ae_params, (ae_res, ae_res), codes_sharded
             )
