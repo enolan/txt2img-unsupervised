@@ -2242,13 +2242,13 @@ test = ["dm-haiku (>=0.0.3)", "dm-tree (>=0.1.7)", "flax (==0.5.3)"]
 
 [[package]]
 name = "orbax-checkpoint"
-version = "0.4.8"
+version = "0.5.3"
 description = "Orbax Checkpoint"
 optional = false
 python-versions = ">=3.9"
 files = [
-    {file = "orbax_checkpoint-0.4.8-py3-none-any.whl", hash = "sha256:3440922fa1e92f8298a9543d3ae14cce08b2d006e2f1c9a0486dd317757c4ec8"},
-    {file = "orbax_checkpoint-0.4.8.tar.gz", hash = "sha256:b72aacbfbd07fe767ca39ed4152118894181412e620cf283b5951c8ce1e0ea6c"},
+    {file = "orbax_checkpoint-0.5.3-py3-none-any.whl", hash = "sha256:82acdf18acb1e294396dd583634d3b1bd005bbb81f3de650740384c465d735c3"},
+    {file = "orbax_checkpoint-0.5.3.tar.gz", hash = "sha256:1572904cbbfe8513927e0d80f80b730e0ef2f680332d3c2810d8443532938b45"},
 ]
 
 [package.dependencies]
@@ -4088,4 +4088,4 @@ testing = ["big-O", "jaraco.functools", "jaraco.itertools", "more-itertools", "p
 [metadata]
 lock-version = "2.0"
 python-versions = "3.11.6"
-content-hash = "9149a0578737202b9770a0e673d6ad29590cd1288ac67f191e82799fdeae914f"
+content-hash = "0fb3333648d87bd618b33106857817bf4c0cd22f480486b8b52de1722e1b1e79"
