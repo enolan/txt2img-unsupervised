@@ -2071,9 +2071,7 @@ class AsyncLeafChecker:
         # arrays of cap centers and max cosine distances, their pre-padding lengths, and result
         # queues for sending the results back.
         self._workqueues = [queue.Queue() for _ in range(n_devices)]
-        self._qsem = QuantitySemaphore(
-            max_inflight_vectors, n_quantities=n_devices
-        )
+        self._qsem = QuantitySemaphore(max_inflight_vectors, n_quantities=n_devices)
 
         # Thread pool for loading from Infinidata
         self._loaderpool = concurrent.futures.ThreadPoolExecutor(
