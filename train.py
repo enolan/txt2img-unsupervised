@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import json
 import numpy as np
 import optax  # type:ignore[import]
-import orbax.checkpoint  # type:ignore[import]
+import orbax.checkpoint as ocp
 import PIL.Image
 import time
 import torch
@@ -96,16 +96,17 @@ def json_pretty(dict):
 
 def setup_cfg_and_wandb():
     """Set up our ModelConfig and TrainingConfig and initialize wandb."""
-    checkpoint_options = orbax.checkpoint.CheckpointManagerOptions(
+    checkpoint_options = ocp.CheckpointManagerOptions(
         max_to_keep=3, keep_time_interval=datetime.timedelta(hours=6)
     )
+    checkpoint_manager_items = ("params", "opt_state", "rng")
     if args.resume is not None:
         print(f"Resuming from checkpoint {args.resume}...")
         checkpoint_dir = args.resume.absolute()
-        checkpoint_manager = orbax.checkpoint.CheckpointManager(
+        checkpoint_manager = ocp.CheckpointManager(
             checkpoint_dir,
-            orbax.checkpoint.Checkpointer(orbax.checkpoint.PyTreeCheckpointHandler()),
             options=checkpoint_options,
+            item_names=checkpoint_manager_items,
         )
         global_step = checkpoint_manager.latest_step()
         restoring = True
@@ -147,10 +148,10 @@ def setup_cfg_and_wandb():
 
         checkpoint_dir = Path(f"checkpoints/{wandb.run.id}").absolute()
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_manager = orbax.checkpoint.CheckpointManager(
+        checkpoint_manager = ocp.CheckpointManager(
             checkpoint_dir,
-            orbax.checkpoint.Checkpointer(orbax.checkpoint.PyTreeCheckpointHandler()),
             options=checkpoint_options,
+            item_names=checkpoint_manager_items,
             metadata={
                 "model_cfg": model_cfg.to_json_dict(),
                 "training_cfg": training_cfg.to_json_dict(),
@@ -254,8 +255,8 @@ def setup_optimizer(
         clip = optax.identity()
     opt = optax.apply_if_finite(optax.chain(clip, opt), 20)
 
-    # We need templates to feed to checkpoint_manager.restore so we get a TrainState instead of a
-    # dict
+    # We need template inputs to get initial parameters, regardless of if we're loading or starting
+    # anew.
     max_cos_distance_dummy = (
         jnp.zeros((model_cfg.clip_cap_count,), dtype=jnp.float32)
         if model_cfg.clip_caps
@@ -286,18 +287,32 @@ def setup_optimizer(
     )
     print(table_str)
 
-    ts_empty = TrainState.create(
-        apply_fn=mdl.apply, params=params_empty, tx=opt, rng=jax.random.PRNGKey(1337)
-    )
-
     # Set up parameters
     if restoring:
-        ts = checkpoint_manager.restore(global_step, items=ts_empty)
-        assert (
-            ts.step == global_step
-        ), f"restored trainstate step {ts.step} != {global_step}"
+        opt_state_skeleton = opt.init(params_empty)
+        restored = checkpoint_manager.restore(
+            global_step,
+            args=ocp.args.Composite(
+                params=ocp.args.StandardRestore(),
+                opt_state=ocp.args.StandardRestore(opt_state_skeleton),
+                rng=ocp.args.JaxRandomKeyRestore(),
+            ),
+        )
+        ts = TrainState(
+            step=global_step,
+            apply_fn=mdl.apply,
+            params=restored["params"],
+            tx=opt,
+            rng=restored["rng"],
+            opt_state=restored["opt_state"],
+        )
     else:
-        ts = ts_empty
+        ts = TrainState.create(
+            apply_fn=mdl.apply,
+            params=params_empty,
+            tx=opt,
+            rng=jax.random.PRNGKey(1337),
+        )
 
     return mdl, ts
 
@@ -851,7 +866,14 @@ def save_checkpoint_and_sample(my_train_state, global_step) -> None:
     tqdm.write("Attempting to save checkpoint")
     while True:
         try:
-            checkpoint_manager.save(global_step, my_train_state)
+            checkpoint_manager.save(
+                global_step,
+                args=ocp.args.Composite(
+                    params=ocp.args.StandardSave(my_train_state.params),
+                    opt_state=ocp.args.StandardSave(my_train_state.opt_state),
+                    rng=ocp.args.JaxRandomKeySave(my_train_state.rng),
+                ),
+            )
             break
         except (OSError, ValueError) as e:
             tqdm.write(f"Error saving checkpoint: {e}")

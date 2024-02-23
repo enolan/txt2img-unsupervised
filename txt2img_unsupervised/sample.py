@@ -4,7 +4,7 @@ import dacite
 import jax
 import jax.numpy as jnp
 import numpy as np
-import orbax.checkpoint  # type: ignore[import]
+import orbax.checkpoint as ocp
 import PIL.Image
 import torch
 import transformers
@@ -299,20 +299,22 @@ if __name__ == "__main__":
     rng = jax.random.PRNGKey(seed)
 
     print("Loading transformer model...")
-    checkpoint_mngr = orbax.checkpoint.CheckpointManager(
+    checkpoint_mngr = ocp.CheckpointManager(
         # Orbax chokes on relative paths for some godforsaken reason
         args.transformer_checkpoint_dir.absolute(),
-        orbax.checkpoint.Checkpointer(orbax.checkpoint.PyTreeCheckpointer()),
+        item_names=("params",),
     )
     print(
         f"Loading step {checkpoint_mngr.latest_step()} from {args.transformer_checkpoint_dir}"
     )
-    restored = checkpoint_mngr.restore(checkpoint_mngr.latest_step())
+    im_params = checkpoint_mngr.restore(
+        checkpoint_mngr.latest_step(),
+        args=ocp.args.Composite(params=ocp.args.StandardRestore()),
+    )["params"]
 
     model_cfg = ModelConfig.from_json_dict(checkpoint_mngr.metadata()["model_cfg"])
     model_cfg.activations_dtype = jnp.float32  # Assume we're on the GPU at home
     im_mdl = ImageModel(**model_cfg.__dict__)
-    im_params = freeze(restored["params"])
     if model_cfg.clip_conditioning:
         print("Loading CLIP model...")
 
