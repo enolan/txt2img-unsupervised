@@ -25,14 +25,13 @@ pytorch-lightning = "^2.0.2"
 sortedcontainers = "^2.4.0"
 torch = {url = "https://download.pytorch.org/whl/cpu/torch-2.0.1%2Bcpu-cp311-cp311-linux_x86_64.whl"}
 transformers = "^4.34.1"
-wandb = "^0.15.12"
+wandb = "^0.16.3"
 warcat = "^2.2.5"
 xdg-base-dirs = "^6.0.1"
 
 [tool.poetry.group.cuda.dependencies]
 jax = {extras = ["cuda12_pip"], version = "0.4.23"}
 jaxlib = {extras = ["cuda12_pip"], version = "0.4.23"}
-nvidia-cudnn-cu12 = "8.9.4.25" # 8.9.5.29 is latest as of now (2023-10-19) but is for some fucking reason only has a windows wheel
 
 [tool.poetry.group.dev.dependencies]
 black = "^23.3.0"
