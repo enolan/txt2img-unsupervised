@@ -2329,7 +2329,13 @@ class AsyncLeafChecker:
         lambda x: st.tuples(
             _unit_vecs(st.just((x[0], x[2]))),
             _unit_vecs(st.just((x[1], x[2]))),
-            hyp_np.arrays(np.float32, (x[1],), elements=st.floats(0.0, 2.0, width=32)),
+            hyp_np.arrays(
+                np.float32,
+                (x[1],),
+                elements=st.floats(  # Dear Hypothesis: die in a fire
+                    min_value=0.009999999776482582, max_value=2.0, width=32
+                ),
+            ),
         )
     )
 )
