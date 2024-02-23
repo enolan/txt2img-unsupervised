@@ -1,0 +1,11 @@
+{
+  "d_model": 768,
+  "num_heads": 12,
+  "ff_dim": 3072,
+  "dropout": null,
+  "n_layers": 12,
+  "image_tokens": 256,
+  "use_biases": true,
+  "activations_dtype": "float32",
+  "activation_function": "relu"
+}
