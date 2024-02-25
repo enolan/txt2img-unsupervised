@@ -69,6 +69,7 @@ parser.add_argument("--pq-dir", type=Path, required=True)
 parser.add_argument("--model-config", type=Path, required=True)
 parser.add_argument("--training-config", type=Path, required=True)
 parser.add_argument("--batch-size", type=int)
+parser.add_argument("--sample-batch-size", type=int, default=None)
 parser.add_argument("--epochs", type=int)
 parser.add_argument("--training-images", type=int)
 parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -159,17 +160,30 @@ def setup_cfg_and_wandb():
             },
         )
 
+    if args.sample_batch_size is None:
+        sample_batch_size = training_cfg.batch_size
+    else:
+        sample_batch_size = args.sample_batch_size
+
     wandb.define_metric("*", step_metric="global_step")
     wandb.define_metric("test/loss", summary="last")
     wandb.define_metric("train/loss", summary="last")
 
-    return global_step, model_cfg, training_cfg, checkpoint_manager, restoring
+    return (
+        global_step,
+        model_cfg,
+        training_cfg,
+        sample_batch_size,
+        checkpoint_manager,
+        restoring,
+    )
 
 
 (
     global_step,
     model_cfg,
     training_cfg,
+    sample_batch_size,
     checkpoint_manager,
     restoring,
 ) = setup_cfg_and_wandb()
@@ -577,7 +591,7 @@ ae_mdl = LDMAutoencoder(ae_cfg)
 ae_params_torch = torch.load(args.ae_ckpt, map_location="cpu")
 
 
-def sample_and_log(ts: TrainState, global_step: int) -> None:
+def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> None:
     """Sample from the model and log to wandb."""
 
     ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
@@ -637,7 +651,7 @@ def sample_and_log(ts: TrainState, global_step: int) -> None:
                 ts.params,
                 ae_mdl,
                 ae_params,
-                training_cfg.batch_size,
+                sample_batch_size,
                 all_centers_for_sampling,
                 all_max_cos_distances_for_sampling,
                 ts.rng,
@@ -718,7 +732,7 @@ def sample_and_log(ts: TrainState, global_step: int) -> None:
                 ts.params,
                 ae_mdl,
                 ae_params,
-                training_cfg.batch_size,
+                sample_batch_size,
                 all_clip_embeddings_for_sampling,
                 None,
                 ts.rng,
@@ -861,7 +875,7 @@ my_train_state = my_train_state.replace(
 last_checkpoint_time = None
 
 
-def save_checkpoint_and_sample(my_train_state, global_step) -> None:
+def save_checkpoint_and_sample(my_train_state, sample_batch_size, global_step) -> None:
     # TPU VMs run out of disk space a lot. Retrying in a loop lets me manually clean up the disk
     tqdm.write("Attempting to save checkpoint")
     while True:
@@ -881,7 +895,7 @@ def save_checkpoint_and_sample(my_train_state, global_step) -> None:
             time.sleep(60)
     tqdm.write("Saved checkpoint")
     tqdm.write("Sampling")
-    sample_and_log(my_train_state, global_step)
+    sample_and_log(my_train_state, sample_batch_size, global_step)
     tqdm.write("Done sampling")
 
 
@@ -931,7 +945,9 @@ for epoch in trange(
             if last_checkpoint_time is None or (
                 datetime.datetime.now() - last_checkpoint_time
             ) > datetime.timedelta(minutes=30):
-                save_checkpoint_and_sample(my_train_state, global_step)
+                save_checkpoint_and_sample(
+                    my_train_state, sample_batch_size, global_step
+                )
                 last_checkpoint_time = datetime.datetime.now()
 
             batch_imgs = jax.device_put(batch["encoded_img"], examples_sharding)
@@ -1029,5 +1045,5 @@ for epoch in trange(
         f"Epoch {epoch} done, train loss: {loss:.4f}, test loss {test_loss:.4f}",
         end="",
     )
-    save_checkpoint_and_sample(my_train_state, global_step)
+    save_checkpoint_and_sample(my_train_state, sample_batch_size, global_step)
     last_checkpoint_time = datetime.datetime.now()
