@@ -414,7 +414,7 @@ if __name__ == "__main__":
         top_p=args.top_p,
     )
 
-    args.out_dir.mkdir(exist_ok=True)
+    args.out_dir.mkdir(exist_ok=True, parents=True)
 
     print("Saving images...")
     for i, img in enumerate(tqdm(imgs, unit="img")):
