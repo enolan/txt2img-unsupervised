@@ -1134,7 +1134,8 @@ def test_clip_caps_overfit():
     loss, then sample and check the generated samples. The training data is 100k pairs generated
     from 100 images (drawn with replacement). This tests the model's ability to memorize a small
     set of image encodings and learn to sample based on their CLIP encodings being within caps.
-    """
+    The trained model should be overfit on the images, but not overfit on the caps. We test against
+    a holdout set of cap-image pairs from the same 100 images."""
 
     params_rng, sample_rng = jax.random.split(jax.random.PRNGKey(42), 2)
     # run get-test-data.sh to download this
