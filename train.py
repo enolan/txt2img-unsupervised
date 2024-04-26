@@ -434,14 +434,14 @@ def get_image_prompt_clip_embeddings(
 def get_clip_text_embeddings_to_sample(n: int) -> jax.Array:
     """Generate some text embeddings to test the model with."""
     prompts = [
+        "A woman’s face",
+        "A screenshot of Grand Theft Auto",
         "Barack Obama riding a bicycle",
         "a painting of a cat",
         "The Golden Gate Bridge at sunset",
         "Samoyed puppies!",
         "Taylor Swift in concert",
-        "Manhattan from above #dronephotography",
         "my favorite art car from Burning Man 2018",
-        "engineering diagram of an internal combustion engine",
     ]
     assert n <= len(prompts), "write more prompts?"
     text_tokens = clip_processor(prompts, return_tensors="jax", padding=True)
@@ -562,7 +562,7 @@ def mk_txt_prompt_conditions(text_prompt_clips, grid_size):
             text_prompt_clips, "prompt clip -> prompt g 1 clip", g=grid_size
         )
         cap_max_cos_distances_cond = np.full(
-            (len(text_prompt_clips), grid_size, 1), 0.75
+            (len(text_prompt_clips), grid_size, 1), 0.70
         )
 
         cap_centers = np.concatenate([cap_centers_cond, cap_centers_fill], axis=2)
