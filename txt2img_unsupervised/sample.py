@@ -153,6 +153,7 @@ def sample_loop(
     max_cos_distances,
     rng,
     top_p,
+    force_f32=True,
 ):
     """Sample a bunch of images and return PIL images. cap_centers should have shape
     (n, cap_centers, 768) and max_cos_distances should have shape (n, cap_centers) where n is the
@@ -179,6 +180,11 @@ def sample_loop(
         assert cap_centers.shape[1] == 768
     assert batch_size % jax.device_count() == 0
     assert (len(cap_centers) % batch_size) % jax.device_count() == 0
+
+    if force_f32:
+        # Even with models that are trained with bf16, float32 gives subjectively substantially
+        # better results
+        mdl = mdl.clone(activations_dtype=jnp.float32)
 
     # Sample from the transformer model
     batches = batches_split(batch_size, len(cap_centers))
@@ -313,7 +319,8 @@ if __name__ == "__main__":
     )["params"]
 
     model_cfg = ModelConfig.from_json_dict(checkpoint_mngr.metadata()["model_cfg"])
-    model_cfg.activations_dtype = jnp.float32  # Assume we're on the GPU at home
+    # Samples are substantially better with 32 bits, even for models trained with bf16
+    model_cfg.activations_dtype = jnp.float32
     im_mdl = ImageModel(**model_cfg.__dict__)
     if model_cfg.clip_conditioning:
         print("Loading CLIP model...")
