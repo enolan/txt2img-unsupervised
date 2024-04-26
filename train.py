@@ -79,6 +79,7 @@ parser.add_argument(
 parser.add_argument("--gradient-accumulation-steps", type=int)
 parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--gradient-clipping", type=float, default=None)
+parser.add_argument("--loss-decay-constant", type=float, default=1.0)
 parser.add_argument("--ae-cfg", type=Path, required=True)
 parser.add_argument("--ae-ckpt", type=Path, required=True)
 parser.add_argument("--activations-dtype", type=argparse_from_dict(str_to_dtype))
@@ -146,6 +147,10 @@ def setup_cfg_and_wandb():
         training_cfg = TrainingConfig.from_json_dict(wandb.config.as_dict())
         print(f"Model config post-wandb: {json_pretty(model_cfg.to_json_dict())}")
         print(f"Training config post-wandb: {json_pretty(training_cfg.to_json_dict())}")
+
+        assert (
+            0 < training_cfg.loss_decay_constant <= 1
+        ), "loss_decay_constant must be in (0, 1]"
 
         checkpoint_dir = Path(f"checkpoints/{wandb.run.id}").absolute()
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -840,6 +845,7 @@ def rearrange_batch_caps(centers, max_cos_distances, cap_count):
 @partial(jax.jit, donate_argnums=(0,))
 def train_step(
     state: TrainState,
+    loss_decay_constant: float,
     batch_imgs: jax.Array,
     batch_clips: jax.Array,
     batch_max_cos_distances: jax.Array,
@@ -847,7 +853,13 @@ def train_step(
     """Compute a single optimization step."""
     dropout_rng, rng2 = jax.random.split(state.rng, 2)
     loss, grads = loss_grad_fn(
-        mdl, state.params, dropout_rng, batch_imgs, batch_clips, batch_max_cos_distances
+        mdl,
+        state.params,
+        loss_decay_constant,
+        dropout_rng,
+        batch_imgs,
+        batch_clips,
+        batch_max_cos_distances,
     )
     new_state = state.apply_gradients(
         grads=grads, rng=rng2
@@ -974,7 +986,11 @@ for epoch in trange(
                     jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
                 )
             my_train_state, loss, norm = train_step(
-                my_train_state, batch_imgs, batch_clips, batch_max_cos_distances
+                my_train_state,
+                training_cfg.loss_decay_constant,
+                batch_imgs,
+                batch_clips,
+                batch_max_cos_distances,
             )
             # TODO check if moving this check inside an if opt_state.notfinite_count > 0 is faster
             if not jnp.isfinite(loss):
@@ -1033,6 +1049,7 @@ for epoch in trange(
         losses.append(
             loss_fn(
                 my_train_state.params,
+                training_cfg.loss_decay_constant,
                 dropout_rng,
                 batch_imgs,
                 batch_clips,

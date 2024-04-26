@@ -136,11 +136,14 @@ def test_modelconfig_roundtrip_from_object() -> None:
 class TrainingConfig:
     learning_rate: float
     batch_size: int
-    epochs: int # How many epochs to train for
+    epochs: int  # How many epochs to train for
     triangle_schedule: bool
     gradient_accumulation_steps: int
     gradient_clipping: Optional[float]
-    training_images: int = 0 # How many images to train for (in addition to epochs)
+    training_images: int = 0  # How many images to train for (in addition to epochs)
+    loss_decay_constant: float = (
+        1.0  # How much to decay the loss to weight later tokens less. in (0, 1]
+    )
 
     @staticmethod
     def from_json_dict(dict: dict[str, Any]) -> "TrainingConfig":
