@@ -75,6 +75,10 @@ def merge_dsets(dsets, out_dir, out_chunk_size, cap_count):
             out_cap_centers = [
                 dsets[i][dset_idxs[i]]["cap_center"] for i in matching_idxs
             ]
+            assert all(
+                np.any(cap_center != out_cap_centers[0])
+                for cap_center in out_cap_centers[1:]
+            ), "cap centers are identical :("
             out_cap_centers = np.concatenate(out_cap_centers)
             assert out_cap_centers.shape == (
                 cap_count * 768,
@@ -86,6 +90,10 @@ def merge_dsets(dsets, out_dir, out_chunk_size, cap_count):
             out_cap_max_cos_distances = [
                 dsets[i][dset_idxs[i]]["cap_max_cos_distance"] for i in matching_idxs
             ]
+            assert all(
+                np.any(max_cos_distance != out_cap_max_cos_distances[0])
+                for max_cos_distance in out_cap_max_cos_distances[1:]
+            ), "cap max cos distances are identical :("
             assert all(
                 max_dist.dtype == np.float32 for max_dist in out_cap_max_cos_distances
             )
@@ -201,6 +209,21 @@ def test_merge_2_dsets():
 
 def test_merge_3_dsets():
     _test_merge_n_dsets(3)
+
+
+def test_merging_same_caps_fails():
+    dset_path = (
+        Path(__file__).parent / "test-images/capped-examples/test-caps-0.parquet"
+    )
+    dset = Dataset.from_parquet(str(dset_path))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = Path(tmpdir)
+        try:
+            merge_dsets([dset, dset], out_dir, 8192, 2)
+        except AssertionError as e:
+            return
+        assert False, "Merging the same dataset twice should raise an AssertionError"
 
 
 def main():
