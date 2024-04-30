@@ -369,6 +369,9 @@ def main():
 
     tree = CapTree.load_from_disk(args.tree_path, save_cache=args.save_cache)
     if args.seed is not None:
+        # --seed makes the generated caps deterministic, but not which images are sampled in the
+        # caps
+        print("WARNING: passing --seed does not actually makes this deterministic!")
         rng = jax.random.PRNGKey(args.seed)
     else:
         rng = jax.random.PRNGKey(np.random.randint(0, 2**32))
