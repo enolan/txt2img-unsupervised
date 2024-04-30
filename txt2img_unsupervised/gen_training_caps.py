@@ -308,10 +308,12 @@ def gen_training_examples_from_tree(
                     == cap_centers_this_batch.shape[0]
                     == cap_max_cos_distances_this_batch.shape[0]
                 )
-                new_dict = {
+                # The order of the | is important here, if the captree's dataset already contains
+                # caps for each row we want to override them in the output.
+                new_dict = rows_orig_batch | {
                     "cap_center": cap_centers_this_batch,
                     "cap_max_cos_distance": cap_max_cos_distances_this_batch,
-                } | rows_orig_batch
+                }
                 sampled_rows_merged.append(TableView(new_dict))
 
             del sampled_cap_centers_this_run_arr
