@@ -38,19 +38,20 @@ def merge_dsets(dsets, out_dir, out_chunk_size, cap_count):
             )
 
         while any(dset_idxs[i] < len(dset) for i, dset in enumerate(dsets)):
-            # Find the earliest name at the current indices
-            names = [
-                dset[dset_idxs[i]]["name"]
+            # Get the row in each of our input datasets at the current index
+            rows = [
+                dset[dset_idxs[i]]
                 for i, dset in enumerate(dsets)
                 if dset_idxs[i] < len(dset)
             ]
+            # Find the earliest name at the current indices
+            names = [row["name"] for row in rows]
             earliest_name = min(names)
             # Find the indices of the datasets with that name
             matching_idxs = [
                 i
                 for i, dset in enumerate(dsets)
-                if dset_idxs[i] < len(dset)
-                and dset[dset_idxs[i]]["name"] == earliest_name
+                if dset_idxs[i] < len(dset) and names[i] == earliest_name
             ]
             match_cnt = len(matching_idxs)
             # Check that the number of matching rows is equal to the cap count
@@ -72,9 +73,7 @@ def merge_dsets(dsets, out_dir, out_chunk_size, cap_count):
                     dsets[i].column_names == keys
                 ), "All datasets must have the same schema"
             # Parquet doesn't support multi-dimensional arrays so we need to flatten the caps
-            out_cap_centers = [
-                dsets[i][dset_idxs[i]]["cap_center"] for i in matching_idxs
-            ]
+            out_cap_centers = [rows[i]["cap_center"] for i in matching_idxs]
             assert all(
                 np.any(cap_center != out_cap_centers[0])
                 for cap_center in out_cap_centers[1:]
@@ -88,7 +87,7 @@ def merge_dsets(dsets, out_dir, out_chunk_size, cap_count):
             ), f"out_cap_centers dtype {out_cap_centers.dtype}"
 
             out_cap_max_cos_distances = [
-                dsets[i][dset_idxs[i]]["cap_max_cos_distance"] for i in matching_idxs
+                rows[i]["cap_max_cos_distance"] for i in matching_idxs
             ]
             assert all(
                 np.any(max_cos_distance != out_cap_max_cos_distances[0])
@@ -108,13 +107,13 @@ def merge_dsets(dsets, out_dir, out_chunk_size, cap_count):
             # Check that everything except the caps is equal across the matches
             keys_to_copy = set(keys) - {"cap_center", "cap_max_cos_distance"}
             for k in keys_to_copy:
-                vals = [dsets[i][dset_idxs[i]][k] for i in matching_idxs]
+                vals = [rows[i][k] for i in matching_idxs]
                 assert all(
                     np.array_equal(vals[0], v) for v in vals
                 ), f"Values for key {k} do not match across matches"
 
             # Create the output row
-            first_matching_row = dsets[matching_idxs[0]][dset_idxs[matching_idxs[0]]]
+            first_matching_row = rows[0]
             out_row = {k: first_matching_row[k] for k in keys_to_copy}
             out_row["cap_center"] = out_cap_centers
             out_row["cap_max_cos_distance"] = out_cap_max_cos_distances
