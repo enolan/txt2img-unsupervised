@@ -18,7 +18,7 @@ RUN curl https://pyenv.run | bash
 ENV PATH="/root/.pyenv/bin:/root/.pyenv/shims:$PATH"
 RUN echo $(pyenv init) >> /root/.bashrc
 
-RUN pyenv install 3.11.6 && pyenv global 3.11.6
+RUN pyenv install 3.11.8 && pyenv global 3.11.8
 
 ADD fish-pyenv.fish /root/.config/fish/conf.d/fish-pyenv.fish
 
