@@ -834,11 +834,55 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
         wandb.log(to_log)
 
 
-def rearrange_batch_caps(centers, max_cos_distances, cap_count):
-    """Rearrange the data from parquet into the shape expected by the model. For reasons, parquet
-    does not support multidimensional arrays."""
-    centers = rearrange(centers, "b (n c) -> b n c", n=cap_count, c=768)
-    max_cos_distances = rearrange(max_cos_distances, "(b n) -> b n", n=cap_count)
+last_cap_set = None  # We track the last one so we can print when it changes
+
+
+def rearrange_batch_caps(
+    centers, max_cos_distances, model_cap_count, epoch, is_test=False
+):
+    """Rearrange the cap data from parquet into the shape expected by the model and select the
+    appropriate subset of the caps for the current epoch. For reasons, parquet does not support
+    multidimensional arrays. Prints a message when the cap set changes, unless is_test is True, in
+    which case it doesn't print anything."""
+    assert len(centers.shape) == 2
+    batch_size = centers.shape[0]
+    assert centers.shape[1] % 768 == 0
+    dset_cap_count = centers.shape[1] // 768
+
+    # normalize max_cos_distances shape, one of the dimensions should be dset_cap_count
+    if dset_cap_count == 1:
+        assert max_cos_distances.shape == (
+            batch_size,
+        ), f"max_cos_distances batch shape {max_cos_distances.shape}, should be unidimensional if the dataset contains only a sinple cap"
+        max_cos_distances = rearrange(max_cos_distances, "b -> b 1")
+
+    assert max_cos_distances.shape[0] == batch_size
+    assert max_cos_distances.shape[1] == dset_cap_count
+
+    centers = rearrange(centers, "b (n c) -> b n c", n=dset_cap_count, c=768)
+
+    assert centers.shape[1] == max_cos_distances.shape[1]
+    dset_cap_count = centers.shape[1]
+    assert (
+        dset_cap_count % model_cap_count == 0
+    ), f"Dataset cap count {dset_cap_count} not divisible by model cap count {model_cap_count}"
+
+    distinct_cap_sets = dset_cap_count // model_cap_count
+    this_cap_set = epoch % distinct_cap_sets
+    this_cap_set_start = this_cap_set * model_cap_count
+    this_cap_set_end = this_cap_set_start + model_cap_count
+
+    if not is_test:
+        global last_cap_set
+        if last_cap_set != this_cap_set:
+            tqdm.write(
+                f"Switching to cap set #{this_cap_set} of {distinct_cap_sets} total - {this_cap_set_start}:{this_cap_set_end}"
+            )
+            last_cap_set = this_cap_set
+
+    centers = centers[:, this_cap_set_start:this_cap_set_end, :]
+    max_cos_distances = max_cos_distances[:, this_cap_set_start:this_cap_set_end]
+
     return centers, max_cos_distances
 
 
@@ -973,6 +1017,7 @@ for epoch in trange(
                     batch["cap_center"],
                     batch["cap_max_cos_distance"],
                     model_cfg.clip_cap_count,
+                    epoch,
                 )
                 batch_clips = jax.device_put(batch_centers, examples_sharding)
                 batch_max_cos_distances = jax.device_put(
@@ -1029,6 +1074,8 @@ for epoch in trange(
                     batch["cap_center"],
                     batch["cap_max_cos_distance"],
                     model_cfg.clip_cap_count,
+                    epoch=0,  # could iterate and do every cap set but this is faster and fine with lots of test images
+                    is_test=True,
                 )
                 batch_clips = jax.device_put(batch_cap_centers, examples_sharding)
                 batch_max_cos_distances = jax.device_put(
