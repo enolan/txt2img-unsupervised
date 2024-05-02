@@ -179,10 +179,18 @@ class ImageModel(nn.Module):
             else:
                 assert clip_embedding.shape == (self.clip_cap_count, 768)
                 assert max_cos_distance.shape == (self.clip_cap_count,)
-                res = (
-                    self.clip_proj(clip_embedding)
-                    + self.max_cos_distance_proj(1 - max_cos_distance)
-                ) / 2
+
+                # Without this rearrange when we apply the dense layer it interprets the max cos
+                # distances as a single vector of length n rather than n vectors of length 1, and
+                # produces one embedding for the whole sequence of distances rather than one for
+                # each cap. Shapes, man.
+                max_cos_distance = rearrange(max_cos_distance, "caps -> caps 1")
+
+                res_cap_centers = self.clip_proj(clip_embedding)
+                res_max_cos_distances = self.max_cos_distance_proj(1 - max_cos_distance)
+                assert res_cap_centers.shape == (self.clip_cap_count, self.d_model)
+                assert res_max_cos_distances.shape == (self.clip_cap_count, self.d_model)
+                res = (res_cap_centers + res_max_cos_distances) / 2
         assert res.shape == (self.prepended_tokens(), self.d_model)
         return res
 
