@@ -92,10 +92,19 @@ def merge_dsets(dsets, out_dir, out_chunk_size, cap_count):
             out_cap_max_cos_distances = [
                 rows[i]["cap_max_cos_distance"] for i in matching_idxs
             ]
-            assert all(
+            max_cos_dists_unique = all(
                 np.any(max_cos_distance != out_cap_max_cos_distances[0])
                 for max_cos_distance in out_cap_max_cos_distances[1:]
-            ), "cap max cos distances are identical :("
+            )
+            if not max_cos_dists_unique:
+                # This happened once when merging two caps in the 25M image dataset. ISTM that
+                # should be extremely unlikely, but it did happen. The caps are not identical unless
+                # the centers and max cos distances are, so whatever.
+                tqdm.write(
+                    f"WARNING: Maximum cosine distances in row are not unique: {out_cap_max_cos_distances}, skipping row"
+                )
+                for i in matching_idxs:
+                    dset_idxs[i] += 1
             assert all(
                 max_dist.dtype == np.float32 for max_dist in out_cap_max_cos_distances
             )
