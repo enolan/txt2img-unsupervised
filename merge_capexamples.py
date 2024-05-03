@@ -19,7 +19,10 @@ def merge_dsets(dsets, out_dir, out_chunk_size, cap_count):
 
     # The lockstep iteration needs the datasets to be sorted so the images appear in the same order.
     # For some reason sorting resets the format :/
-    dsets = [dset.sort(column_names="name").with_format("numpy") for dset in dsets]
+    dsets = [
+        dset.sort(column_names="name").flatten_indices(num_proc=16).with_format("numpy")
+        for dset in dsets
+    ]
 
     dset_idxs = [0] * len(dsets)  # The index of the next row to read from each dataset
     out_buf = []
