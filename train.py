@@ -292,7 +292,7 @@ def setup_optimizer(
 
     rngs_dummy = {"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)}
     image_dummy = jnp.zeros((model_cfg.image_tokens,), dtype=jnp.int32)
-    params_empty = mdl.init(
+    params_init = mdl.init(
         rngs=rngs_dummy,
         image=image_dummy,
         clip_embedding=clip_embedding_dummy,
@@ -306,37 +306,45 @@ def setup_optimizer(
     )
     print(table_str)
 
-    # Set up parameters
+    # Set up sharding
+    print(
+        f"Sharding batches of {training_cfg.batch_size} across {jax.device_count()} devices, {training_cfg.batch_size / jax.device_count()} per device"
+    )
+    assert training_cfg.batch_size % jax.device_count() == 0
+    # NamedSharding is overkill for the simple batch parallelism we do, but it's necessary to get orbax
+    # to save checkpoints correctly.
+    devices = mesh_utils.create_device_mesh((jax.device_count(),))
+    mesh = Mesh(devices, axis_names=("dev",))
+    # replicate network parameters across all GPUs
+    params_init = jax.device_put(params_init, NamedSharding(mesh, PartitionSpec(None)))
+
+    ts = TrainState.create(
+        apply_fn=mdl.apply,
+        params=params_init,
+        tx=opt,
+        rng=jax.random.PRNGKey(1337),
+    )
+
     if restoring:
-        opt_state_skeleton = opt.init(params_empty)
         restored = checkpoint_manager.restore(
             global_step,
             args=ocp.args.Composite(
-                params=ocp.args.StandardRestore(),
-                opt_state=ocp.args.StandardRestore(opt_state_skeleton),
-                rng=ocp.args.JaxRandomKeyRestore(),
+                params=ocp.args.StandardRestore(ts.params),
+                opt_state=ocp.args.StandardRestore(ts.opt_state),
+                rng=ocp.args.ArrayRestore(ts.rng),
             ),
         )
-        ts = TrainState(
+        ts = ts.replace(
             step=global_step,
-            apply_fn=mdl.apply,
             params=restored["params"],
-            tx=opt,
             rng=restored["rng"],
             opt_state=restored["opt_state"],
         )
-    else:
-        ts = TrainState.create(
-            apply_fn=mdl.apply,
-            params=params_empty,
-            tx=opt,
-            rng=jax.random.PRNGKey(1337),
-        )
 
-    return mdl, ts
+    return mdl, ts, mesh
 
 
-mdl, my_train_state = setup_optimizer(
+mdl, my_train_state, mesh = setup_optimizer(
     model_cfg, training_cfg, batches_total, checkpoint_manager, global_step, restoring
 )
 
@@ -912,22 +920,6 @@ def train_step(
     return new_state, loss, norm
 
 
-# Set up sharding
-print(
-    f"Sharding batches of {training_cfg.batch_size} across {jax.device_count()} devices, {training_cfg.batch_size / jax.device_count()} per device"
-)
-assert training_cfg.batch_size % jax.device_count() == 0
-# NamedSharding is overkill for the simple batch parallelism we do, but it's necessary to get orbax
-# to save checkpoints correctly.
-devices = mesh_utils.create_device_mesh((jax.device_count(),))
-mesh = Mesh(devices, axis_names=("dev",))
-my_train_state = my_train_state.replace(
-    params=jax.device_put(
-        my_train_state.params, NamedSharding(mesh, PartitionSpec(None))
-    )
-)
-
-
 last_checkpoint_time = None
 
 
@@ -941,7 +933,7 @@ def save_checkpoint_and_sample(my_train_state, sample_batch_size, global_step) -
                 args=ocp.args.Composite(
                     params=ocp.args.StandardSave(my_train_state.params),
                     opt_state=ocp.args.StandardSave(my_train_state.opt_state),
-                    rng=ocp.args.JaxRandomKeySave(my_train_state.rng),
+                    rng=ocp.args.ArraySave(my_train_state.rng),
                 ),
             )
             break
