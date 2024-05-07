@@ -9,6 +9,7 @@ import numpy as np
 import optax  # type:ignore[import]
 import orbax.checkpoint as ocp
 import PIL.Image
+import subprocess
 import time
 import torch
 import transformers
@@ -152,6 +153,15 @@ def setup_cfg_and_wandb():
             0 < training_cfg.loss_decay_constant <= 1
         ), "loss_decay_constant must be in (0, 1]"
 
+        # get git commit
+        try:
+            commit_hash = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], encoding="utf-8"
+            ).strip()
+        except subprocess.CalledProcessError:
+            commit_hash = "unknown"
+
+        # Set up checkpoint manager
         checkpoint_dir = Path(f"checkpoints/{wandb.run.id}").absolute()
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_manager = ocp.CheckpointManager(
@@ -162,6 +172,7 @@ def setup_cfg_and_wandb():
                 "model_cfg": model_cfg.to_json_dict(),
                 "training_cfg": training_cfg.to_json_dict(),
                 "run_id": wandb.run.id,
+                "commit_hash": commit_hash,
             },
         )
 
