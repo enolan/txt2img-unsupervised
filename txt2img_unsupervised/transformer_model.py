@@ -1237,7 +1237,7 @@ def _train_clip_caps_overfit(dset_train, mdl, rng):
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
 
     steps = 2_000
-    batch_size = 36
+    batch_size = 32
 
     adam = optax.adam(learning_rate=triangle_schedule(1e-4, steps))
     opt = optax.chain(optax.clip_by_global_norm(0.25), adam)

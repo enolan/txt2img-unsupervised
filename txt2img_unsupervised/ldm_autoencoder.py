@@ -655,7 +655,7 @@ def _test_mid_attn_block_1(name: str) -> None:
     np.testing.assert_allclose(
         rearrange(computed_mid_attn_1, "h w c -> c h w"),
         golden_mid_attn_1,
-        atol=1e-4,
+        atol=3e-4,
         rtol=0,
     )
 

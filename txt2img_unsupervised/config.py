@@ -206,7 +206,8 @@ def test_trainingconfig_roundtrip_from_json() -> None:
         "training_images": 0,
         "triangle_schedule": true,
         "gradient_accumulation_steps": 1,
-        "gradient_clipping": "None"}"""
+        "gradient_clipping": "None",
+        "loss_decay_constant": 0.25}"""
     cfg = TrainingConfig.from_json_dict(json.loads(json_str))
     assert TrainingConfig.to_json_dict(cfg) == json.loads(json_str)
 
