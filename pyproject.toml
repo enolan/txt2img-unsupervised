@@ -12,12 +12,12 @@ dacite = "^1.8.1"
 datasets = "^2.14.6"
 einops = "^0.7.0"
 flash-attention-jax = { git = "https://github.com/enolan/flash-attention-jax.git", rev = "20621388795614de137c159a5c07abec5c475388"}
-flax = "^0.7.4"
+flax = "^0.8.3"
 imageio-ffmpeg = "^0.4.8"
 infinidata = { url = "https://github.com/enolan/infinidata/releases/download/v0.0.1-alpha2/infinidata-0.0.1a2-cp311-cp311-manylinux_2_34_x86_64.whl" }
 internetarchive = "^3.5.0"
 omegaconf = "^2.3.0"
-orbax-checkpoint = "^0.5.3"
+orbax-checkpoint = "^0.5.10"
 pillow = "^9.5.0"
 pytest = "^7.3.1"
 python = "^3.11.8"
@@ -30,8 +30,8 @@ warcat = "^2.2.5"
 xdg-base-dirs = "^6.0.1"
 
 [tool.poetry.group.cuda.dependencies]
-jax = {extras = ["cuda12_pip"], version = "0.4.23"}
-jaxlib = {extras = ["cuda12_pip"], version = "0.4.23"}
+jax = {extras = ["cuda12_pip"], version = "0.4.26"}
+jaxlib = {extras = ["cuda12_pip"], version = "0.4.26"}
 
 [tool.poetry.group.dev.dependencies]
 black = "^23.3.0"
