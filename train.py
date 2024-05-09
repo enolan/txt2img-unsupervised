@@ -345,11 +345,16 @@ def setup_optimizer(
                 rng=ocp.args.ArrayRestore(ts.rng),
             ),
         )
+
+        # For whatever reason, things come back committed to whatever device they're on even
+        # if they weren't when they were saved. Roundtripping the optimizer state to RAM and back
+        # un-commits it. If we don't do this JAX can't move it and when can't train the model.
+        opt_state = jax.device_put(jax.device_get(restored["opt_state"]))
         ts = ts.replace(
             step=global_step,
             params=restored["params"],
             rng=restored["rng"],
-            opt_state=restored["opt_state"],
+            opt_state=opt_state,
         )
 
     return mdl, ts, mesh
