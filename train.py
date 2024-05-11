@@ -30,10 +30,12 @@ from tqdm import tqdm, trange
 from typing import Any, Callable, Tuple
 
 from txt2img_unsupervised.config import (
+    LearningRateSchedule,
     ModelConfig,
     TrainingConfig,
     str_to_activation,
     str_to_dtype,
+    str_to_learning_rate_schedule,
 )
 from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
 from txt2img_unsupervised.load_pq_dir import load_pq_dir
@@ -75,8 +77,9 @@ parser.add_argument("--epochs", type=int)
 parser.add_argument("--training-images", type=int)
 parser.add_argument("--learning-rate", type=float, default=1e-4)
 parser.add_argument(
-    "--triangle-schedule", type=lambda x: bool(strtobool(x)), default=True
+    "--learning-rate-schedule", type=argparse_from_dict(str_to_learning_rate_schedule)
 )
+parser.add_argument("--warmup-steps", type=int, default=None)
 parser.add_argument("--gradient-accumulation-steps", type=int)
 parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--gradient-clipping", type=float, default=None)
@@ -264,15 +267,32 @@ def setup_optimizer(
     mdl = transformer_model.ImageModel(**model_cfg.__dict__)
 
     # Set up optimizer
-    if training_cfg.triangle_schedule:
+    if training_cfg.learning_rate_schedule == LearningRateSchedule.CONSTANT:
+        assert training_cfg.warmup_steps is None
+        opt = optax.adam(learning_rate=training_cfg.learning_rate)
+    elif training_cfg.learning_rate_schedule == LearningRateSchedule.TRIANGLE:
+        assert training_cfg.warmup_steps is None
         opt = optax.adam(
             learning_rate=triangle_schedule(
                 training_cfg.learning_rate,
                 batches_total,
             )
         )
+    elif training_cfg.learning_rate_schedule == LearningRateSchedule.WARMUP_PLUS_COSINE:
+        assert training_cfg.warmup_steps is not None
+        opt = optax.adam(
+            learning_rate=optax.warmup_cosine_decay_schedule(
+                init_value=0.0,
+                peak_value=training_cfg.learning_rate,
+                warmup_steps=training_cfg.warmup_steps,
+                decay_steps=batches_total,
+                end_value=training_cfg.learning_rate * 0.05,
+            )
+        )
     else:
-        opt = optax.adam(learning_rate=training_cfg.learning_rate)
+        raise ValueError(
+            f"Unknown learning rate schedule {training_cfg.learning_rate_schedule}"
+        )
 
     assert training_cfg.gradient_accumulation_steps > 0
     if training_cfg.gradient_accumulation_steps > 1:

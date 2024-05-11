@@ -2,7 +2,7 @@
   "learning_rate": 0.1,
   "batch_size": 2368,
   "epochs": 10,
-  "triangle_schedule": true,
+  "learning_rate_schedule": "triangle",
   "gradient_accumulation_steps": 1,
   "gradient_clipping": 0.5
 }

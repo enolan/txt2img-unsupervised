@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import json
 from copy import copy
+from enum import Enum
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -132,14 +133,43 @@ def test_modelconfig_roundtrip_from_object() -> None:
     assert ModelConfig.from_json_dict(ModelConfig.to_json_dict(cfg)) == cfg
 
 
+class LearningRateSchedule(Enum):
+    CONSTANT = "constant"  # Constant learning rate
+    TRIANGLE = (
+        "triangle"  # Linear warmup to peak at halfway through, then linear decay to 0
+    )
+    WARMUP_PLUS_COSINE = (
+        "warmup_plus_cosine"  # Linear warmup for a fixed # of steps, then cosine decay.
+    )
+
+
+str_to_learning_rate_schedule = {
+    "constant": LearningRateSchedule.CONSTANT,
+    "triangle": LearningRateSchedule.TRIANGLE,
+    "warmup_plus_cosine": LearningRateSchedule.WARMUP_PLUS_COSINE,
+}
+
+
+learning_rate_schedule_to_str = invert_dict(str_to_learning_rate_schedule)
+
+
+def remove_nones_from_dict(d):
+    """Remove None values from a dictionary, so dataclasses with optional fields get serialized as
+    JSON objects without null values."""
+    return {k: v for k, v in d.items() if v is not None}
+
+
 @dataclass
 class TrainingConfig:
-    learning_rate: float
+    learning_rate: float  # peak learning rate
     batch_size: int
     epochs: int  # How many epochs to train for
-    triangle_schedule: bool
+    learning_rate_schedule: LearningRateSchedule
     gradient_accumulation_steps: int
     gradient_clipping: Optional[float]
+    # How many steps to linearly increase the learning rate when using WARMUP_PLUS_COSINE_LR. With
+    # the other schedules this value must be None
+    warmup_steps: Optional[int] = None
     training_images: int = 0  # How many images to train for (in addition to epochs)
     loss_decay_constant: float = (
         1.0  # How much to decay the loss to weight later tokens less. in (0, 1]
@@ -149,15 +179,17 @@ class TrainingConfig:
     def from_json_dict(dict: dict[str, Any]) -> "TrainingConfig":
         """Convert a dictionary parsed from JSON to a TrainingConfig object."""
         dict = copy(dict)
-        if dict["gradient_clipping"] == "None":
-            dict["gradient_clipping"] = None
+        dict["learning_rate_schedule"] = str_to_x_or_valueerror(
+            dict["learning_rate_schedule"],
+            str_to_learning_rate_schedule,
+            "learning rate schedule",
+        )
         return dacite.from_dict(data_class=TrainingConfig, data=dict)
 
     def to_json_dict(self) -> dict[str, Any]:
         """Convert a TrainingConfig object to a dictionary that can be serialized to JSON."""
-        dict = copy(self.__dict__)
-        if dict["gradient_clipping"] is None:
-            dict["gradient_clipping"] = "None"
+        dict = remove_nones_from_dict(copy(self.__dict__))
+        dict["learning_rate_schedule"] = self.learning_rate_schedule.value
         return dict
 
 
@@ -174,7 +206,7 @@ def test_trainingconfig_merge_argparse() -> None:
         learning_rate=1,
         batch_size=4096,
         epochs=1,
-        triangle_schedule=True,
+        learning_rate_schedule=LearningRateSchedule.TRIANGLE,
         gradient_accumulation_steps=1,
         gradient_clipping=0.5,
     )
@@ -191,7 +223,7 @@ def test_trainingconfig_merge_argparse() -> None:
         learning_rate=2,
         batch_size=4096,
         epochs=2,
-        triangle_schedule=True,
+        learning_rate_schedule=LearningRateSchedule.TRIANGLE,
         gradient_accumulation_steps=1,
         gradient_clipping=0.5,
     )
@@ -204,9 +236,8 @@ def test_trainingconfig_roundtrip_from_json() -> None:
         "batch_size": 4,
         "epochs": 100,
         "training_images": 0,
-        "triangle_schedule": true,
+        "learning_rate_schedule": "triangle",
         "gradient_accumulation_steps": 1,
-        "gradient_clipping": "None",
         "loss_decay_constant": 0.25}"""
     cfg = TrainingConfig.from_json_dict(json.loads(json_str))
     assert TrainingConfig.to_json_dict(cfg) == json.loads(json_str)
@@ -218,7 +249,7 @@ def test_trainingconfig_roundtrip_from_object() -> None:
         learning_rate=1,
         batch_size=4096,
         epochs=1,
-        triangle_schedule=True,
+        learning_rate_schedule=LearningRateSchedule.TRIANGLE,
         gradient_accumulation_steps=1,
         gradient_clipping=0.5,
     )
