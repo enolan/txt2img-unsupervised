@@ -103,7 +103,7 @@ def json_pretty(dict):
 def setup_cfg_and_wandb():
     """Set up our ModelConfig and TrainingConfig and initialize wandb."""
     checkpoint_options = ocp.CheckpointManagerOptions(
-        max_to_keep=3, keep_time_interval=datetime.timedelta(hours=6)
+        max_to_keep=3, keep_time_interval=datetime.timedelta(hours=24)
     )
     checkpoint_manager_items = ("params", "opt_state", "rng")
     if args.resume is not None:
