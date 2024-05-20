@@ -103,7 +103,10 @@ def json_pretty(dict):
 def setup_cfg_and_wandb():
     """Set up our ModelConfig and TrainingConfig and initialize wandb."""
     checkpoint_options = ocp.CheckpointManagerOptions(
-        max_to_keep=3, keep_time_interval=datetime.timedelta(hours=24)
+        max_to_keep=3,
+        keep_time_interval=datetime.timedelta(hours=24),
+        # Async checkpointing can hide out of disk errors, so we disable it.
+        enable_async_checkpointing=False,
     )
     checkpoint_manager_items = ("params", "opt_state", "rng")
     if args.resume is not None:
