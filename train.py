@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import json
 import numpy as np
 import optax  # type:ignore[import]
+import optax.contrib
 import orbax.checkpoint as ocp
 import PIL.Image
 import subprocess
@@ -80,6 +81,7 @@ parser.add_argument(
     "--learning-rate-schedule", type=argparse_from_dict(str_to_learning_rate_schedule)
 )
 parser.add_argument("--warmup-steps", type=int, default=None)
+parser.add_argument("--schedule-free-beta1", type=float, default=None)
 parser.add_argument("--gradient-accumulation-steps", type=int)
 parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--gradient-clipping", type=float, default=None)
@@ -270,19 +272,31 @@ def setup_optimizer(
     mdl = transformer_model.ImageModel(**model_cfg.__dict__)
 
     # Set up optimizer
+    get_eval_params_identity = lambda opt_state, params: params
     if training_cfg.learning_rate_schedule == LearningRateSchedule.CONSTANT:
-        assert training_cfg.warmup_steps is None
+        assert (
+            training_cfg.warmup_steps is None
+            and training_cfg.schedule_free_beta1 is None
+        )
         opt = optax.adam(learning_rate=training_cfg.learning_rate)
+        get_eval_params_inner = get_eval_params_identity
     elif training_cfg.learning_rate_schedule == LearningRateSchedule.TRIANGLE:
-        assert training_cfg.warmup_steps is None
+        assert (
+            training_cfg.warmup_steps is None
+            and training_cfg.schedule_free_beta1 is None
+        )
         opt = optax.adam(
             learning_rate=triangle_schedule(
                 training_cfg.learning_rate,
                 batches_total,
             )
         )
+        get_eval_params_inner = get_eval_params_identity
     elif training_cfg.learning_rate_schedule == LearningRateSchedule.WARMUP_PLUS_COSINE:
-        assert training_cfg.warmup_steps is not None
+        assert (
+            training_cfg.warmup_steps is not None
+            and training_cfg.schedule_free_beta1 is None
+        )
         opt = optax.adam(
             learning_rate=optax.warmup_cosine_decay_schedule(
                 init_value=0.0,
@@ -292,21 +306,57 @@ def setup_optimizer(
                 end_value=training_cfg.learning_rate * 0.05,
             )
         )
+        get_eval_params_inner = get_eval_params_identity
+    elif (
+        training_cfg.learning_rate_schedule
+        == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+    ):
+        assert (
+            training_cfg.warmup_steps is not None
+            and training_cfg.schedule_free_beta1 is not None
+        )
+        learning_rate_fn = optax.join_schedules(
+            [
+                optax.linear_schedule(
+                    0.0, training_cfg.learning_rate, training_cfg.warmup_steps
+                ),
+                optax.constant_schedule(training_cfg.learning_rate),
+            ],
+            [training_cfg.warmup_steps],
+        )
+        opt = optax.adam(learning_rate=learning_rate_fn, b1=0.0, use_first_moment=False)
+        opt = optax.contrib.schedule_free(
+            opt, learning_rate_fn, b1=training_cfg.schedule_free_beta1
+        )
+        get_eval_params_inner = (
+            lambda opt_state, params: optax.contrib.schedule_free_eval_params(
+                opt_state, params
+            )
+        )
     else:
         raise ValueError(
             f"Unknown learning rate schedule {training_cfg.learning_rate_schedule}"
         )
 
+    state_getter_fns = []  # Functions to run to get the state of the inner optimizer
     assert training_cfg.gradient_accumulation_steps > 0
     if training_cfg.gradient_accumulation_steps > 1:
         opt = optax.MultiSteps(
             opt, every_k_schedule=training_cfg.gradient_accumulation_steps
         )
+        state_getter_fns.append(lambda opt_state: opt_state.inner_opt_state)
     if training_cfg.gradient_clipping is not None:
         clip = optax.clip_by_global_norm(training_cfg.gradient_clipping)
     else:
         clip = optax.identity()
     opt = optax.apply_if_finite(optax.chain(clip, opt), 20)
+    state_getter_fns.append(lambda opt_state: opt_state.inner_state[1])
+
+    @jax.jit
+    def get_eval_params(opt_state, params):
+        for fn in state_getter_fns[::-1]:
+            opt_state = fn(opt_state)
+        return get_eval_params_inner(opt_state, params)
 
     # We need template inputs to get initial parameters, regardless of if we're loading or starting
     # anew.
@@ -380,10 +430,10 @@ def setup_optimizer(
             opt_state=opt_state,
         )
 
-    return mdl, ts, mesh
+    return mdl, ts, get_eval_params, mesh
 
 
-mdl, my_train_state, mesh = setup_optimizer(
+mdl, my_train_state, get_eval_params, mesh = setup_optimizer(
     model_cfg, training_cfg, batches_total, checkpoint_manager, global_step, restoring
 )
 
@@ -647,6 +697,7 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
     """Sample from the model and log to wandb."""
 
     ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
+    eval_params = get_eval_params(ts.opt_state, ts.params)
 
     if model_cfg.clip_conditioning:
         # Create a grid of samples for each set of conditions.
@@ -700,7 +751,7 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
             imgs_list = sample.sample_loop(
                 mdl,
                 model_cfg,
-                ts.params,
+                eval_params,
                 ae_mdl,
                 ae_params,
                 sample_batch_size,
@@ -781,7 +832,7 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
             imgs_list = sample.sample_loop(
                 mdl,
                 model_cfg,
-                ts.params,
+                eval_params,
                 ae_mdl,
                 ae_params,
                 sample_batch_size,
@@ -865,7 +916,7 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
 
         clip_embeddings = jnp.zeros((imgs_to_sample, 0), dtype=jnp.float32)
 
-        samples = sample_jv(ts.params, clip_embeddings, rngs, img_top_ps)
+        samples = sample_jv(eval_params, clip_embeddings, rngs, img_top_ps)
 
         decoded = sample.decode_jv(ae_mdl, ae_params, samples)
         decoded = np.array(decoded)
@@ -1061,7 +1112,7 @@ for epoch in trange(
                 batch_max_cos_distances = jax.device_put(
                     jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
                 )
-            my_train_state, loss, norm = train_step(
+            my_train_state, train_loss, norm = train_step(
                 my_train_state,
                 training_cfg.loss_decay_constant,
                 batch_imgs,
@@ -1069,14 +1120,14 @@ for epoch in trange(
                 batch_max_cos_distances,
             )
             # TODO check if moving this check inside an if opt_state.notfinite_count > 0 is faster
-            if not jnp.isfinite(loss):
-                tqdm.write(f"Loss nonfinite 😢 ({loss})")
+            if not jnp.isfinite(train_loss):
+                tqdm.write(f"Loss nonfinite 😢 ({train_loss})")
             opt_state = my_train_state.opt_state
             global_step += 1
             wandb.log(
                 {
                     "global_step": global_step,
-                    "train/loss": loss,
+                    "train/loss": train_loss,
                     "grad_global_norm": norm,
                     "debug/notfinite_count": opt_state.notfinite_count,
                 }
@@ -1084,10 +1135,38 @@ for epoch in trange(
             if opt_state.notfinite_count > 50:
                 tqdm.write(f"Too many nonfinite values in gradients, giving up")
                 exit(1)
+            if (
+                pbar.n % 10 == 0
+                and training_cfg.learning_rate_schedule
+                == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+            ):
+                # Since the params used for gradient computation with a schedule-free optimizer are
+                # not the same as the params used for inference, we want to test with the inference
+                # params occasionally for charting.
+                eval_params = get_eval_params(opt_state, my_train_state.params)
+                eval_loss = loss_fn(
+                    eval_params,
+                    training_cfg.loss_decay_constant,
+                    my_train_state.rng,
+                    batch_imgs,
+                    batch_clips,
+                    batch_max_cos_distances,
+                )
+                del eval_params
+                wandb.log({"global_step": global_step, "eval/loss": eval_loss})
+            if (
+                training_cfg.learning_rate_schedule
+                == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+            ):
+                pbar.set_postfix(
+                    train_loss=f"{train_loss:.4f}", eval_loss=f"{eval_loss:.4f}"
+                )
+            else:
+                pbar.set_postfix(train_loss=f"{train_loss:.4f}")
             pbar.update()
-            pbar.set_postfix(loss=f"{loss:.4f}")
     # Evaluate on test set
     losses = []
+    eval_params = get_eval_params(opt_state, my_train_state.params)
     for batch in tqdm(
         # The last batch needs to be a multiple of the number of devices, and it isn't guaranteed
         # to be, so we drop it. Shouldn't matter much when even 1% of the dataset is thousands of
@@ -1126,7 +1205,7 @@ for epoch in trange(
             )
         losses.append(
             loss_fn(
-                my_train_state.params,
+                eval_params,
                 training_cfg.loss_decay_constant,
                 dropout_rng,
                 batch_imgs,
@@ -1134,10 +1213,11 @@ for epoch in trange(
                 batch_max_cos_distances,
             )
         )
+    del eval_params
     test_loss = jnp.mean(jnp.stack(losses))
     wandb.log({"global_step": global_step, "test/loss": test_loss})
     tqdm.write(
-        f"Epoch {epoch} done, train loss: {loss:.4f}, test loss {test_loss:.4f}",
+        f"Epoch {epoch} done, train loss: {train_loss:.4f}, test loss {test_loss:.4f}",
         end="",
     )
     save_checkpoint_and_sample(my_train_state, sample_batch_size, global_step)

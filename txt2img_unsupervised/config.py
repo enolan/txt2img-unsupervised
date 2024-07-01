@@ -141,12 +141,14 @@ class LearningRateSchedule(Enum):
     WARMUP_PLUS_COSINE = (
         "warmup_plus_cosine"  # Linear warmup for a fixed # of steps, then cosine decay.
     )
+    WARMUP_PLUS_SCHEDULE_FREE = "warmup_plus_schedule_free"  # Linear warmup for a fixed # of steps, then schedule-free Adam.
 
 
 str_to_learning_rate_schedule = {
     "constant": LearningRateSchedule.CONSTANT,
     "triangle": LearningRateSchedule.TRIANGLE,
     "warmup_plus_cosine": LearningRateSchedule.WARMUP_PLUS_COSINE,
+    "warmup_plus_schedule_free": LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE,
 }
 
 
@@ -170,6 +172,8 @@ class TrainingConfig:
     # How many steps to linearly increase the learning rate when using WARMUP_PLUS_COSINE_LR. With
     # the other schedules this value must be None
     warmup_steps: Optional[int] = None
+    # Schedule-free beta1
+    schedule_free_beta1: Optional[float] = None
     training_images: int = 0  # How many images to train for (in addition to epochs)
     loss_decay_constant: float = (
         1.0  # How much to decay the loss to weight later tokens less. in (0, 1]

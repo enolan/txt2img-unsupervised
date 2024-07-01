@@ -4,5 +4,5 @@
   "epochs": 10,
   "learning_rate_schedule": "triangle",
   "gradient_accumulation_steps": 1,
-  "gradient_clipping": 0.5
+  "gradient_clipping": null
 }
