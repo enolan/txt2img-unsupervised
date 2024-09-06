@@ -310,18 +310,38 @@ if __name__ == "__main__":
         args.transformer_checkpoint_dir.absolute(),
         item_names=("params",),
     )
-    print(
-        f"Loading step {checkpoint_mngr.latest_step()} from {args.transformer_checkpoint_dir}"
-    )
-    im_params = checkpoint_mngr.restore(
-        checkpoint_mngr.latest_step(),
-        args=ocp.args.Composite(params=ocp.args.StandardRestore()),
-    )["params"]
 
     model_cfg = ModelConfig.from_json_dict(checkpoint_mngr.metadata()["model_cfg"])
     # Samples are substantially better with 32 bits, even for models trained with bf16
     model_cfg.activations_dtype = jnp.float32
     im_mdl = ImageModel(**model_cfg.__dict__)
+
+    if model_cfg.clip_conditioning and model_cfg.clip_caps:
+        clip_embedding_dummy = jnp.zeros((model_cfg.clip_cap_count, 768))
+        max_cos_distance_dummy = jnp.zeros(model_cfg.clip_cap_count)
+    elif model_cfg.clip_conditioning:
+        clip_embedding_dummy = jnp.zeros(768)
+        max_cos_distance_dummy = jnp.array([], dtype=jnp.float32)
+    else:
+        clip_embedding_dummy = jnp.array([], dtype=jnp.float32)
+        max_cos_distance_dummy = jnp.array([], dtype=jnp.float32)
+    template_params = im_mdl.init(
+        rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(0)},
+        image=jnp.zeros((model_cfg.image_tokens,), dtype=jnp.int32),
+        clip_embedding=clip_embedding_dummy,
+        max_cos_distance=max_cos_distance_dummy,
+    )
+
+    print(
+        f"Loading step {checkpoint_mngr.latest_step()} from {args.transformer_checkpoint_dir}"
+    )
+    im_params = checkpoint_mngr.restore(
+        checkpoint_mngr.latest_step(),
+        args=ocp.args.Composite(params=ocp.args.StandardRestore(template_params)),
+    )["params"]
+
+    del template_params, clip_embedding_dummy, max_cos_distance_dummy
+
     if model_cfg.clip_conditioning:
         print("Loading CLIP model...")
 
@@ -339,6 +359,7 @@ if __name__ == "__main__":
             parse_cond_txt(s, clip_mdl, clip_processor) for s in (args.cond_txt or [])
         ]
         cond_dicts = cond_img_dicts + cond_txt_dicts
+        del clip_mdl, clip_processor
 
         if model_cfg.clip_caps:
             total_conds = len(cond_dicts)
