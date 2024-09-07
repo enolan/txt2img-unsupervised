@@ -38,7 +38,10 @@ def batches_split(batch_size: int, n: int) -> list[int]:
 
 
 @partial(jax.jit, static_argnums=(0,))
-def sample_jv(mdl, params, top_p, clip_embeddings, max_cos_distances, rng):
+def sample_jv(mdl, params, top_p, clip_embeddings, max_cos_distances, rngs):
+    assert (
+        clip_embeddings.shape[0] == max_cos_distances.shape[0] == rngs.shape[0]
+    ), "Number of clip embeddings, max cosine distances, and random keys should be equal"
     return jax.vmap(
         lambda clip_embedding, max_cos_distance, rng: sample(
             mdl,
@@ -51,7 +54,7 @@ def sample_jv(mdl, params, top_p, clip_embeddings, max_cos_distances, rng):
     )(
         clip_embeddings,
         max_cos_distances,
-        jax.random.split(rng, len(clip_embeddings)),
+        rngs,
     )
 
 
@@ -187,6 +190,7 @@ def sample_loop(
         mdl = mdl.clone(activations_dtype=jnp.float32)
 
     # Sample from the transformer model
+    rngs = jax.random.split(rng, len(cap_centers))
     batches = batches_split(batch_size, len(cap_centers))
     sampled_codes_arrs = []
     with tqdm(total=len(cap_centers), desc="sampling", unit="img") as pbar:
@@ -200,25 +204,29 @@ def sample_loop(
                 max_cos_distances_sharded = jax.device_put(
                     max_cos_distances_batch, sharding
                 )
+                rngs_batch = rngs[ctr : ctr + batch]
+                rngs_sharded = jax.device_put(rngs_batch, sharding)
                 codes = sample_jv(
                     mdl,
                     params,
                     top_p,
                     cap_centers_sharded,
                     max_cos_distances_sharded,
-                    rng2,
+                    rngs_sharded,
                 )
                 sampled_codes_arrs.append(jax.device_get(codes))
             else:
                 cap_centers_batch = cap_centers[ctr : ctr + batch]
                 cap_centers_sharded = jax.device_put(cap_centers_batch, sharding)
+                rngs_batch = rngs[ctr : ctr + batch]
+                rngs_sharded = jax.device_put(rngs_batch, sharding)
                 codes = sample_jv(
                     mdl,
                     params,
                     top_p,
                     cap_centers_sharded,
                     jnp.zeros((batch, 0), dtype=jnp.float32),
-                    rng2,
+                    rngs_batch,
                 )
                 sampled_codes_arrs.append(jax.device_get(codes))
             pbar.update(batch)
@@ -252,6 +260,115 @@ def sample_loop(
     for img in tqdm(decoded_imgs, desc="PILifying", unit="img"):
         pil_imgs.append(PIL.Image.fromarray(img))
     return pil_imgs
+
+
+def test_sample_loop_batch_equivalence():
+    """Test that sampling with batch size 1 is equivalent to sampling with batch size 64.
+    This should fail with certain busted cudnn versions."""
+
+    # Set up ImageModel
+    model_cfg = ModelConfig(
+        image_tokens=256,
+        clip_conditioning=True,
+        clip_caps=True,
+        clip_cap_count=1,
+        n_layers=12,
+        num_heads=12,
+        d_model=768,
+        ff_dim=3072,
+        dropout=None,
+        use_biases=True,
+        activations_dtype=jnp.float32,
+        activation_function=jax.nn.gelu,
+    )
+    ae_res = 16
+
+    mdl = ImageModel(**model_cfg.__dict__)
+
+    im_params_rng, ae_params_rng, caps_rng, sample_rng = jax.random.split(
+        jax.random.PRNGKey(0), 4
+    )
+
+    params = mdl.init(
+        rngs={"params": im_params_rng},
+        image=jnp.zeros((model_cfg.image_tokens,), dtype=jnp.int32),
+        clip_embedding=jnp.zeros((model_cfg.clip_cap_count, 768), dtype=jnp.float32),
+        max_cos_distance=jnp.zeros((model_cfg.clip_cap_count,), dtype=jnp.float32),
+    )
+
+    # Set up LDMAutoencoder
+    ae_cfg = {
+        "n_embed": 8192,
+        "embed_dim": 3,
+        "ddconfig": {
+            "double_z": False,
+            "z_channels": 3,
+            "resolution": 256,
+            "in_channels": 3,
+            "out_ch": 3,
+            "ch": 128,
+            "ch_mult": [1, 2, 4],
+            "num_res_blocks": 2,
+            "attn_resolutions": [],
+            "dropout": 0.0,
+        },
+    }
+    ae_cfg = OmegaConf.create(ae_cfg)
+    ae_mdl = LDMAutoencoder(ae_cfg)
+    ae_params = ae_mdl.init(
+        rngs={"params": ae_params_rng},
+        x=jnp.zeros((256,), dtype=jnp.int32),
+        method=LDMAutoencoder.decode,
+        shape=(ae_res, ae_res),
+    )
+
+    # Generate inputs
+    n_samples = 64
+    centers_rng, cos_distances_rng = jax.random.split(caps_rng)
+    cap_centers = jax.device_get(
+        jax.random.normal(centers_rng, (n_samples, model_cfg.clip_cap_count, 768))
+    )
+    max_cos_distances = jax.device_get(
+        jax.random.uniform(cos_distances_rng, (n_samples, model_cfg.clip_cap_count))
+    )
+
+    # Sample
+    sample_bs = lambda bs: sample_loop(
+        mdl,
+        model_cfg,
+        params,
+        ae_mdl,
+        ae_params,
+        bs,
+        cap_centers,
+        max_cos_distances,
+        sample_rng,
+        0.9,
+    )
+
+    samples_1 = sample_bs(1)
+    samples_64 = sample_bs(64)
+
+    # check
+    assert (
+        len(samples_1) == len(samples_64) == n_samples
+    ), "Number of samples should be equal"
+    close_samples, far_samples = [], []
+    for idx, (s1, s64) in enumerate(zip(samples_1, samples_64)):
+        s1_arr, s64_arr = np.asarray(s1), np.asarray(s64)
+        if np.allclose(s1_arr, s64_arr, rtol=0, atol=1):
+            close_samples.append(idx)
+        else:
+            far_samples.append(idx)
+            print(
+                f"Samples at index {idx} are substantially different: {s1_arr} != {s64_arr}"
+            )
+    if len(far_samples) > 0:
+        print(f"Far samples: {far_samples}")
+        print(f"Close samples: {close_samples}")
+        assert (
+            len(close_samples) >= 0.95 * n_samples
+        ), "Too many substantially different samples"
 
 
 def mk_filler_caps(model_cfg, n_cap_sets, n_used_caps, rng):
@@ -310,18 +427,38 @@ if __name__ == "__main__":
         args.transformer_checkpoint_dir.absolute(),
         item_names=("params",),
     )
-    print(
-        f"Loading step {checkpoint_mngr.latest_step()} from {args.transformer_checkpoint_dir}"
-    )
-    im_params = checkpoint_mngr.restore(
-        checkpoint_mngr.latest_step(),
-        args=ocp.args.Composite(params=ocp.args.StandardRestore()),
-    )["params"]
 
     model_cfg = ModelConfig.from_json_dict(checkpoint_mngr.metadata()["model_cfg"])
     # Samples are substantially better with 32 bits, even for models trained with bf16
     model_cfg.activations_dtype = jnp.float32
     im_mdl = ImageModel(**model_cfg.__dict__)
+
+    if model_cfg.clip_conditioning and model_cfg.clip_caps:
+        clip_embedding_dummy = jnp.zeros((model_cfg.clip_cap_count, 768))
+        max_cos_distance_dummy = jnp.zeros(model_cfg.clip_cap_count)
+    elif model_cfg.clip_conditioning:
+        clip_embedding_dummy = jnp.zeros(768)
+        max_cos_distance_dummy = jnp.array([], dtype=jnp.float32)
+    else:
+        clip_embedding_dummy = jnp.array([], dtype=jnp.float32)
+        max_cos_distance_dummy = jnp.array([], dtype=jnp.float32)
+    template_params = im_mdl.init(
+        rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(0)},
+        image=jnp.zeros((model_cfg.image_tokens,), dtype=jnp.int32),
+        clip_embedding=clip_embedding_dummy,
+        max_cos_distance=max_cos_distance_dummy,
+    )
+
+    print(
+        f"Loading step {checkpoint_mngr.latest_step()} from {args.transformer_checkpoint_dir}"
+    )
+    im_params = checkpoint_mngr.restore(
+        checkpoint_mngr.latest_step(),
+        args=ocp.args.Composite(params=ocp.args.StandardRestore(template_params)),
+    )["params"]
+
+    del template_params, clip_embedding_dummy, max_cos_distance_dummy
+
     if model_cfg.clip_conditioning:
         print("Loading CLIP model...")
 
@@ -339,6 +476,7 @@ if __name__ == "__main__":
             parse_cond_txt(s, clip_mdl, clip_processor) for s in (args.cond_txt or [])
         ]
         cond_dicts = cond_img_dicts + cond_txt_dicts
+        del clip_mdl, clip_processor
 
         if model_cfg.clip_caps:
             total_conds = len(cond_dicts)
