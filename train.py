@@ -314,7 +314,7 @@ def setup_optimizer(
         assert (
             training_cfg.warmup_steps is not None
             and training_cfg.schedule_free_beta1 is not None
-        )
+        ), "WARMUP_PLUS_SCHEDULE_FREE requires both warmup_steps and schedule_free_beta1 to be set"
         learning_rate_fn = optax.join_schedules(
             [
                 optax.linear_schedule(
