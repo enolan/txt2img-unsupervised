@@ -1043,6 +1043,9 @@ start_step = global_step % batches_per_epoch
 tqdm.write(f"Starting at epoch {start_epoch}, step {start_step}")
 
 examples_sharding = NamedSharding(mesh, PartitionSpec("dev"))
+
+eval_loss = None
+
 for epoch in trange(
     start_epoch,
     epochs_total,
@@ -1123,7 +1126,6 @@ for epoch in trange(
             if not jnp.isfinite(train_loss):
                 tqdm.write(f"Loss nonfinite 😢 ({train_loss})")
             opt_state = my_train_state.opt_state
-            global_step += 1
             wandb.log(
                 {
                     "global_step": global_step,
@@ -1136,7 +1138,7 @@ for epoch in trange(
                 tqdm.write(f"Too many nonfinite values in gradients, giving up")
                 exit(1)
             if (
-                pbar.n % 10 == 0
+                global_step % 20 == 0
                 and training_cfg.learning_rate_schedule
                 == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
             ):
@@ -1157,6 +1159,7 @@ for epoch in trange(
             if (
                 training_cfg.learning_rate_schedule
                 == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+                and eval_loss is not None # can be None if resuming from checkpoint
             ):
                 pbar.set_postfix(
                     train_loss=f"{train_loss:.4f}", eval_loss=f"{eval_loss:.4f}"
@@ -1164,6 +1167,8 @@ for epoch in trange(
             else:
                 pbar.set_postfix(train_loss=f"{train_loss:.4f}")
             pbar.update()
+            global_step += 1
+
     # Evaluate on test set
     losses = []
     eval_params = get_eval_params(opt_state, my_train_state.params)
