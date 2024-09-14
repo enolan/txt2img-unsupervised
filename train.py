@@ -315,18 +315,10 @@ def setup_optimizer(
             training_cfg.warmup_steps is not None
             and training_cfg.schedule_free_beta1 is not None
         ), "WARMUP_PLUS_SCHEDULE_FREE requires both warmup_steps and schedule_free_beta1 to be set"
-        learning_rate_fn = optax.join_schedules(
-            [
-                optax.linear_schedule(
-                    0.0, training_cfg.learning_rate, training_cfg.warmup_steps
-                ),
-                optax.constant_schedule(training_cfg.learning_rate),
-            ],
-            [training_cfg.warmup_steps],
-        )
-        opt = optax.adam(learning_rate=learning_rate_fn, b1=0.0, use_first_moment=False)
-        opt = optax.contrib.schedule_free(
-            opt, learning_rate_fn, b1=training_cfg.schedule_free_beta1
+        opt = optax.contrib.schedule_free_adamw(
+            learning_rate=training_cfg.learning_rate,
+            warmup_steps=training_cfg.warmup_steps,
+            b1=training_cfg.schedule_free_beta1,
         )
         get_eval_params_inner = (
             lambda opt_state, params: optax.contrib.schedule_free_eval_params(

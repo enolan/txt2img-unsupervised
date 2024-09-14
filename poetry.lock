@@ -2322,7 +2322,7 @@ tests = ["pytest", "pytest-cov", "pytest-pep8"]
 
 [[package]]
 name = "optax"
-version = "0.2.3.dev0"
+version = "0.2.4.dev0"
 description = "A gradient processing and optimisation library in JAX."
 optional = false
 python-versions = ">=3.9"
@@ -2346,8 +2346,8 @@ test = ["dm-tree (>=0.1.7)", "flax (>=0.5.3)", "scikit-learn", "scipy (>=1.7.1)"
 [package.source]
 type = "git"
 url = "https://github.com/enolan/optax.git"
-reference = "ba5ca3a9f1b7436849b94a8acf28a2fb32248fee"
-resolved_reference = "ba5ca3a9f1b7436849b94a8acf28a2fb32248fee"
+reference = "faef917"
+resolved_reference = "faef917ab56861f9047d375a7a721028142a7d23"
 
 [[package]]
 name = "orbax-checkpoint"
@@ -4222,4 +4222,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.11.8"
-content-hash = "d8f9fbcb8897bab1c9e96528d15ca777b20354db4864b3975a32f633aafda49d"
+content-hash = "1da21d01d461f4dac2210c5e8501418a2145aba99d8f68195062dfecf9467b99"

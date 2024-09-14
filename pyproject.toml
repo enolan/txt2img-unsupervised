@@ -21,7 +21,12 @@ numpy = "1.*" # 2.x series is out, should probably upgrade at some point.
 # unpin at some point.
 nvidia-cudnn-cu12 = "9.3.0.75"
 omegaconf = "^2.3.0"
-optax = { git = "https://github.com/enolan/optax.git", branch = "txt2img-unsupervised-schedule-free", rev = "ba5ca3a9f1b7436849b94a8acf28a2fb32248fee"}
+# TODO: use regular release of optax
+# we can get rid of my special optax branch and use optax.contrib.schedule_free_adamw instead of the use_first_moment=False hack
+# but the schedule_free_adamw function isn't in a release yet, and my code that makes donating the train state work isn't either.
+#optax = { git = "https://github.com/enolan/optax.git", branch = "txt2img-unsupervised-schedule-free", rev = "ba5ca3a9f1b7436849b94a8acf28a2fb32248fee"}
+#optax = { git = "https://github.com/google-deepmind/optax.git", rev = "8b599cc2ca6fb271220ae3b25f28baf82684357f"}
+optax = { git = "https://github.com/enolan/optax.git", branch = "fix-schedule-free-donate", rev = "faef917"}
 orbax-checkpoint = "^0.5.10"
 pillow = "^9.5.0"
 pytest = "^7.3.1"
