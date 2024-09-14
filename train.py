@@ -273,18 +273,21 @@ def setup_optimizer(
 
     # Set up optimizer
     get_eval_params_identity = lambda opt_state, params: params
+    assert_msg = (
+        lambda name, warmup, beta1: f"{name} requires warmup_steps to be {'set' if warmup else 'unset'} and schedule_free_beta1 to be {'set' if beta1 else 'unset'}"
+    )
     if training_cfg.learning_rate_schedule == LearningRateSchedule.CONSTANT:
         assert (
             training_cfg.warmup_steps is None
             and training_cfg.schedule_free_beta1 is None
-        )
+        ), assert_msg("constant schedule", False, False)
         opt = optax.adam(learning_rate=training_cfg.learning_rate)
         get_eval_params_inner = get_eval_params_identity
     elif training_cfg.learning_rate_schedule == LearningRateSchedule.TRIANGLE:
         assert (
             training_cfg.warmup_steps is None
             and training_cfg.schedule_free_beta1 is None
-        )
+        ), assert_msg("triangle schedule", False, False)
         opt = optax.adam(
             learning_rate=triangle_schedule(
                 training_cfg.learning_rate,
@@ -296,7 +299,7 @@ def setup_optimizer(
         assert (
             training_cfg.warmup_steps is not None
             and training_cfg.schedule_free_beta1 is None
-        )
+        ), assert_msg("warmup plus cosine schedule", True, False)
         opt = optax.adam(
             learning_rate=optax.warmup_cosine_decay_schedule(
                 init_value=0.0,
@@ -314,7 +317,7 @@ def setup_optimizer(
         assert (
             training_cfg.warmup_steps is not None
             and training_cfg.schedule_free_beta1 is not None
-        ), "WARMUP_PLUS_SCHEDULE_FREE requires both warmup_steps and schedule_free_beta1 to be set"
+        ), assert_msg("warmup plus schedule-free", True, True)
         opt = optax.contrib.schedule_free_adamw(
             learning_rate=training_cfg.learning_rate,
             warmup_steps=training_cfg.warmup_steps,
