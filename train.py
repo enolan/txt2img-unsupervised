@@ -1154,7 +1154,7 @@ for epoch in trange(
             if (
                 training_cfg.learning_rate_schedule
                 == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
-                and eval_loss is not None # can be None if resuming from checkpoint
+                and eval_loss is not None  # can be None if resuming from checkpoint
             ):
                 pbar.set_postfix(
                     train_loss=f"{train_loss:.4f}", eval_loss=f"{eval_loss:.4f}"
