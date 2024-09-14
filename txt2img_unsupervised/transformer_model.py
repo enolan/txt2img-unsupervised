@@ -189,7 +189,10 @@ class ImageModel(nn.Module):
                 res_cap_centers = self.clip_proj(clip_embedding)
                 res_max_cos_distances = self.max_cos_distance_proj(1 - max_cos_distance)
                 assert res_cap_centers.shape == (self.clip_cap_count, self.d_model)
-                assert res_max_cos_distances.shape == (self.clip_cap_count, self.d_model)
+                assert res_max_cos_distances.shape == (
+                    self.clip_cap_count,
+                    self.d_model,
+                )
                 res = (res_cap_centers + res_max_cos_distances) / 2
         assert res.shape == (self.prepended_tokens(), self.d_model)
         return res
