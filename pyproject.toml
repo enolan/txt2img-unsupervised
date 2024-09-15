@@ -26,7 +26,7 @@ omegaconf = "^2.3.0"
 # but the schedule_free_adamw function isn't in a release yet, and my code that makes donating the train state work isn't either.
 #optax = { git = "https://github.com/enolan/optax.git", branch = "txt2img-unsupervised-schedule-free", rev = "ba5ca3a9f1b7436849b94a8acf28a2fb32248fee"}
 #optax = { git = "https://github.com/google-deepmind/optax.git", rev = "8b599cc2ca6fb271220ae3b25f28baf82684357f"}
-optax = { git = "https://github.com/enolan/optax.git", branch = "fix-schedule-free-donate", rev = "faef917"}
+optax = { git = "https://github.com/enolan/optax.git", branch = "fix-schedule-free-donate", rev = "754470910729c7e0a789587d0096b263e9fa576e"}
 orbax-checkpoint = "^0.5.10"
 pillow = "^9.5.0"
 pytest = "^7.3.1"
