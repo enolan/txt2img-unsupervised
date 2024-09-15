@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax  # type: ignore[import]
+import pytest
 from copy import copy
 from dataclasses import dataclass
 from datetime import datetime
@@ -39,6 +40,7 @@ class ImageModel(nn.Module):
     use_biases: bool
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
+    pre_norm: bool
     decode: bool = False
     flash_attention: bool = True
 
@@ -130,10 +132,14 @@ class ImageModel(nn.Module):
             use_biases=self.use_biases,
             activations_dtype=self.activations_dtype,
             activation_function=self.activation_function,
+            pre_norm=self.pre_norm,
             kernel_init=default_kernel_init,
             decode=self.decode,
             flash_attention=self.flash_attention,
         )
+
+        if self.pre_norm:
+            self.final_layer_norm = nn.LayerNorm(dtype=self.activations_dtype)
 
         self.logits_decoder = nn.Dense(
             features=8192,
@@ -220,6 +226,8 @@ class ImageModel(nn.Module):
 
         h: jax.Array = toks + self.positional_encoding(jnp.arange(self.seq_len()))
         h, _ = self.transformer_layers(h, None)
+        if self.pre_norm:
+            h = self.final_layer_norm(h)
         h = h[self.prepended_tokens() - 1 :]
         h = self.logits_decoder(h)
         assert h.shape == (self.image_tokens, 8192)
@@ -727,6 +735,7 @@ class TransformerLayer(nn.Module):
     use_biases: bool
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
+    pre_norm: bool
     kernel_init: Callable[..., jnp.ndarray]
     decode: bool
     flash_attention: bool
@@ -823,14 +832,22 @@ class TransformerLayer(nn.Module):
             mask = jnp.tril(
                 jnp.ones((self.num_heads, embeds.shape[0], embeds.shape[0]))
             )
-        out_block_1 = self.layer_norm_1(self.mha(embeds, mask=mask))
-        in_block_2: jax.Array = embeds + self.dropout_layer(out_block_1)
-        out_block_2: jax.Array = self.layer_norm_2(
-            self.dropout_layer(
-                self.linear_2(self.activation_function(self.linear_1(in_block_2)))  # type: ignore[attr-defined]
-            )
-        )
-        return in_block_2 + out_block_2, None
+
+        if self.pre_norm:
+            embeds = self.layer_norm_1(embeds)
+        attn_output = self.mha(embeds, mask=mask)
+        if not self.pre_norm:
+            attn_output = self.layer_norm_1(attn_output)
+        embeds = embeds + self.dropout_layer(attn_output)
+
+        if self.pre_norm:
+            embeds = self.layer_norm_2(embeds)
+        ff_output = self.linear_2(self.activation_function(self.linear_1(embeds)))
+        if not self.pre_norm:
+            ff_output = self.layer_norm_2(ff_output)
+        embeds = embeds + self.dropout_layer(ff_output)
+
+        return embeds, None
 
 
 def test_flash_attention_equals_standard() -> None:
@@ -843,6 +860,7 @@ def test_flash_attention_equals_standard() -> None:
         use_biases=False,
         activations_dtype=jnp.float32,
         activation_function=jax.nn.relu,
+        pre_norm=False,
         kernel_init=jax.nn.initializers.xavier_uniform(),
         decode=False,
         flash_attention=False,
@@ -1054,7 +1072,11 @@ def test_cap_train() -> None:
 
 
 def train_loop_simple(
-    data: jax.Array, mdl: ImageModel, iters: int, loss_decay_constant: float = 1.0
+    data: jax.Array,
+    mdl: ImageModel,
+    iters: int,
+    learning_rate: float = 3e-5,
+    loss_decay_constant: float = 1.0,
 ) -> Tuple[jax.Array, dict[str, Any]]:
     """Train the model repeatedly on a single batch for testing."""
     assert mdl.clip_conditioning is False
@@ -1064,7 +1086,7 @@ def train_loop_simple(
         clip_embedding=jnp.zeros((0,), dtype=jnp.float32),
         max_cos_distance=jnp.array([]),
     )
-    opt = optax.adam(learning_rate=3e-5)
+    opt = optax.adam(learning_rate=learning_rate)
     opt_state = opt.init(params)
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
 
@@ -1101,11 +1123,14 @@ def train_loop_simple(
     return loss, params  # type:ignore[return-value]
 
 
-def test_learn_zeros() -> None:
+@pytest.mark.parametrize("pre_norm", [True, False])
+def test_learn_zeros(pre_norm: bool) -> None:
     """Test whether the model can learn to predict all zeros."""
-    mdl = ImageModel(**gpt_1_config.__dict__)
+    mdl_cfg = copy(gpt_1_config)
+    mdl_cfg.pre_norm = pre_norm
+    mdl = ImageModel(**mdl_cfg.__dict__)
     data = jnp.zeros((16, gpt_1_config.image_tokens), dtype=jnp.int32)
-    loss, params = train_loop_simple(data, mdl, 10)
+    loss, params = train_loop_simple(data, mdl, 20, learning_rate=3e-3)
     assert loss < 1e-10
 
     sampled_arr = sample(
@@ -1118,14 +1143,20 @@ def test_learn_zeros() -> None:
     assert jnp.all(sampled_arr == 0)
 
 
-def test_learn_ranges() -> None:
-    """Test whether the model can learn to predict a range of integers."""
-    mdl = ImageModel(**gpt_1_config.__dict__)
+@pytest.mark.parametrize("pre_norm", [True, False])
+def test_learn_ranges(pre_norm: bool) -> None:
+    """Test whether the model can memorize ranges of integers."""
+    mdl_cfg = copy(gpt_1_config)
+    mdl_cfg.pre_norm = pre_norm
+    mdl = ImageModel(**mdl_cfg.__dict__)
+    # The numbers are sequential but there's nothing about the way the model works that tells it
+    # the ordering of the tokens in the codebook, so this is a pure memorization test.
     data = jnp.arange(16 * gpt_1_config.image_tokens).reshape(
         (16, gpt_1_config.image_tokens)
     )
-    # It's annoying how many iterations we need to get to minimal loss on such a trivial dataset
-    loss, params = train_loop_simple(data, mdl, 1000)
+    loss, params = train_loop_simple(
+        data, mdl, 200 if pre_norm else 400, learning_rate=3e-4 if pre_norm else 3e-5
+    )
     assert loss < 0.6
     empty_arr = jnp.zeros((0,), dtype=jnp.float32)
     sample_jv = jax.jit(

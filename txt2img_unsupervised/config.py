@@ -23,6 +23,7 @@ class ModelConfig:
     use_biases: bool
     activation_function: Callable[[jax.Array], jax.Array]
     activations_dtype: jnp.dtype = jnp.float32
+    pre_norm: bool = False
     clip_conditioning: bool = False
     clip_caps: bool = False
     clip_cap_count: int = None
@@ -109,6 +110,7 @@ def test_modelconfig_roundtrip_from_json() -> None:
         "use_biases": true,
         "activations_dtype": "float32",
         "activation_function": "relu",
+        "pre_norm": false,
         "clip_cap_count": null,
         "clip_caps": false,
         "clip_conditioning": false
