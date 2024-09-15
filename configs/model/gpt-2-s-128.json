@@ -1,7 +1,7 @@
 {
   "d_model": 1024,
   "num_heads": 16,
-  "ff_dim": 3072,
+  "ff_dim": 4096,
   "dropout": 0.1,
   "n_layers": 24,
   "image_tokens": 1024,
