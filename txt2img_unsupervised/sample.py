@@ -291,9 +291,11 @@ def test_sample_loop_batch_equivalence():
 
     params = mdl.init(
         rngs={"params": im_params_rng},
-        image=jnp.zeros((model_cfg.image_tokens,), dtype=jnp.int32),
-        clip_embedding=jnp.zeros((model_cfg.clip_cap_count, 768), dtype=jnp.float32),
-        max_cos_distance=jnp.zeros((model_cfg.clip_cap_count,), dtype=jnp.float32),
+        images=jnp.zeros((1, model_cfg.image_tokens), dtype=jnp.int32),
+        clip_embeddings=jnp.zeros(
+            (1, model_cfg.clip_cap_count, 768), dtype=jnp.float32
+        ),
+        max_cos_distances=jnp.zeros((1, model_cfg.clip_cap_count), dtype=jnp.float32),
     )
 
     # Set up LDMAutoencoder
@@ -434,19 +436,19 @@ if __name__ == "__main__":
     im_mdl = ImageModel(**model_cfg.__dict__)
 
     if model_cfg.clip_conditioning and model_cfg.clip_caps:
-        clip_embedding_dummy = jnp.zeros((model_cfg.clip_cap_count, 768))
-        max_cos_distance_dummy = jnp.zeros(model_cfg.clip_cap_count)
+        clip_embedding_dummy = jnp.zeros((1, model_cfg.clip_cap_count, 768))
+        max_cos_distance_dummy = jnp.zeros((1, model_cfg.clip_cap_count))
     elif model_cfg.clip_conditioning:
-        clip_embedding_dummy = jnp.zeros(768)
-        max_cos_distance_dummy = jnp.array([], dtype=jnp.float32)
+        clip_embedding_dummy = jnp.zeros((1, 768))
+        max_cos_distance_dummy = jnp.zeros((1,))
     else:
-        clip_embedding_dummy = jnp.array([], dtype=jnp.float32)
-        max_cos_distance_dummy = jnp.array([], dtype=jnp.float32)
+        clip_embedding_dummy = jnp.zeros((1, 0))
+        max_cos_distance_dummy = jnp.zeros((1, 0))
     template_params = im_mdl.init(
         rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(0)},
-        image=jnp.zeros((model_cfg.image_tokens,), dtype=jnp.int32),
-        clip_embedding=clip_embedding_dummy,
-        max_cos_distance=max_cos_distance_dummy,
+        images=jnp.zeros((1, model_cfg.image_tokens), dtype=jnp.int32),
+        clip_embeddings=clip_embedding_dummy,
+        max_cos_distances=max_cos_distance_dummy,
     )
 
     print(

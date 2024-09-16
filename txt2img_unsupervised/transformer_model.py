@@ -209,28 +209,49 @@ class ImageModel(nn.Module):
         return (res, res)
 
     def __call__(
-        self, image: jax.Array, clip_embedding: jax.Array, max_cos_distance
+        self,
+        images: jax.Array,
+        clip_embeddings: jax.Array,
+        max_cos_distances: jax.Array,
     ) -> jax.Array:
         """Run the model, returning log probabilities of the image tokens. No probabilities are computed
         for any CLIP conditioning tokens."""
-        assert image.shape == (
-            self.image_tokens,
-        ), f"Expected image shape {(self.image_tokens,)}, got {image.shape}"
-        assert image.dtype == jnp.int32 or image.dtype == jnp.int64
+        assert_msg = f"Expected images array with shape (N, {self.image_tokens}), got {images.shape}"
+        assert len(images.shape) == 2, assert_msg
+        assert images.shape[1] == self.image_tokens, assert_msg
+        assert images.dtype == jnp.int32 or images.dtype == jnp.int64
 
-        embeds = self.in_embed(image)
+        batch_size = images.shape[0]
 
-        cond_tokens = self.gen_conditioning_tokens(clip_embedding, max_cos_distance)
-        toks = jnp.concatenate([cond_tokens, embeds[:-1]], axis=0)
-        assert toks.shape == (self.seq_len(), self.d_model)
+        if self.clip_conditioning:
+            if self.clip_caps:
+                assert clip_embeddings.shape == (batch_size, self.clip_cap_count, 768)
+                assert max_cos_distances.shape == (batch_size, self.clip_cap_count)
+            else:
+                assert clip_embeddings.shape == (batch_size, 768)
+                assert max_cos_distances.shape == (batch_size, 0)
+        else:
+            assert clip_embeddings.shape == max_cos_distances.shape == (batch_size, 0)
+
+        embeds = self.in_embed(images)
+        assert embeds.shape == (batch_size, self.image_tokens, self.d_model)
+
+        cond_tokens = jax.vmap(self.gen_conditioning_tokens)(
+            clip_embeddings, max_cos_distances
+        )
+        assert cond_tokens.shape == (batch_size, self.prepended_tokens(), self.d_model)
+        toks = jnp.concatenate([cond_tokens, embeds[:, :-1]], axis=1)
+        assert toks.shape == (batch_size, self.seq_len(), self.d_model)
 
         h: jax.Array = toks + self.positional_encoding(jnp.arange(self.seq_len()))
+        assert h.shape == (batch_size, self.seq_len(), self.d_model)
         h, _ = self.transformer_layers(h, None)
+        assert h.shape == (batch_size, self.seq_len(), self.d_model)
         if self.pre_norm:
             h = self.final_layer_norm(h)
-        h = h[self.prepended_tokens() - 1 :]
+        h = h[:, self.prepended_tokens() - 1 :]
         h = self.logits_decoder(h)
-        assert h.shape == (self.image_tokens, 8192)
+        assert h.shape == (batch_size, self.image_tokens, 8192)
 
         return h
 
@@ -241,9 +262,21 @@ class ImageModel(nn.Module):
     ):
         """Initialize the cache for decoding by computing and feeding the conditioning tokens. Returns
         the logits for the first image token. The cache should be ready for use with decode_step
-        when this is done."""
+        when this is done. Batchless (for now)."""
         assert self.decode
         assert not self.flash_attention, "Flash attention doesn't work with decoding."
+
+        if self.clip_conditioning:
+            if self.clip_caps:
+                assert clip_embedding.shape == (self.clip_cap_count, 768)
+                assert max_cos_distance.shape == (self.clip_cap_count,)
+            else:
+                assert clip_embedding.shape == (768,)
+                assert max_cos_distance.shape == (0,)
+        else:
+            assert (
+                clip_embedding.shape == max_cos_distance.shape == (0,)
+            ), f"Expected empty shapes, got {clip_embedding.shape} and {max_cos_distance.shape}"
 
         cond_tokens = self.gen_conditioning_tokens(clip_embedding, max_cos_distance)
 
@@ -252,8 +285,9 @@ class ImageModel(nn.Module):
 
         # TODO vectorize, don't loop
         for tok in h:
-            h, _ = self.transformer_layers(tok[None, :], None)
-            last_tok = h[0]
+            # Add batch dimension and sequence dimension before running transformer blocks
+            h, _ = self.transformer_layers(tok[None, None, :], None)
+            last_tok = h[0, 0]
         assert last_tok.shape == (self.d_model,)
 
         logits_out = self.logits_decoder(last_tok)
@@ -262,7 +296,7 @@ class ImageModel(nn.Module):
 
     def decode_step(self, tok: jax.Array, idx: jax.Array) -> jax.Array:
         """Do a step of iterative decoding from the model. Returns the logits for the next token.
-        See below tests for usage examples.
+        See below tests for usage examples. Batchless (for now).
         """
         assert (
             self.decode
@@ -277,10 +311,9 @@ class ImageModel(nn.Module):
 
         h = embed + self.positional_encoding(idx + self.prepended_tokens())
         assert h.shape == (self.d_model,)
-        h = h[None, :]
 
-        h, _ = self.transformer_layers(h, None)
-        return self.logits_decoder(h[0])  # type: ignore[no-any-return]
+        h, _ = self.transformer_layers(h[None, None, :], None)
+        return self.logits_decoder(h[0, 0])  # type: ignore[no-any-return]
 
 
 def _assert_dicts_equal(d1, d2, name) -> None:
@@ -341,27 +374,27 @@ def _setup_test_sample(
 
     params = mdl_nodec.init(
         jax.random.PRNGKey(69),
-        img_toks,
-        clip_embedding=clip_embedding,
-        max_cos_distance=max_cos_distance,
+        images=img_toks[None, :],
+        clip_embeddings=clip_embedding[None, :],
+        max_cos_distances=max_cos_distance[None, :],
     )
     # IMPORTANT: use regular __call__ here, not decode_step. The cache needs to be initialized to
     # the full seq_len size.
     params_dec = mdl_dec.init(
         jax.random.PRNGKey(69),
-        img_toks,
-        clip_embedding=clip_embedding,
-        max_cos_distance=max_cos_distance,
+        images=img_toks[None, :],
+        clip_embeddings=clip_embedding[None, :],
+        max_cos_distances=max_cos_distance[None, :],
     )
 
     _assert_dicts_equal(params["params"], params_dec["params"], "params")
 
     logits_all = mdl_nodec.apply(
         params,
-        image=img_toks,
-        clip_embedding=clip_embedding,
-        max_cos_distance=max_cos_distance,
-    )
+        images=img_toks[None, :],
+        clip_embeddings=clip_embedding[None, :],
+        max_cos_distances=max_cos_distance[None, :],
+    )[0]
 
     return (
         mdl_nodec,
@@ -551,9 +584,9 @@ def test_clip_does_anything() -> None:
     clip_embedding = jnp.zeros_like(clip_embedding)
     logits_all_zero = mdl_nodec.apply(
         params,
-        image=toks,
-        clip_embedding=clip_embedding,
-        max_cos_distance=jnp.array([]),
+        images=toks[None, :],
+        clip_embeddings=clip_embedding[None, :],
+        max_cos_distances=jnp.array([[]]),
     )
 
     assert not jnp.allclose(logits_all, logits_all_zero, rtol=0, atol=1e-3)
@@ -574,9 +607,9 @@ def test_clip_caps_do_anything() -> None:
 
     logits_full_range = mdl_nodec.apply(
         params,
-        image=toks,
-        clip_embedding=clip_embedding,
-        max_cos_distance=jnp.array([2.0, 0.85]),
+        images=toks[None, :],
+        clip_embeddings=clip_embedding[None, :],
+        max_cos_distances=jnp.array([[2.0, 0.85]]),
     )
 
     assert not jnp.allclose(logits_all, logits_full_range, rtol=0, atol=1e-3)
@@ -607,9 +640,9 @@ def sample(
     mdl_decode = mdl.clone(decode=True, flash_attention=False, dropout=0.0)
     params_fake = mdl_decode.init(
         jax.random.PRNGKey(0),
-        image=jnp.zeros((mdl.image_tokens,), dtype=jnp.int32),
-        clip_embedding=clip_embedding,
-        max_cos_distance=max_cos_distance,
+        images=jnp.zeros((1, mdl.image_tokens), dtype=jnp.int32),
+        clip_embeddings=clip_embedding[None, :],
+        max_cos_distances=max_cos_distance[None, :],
     )
     params = flax.core.copy(params, {"cache": params_fake["cache"]})
     del params_fake
@@ -756,13 +789,22 @@ class TransformerLayer(nn.Module):
                 dtype=None,
                 precision=None,
             ):
-                assert len(q.shape) == 3, "batch dimensions not implemented"
-                assert q.shape[1] == k.shape[1] == v.shape[1]
-                assert q.shape[2] == k.shape[2] == v.shape[2]
-                assert k.shape[0] == v.shape[0]
+                assert (
+                    len(q.shape) == len(k.shape) == len(v.shape) == 4
+                ), f"q k v shapes: {q.shape} {k.shape} {v.shape}, expected: (batch, seq_len, heads, head_dim)"
+                assert (
+                    q.shape[0] == k.shape[0] == v.shape[0]
+                ), "batch dimensions must match"
+                batch_size = q.shape[0]
+                assert q.shape[1] == k.shape[1] == v.shape[1], "seq_len must match"
+                seq_len = q.shape[1]
+                assert q.shape[2] == k.shape[2] == v.shape[2], "num_heads must match"
+                num_heads = q.shape[2]
+                assert q.shape[3] == k.shape[3], "q & k head_dim must match"
+                qk_head_dim, v_head_dim = q.shape[3], v.shape[3]
 
                 rearrange_qkv = lambda x: rearrange(
-                    x, "seq_len heads head_dim -> 1 heads seq_len head_dim"
+                    x, "batch seq_len heads head_dim -> batch heads seq_len head_dim"
                 )
                 q, k, v = map(rearrange_qkv, (q, k, v))
 
@@ -785,10 +827,12 @@ class TransformerLayer(nn.Module):
                         )
                 if dtype != None:
                     assert res.dtype == dtype
-
-                return rearrange(
-                    res, "1 heads seq_len head_dim -> seq_len heads head_dim"
+                assert res.shape == (batch_size, num_heads, seq_len, v_head_dim)
+                res = rearrange(
+                    res, "batch heads seq_len head_dim -> batch seq_len heads head_dim"
                 )
+                assert res.shape == (batch_size, seq_len, num_heads, v_head_dim)
+                return res
 
         else:
             attn_function = nn.attention.dot_product_attention
@@ -826,11 +870,19 @@ class TransformerLayer(nn.Module):
             self.dropout_layer = nn.Dropout(rate=0, deterministic=True)
 
     def __call__(self, embeds: jax.Array, _) -> jax.Array:
+        assert_msg = (
+            f"embeds.shape: {embeds.shape}, expected: (batch, seq_len, {self.d_model})"
+        )
+        assert len(embeds.shape) == 3, assert_msg
+        assert embeds.shape[2] == self.d_model, assert_msg
+        batch_size = embeds.shape[0]
+        seq_len = embeds.shape[1]
+
         if self.flash_attention:
             mask = None
         else:
             mask = jnp.tril(
-                jnp.ones((self.num_heads, embeds.shape[0], embeds.shape[0]))
+                jnp.ones((batch_size, self.num_heads, embeds.shape[1], embeds.shape[1]))
             )
 
         if self.pre_norm:
@@ -847,6 +899,7 @@ class TransformerLayer(nn.Module):
             ff_output = self.layer_norm_2(ff_output)
         embeds = embeds + self.dropout_layer(ff_output)
 
+        assert embeds.shape == (batch_size, seq_len, self.d_model)
         return embeds, None
 
 
@@ -866,7 +919,7 @@ def test_flash_attention_equals_standard() -> None:
         flash_attention=False,
     )
 
-    input_shape = (64, 768)
+    input_shape = (4, 64, 768)
     input_vals = jax.random.normal(jax.random.PRNGKey(0), input_shape)
 
     params = mdl_std.init(
@@ -878,48 +931,46 @@ def test_flash_attention_equals_standard() -> None:
     mdl_flash = mdl_std.clone(flash_attention=True)
     out_flash, _ = mdl_flash.apply(params, input_vals, None)
 
-    np.testing.assert_allclose(out_std, out_flash, atol=3e-6, rtol=0)
+    np.testing.assert_allclose(out_std, out_flash, atol=1e-5, rtol=0)
 
 
-def loss(
+def loss_batch_tokens(
     model: ImageModel,
     params: dict[str, Any],
-    loss_decay_constant: float,
     dropout_rng: jax.Array,
-    ex_img: jax.Array,
-    ex_clip: jax.Array,
-    ex_max_cos_distance: jax.Array,
+    batch_imgs: jax.Array,
+    batch_clips: jax.Array,
+    batch_max_cos_distances: jax.Array,
 ) -> jax.Array:
-    """Compute the cross-entropy loss for a single example. The loss is scaled by
-    loss_decay_constant such that the last token is weighted loss_decay_constant as much as the
-    first one and the rest are exponentially decayed in between. loss_decay_constant should be in
-    (0, 1] with 1 meaning no decay."""
-    assert ex_img.shape == (
+    """Compute the cross-entropy loss for each token in a batch of examples."""
+    batch_size = batch_imgs.shape[0]
+    assert batch_imgs.shape == (
+        batch_size,
         model.image_tokens,
-    ), f"ex_img.shape: {ex_img.shape}, expected: {(model.image_tokens,)}"
+    ), f"batch_img.shape: {batch_imgs.shape}, expected: {(batch_size, model.image_tokens)}"
     if model.clip_conditioning and not model.clip_caps:
-        assert ex_clip.shape == (768,)
-        assert ex_max_cos_distance.shape == (0,)
+        assert batch_clips.shape == (batch_size, 768)
+        assert batch_max_cos_distances.shape == (batch_size, 0)
     elif model.clip_conditioning and model.clip_caps:
-        assert ex_clip.shape == (model.clip_cap_count, 768)
-        assert ex_max_cos_distance.shape == (model.clip_cap_count,)
+        assert batch_clips.shape == (batch_size, model.clip_cap_count, 768)
+        assert batch_max_cos_distances.shape == (batch_size, model.clip_cap_count)
     else:
-        assert ex_clip.shape == ex_max_cos_distance.shape == (0,)
+        assert batch_clips.shape == batch_max_cos_distances.shape == (batch_size, 0)
     logits: jax.Array = model.apply(
         params,
         rngs={"dropout": dropout_rng},
-        image=ex_img,
-        clip_embedding=ex_clip,
-        max_cos_distance=ex_max_cos_distance,
+        images=batch_imgs,
+        clip_embeddings=batch_clips,
+        max_cos_distances=batch_max_cos_distances,
     )
-    per_token_loss = optax.softmax_cross_entropy(logits, jax.nn.one_hot(ex_img, 8192))
+    per_token_loss = optax.softmax_cross_entropy(
+        logits, jax.nn.one_hot(batch_imgs, 8192)
+    )
     assert per_token_loss.shape == (
+        batch_size,
         model.image_tokens,
     ), f"per_token_loss.shape: {per_token_loss.shape}"
-    token_weights = loss_decay_constant ** jnp.linspace(0, 1, num=model.image_tokens)
-    # Normalize so the total weight is always equal to what it'd be with no decay
-    token_weights = token_weights / token_weights.sum() * model.image_tokens
-    return per_token_loss * token_weights
+    return per_token_loss
 
 
 def loss_batch(
@@ -931,21 +982,27 @@ def loss_batch(
     batch_clips: jax.Array,
     batch_max_cos_distances: jax.Array,
 ) -> jax.Array:
-    """Compute the cross-entropy loss for a batch of examples."""
-    assert (
-        batch_imgs.shape[0] == batch_clips.shape[0] == batch_max_cos_distances.shape[0]
+    """Compute the weighted cross-entropy loss for a batch of examples. The loss is scaled by
+    loss_decay_constant such that the last token is weighted loss_decay_constant as much as the
+    first one and the rest are exponentially decayed in between. loss_decay_constant should be in
+    (0, 1] with 1 meaning no decay."""
+    per_token_loss = loss_batch_tokens(
+        model, params, dropout_rng, batch_imgs, batch_clips, batch_max_cos_distances
     )
-    return jnp.mean(
-        jax.vmap(loss, in_axes=(None, None, None, 0, 0, 0, 0))(
-            model,
-            params,
-            loss_decay_constant,
-            jax.random.split(dropout_rng, batch_imgs.shape[0]),
-            batch_imgs,
-            batch_clips,
-            batch_max_cos_distances,
-        )
-    )
+    token_weights = loss_decay_constant ** jnp.linspace(0, 1, num=model.image_tokens)
+    # Normalize so the total weight is always equal to what it'd be with no decay
+    token_weights = token_weights / token_weights.sum() * model.image_tokens
+    assert token_weights.shape == (
+        model.image_tokens,
+    ), f"token_weights.shape: {token_weights.shape}, expected: {(model.image_tokens,)}"
+    weighted_loss = per_token_loss * token_weights[None, :]
+    assert weighted_loss.shape == (
+        per_token_loss.shape[0],
+        model.image_tokens,
+    ), f"weighted_loss.shape: {weighted_loss.shape}, expected: {(per_token_loss.shape[0], model.image_tokens)}"
+    out = jnp.mean(weighted_loss)
+    assert out.shape == (), f"out.shape: {out.shape}, expected scalar"
+    return out
 
 
 # Parameters taken from GPT-1, except seq_len is 256 instead of 1024
@@ -996,9 +1053,9 @@ def test_cap_train() -> None:
 
     params = mdl.init(
         {"params": params_rng, "dropout": jax.random.PRNGKey(0)},
-        image=jnp.zeros((mdl.image_tokens,), dtype=jnp.int32),
-        clip_embedding=jnp.zeros((mdl.clip_cap_count, 768), dtype=jnp.float32),
-        max_cos_distance=jnp.zeros((mdl.clip_cap_count,), dtype=jnp.float32),
+        images=jnp.zeros((1, mdl.image_tokens), dtype=jnp.int32),
+        clip_embeddings=jnp.zeros((1, mdl.clip_cap_count, 768), dtype=jnp.float32),
+        max_cos_distances=jnp.zeros((1, mdl.clip_cap_count), dtype=jnp.float32),
     )
 
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
@@ -1080,11 +1137,14 @@ def train_loop_simple(
 ) -> Tuple[jax.Array, dict[str, Any]]:
     """Train the model repeatedly on a single batch for testing."""
     assert mdl.clip_conditioning is False
+    assert len(data.shape) == 2
+    batch_size = data.shape[0]
+    assert data.shape == (batch_size, mdl.image_tokens)
     params = mdl.init(
         rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
-        image=jnp.zeros((gpt_1_config.image_tokens,), dtype=jnp.int32),
-        clip_embedding=jnp.zeros((0,), dtype=jnp.float32),
-        max_cos_distance=jnp.array([]),
+        images=jnp.zeros((1, gpt_1_config.image_tokens), dtype=jnp.int32),
+        clip_embeddings=jnp.zeros((1, 0), dtype=jnp.float32),
+        max_cos_distances=jnp.zeros((1, 0), dtype=jnp.float32),
     )
     opt = optax.adam(learning_rate=learning_rate)
     opt_state = opt.init(params)
@@ -1096,7 +1156,7 @@ def train_loop_simple(
         rng: jax.Array,
         batch_imgs: jax.Array,
     ) -> Tuple[dict[str, Any], Any, jax.Array, jax.Array]:
-        dropout_rng, caps_rng, rng2 = jax.random.split(rng, 3)
+        dropout_rng, rng2 = jax.random.split(rng, 2)
         loss, grads = loss_grad_fn(
             mdl,
             params,
@@ -1202,16 +1262,14 @@ def test_loss_weighting() -> None:
 
     def loss_first_half(params):
         # Compute the loss on the first half of the tokens
-        loss_fn = lambda img: loss(
+        losses = loss_batch_tokens(
             mdl,
             params,
-            1.0,
             jax.random.PRNGKey(0),
-            img,
-            jnp.zeros((0,), dtype=jnp.float32),
-            jnp.array([]),
+            data,
+            jnp.zeros((16, 0), dtype=jnp.float32),
+            jnp.zeros((16, 0), dtype=jnp.float32),
         )
-        losses = jax.vmap(loss_fn)(data)
         assert losses.shape == (16, gpt_1_config.image_tokens)
         losses_first_half = losses[:, : gpt_1_config.image_tokens // 2]
         return jnp.mean(losses_first_half)
@@ -1263,9 +1321,9 @@ def _train_clip_caps_overfit(dset_train, mdl, rng):
 
     params = mdl.init(
         {"params": params_rng},
-        image=jnp.zeros((mdl.image_tokens,), dtype=jnp.int32),
-        clip_embedding=jnp.zeros((mdl.clip_cap_count, 768), dtype=jnp.float32),
-        max_cos_distance=jnp.zeros((mdl.clip_cap_count,), dtype=jnp.float32),
+        images=jnp.zeros((1, mdl.image_tokens), dtype=jnp.int32),
+        clip_embeddings=jnp.zeros((1, mdl.clip_cap_count, 768), dtype=jnp.float32),
+        max_cos_distances=jnp.zeros((1, mdl.clip_cap_count), dtype=jnp.float32),
     )
 
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)

@@ -356,32 +356,32 @@ def setup_optimizer(
     # We need template inputs to get initial parameters, regardless of if we're loading or starting
     # anew.
     max_cos_distance_dummy = (
-        jnp.zeros((model_cfg.clip_cap_count,), dtype=jnp.float32)
+        jnp.zeros((1, model_cfg.clip_cap_count), dtype=jnp.float32)
         if model_cfg.clip_caps
-        else jnp.array([], dtype=jnp.float32)
+        else jnp.zeros((1, 0), dtype=jnp.float32)
     )
     if model_cfg.clip_conditioning and not model_cfg.clip_caps:
-        clip_embedding_dummy = jnp.zeros((768,), dtype=jnp.float32)
+        clip_embeddings_dummy = jnp.zeros((1, 768), dtype=jnp.float32)
     elif model_cfg.clip_conditioning and model_cfg.clip_caps:
-        clip_embedding_dummy = jnp.zeros(
-            (model_cfg.clip_cap_count, 768), dtype=jnp.float32
+        clip_embeddings_dummy = jnp.zeros(
+            (1, model_cfg.clip_cap_count, 768), dtype=jnp.float32
         )
     else:
-        clip_embedding_dummy = jnp.zeros((0,), dtype=jnp.float32)
+        clip_embeddings_dummy = jnp.zeros((1, 0), dtype=jnp.float32)
 
     rngs_dummy = {"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)}
-    image_dummy = jnp.zeros((model_cfg.image_tokens,), dtype=jnp.int32)
+    images_dummy = jnp.zeros((1, model_cfg.image_tokens), dtype=jnp.int32)
     params_init = mdl.init(
         rngs=rngs_dummy,
-        image=image_dummy,
-        clip_embedding=clip_embedding_dummy,
-        max_cos_distance=max_cos_distance_dummy,
+        images=images_dummy,
+        clip_embeddings=clip_embeddings_dummy,
+        max_cos_distances=max_cos_distance_dummy,
     )
     table_str = mdl.tabulate(
         rngs=rngs_dummy,
-        image=image_dummy,
-        clip_embedding=clip_embedding_dummy,
-        max_cos_distance=max_cos_distance_dummy,
+        images=images_dummy,
+        clip_embeddings=clip_embeddings_dummy,
+        max_cos_distances=max_cos_distance_dummy,
     )
     print(table_str)
 
@@ -442,30 +442,36 @@ loss_fn = jax.jit(partial(transformer_model.loss_batch, mdl))
 sample_cfg = copy(model_cfg)
 sample_cfg.dropout = None
 sample_mdl = transformer_model.ImageModel(**sample_cfg.__dict__, decode=True)
-max_cos_distance_dummy = (
-    jnp.zeros((model_cfg.clip_cap_count,), dtype=jnp.float32)
+max_cos_distances_dummy = (
+    jnp.zeros((1, model_cfg.clip_cap_count), dtype=jnp.float32)
     if model_cfg.clip_caps
-    else jnp.array([], dtype=jnp.float32)
+    else jnp.zeros((1, 0), dtype=jnp.float32)
 )
 if model_cfg.clip_conditioning and not model_cfg.clip_caps:
-    clip_embedding_dummy = jnp.zeros((768,), dtype=jnp.float32)
-    max_cos_distance_dummy = jnp.zeros((0,), dtype=jnp.float32)
+    clip_embeddings_dummy = jnp.zeros((1, 768), dtype=jnp.float32)
+    max_cos_distances_dummy = jnp.zeros((1, 0), dtype=jnp.float32)
 elif model_cfg.clip_conditioning and model_cfg.clip_caps:
-    clip_embedding_dummy = jnp.zeros((model_cfg.clip_cap_count, 768), dtype=jnp.float32)
-    max_cos_distance_dummy = jnp.zeros((model_cfg.clip_cap_count,), dtype=jnp.float32)
+    clip_embeddings_dummy = jnp.zeros(
+        (1, model_cfg.clip_cap_count, 768), dtype=jnp.float32
+    )
+    max_cos_distances_dummy = jnp.zeros(
+        (1, model_cfg.clip_cap_count), dtype=jnp.float32
+    )
 else:
-    clip_embedding_dummy = jnp.zeros((0,), dtype=jnp.float32)
-    max_cos_distance_dummy = jnp.zeros((0,), dtype=jnp.float32)
+    clip_embeddings_dummy = jnp.zeros((1, 0), dtype=jnp.float32)
+    max_cos_distances_dummy = jnp.zeros((1, 0), dtype=jnp.float32)
 sample_params = sample_mdl.init(
     jax.random.PRNGKey(0),
-    image=jnp.arange(model_cfg.image_tokens, dtype=jnp.int32),
-    clip_embedding=clip_embedding_dummy,
-    max_cos_distance=max_cos_distance_dummy,
+    images=jnp.arange(model_cfg.image_tokens, dtype=jnp.int32).reshape(
+        1, model_cfg.image_tokens
+    ),
+    clip_embeddings=clip_embeddings_dummy,
+    max_cos_distances=max_cos_distances_dummy,
 )
 sample_cache = sample_params["cache"]
 del sample_params
-del clip_embedding_dummy
-del max_cos_distance_dummy
+del clip_embeddings_dummy
+del max_cos_distances_dummy
 
 sample_jv = jax.jit(
     jax.vmap(
