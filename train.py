@@ -2,6 +2,7 @@
 import argparse
 import datetime
 import flax.core
+import importlib.util
 import jax
 import jax.numpy as jnp
 import json
@@ -74,6 +75,9 @@ parser.add_argument("--model-config", type=Path, required=True)
 parser.add_argument("--training-config", type=Path, required=True)
 parser.add_argument("--batch-size", type=int)
 parser.add_argument("--sample-batch-size", type=int, default=None)
+parser.add_argument(
+    "--profiling-server", action="store_true", help="Enable JAX profiling server"
+)
 parser.add_argument("--epochs", type=int)
 parser.add_argument("--training-images", type=int)
 parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -95,6 +99,19 @@ parser.add_argument("--clip-caps", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--clip-cap-count", type=int)
 parser.add_argument("--resume", type=Path)
 args, _unknown = parser.parse_known_args()
+
+
+def setup_profiling_server():
+    if args.profiling_server:
+        if importlib.util.find_spec("tensorflow") is None:
+            print("You gotta install tensorflow for profiling bro")
+            exit(1)
+
+        jax.profiler.start_server(6969)
+        print("JAX profiling server started on port 6969")
+
+
+setup_profiling_server()
 
 
 def json_pretty(dict):
