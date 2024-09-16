@@ -718,6 +718,23 @@ reference = "20621388795614de137c159a5c07abec5c475388"
 resolved_reference = "20621388795614de137c159a5c07abec5c475388"
 
 [[package]]
+name = "flash-attn-jax"
+version = "0.2.2"
+description = "Flash Attention Jax"
+optional = false
+python-versions = ">=3.9"
+files = [
+    {file = "flash_attn_jax-0.2.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:0a9ad5287219907f2cd3ace17f3a325fe58568cf62bdfa8cc1f218ae7f838b38"},
+    {file = "flash_attn_jax-0.2.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:1a7c5cee3237426264344dc2ed9110e3cee286eafec2e76383d3e84545f97a58"},
+    {file = "flash_attn_jax-0.2.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:11183d52e1e89ed8b77a1d95d3fbb5d55cb237a4186d9571de6e7dc1ed0581f8"},
+    {file = "flash_attn_jax-0.2.2-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:967e21e81a1350140c56f594c6ff4bb10b603e28e8e78854380c0b4a042c63af"},
+    {file = "flash_attn_jax-0.2.2.tar.gz", hash = "sha256:a97353523b845789fd1608eac704644f211e1604a1e5e75918a9809ad1226df5"},
+]
+
+[package.dependencies]
+einops = "*"
+
+[[package]]
 name = "flax"
 version = "0.8.5"
 description = "Flax: A neural network library for JAX designed for flexibility"
@@ -4222,4 +4239,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.11.8"
-content-hash = "355201989ddb05bd48ed546e7b60e4df6e92f1b9870b8f8181925cb798c1b95e"
+content-hash = "4e03cc26e06eaf217d05909d322d50d68b26c02bb12c1e5e5f93ec75a224b173"

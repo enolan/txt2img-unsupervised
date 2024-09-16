@@ -1,3 +1,5 @@
+import flash_attention_jax # Pure JAX flash attention implementation by lucidrains
+import flash_attn_jax as flash_attention_cpp # C++ flash attention by Tri Dao et al, JAX bindings by nshepperd
 import flax.core
 import flax.linen as nn
 import jax
@@ -8,8 +10,8 @@ import pytest
 from copy import copy
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from einops import rearrange, repeat
-from flash_attention_jax import causal_flash_attention
 from flax import struct
 from functools import partial
 from infinidata import TableView
@@ -23,6 +25,9 @@ from .gen_training_caps import gen_training_examples_from_tree
 from .load_pq_dir import load_pq_to_infinidata
 from .spherical_space_partitioning import CapTree
 from .triangle_schedule import triangle_schedule
+
+
+AttnMethod = Enum('AttnMethod', ['STANDARD', 'FLASH_JAX', 'FLASH_CPP'])
 
 
 class ImageModel(nn.Module):
@@ -42,7 +47,7 @@ class ImageModel(nn.Module):
     activation_function: Callable[[jax.Array], jax.Array]
     pre_norm: bool
     decode: bool = False
-    flash_attention: bool = True
+    attn_method: AttnMethod = AttnMethod.FLASH_JAX
 
     def setup(self) -> None:
         default_stddev = 0.02 / jnp.sqrt(self.n_layers)
@@ -135,7 +140,7 @@ class ImageModel(nn.Module):
             pre_norm=self.pre_norm,
             kernel_init=default_kernel_init,
             decode=self.decode,
-            flash_attention=self.flash_attention,
+            attn_method=self.attn_method,
         )
 
         if self.pre_norm:
@@ -264,7 +269,8 @@ class ImageModel(nn.Module):
         the logits for the first image token. The cache should be ready for use with decode_step
         when this is done. Batchless (for now)."""
         assert self.decode
-        assert not self.flash_attention, "Flash attention doesn't work with decoding."
+        # TODO test CPP flash attention, maybe it works.
+        assert self.attn_method == AttnMethod.STANDARD, "Only standard attention works with decoding."
 
         if self.clip_conditioning:
             if self.clip_caps:
@@ -301,7 +307,7 @@ class ImageModel(nn.Module):
         assert (
             self.decode
         ), "Can't call decode_step on a model that wasn't set up for decoding."
-        assert not self.flash_attention, "Flash attention doesn't work with decoding."
+        assert self.attn_method == AttnMethod.STANDARD, "Only standard attention works with decoding."
         assert tok.shape == ()
         assert tok.dtype == jnp.int32 or tok.dtype == jnp.int64
         assert idx.shape == ()
@@ -637,7 +643,7 @@ def sample(
 
     # Flash attention doesn't work with Flax's fast decoding. Something to do with how masks are
     # handled. Would be nice to fix it, but for now we just use the slower attention when sampling.
-    mdl_decode = mdl.clone(decode=True, flash_attention=False, dropout=0.0)
+    mdl_decode = mdl.clone(decode=True, attn_method=AttnMethod.STANDARD, dropout=0.0)
     params_fake = mdl_decode.init(
         jax.random.PRNGKey(0),
         images=jnp.zeros((1, mdl.image_tokens), dtype=jnp.int32),
@@ -771,10 +777,10 @@ class TransformerLayer(nn.Module):
     pre_norm: bool
     kernel_init: Callable[..., jnp.ndarray]
     decode: bool
-    flash_attention: bool
+    attn_method: AttnMethod
 
     def setup(self) -> None:
-        if self.flash_attention:
+        if self.attn_method == AttnMethod.FLASH_JAX:
             # Use fast flash attention implementation
             def attn_function(
                 q,
@@ -815,7 +821,7 @@ class TransformerLayer(nn.Module):
                 assert dropout_rate == 0.0, "attention dropout not implemented"
 
                 try:
-                    res = causal_flash_attention(q, k, v)
+                    res = flash_attention_jax.causal_flash_attention(q, k, v)
                 except TypeError as e:
                     if "cannot reshape array of shape" in str(e):
                         raise ValueError(
@@ -834,8 +840,34 @@ class TransformerLayer(nn.Module):
                 assert res.shape == (batch_size, seq_len, num_heads, v_head_dim)
                 return res
 
-        else:
+        elif self.attn_method == AttnMethod.FLASH_CPP:
+            def attn_function(
+                q,
+                k,
+                v,
+                bias=None,
+                mask=None,
+                broadcast_dropout=True,
+                dropout_rng=None,
+                dropout_rate=0.0,
+                deterministic=False,
+                dtype=None,
+                precision=None,
+            ):
+                assert bias == None, "attention bias not implemented"
+                assert mask == None, "attention mask is redundant with causal_flash_attention"
+                assert dropout_rate == 0.0, "attention dropout not implemented"
+                assert dtype in [jnp.bfloat16, jnp.float16], "CPP flash attention only supports bfloat16 & float16"
+
+                res = flash_attention_cpp.flash_mha(q, k, v, is_causal=True)
+                assert res.shape == v.shape
+                return res
+
+        elif self.attn_method == AttnMethod.STANDARD:
             attn_function = nn.attention.dot_product_attention
+        else:
+            raise ValueError(f"Invalid attention method: {self.attn_method}")
+
         self.mha = nn.SelfAttention(
             num_heads=self.num_heads,
             qkv_features=self.d_model,
@@ -878,7 +910,7 @@ class TransformerLayer(nn.Module):
         batch_size = embeds.shape[0]
         seq_len = embeds.shape[1]
 
-        if self.flash_attention:
+        if self.attn_method == AttnMethod.FLASH_JAX or self.attn_method == AttnMethod.FLASH_CPP:
             mask = None
         else:
             mask = jnp.tril(
@@ -902,21 +934,24 @@ class TransformerLayer(nn.Module):
         assert embeds.shape == (batch_size, seq_len, self.d_model)
         return embeds, None
 
-
-def test_flash_attention_equals_standard() -> None:
+@pytest.mark.parametrize("flash_method", [
+    pytest.param(AttnMethod.FLASH_JAX),
+    pytest.param(AttnMethod.FLASH_CPP, marks=pytest.mark.requires_ampere_or_newer)])
+def test_flash_attention_equals_standard(flash_method: AttnMethod) -> None:
     """Test that flash attention gives the same results as Flax's standard attention."""
+    activations_dtype = jnp.float32 if flash_method == AttnMethod.FLASH_JAX else jnp.bfloat16
     mdl_std = TransformerLayer(
         d_model=768,
         num_heads=12,
         ff_dim=3072,
         dropout=None,
         use_biases=False,
-        activations_dtype=jnp.float32,
+        activations_dtype=activations_dtype,
         activation_function=jax.nn.relu,
         pre_norm=False,
         kernel_init=jax.nn.initializers.xavier_uniform(),
         decode=False,
-        flash_attention=False,
+        attn_method=AttnMethod.STANDARD,
     )
 
     input_shape = (4, 64, 768)
@@ -928,7 +963,7 @@ def test_flash_attention_equals_standard() -> None:
 
     out_std, _ = mdl_std.apply(params, input_vals, None)
 
-    mdl_flash = mdl_std.clone(flash_attention=True)
+    mdl_flash = mdl_std.clone(attn_method=flash_method)
     out_flash, _ = mdl_flash.apply(params, input_vals, None)
 
     np.testing.assert_allclose(out_std, out_flash, atol=1e-5, rtol=0)

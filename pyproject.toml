@@ -38,6 +38,7 @@ transformers = "^4.34.1"
 wandb = "^0.17.9"
 warcat = "^2.2.5"
 xdg-base-dirs = "^6.0.1"
+flash-attn-jax = "^0.2.2"
 
 [tool.poetry.group.cuda.dependencies]
 jax = {extras = ["cuda12"], version = "^0.4.31"}
