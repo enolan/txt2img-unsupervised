@@ -257,6 +257,7 @@ class ImageModel(nn.Module):
         h = h[:, self.prepended_tokens() - 1 :]
         h = self.logits_decoder(h)
         assert h.shape == (batch_size, self.image_tokens, 8192)
+        assert h.dtype == self.activations_dtype
 
         return h
 
