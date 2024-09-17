@@ -360,7 +360,7 @@ def _setup_test_sample(
             clip_cap_count = 2
         cfg_nodec.clip_cap_count = clip_cap_count
     mdl_nodec = ImageModel(**cfg_nodec.__dict__)
-    mdl_dec = mdl_nodec.clone(decode=True, flash_attention=False)
+    mdl_dec = mdl_nodec.clone(decode=True, attn_method=AttnMethod.STANDARD)
 
     img_toks = jax.random.randint(jax.random.PRNGKey(420), (image_tokens,), 0, 8192)
     if clip_conditioning:
