@@ -2437,24 +2437,58 @@ def test_async_leaf_checker_multiple(vals):
     leaf_vecs, query_blocks = vals
     leaf_dset = infinidata.TableView({"clip_embedding": leaf_vecs})
     checker = AsyncLeafChecker()
-    res_async = []
+    # Counts can be slightly different due to floating point error, so we test both immedate and
+    # async with both the hypothesis generated max_cos_distances and those distances increased by
+    # an epsilon. The counts for the smaller caps should be <= the counts for the wider caps, both
+    # within a single method and between methods.
+    cos_dist_eps = 1e-3
+    res_async_tight = []
+    res_async_loose = []
     for queries, max_cos_distances in query_blocks:
-        res_async.append(
+        res_async_tight.append(
             checker.submit_and_return_func(
                 AsyncLeafChecker.CheckType.COUNTS, leaf_dset, queries, max_cos_distances
             )
         )
-    res_immediate = [
-        vectors_in_caps(
-            leaf_vecs, queries, max_cos_distances, need_counts=True, need_bools=False
+        res_async_loose.append(
+            checker.submit_and_return_func(
+                AsyncLeafChecker.CheckType.COUNTS,
+                leaf_dset,
+                queries,
+                max_cos_distances + cos_dist_eps,
+            )
+        )
+    res_immediates = [
+        (
+            vectors_in_caps(
+                leaf_vecs,
+                queries,
+                max_cos_distances,
+                need_counts=True,
+                need_bools=False,
+            ),
+            vectors_in_caps(
+                leaf_vecs,
+                queries,
+                max_cos_distances + cos_dist_eps,
+                need_counts=True,
+                need_bools=False,
+            ),
         )
         for queries, max_cos_distances in query_blocks
     ]
-    res_immediate = jax.device_get(res_immediate)
-    res_async_done = [f() for f in res_async]
+    res_immediates = jax.device_get(res_immediates)
+    res_immediates_tight, res_immediates_loose = [res for res, _ in res_immediates], [
+        res for _, res in res_immediates
+    ]
+    res_async_done_tight = [f() for f in res_async_tight]
+    res_async_done_loose = [f() for f in res_async_loose]
 
-    for i in range(len(res_async_done)):
-        np.testing.assert_array_equal(res_async_done[i], res_immediate[i])
+    for i in range(len(res_async_done_tight)):
+        assert np.all(res_async_done_tight[i] <= res_async_done_loose[i])
+        assert np.all(res_immediates_tight[i] <= res_immediates_loose[i])
+        assert np.all(res_async_done_tight[i] <= res_immediates_loose[i])
+        assert np.all(res_immediates_tight[i] <= res_async_done_loose[i])
 
 
 @hyp.settings(
