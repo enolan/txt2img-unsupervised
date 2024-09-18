@@ -98,6 +98,7 @@ parser.add_argument("--clip-conditioning", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--clip-caps", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--clip-cap-count", type=int)
 parser.add_argument("--resume", type=Path)
+parser.add_argument("--skip-sampling", action="store_true", help="Skip sampling during training")
 args, _unknown = parser.parse_known_args()
 
 
@@ -1050,9 +1051,12 @@ def save_checkpoint_and_sample(my_train_state, sample_batch_size, global_step) -
             tqdm.write("Retrying in 60 seconds")
             time.sleep(60)
     tqdm.write("Saved checkpoint")
-    tqdm.write("Sampling")
-    sample_and_log(my_train_state, sample_batch_size, global_step)
-    tqdm.write("Done sampling")
+    if not args.skip_sampling:
+        tqdm.write("Sampling")
+        sample_and_log(my_train_state, sample_batch_size, global_step)
+        tqdm.write("Done sampling")
+    else:
+        tqdm.write("Skipping sampling")
 
 
 assert global_step < batches_total, "training run is over my dude"
