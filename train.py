@@ -5,6 +5,7 @@ import flax.core
 import importlib.util
 import jax
 import jax.numpy as jnp
+import jax.tree_util as jtu
 import json
 import numpy as np
 import optax  # type:ignore[import]
@@ -421,25 +422,39 @@ def setup_optimizer(
         tx=opt,
         rng=jax.random.PRNGKey(1337),
     )
+    del params_init  # Ensure these params are freed as soon as this ts is
 
     if restoring:
+        # Ensure we free the VRAM from the original TrainState
+        params_template = jtu.tree_map(ocp.utils.to_shape_dtype_struct, ts.params)
+        opt_state_template = jtu.tree_map(ocp.utils.to_shape_dtype_struct, ts.opt_state)
+        rng_template = ocp.utils.to_shape_dtype_struct(ts.rng)
+        del ts
         restored = checkpoint_manager.restore(
             global_step,
             args=ocp.args.Composite(
-                params=ocp.args.StandardRestore(ts.params),
-                opt_state=ocp.args.StandardRestore(ts.opt_state),
-                rng=ocp.args.ArrayRestore(ts.rng),
+                params=ocp.args.StandardRestore(params_template),
+                opt_state=ocp.args.StandardRestore(opt_state_template),
+                rng=ocp.args.ArrayRestore(rng_template),
             ),
         )
 
         # For whatever reason, things come back committed to whatever device they're on even
         # if they weren't when they were saved. Roundtripping the optimizer state to RAM and back
         # un-commits it. If we don't do this JAX can't move it and when can't train the model.
-        opt_state = jax.device_put(jax.device_get(restored["opt_state"]))
-        ts = ts.replace(
+        # Since we do the roundtrip thing, we also want to make sure we don't keep an extra copy
+        # of the optimizer state in VRAM.
+        opt_state = jax.device_get(restored["opt_state"])
+        params = restored["params"]
+        rng = restored["rng"]
+        del restored
+        opt_state = jax.device_put(opt_state)
+        ts = TrainState(
+            apply_fn=mdl.apply,
+            params=params,
+            tx=opt,
+            rng=rng,
             step=global_step,
-            params=restored["params"],
-            rng=restored["rng"],
             opt_state=opt_state,
         )
 
