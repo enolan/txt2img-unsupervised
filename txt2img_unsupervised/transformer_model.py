@@ -832,6 +832,8 @@ class TransformerLayer(nn.Module):
                                 "the chunk size."
                             ).format(e)
                         )
+                    else:
+                        raise e
                 if dtype != None:
                     assert res.dtype == dtype
                 assert res.shape == (batch_size, num_heads, seq_len, v_head_dim)
