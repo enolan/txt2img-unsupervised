@@ -22,6 +22,7 @@ from tqdm import tqdm, trange
 from .cone_sampling import random_pt_with_cosine_similarity
 from .config import ModelConfig
 from .gen_training_caps import gen_training_examples_from_tree
+from .gpu_check import gpu_is_ampere_or_newer
 from .load_pq_dir import load_pq_to_infinidata
 from .spherical_space_partitioning import CapTree
 from .triangle_schedule import triangle_schedule
@@ -47,7 +48,7 @@ class ImageModel(nn.Module):
     activation_function: Callable[[jax.Array], jax.Array]
     pre_norm: bool
     decode: bool = False
-    attn_method: AttnMethod = AttnMethod.FLASH_JAX
+    attn_method: Optional[AttnMethod] = None
 
     def setup(self) -> None:
         default_stddev = 0.02 / jnp.sqrt(self.n_layers)
@@ -119,6 +120,19 @@ class ImageModel(nn.Module):
             embedding_init=default_kernel_init,
             dtype=self.activations_dtype,
         )
+
+        # Detect best available attention method
+        if self.attn_method is None:
+            if gpu_is_ampere_or_newer():
+                attn_method = AttnMethod.FLASH_CPP
+            else:
+                print(
+                    "Warning: falling back to pure JAX flash attention because no >= Ampere architecture GPU was detected."
+                )
+                attn_method = AttnMethod.FLASH_JAX
+        else:
+            attn_method = self.attn_method
+
         # it'd potentially be better to use nn.remat_scan here, but it makes inference massively
         # slower for some reason. Even though checkpointing should only affect gradient computation.
         # Might have to do with the fact that remat_scan creates a scan-of-scans? Could cause bad
@@ -140,7 +154,7 @@ class ImageModel(nn.Module):
             pre_norm=self.pre_norm,
             kernel_init=default_kernel_init,
             decode=self.decode,
-            attn_method=self.attn_method,
+            attn_method=attn_method,
         )
 
         if self.pre_norm:
