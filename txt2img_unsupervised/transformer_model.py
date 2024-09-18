@@ -1,5 +1,5 @@
-import flash_attention_jax # Pure JAX flash attention implementation by lucidrains
-import flash_attn_jax as flash_attention_cpp # C++ flash attention by Tri Dao et al, JAX bindings by nshepperd
+import flash_attention_jax  # Pure JAX flash attention implementation by lucidrains
+import flash_attn_jax as flash_attention_cpp  # C++ flash attention by Tri Dao et al, JAX bindings by nshepperd
 import flax.core
 import flax.linen as nn
 import jax
@@ -28,7 +28,7 @@ from .spherical_space_partitioning import CapTree
 from .triangle_schedule import triangle_schedule
 
 
-AttnMethod = Enum('AttnMethod', ['STANDARD', 'FLASH_JAX', 'FLASH_CPP'])
+AttnMethod = Enum("AttnMethod", ["STANDARD", "FLASH_JAX", "FLASH_CPP"])
 
 
 class ImageModel(nn.Module):
@@ -285,7 +285,9 @@ class ImageModel(nn.Module):
         when this is done. Batchless (for now)."""
         assert self.decode
         # TODO test CPP flash attention, maybe it works.
-        assert self.attn_method == AttnMethod.STANDARD, "Only standard attention works with decoding."
+        assert (
+            self.attn_method == AttnMethod.STANDARD
+        ), "Only standard attention works with decoding."
 
         if self.clip_conditioning:
             if self.clip_caps:
@@ -322,7 +324,9 @@ class ImageModel(nn.Module):
         assert (
             self.decode
         ), "Can't call decode_step on a model that wasn't set up for decoding."
-        assert self.attn_method == AttnMethod.STANDARD, "Only standard attention works with decoding."
+        assert (
+            self.attn_method == AttnMethod.STANDARD
+        ), "Only standard attention works with decoding."
         assert tok.shape == ()
         assert tok.dtype == jnp.int32 or tok.dtype == jnp.int64
         assert idx.shape == ()
@@ -858,6 +862,7 @@ class TransformerLayer(nn.Module):
                 return res
 
         elif self.attn_method == AttnMethod.FLASH_CPP:
+
             def attn_function(
                 q,
                 k,
@@ -872,9 +877,14 @@ class TransformerLayer(nn.Module):
                 precision=None,
             ):
                 assert bias == None, "attention bias not implemented"
-                assert mask == None, "attention mask is redundant with causal_flash_attention"
+                assert (
+                    mask == None
+                ), "attention mask is redundant with causal_flash_attention"
                 assert dropout_rate == 0.0, "attention dropout not implemented"
-                assert dtype in [jnp.bfloat16, jnp.float16], "CPP flash attention only supports bfloat16 & float16"
+                assert dtype in [
+                    jnp.bfloat16,
+                    jnp.float16,
+                ], "CPP flash attention only supports bfloat16 & float16"
 
                 res = flash_attention_cpp.flash_mha(q, k, v, is_causal=True)
                 assert res.shape == v.shape
@@ -927,7 +937,10 @@ class TransformerLayer(nn.Module):
         batch_size = embeds.shape[0]
         seq_len = embeds.shape[1]
 
-        if self.attn_method == AttnMethod.FLASH_JAX or self.attn_method == AttnMethod.FLASH_CPP:
+        if (
+            self.attn_method == AttnMethod.FLASH_JAX
+            or self.attn_method == AttnMethod.FLASH_CPP
+        ):
             mask = None
         else:
             mask = jnp.tril(
@@ -951,12 +964,19 @@ class TransformerLayer(nn.Module):
         assert embeds.shape == (batch_size, seq_len, self.d_model)
         return embeds, None
 
-@pytest.mark.parametrize("flash_method", [
-    pytest.param(AttnMethod.FLASH_JAX),
-    pytest.param(AttnMethod.FLASH_CPP, marks=pytest.mark.requires_ampere_or_newer)])
+
+@pytest.mark.parametrize(
+    "flash_method",
+    [
+        pytest.param(AttnMethod.FLASH_JAX),
+        pytest.param(AttnMethod.FLASH_CPP, marks=pytest.mark.requires_ampere_or_newer),
+    ],
+)
 def test_flash_attention_equals_standard(flash_method: AttnMethod) -> None:
     """Test that flash attention gives the same results as Flax's standard attention."""
-    activations_dtype = jnp.float32 if flash_method == AttnMethod.FLASH_JAX else jnp.bfloat16
+    activations_dtype = (
+        jnp.float32 if flash_method == AttnMethod.FLASH_JAX else jnp.bfloat16
+    )
     mdl_std = TransformerLayer(
         d_model=768,
         num_heads=12,
