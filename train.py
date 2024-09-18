@@ -1144,19 +1144,19 @@ for epoch in trange(
                 batch_clips,
                 batch_max_cos_distances,
             )
-            # TODO check if moving this check inside an if opt_state.notfinite_count > 0 is faster
+            opt_state = my_train_state.opt_state
+            train_loss, notfinite_count, norm = jax.device_get((train_loss, opt_state.notfinite_count, norm))
             if not jnp.isfinite(train_loss):
                 tqdm.write(f"Loss nonfinite 😢 ({train_loss})")
-            opt_state = my_train_state.opt_state
             wandb.log(
                 {
                     "global_step": global_step,
                     "train/loss": train_loss,
                     "grad_global_norm": norm,
-                    "debug/notfinite_count": opt_state.notfinite_count,
+                    "debug/notfinite_count": notfinite_count,
                 }
             )
-            if opt_state.notfinite_count > 50:
+            if notfinite_count > 50:
                 tqdm.write(f"Too many nonfinite values in gradients, giving up")
                 exit(1)
             if (
@@ -1168,14 +1168,14 @@ for epoch in trange(
                 # not the same as the params used for inference, we want to test with the inference
                 # params occasionally for charting.
                 eval_params = get_eval_params(opt_state, my_train_state.params)
-                eval_loss = loss_fn(
+                eval_loss = jax.device_get(loss_fn(
                     eval_params,
                     training_cfg.loss_decay_constant,
                     my_train_state.rng,
                     batch_imgs,
                     batch_clips,
                     batch_max_cos_distances,
-                )
+                ))
                 del eval_params
                 wandb.log({"global_step": global_step, "eval/loss": eval_loss})
             if (
