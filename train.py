@@ -99,7 +99,9 @@ parser.add_argument("--clip-conditioning", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--clip-caps", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--clip-cap-count", type=int)
 parser.add_argument("--resume", type=Path)
-parser.add_argument("--skip-sampling", action="store_true", help="Skip sampling during training")
+parser.add_argument(
+    "--skip-sampling", action="store_true", help="Skip sampling during training"
+)
 args, _unknown = parser.parse_known_args()
 
 
@@ -1160,7 +1162,9 @@ for epoch in trange(
                 batch_max_cos_distances,
             )
             opt_state = my_train_state.opt_state
-            train_loss, notfinite_count, norm = jax.device_get((train_loss, opt_state.notfinite_count, norm))
+            train_loss, notfinite_count, norm = jax.device_get(
+                (train_loss, opt_state.notfinite_count, norm)
+            )
             if not jnp.isfinite(train_loss):
                 tqdm.write(f"Loss nonfinite 😢 ({train_loss})")
             wandb.log(
@@ -1183,14 +1187,16 @@ for epoch in trange(
                 # not the same as the params used for inference, we want to test with the inference
                 # params occasionally for charting.
                 eval_params = get_eval_params(opt_state, my_train_state.params)
-                eval_loss = jax.device_get(loss_fn(
-                    eval_params,
-                    training_cfg.loss_decay_constant,
-                    my_train_state.rng,
-                    batch_imgs,
-                    batch_clips,
-                    batch_max_cos_distances,
-                ))
+                eval_loss = jax.device_get(
+                    loss_fn(
+                        eval_params,
+                        training_cfg.loss_decay_constant,
+                        my_train_state.rng,
+                        batch_imgs,
+                        batch_clips,
+                        batch_max_cos_distances,
+                    )
+                )
                 del eval_params
                 wandb.log({"global_step": global_step, "eval/loss": eval_loss})
             if (
