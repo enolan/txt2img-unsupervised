@@ -1,0 +1,27 @@
+# For some godforsaken reason if you use the nvidia cuda image, your runpod instance will just
+# boot loop with no debug info. So we derive from their image.
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
+    libsqlite3-dev curl libncursesw5-dev xz-utils tk-dev libxml2-dev \
+    libxmlsec1-dev libffi-dev liblzma-dev rclone magic-wormhole zstd atop fish \
+    unzip git wget htop nano tmux less
+
+RUN usermod -s /bin/fish root
+
+# https://ommer-lab.com/files/latent-diffusion/vq-f4.zip
+ADD vq-f4.zip /root/vq-f4.zip
+RUN unzip /root/vq-f4.zip -d /root/vq-f4
+
+ADD setup-repo.sh /root/setup-repo.sh
+
+RUN curl https://pyenv.run | bash
+ENV PATH="/root/.pyenv/bin:/root/.pyenv/shims:$PATH"
+RUN echo $(pyenv init) >> /root/.bashrc
+
+RUN pyenv install 3.11.8 && pyenv global 3.11.8
+
+ADD fish-pyenv.fish /root/.config/fish/conf.d/fish-pyenv.fish
+
+RUN pip install poetry
