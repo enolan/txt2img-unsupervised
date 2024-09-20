@@ -51,8 +51,10 @@ class ImageModel(nn.Module):
     attn_method: Optional[AttnMethod] = None
 
     def setup(self) -> None:
-        default_stddev = 0.02 / jnp.sqrt(self.n_layers)
+        default_stddev = 0.02
         default_kernel_init = nn.initializers.normal(stddev=default_stddev)
+        out_proj_stddev = 0.02 / jnp.sqrt(2 * self.n_layers)
+        out_proj_kernel_init = nn.initializers.normal(stddev=out_proj_stddev)
         self.in_embed = nn.Embed(
             num_embeddings=8192,
             features=self.d_model,
@@ -153,6 +155,7 @@ class ImageModel(nn.Module):
             activation_function=self.activation_function,
             pre_norm=self.pre_norm,
             kernel_init=default_kernel_init,
+            out_proj_kernel_init=out_proj_kernel_init,
             decode=self.decode,
             attn_method=attn_method,
         )
@@ -795,6 +798,7 @@ class TransformerLayer(nn.Module):
     activation_function: Callable[[jax.Array], jax.Array]
     pre_norm: bool
     kernel_init: Callable[..., jnp.ndarray]
+    out_proj_kernel_init: Callable[..., jnp.ndarray]
     decode: bool
     attn_method: AttnMethod
 
@@ -906,6 +910,7 @@ class TransformerLayer(nn.Module):
             use_bias=self.use_biases,
             dtype=self.activations_dtype,
             kernel_init=self.kernel_init,
+            out_kernel_init=self.out_proj_kernel_init,
             decode=self.decode,
             attention_fn=attn_function,
         )
@@ -919,7 +924,7 @@ class TransformerLayer(nn.Module):
         self.linear_2 = nn.Dense(
             features=self.d_model,
             use_bias=self.use_biases,
-            kernel_init=self.kernel_init,
+            kernel_init=self.out_proj_kernel_init,
             dtype=self.activations_dtype,
         )
         self.layer_norm_2 = nn.LayerNorm(dtype=self.activations_dtype)
