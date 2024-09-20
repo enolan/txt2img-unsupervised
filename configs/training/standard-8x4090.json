@@ -1,0 +1,11 @@
+{
+  "learning_rate": 3e-06,
+  "batch_size": 360,
+  "epochs": 1,
+  "learning_rate_schedule": "warmup_plus_schedule_free",
+  "gradient_accumulation_steps": 1,
+  "warmup_steps": 400,
+  "schedule_free_beta1": 0.98,
+  "training_images": 0,
+  "loss_decay_constant": 1
+}
