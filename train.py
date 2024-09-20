@@ -1294,5 +1294,5 @@ for epoch in trange(
         f"Epoch {epoch} done, train loss: {train_loss:.4f}, test loss {test_loss:.4f}",
         end="",
     )
-    save_checkpoint_and_sample(my_train_state, sample_batch_size, global_step)
+    save_checkpoint_and_sample(my_train_state, sample_batch_size, global_step, skip_sampling=False)
     last_checkpoint_time = datetime.datetime.now()
