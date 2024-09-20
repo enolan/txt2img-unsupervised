@@ -141,7 +141,8 @@ def setup_cfg_and_wandb():
             options=checkpoint_options,
             item_names=checkpoint_manager_items,
         )
-        global_step = checkpoint_manager.latest_step()
+        # Checkpoint saved after step n, so we start at step n+1
+        global_step = checkpoint_manager.latest_step() + 1
         restoring = True
         metadata = checkpoint_manager.metadata()
         model_cfg = ModelConfig.from_json_dict(metadata["model_cfg"])
@@ -1230,13 +1231,13 @@ for epoch in trange(
             else:
                 pbar.set_postfix(train_loss=f"{train_loss:.4f}")
             pbar.update()
-            global_step += 1
             if exit_requested:
                 tqdm.write("Saving checkpoint and exiting early")
                 save_checkpoint_and_sample(
                     my_train_state, sample_batch_size, global_step, skip_sampling=True
                 )
                 exit(0)
+            global_step += 1
     # Evaluate on test set
     losses = []
     eval_params = get_eval_params(opt_state, my_train_state.params)
