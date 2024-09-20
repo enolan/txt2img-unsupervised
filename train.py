@@ -12,6 +12,7 @@ import optax  # type:ignore[import]
 import optax.contrib
 import orbax.checkpoint as ocp
 import PIL.Image
+import signal
 import subprocess
 import time
 import torch
@@ -1049,7 +1050,9 @@ def train_step(
 last_checkpoint_time = None
 
 
-def save_checkpoint_and_sample(my_train_state, sample_batch_size, global_step) -> None:
+def save_checkpoint_and_sample(
+    my_train_state, sample_batch_size, global_step, skip_sampling
+) -> None:
     # TPU VMs run out of disk space a lot. Retrying in a loop lets me manually clean up the disk
     tqdm.write("Attempting to save checkpoint")
     while True:
@@ -1068,7 +1071,7 @@ def save_checkpoint_and_sample(my_train_state, sample_batch_size, global_step) -
             tqdm.write("Retrying in 60 seconds")
             time.sleep(60)
     tqdm.write("Saved checkpoint")
-    if not args.skip_sampling:
+    if not skip_sampling:
         tqdm.write("Sampling")
         sample_and_log(my_train_state, sample_batch_size, global_step)
         tqdm.write("Done sampling")
@@ -1084,6 +1087,20 @@ tqdm.write(f"Starting at epoch {start_epoch}, step {start_step}")
 examples_sharding = NamedSharding(mesh, PartitionSpec("dev"))
 
 eval_loss = None
+
+exit_requested = False
+
+
+def exit_early_signal_handler(signum, frame):
+    # It's important to checkpoint and exit at well-defined times (not in the middle of a train
+    # step), so we use a flag and check for it rather than exiting immediately upon recieving the
+    # signal.
+    global exit_requested
+    exit_requested = True
+
+
+signal.signal(signal.SIGTERM, exit_early_signal_handler)
+signal.signal(signal.SIGINT, exit_early_signal_handler)
 
 for epoch in trange(
     start_epoch,
@@ -1126,7 +1143,10 @@ for epoch in trange(
                 datetime.datetime.now() - last_checkpoint_time
             ) > datetime.timedelta(minutes=30):
                 save_checkpoint_and_sample(
-                    my_train_state, sample_batch_size, global_step
+                    my_train_state,
+                    sample_batch_size,
+                    global_step,
+                    args.skip_sampling,
                 )
                 last_checkpoint_time = datetime.datetime.now()
 
@@ -1211,7 +1231,12 @@ for epoch in trange(
                 pbar.set_postfix(train_loss=f"{train_loss:.4f}")
             pbar.update()
             global_step += 1
-
+            if exit_requested:
+                tqdm.write("Saving checkpoint and exiting early")
+                save_checkpoint_and_sample(
+                    my_train_state, sample_batch_size, global_step, skip_sampling=True
+                )
+                exit(0)
     # Evaluate on test set
     losses = []
     eval_params = get_eval_params(opt_state, my_train_state.params)
