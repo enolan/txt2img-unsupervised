@@ -1138,19 +1138,6 @@ for epoch in trange(
             batch_size=training_cfg.batch_size, drop_last_batch=True
         )
         for batch in islice(iter, this_start_step, this_end_step):
-            # Save checkpoint every 30 minutes. This does one at step 0 too, which is nice so we
-            # don't have to wait half an hour to find out if it crashes.
-            if last_checkpoint_time is None or (
-                datetime.datetime.now() - last_checkpoint_time
-            ) > datetime.timedelta(minutes=30):
-                save_checkpoint_and_sample(
-                    my_train_state,
-                    sample_batch_size,
-                    global_step,
-                    args.skip_sampling,
-                )
-                last_checkpoint_time = datetime.datetime.now()
-
             batch_imgs = jax.device_put(batch["encoded_img"], examples_sharding)
             if model_cfg.clip_conditioning and not model_cfg.clip_caps:
                 batch_clips = jax.device_put(batch["clip_embedding"], examples_sharding)
@@ -1196,6 +1183,19 @@ for epoch in trange(
                     "debug/notfinite_count": notfinite_count,
                 }
             )
+            # Save checkpoint every 30 minutes. This does one at step 0 too, which is nice so we
+            # don't have to wait half an hour to find out if it crashes.
+            if last_checkpoint_time is None or (
+                datetime.datetime.now() - last_checkpoint_time
+            ) > datetime.timedelta(minutes=30):
+                save_checkpoint_and_sample(
+                    my_train_state,
+                    sample_batch_size,
+                    global_step,
+                    args.skip_sampling,
+                )
+                last_checkpoint_time = datetime.datetime.now()
+
             if notfinite_count > 50:
                 tqdm.write(f"Too many nonfinite values in gradients, giving up")
                 exit(1)
