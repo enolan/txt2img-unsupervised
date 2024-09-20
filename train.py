@@ -435,7 +435,8 @@ def setup_optimizer(
         rng_template = ocp.utils.to_shape_dtype_struct(ts.rng)
         del ts
         restored = checkpoint_manager.restore(
-            global_step,
+            # global_step is the step we start on, so the checkpoint was saved at global_step - 1
+            global_step - 1,
             args=ocp.args.Composite(
                 params=ocp.args.StandardRestore(params_template),
                 opt_state=ocp.args.StandardRestore(opt_state_template),
@@ -1294,5 +1295,7 @@ for epoch in trange(
         f"Epoch {epoch} done, train loss: {train_loss:.4f}, test loss {test_loss:.4f}",
         end="",
     )
-    save_checkpoint_and_sample(my_train_state, sample_batch_size, global_step, skip_sampling=False)
+    save_checkpoint_and_sample(
+        my_train_state, sample_batch_size, global_step, skip_sampling=False
+    )
     last_checkpoint_time = datetime.datetime.now()
