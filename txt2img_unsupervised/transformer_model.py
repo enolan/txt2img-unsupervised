@@ -991,7 +991,8 @@ def test_flash_attention_equals_standard(flash_method: AttnMethod) -> None:
         activations_dtype=activations_dtype,
         activation_function=jax.nn.relu,
         pre_norm=False,
-        kernel_init=nn.initializers.normal(stddev=0.02 / jnp.sqrt(12)),
+        kernel_init=nn.initializers.normal(stddev=0.02),
+        out_proj_kernel_init=nn.initializers.normal(stddev=0.02 / jnp.sqrt(2 * 12)),
         decode=False,
         attn_method=AttnMethod.STANDARD,
     )
@@ -1104,10 +1105,7 @@ def test_cap_train() -> None:
     mdl_cfg.clip_caps = True
     mdl_cfg.clip_cap_count = 9
     mdl_cfg.dropout = None
-    # This may or may not actually need a model this big, I'm tired of fucking with it.
-    mdl_cfg.d_model = 1024
-    mdl_cfg.num_heads = 16
-    mdl_cfg.n_layers = 24
+    mdl_cfg.pre_norm = True
 
     n_imgs = 8
 
@@ -1138,9 +1136,10 @@ def test_cap_train() -> None:
 
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
 
-    steps = 500
-    adam = optax.adam(learning_rate=triangle_schedule(3e-5, steps))
-    opt = optax.chain(optax.clip_by_global_norm(0.25), adam)
+    steps = 100
+    opt = optax.contrib.schedule_free_adamw(
+        learning_rate=3e-4, b1=0.98, warmup_steps=20
+    )
     opt_state = opt.init(params)
 
     def opt_step(params, opt_state, rng):
@@ -1154,7 +1153,7 @@ def test_cap_train() -> None:
             batch_clips=clips,
             batch_max_cos_distances=max_cos_distances,
         )
-        updates, opt_state = opt.update(grads, opt_state)
+        updates, opt_state = opt.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
         norm = optax.global_norm(grads)
         return new_params, opt_state, rng2, loss, norm
@@ -1211,6 +1210,7 @@ def train_loop_simple(
     mdl: ImageModel,
     iters: int,
     learning_rate: float = 3e-5,
+    warmup_steps: Optional[int] = None,
     loss_decay_constant: float = 1.0,
 ) -> Tuple[jax.Array, dict[str, Any]]:
     """Train the model repeatedly on a single batch for testing."""
@@ -1224,7 +1224,11 @@ def train_loop_simple(
         clip_embeddings=jnp.zeros((1, 0), dtype=jnp.float32),
         max_cos_distances=jnp.zeros((1, 0), dtype=jnp.float32),
     )
-    opt = optax.adam(learning_rate=learning_rate)
+    if warmup_steps is None:
+        warmup_steps = iters // 10
+    opt = optax.contrib.schedule_free_adamw(
+        learning_rate=learning_rate, b1=0.98, warmup_steps=warmup_steps
+    )
     opt_state = opt.init(params)
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
 
@@ -1246,7 +1250,7 @@ def train_loop_simple(
                 (batch_imgs.shape[0], 0), dtype=jnp.float32
             ),
         )
-        updates, opt_state = opt.update(grads, opt_state)
+        updates, opt_state = opt.update(grads, opt_state, params)
         new_params: dict[str, Any] = optax.apply_updates(params, updates)
         return new_params, opt_state, rng2, loss
 
@@ -1258,6 +1262,7 @@ def train_loop_simple(
             params, opt_state, train_rng, data
         )
         print(f"iter {i} loss: {loss}")
+    params = optax.contrib.schedule_free_eval_params(opt_state, params)
     return loss, params  # type:ignore[return-value]
 
 
@@ -1268,7 +1273,9 @@ def test_learn_zeros(pre_norm: bool) -> None:
     mdl_cfg.pre_norm = pre_norm
     mdl = ImageModel(**mdl_cfg.__dict__)
     data = jnp.zeros((16, gpt_1_config.image_tokens), dtype=jnp.int32)
-    loss, params = train_loop_simple(data, mdl, 20, learning_rate=3e-3)
+    loss, params = train_loop_simple(
+        data, mdl, iters=5, learning_rate=3e-2, warmup_steps=0
+    )
     assert loss < 1e-10
 
     sampled_arr = sample(
@@ -1293,7 +1300,11 @@ def test_learn_ranges(pre_norm: bool) -> None:
         (16, gpt_1_config.image_tokens)
     )
     loss, params = train_loop_simple(
-        data, mdl, 200 if pre_norm else 400, learning_rate=3e-4 if pre_norm else 3e-5
+        data,
+        mdl,
+        iters=100 if pre_norm else 250,
+        learning_rate=1e-3 if pre_norm else 1e-4,
+        warmup_steps=20,
     )
     assert loss < 0.6
     empty_arr = jnp.zeros((0,), dtype=jnp.float32)
@@ -1327,15 +1338,22 @@ def test_learn_ranges(pre_norm: bool) -> None:
 def test_loss_weighting() -> None:
     """Train a model with no weighting to memorize a random data set, and then one with strong
     weighting and check that the weighted model learns the early tokens faster."""
-    mdl = ImageModel(**gpt_1_config.__dict__)
+    mdl_cfg = copy(gpt_1_config)
+    mdl_cfg.pre_norm = True
+    mdl = ImageModel(**mdl_cfg.__dict__)
     data = jax.random.randint(
         jax.random.PRNGKey(0), (16, gpt_1_config.image_tokens), 0, 8192
     )
-    _loss_unweighted, params_unweighted = train_loop_simple(
-        data, mdl, 250, loss_decay_constant=1.0
-    )
-    _loss_weighted, params_weighted = train_loop_simple(
-        data, mdl, 250, loss_decay_constant=0.1
+    (_loss_unweighted, params_unweighted), (_loss_weighted, params_weighted) = map(
+        lambda decay_constant: train_loop_simple(
+            data,
+            mdl,
+            iters=60,
+            warmup_steps=10,
+            learning_rate=3e-4,
+            loss_decay_constant=decay_constant,
+        ),
+        [1.0, 0.1],
     )
 
     def loss_first_half(params):
@@ -1382,9 +1400,8 @@ def test_clip_caps_overfit():
     mdl_cfg.clip_caps = True
     mdl_cfg.clip_cap_count = 1
     mdl_cfg.dropout = None
-    mdl_cfg.d_model = 1024
-    mdl_cfg.num_heads = 16
-    mdl_cfg.n_layers = 24
+    mdl_cfg.activation_function = jax.nn.gelu
+    mdl_cfg.pre_norm = True
 
     mdl = ImageModel(**mdl_cfg.__dict__)
 
@@ -1406,11 +1423,12 @@ def _train_clip_caps_overfit(dset_train, mdl, rng):
 
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
 
-    steps = 2_000
-    batch_size = 32
+    steps = 150
+    batch_size = 64
 
-    adam = optax.adam(learning_rate=triangle_schedule(1e-4, steps))
-    opt = optax.chain(optax.clip_by_global_norm(0.25), adam)
+    opt = optax.contrib.schedule_free_adamw(
+        learning_rate=1e-3, b1=0.98, warmup_steps=100
+    )
     opt_state = opt.init(params)
 
     def opt_step(params, opt_state, rng, images, clips, max_cos_distances):
@@ -1424,7 +1442,7 @@ def _train_clip_caps_overfit(dset_train, mdl, rng):
             batch_clips=clips,
             batch_max_cos_distances=max_cos_distances,
         )
-        updates, opt_state = opt.update(grads, opt_state)
+        updates, opt_state = opt.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
         norm = optax.global_norm(grads)
         return new_params, opt_state, rng2, loss, norm
@@ -1453,7 +1471,7 @@ def _train_clip_caps_overfit(dset_train, mdl, rng):
                     cap_centers,
                     max_cos_distances,
                 )
-                loss, norm = np.asarray(loss), np.asarray(norm)
+                loss, norm = jax.device_get((loss, norm))
                 pbar.update(1)
                 pbar.set_postfix({"loss": loss, "grad norm": norm})
                 if pbar.n % 100 == 0:
@@ -1462,7 +1480,7 @@ def _train_clip_caps_overfit(dset_train, mdl, rng):
                     )
                 if pbar.n >= steps:
                     break
-    return params
+    return optax.contrib.schedule_free_eval_params(opt_state, params)
 
 
 def _test_clip_caps_overfit_test_loss(dset_test, mdl, params):
