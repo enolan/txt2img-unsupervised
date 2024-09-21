@@ -390,7 +390,7 @@ def mk_filler_caps(model_cfg, n_cap_sets, n_used_caps, rng):
     return np.asarray(centers), max_cos_distances
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n", type=int, default=1)
     parser.add_argument("--seed", type=int, default=None)
@@ -576,3 +576,7 @@ if __name__ == "__main__":
         for i, indices in tqdm(enumerate(grid_img_idxs)):
             grid_imgs = [imgs[i] for i in indices]
             make_grid(grid_imgs).save(args.out_dir / f"grid_{i:04d}.png")
+
+
+if __name__ == "__main__":
+    main()
