@@ -431,8 +431,6 @@ if __name__ == "__main__":
     )
 
     model_cfg = ModelConfig.from_json_dict(checkpoint_mngr.metadata()["model_cfg"])
-    # Samples are substantially better with 32 bits, even for models trained with bf16
-    model_cfg.activations_dtype = jnp.float32
     im_mdl = ImageModel(**model_cfg.__dict__)
 
     if model_cfg.clip_conditioning and model_cfg.clip_caps:
