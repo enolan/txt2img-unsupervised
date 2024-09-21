@@ -1128,6 +1128,17 @@ for epoch in trange(
     this_start_step = start_step if epoch == start_epoch else 0
     actual_batches = batches_for_this_epoch - this_start_step
     this_end_step = this_start_step + actual_batches
+
+    # Much faster to skip leading examples this way than with islice
+    shuffled_train_imgs = shuffled_train_imgs.select(
+        range(
+            this_start_step * training_cfg.batch_size,
+            this_end_step * training_cfg.batch_size,
+        )
+    )
+    iter = shuffled_train_imgs.iter(
+        batch_size=training_cfg.batch_size, drop_last_batch=True
+    )
     tqdm.write(
         f"Epoch {epoch} starting at step {this_start_step}, doing {actual_batches} steps, ending at step {this_end_step}"
     )
@@ -1137,10 +1148,7 @@ for epoch in trange(
         desc="train batches",
         initial=this_start_step,
     ) as pbar:
-        iter = shuffled_train_imgs.iter(
-            batch_size=training_cfg.batch_size, drop_last_batch=True
-        )
-        for batch in islice(iter, this_start_step, this_end_step):
+        for batch in iter:
             batch_imgs = jax.device_put(batch["encoded_img"], examples_sharding)
             if model_cfg.clip_conditioning and not model_cfg.clip_caps:
                 batch_clips = jax.device_put(batch["clip_embedding"], examples_sharding)
