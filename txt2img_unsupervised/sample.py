@@ -399,6 +399,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--cond-img", type=str, nargs="*")
     parser.add_argument("--cond-txt", type=str, nargs="*")
+    parser.add_argument("--force-fp32", type=bool, default=True, help="Force float32 precision")
     parser.add_argument("transformer_checkpoint_dir", type=Path)
     parser.add_argument("autoencoder_checkpoint", type=Path)
     parser.add_argument("autoencoder_cfg", type=Path)
@@ -561,6 +562,7 @@ if __name__ == "__main__":
         max_cos_distances=max_cos_distances,
         rng=rng,
         top_p=args.top_p,
+        force_f32=args.force_fp32,
     )
 
     args.out_dir.mkdir(exist_ok=True, parents=True)
