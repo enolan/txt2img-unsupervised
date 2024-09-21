@@ -1423,7 +1423,7 @@ def _train_clip_caps_overfit(dset_train, mdl, rng):
 
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
 
-    steps = 150
+    steps = 200
     batch_size = 64
 
     opt = optax.contrib.schedule_free_adamw(
