@@ -472,7 +472,9 @@ mdl, my_train_state, get_eval_params, mesh = setup_optimizer(
 
 
 loss_grad_fn = jax.value_and_grad(transformer_model.loss_batch, argnums=1)
-loss_fn = jax.jit(partial(transformer_model.loss_batch, mdl))
+loss_fn = jax.jit(
+    partial(transformer_model.loss_batch, mdl), static_argnames=["loss_decay_constant"]
+)
 
 
 # TODO delete this, unnecessary now
@@ -1023,7 +1025,7 @@ def rearrange_batch_caps(
     return centers, max_cos_distances
 
 
-@partial(jax.jit, donate_argnums=(0,))
+@partial(jax.jit, donate_argnames=["state"], static_argnames=["loss_decay_constant"])
 def train_step(
     state: TrainState,
     loss_decay_constant: float,
