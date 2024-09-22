@@ -4,6 +4,7 @@ import flax.core
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import jax.tree_util as jtu
 import numpy as np
 import optax  # type: ignore[import]
 import pytest
@@ -191,38 +192,46 @@ class ImageModel(nn.Module):
 
     def gen_conditioning_tokens(
         self,
-        clip_embedding: jax.Array,
-        max_cos_distance: jax.Array,
+        clip_embeddings: jax.Array,
+        max_cos_distances: jax.Array,
     ) -> jax.Array:
         """Generate the conditioning tokens that should be prepended to the image tokens. Returns a
-        (self.prepended_tokens(), self.d_model) shaped array."""
+        (batch_size, self.prepended_tokens(), self.d_model) shaped array."""
+        batch_size = clip_embeddings.shape[0]
         if not self.clip_conditioning:
-            assert clip_embedding.shape == max_cos_distance.shape == (0,)
-            res = jnp.zeros((1, self.d_model), dtype=self.activations_dtype)
+            assert clip_embeddings.shape == max_cos_distances.shape == (batch_size, 0)
+            res = jnp.zeros((batch_size, 1, self.d_model), dtype=self.activations_dtype)
         else:
             if not self.clip_caps:
-                assert clip_embedding.shape == (768,)
-                assert max_cos_distance.shape == (0,)
-                res = self.clip_proj(clip_embedding)[None, :]
+                assert clip_embeddings.shape == (batch_size, 768)
+                assert max_cos_distances.shape == (batch_size, 0)
+                res = self.clip_proj(clip_embeddings)[:, None, :]
             else:
-                assert clip_embedding.shape == (self.clip_cap_count, 768)
-                assert max_cos_distance.shape == (self.clip_cap_count,)
+                assert clip_embeddings.shape == (batch_size, self.clip_cap_count, 768)
+                assert max_cos_distances.shape == (batch_size, self.clip_cap_count)
 
                 # Without this rearrange when we apply the dense layer it interprets the max cos
                 # distances as a single vector of length n rather than n vectors of length 1, and
                 # produces one embedding for the whole sequence of distances rather than one for
                 # each cap. Shapes, man.
-                max_cos_distance = rearrange(max_cos_distance, "caps -> caps 1")
+                max_cos_distances = rearrange(max_cos_distances, "b caps -> b caps 1")
 
-                res_cap_centers = self.clip_proj(clip_embedding)
-                res_max_cos_distances = self.max_cos_distance_proj(1 - max_cos_distance)
-                assert res_cap_centers.shape == (self.clip_cap_count, self.d_model)
+                res_cap_centers = self.clip_proj(clip_embeddings)
+                res_max_cos_distances = self.max_cos_distance_proj(
+                    1 - max_cos_distances
+                )
+                assert res_cap_centers.shape == (
+                    batch_size,
+                    self.clip_cap_count,
+                    self.d_model,
+                )
                 assert res_max_cos_distances.shape == (
+                    batch_size,
                     self.clip_cap_count,
                     self.d_model,
                 )
                 res = (res_cap_centers + res_max_cos_distances) / 2
-        assert res.shape == (self.prepended_tokens(), self.d_model)
+        assert res.shape == (batch_size, self.prepended_tokens(), self.d_model)
         return res
 
     def output_shape_tokens(self) -> int:
@@ -258,9 +267,7 @@ class ImageModel(nn.Module):
         embeds = self.in_embed(images)
         assert embeds.shape == (batch_size, self.image_tokens, self.d_model)
 
-        cond_tokens = jax.vmap(self.gen_conditioning_tokens)(
-            clip_embeddings, max_cos_distances
-        )
+        cond_tokens = self.gen_conditioning_tokens(clip_embeddings, max_cos_distances)
         assert cond_tokens.shape == (batch_size, self.prepended_tokens(), self.d_model)
         toks = jnp.concatenate([cond_tokens, embeds[:, :-1]], axis=1)
         assert toks.shape == (batch_size, self.seq_len(), self.d_model)
@@ -280,49 +287,53 @@ class ImageModel(nn.Module):
 
     def decode_init(
         self,
-        clip_embedding: jax.Array,
-        max_cos_distance: jax.Array,
+        clip_embeddings: jax.Array,
+        max_cos_distances: jax.Array,
     ):
         """Initialize the cache for decoding by computing and feeding the conditioning tokens. Returns
         the logits for the first image token. The cache should be ready for use with decode_step
-        when this is done. Batchless (for now)."""
+        when this is done."""
         assert self.decode
         # TODO test CPP flash attention, maybe it works.
         assert (
             self.attn_method == AttnMethod.STANDARD
         ), "Only standard attention works with decoding."
 
+        batch_size = clip_embeddings.shape[0]
+
         if self.clip_conditioning:
             if self.clip_caps:
-                assert clip_embedding.shape == (self.clip_cap_count, 768)
-                assert max_cos_distance.shape == (self.clip_cap_count,)
+                assert clip_embeddings.shape == (batch_size, self.clip_cap_count, 768)
+                assert max_cos_distances.shape == (batch_size, self.clip_cap_count)
             else:
-                assert clip_embedding.shape == (768,)
-                assert max_cos_distance.shape == (0,)
+                assert clip_embeddings.shape == (batch_size, 768)
+                assert max_cos_distances.shape == (batch_size, 0)
         else:
             assert (
-                clip_embedding.shape == max_cos_distance.shape == (0,)
-            ), f"Expected empty shapes, got {clip_embedding.shape} and {max_cos_distance.shape}"
+                clip_embeddings.shape == max_cos_distances.shape == (batch_size, 0)
+            ), f"Expected empty shapes, got {clip_embeddings.shape} and {max_cos_distances.shape}"
 
-        cond_tokens = self.gen_conditioning_tokens(clip_embedding, max_cos_distance)
+        cond_tokens = self.gen_conditioning_tokens(clip_embeddings, max_cos_distances)
+        assert cond_tokens.shape == (batch_size, self.prepended_tokens(), self.d_model)
 
         h = cond_tokens + self.positional_encoding(jnp.arange(self.prepended_tokens()))
-        assert h.shape == (self.prepended_tokens(), self.d_model)
+        assert h.shape == (batch_size, self.prepended_tokens(), self.d_model)
 
-        # TODO vectorize, don't loop
-        for tok in h:
-            # Add batch dimension and sequence dimension before running transformer blocks
-            h, _ = self.transformer_layers(tok[None, None, :], None)
-            last_tok = h[0, 0]
-        assert last_tok.shape == (self.d_model,)
+        for i in range(self.prepended_tokens()):
+            # Feed the prepended tokens one by one to initialize kv cache
+            tf_out, _ = self.transformer_layers(h[:, i : i + 1, :], None)
+            assert tf_out.shape == (batch_size, 1, self.d_model)
 
-        logits_out = self.logits_decoder(last_tok)
-        assert logits_out.shape == (8192,)
+        last_toks = tf_out[:, 0, :]
+        assert last_toks.shape == (batch_size, self.d_model)
+
+        logits_out = self.logits_decoder(last_toks)
+        assert logits_out.shape == (batch_size, 8192)
         return logits_out
 
-    def decode_step(self, tok: jax.Array, idx: jax.Array) -> jax.Array:
-        """Do a step of iterative decoding from the model. Returns the logits for the next token.
-        See below tests for usage examples. Batchless (for now).
+    def decode_step(self, toks: jax.Array, idx: jax.Array) -> jax.Array:
+        """Do a step of iterative decoding from the model. Returns the logits for the next set of
+        tokens. See below tests for usage examples.
         """
         assert (
             self.decode
@@ -330,18 +341,20 @@ class ImageModel(nn.Module):
         assert (
             self.attn_method == AttnMethod.STANDARD
         ), "Only standard attention works with decoding."
-        assert tok.shape == ()
-        assert tok.dtype == jnp.int32 or tok.dtype == jnp.int64
+        assert len(toks.shape) == 1
+        batch_size = toks.shape[0]
+        assert toks.dtype == jnp.int32 or toks.dtype == jnp.int64
         assert idx.shape == ()
 
-        embed = self.in_embed(tok)
-        assert embed.shape == (self.d_model,)
+        embed = self.in_embed(toks)
+        assert embed.shape == (batch_size, self.d_model)
 
         h = embed + self.positional_encoding(idx + self.prepended_tokens())
-        assert h.shape == (self.d_model,)
+        assert h.shape == (batch_size, self.d_model)
 
-        h, _ = self.transformer_layers(h[None, None, :], None)
-        return self.logits_decoder(h[0, 0])  # type: ignore[no-any-return]
+        h, _ = self.transformer_layers(h[:, None, :], None)
+        assert h.shape == (batch_size, 1, self.d_model)
+        return self.logits_decoder(h[:, 0, :])  # type: ignore[no-any-return]
 
 
 def _assert_dicts_equal(d1, d2, name) -> None:
@@ -400,7 +413,7 @@ def _setup_test_sample(
     else:
         clip_embedding = max_cos_distance = jnp.array([])
 
-    params = mdl_nodec.init(
+    params = jax.jit(mdl_nodec.init)(
         jax.random.PRNGKey(69),
         images=img_toks[None, :],
         clip_embeddings=clip_embedding[None, :],
@@ -408,7 +421,7 @@ def _setup_test_sample(
     )
     # IMPORTANT: use regular __call__ here, not decode_step. The cache needs to be initialized to
     # the full seq_len size.
-    params_dec = mdl_dec.init(
+    params_dec = jax.jit(mdl_dec.init)(
         jax.random.PRNGKey(69),
         images=img_toks[None, :],
         clip_embeddings=clip_embedding[None, :],
@@ -456,12 +469,12 @@ def _test_sample_tok_0(
         params,
         mutable=["cache"],
         method=mdl_dec.decode_init,
-        clip_embedding=clip_embedding,
-        max_cos_distance=max_cos_distance,
+        clip_embeddings=clip_embedding[None, :],
+        max_cos_distances=max_cos_distance[None, :],
     )
-    assert logits_0.shape == (8192,)
+    assert logits_0.shape == (1, 8192)
 
-    np.testing.assert_allclose(logits_all[0], logits_0, rtol=0, atol=1e-5)
+    np.testing.assert_allclose(logits_all[0], logits_0[0], rtol=0, atol=1e-5)
 
 
 def test_sample_tok_0_no_clip() -> None:
@@ -499,19 +512,19 @@ def _test_sample_tok_1(clip_conditioning: bool, clip_caps: bool) -> None:
         params,
         mutable=["cache"],
         method=mdl_dec.decode_init,
-        clip_embedding=clip_embedding,
-        max_cos_distance=max_cos_distance,
+        clip_embeddings=clip_embedding[None, :],
+        max_cos_distances=max_cos_distance[None, :],
     )
     params = flax.core.copy(params, cache)
     logits_1, _cache = mdl_dec.apply(
         params,
         mutable=["cache"],
         method=mdl_dec.decode_step,
-        tok=toks[0],
+        toks=toks[None, 0],
         idx=jnp.array(0),
     )
 
-    np.testing.assert_allclose(logits_all[1], logits_1, rtol=0, atol=1e-5)
+    np.testing.assert_allclose(logits_all[1], logits_1[0], rtol=0, atol=1e-5)
 
 
 def test_sample_tok_1_no_clip() -> None:
@@ -549,9 +562,10 @@ def _test_sample_tok_all(
         params,
         mutable=["cache"],
         method=mdl_dec.decode_init,
-        clip_embedding=clip_embedding,
-        max_cos_distance=max_cos_distance,
+        clip_embeddings=clip_embedding[None, :],
+        max_cos_distances=max_cos_distance[None, :],
     )
+    logits = logits[0]
     assert logits.shape == (8192,)
     decoded_logits.append(logits)
     params = flax.core.copy(params, new_cache)
@@ -561,7 +575,7 @@ def _test_sample_tok_all(
             params,
             mutable=["cache"],
             method=mdl_dec.decode_step,
-            tok=toks[i],
+            toks=toks[None, i],
             idx=jnp.array(i),
         )
     )
@@ -569,6 +583,7 @@ def _test_sample_tok_all(
     # compute logits for image toks 1-255 (inputting toks 0-254)
     for i in range(image_tokens - 1):
         logits, new_cache = step_j(params, i)
+        logits = logits[0]
         assert logits.shape == (8192,)
         decoded_logits.append(logits)
         params = flax.core.copy(params, new_cache)
@@ -594,6 +609,98 @@ def test_sample_tok_all_clip_caps_1024() -> None:
     # There was a boundary issue with flash attention that broke with sequence lengths that > 1024
     # & not multiples of 1024.
     _test_sample_tok_all(True, True, 1024)
+
+
+def test_batched_decode_consistency() -> None:
+    """Test that decode_init and decode_step produce consistent results for different batch sizes."""
+    (
+        mdl_nodec,
+        mdl_dec,
+        params,
+        cache_1,
+        _toks,
+        _clip_embedding,
+        _max_cos_distance,
+        _logits_all,
+    ) = _setup_test_sample(True, True)
+
+    imgs_to_test = 3
+    clips_rng, max_cos_rng, toks_rng = jax.random.split(jax.random.PRNGKey(1425), 3)
+    clip_embeddings = jax.random.normal(
+        clips_rng, (imgs_to_test, mdl_nodec.clip_cap_count, 768)
+    )
+    clip_embeddings = clip_embeddings / jnp.linalg.norm(
+        clip_embeddings, axis=-1, keepdims=True
+    )
+    max_cos_distances = jax.random.uniform(
+        max_cos_rng,
+        shape=(imgs_to_test, mdl_nodec.clip_cap_count),
+        minval=0.0,
+        maxval=2.0,
+    )
+    toks = jax.random.randint(toks_rng, (imgs_to_test, mdl_nodec.image_tokens), 0, 8192)
+    logits_1 = np.zeros((imgs_to_test, mdl_nodec.image_tokens, 8192))
+    logits_3 = np.zeros((imgs_to_test, mdl_nodec.image_tokens, 8192))
+
+    decode_init_j = jax.jit(
+        lambda params, clip_embeddings, max_cos_distances: mdl_dec.apply(
+            params,
+            mutable=["cache"],
+            method=mdl_dec.decode_init,
+            clip_embeddings=clip_embeddings,
+            max_cos_distances=max_cos_distances,
+        )
+    )
+    decode_step_j = jax.jit(
+        lambda params, toks, idx: mdl_dec.apply(
+            params,
+            mutable=["cache"],
+            method=mdl_dec.decode_step,
+            toks=toks,
+            idx=idx,
+        )
+    )
+
+    # Test batch size 1
+    for i in range(imgs_to_test):
+        params_1 = flax.core.copy(params, {"cache": cache_1})
+        logits_1[i, 0], new_cache = decode_init_j(
+            params_1,
+            clip_embeddings=clip_embeddings[i : i + 1],
+            max_cos_distances=max_cos_distances[i : i + 1],
+        )
+        params_1 = flax.core.copy(params_1, {"cache": new_cache})
+        for j in range(mdl_nodec.image_tokens - 1):
+            logits_1[i, j + 1], new_cache = decode_step_j(
+                params_1,
+                toks=toks[i : i + 1, j],
+                idx=jnp.array(j),
+            )
+            params_1 = flax.core.copy(params_1, {"cache": new_cache})
+
+    # Test batch size 3
+    params_3 = mdl_dec.init(
+        jax.random.PRNGKey(0),
+        images=toks,
+        clip_embeddings=clip_embeddings,
+        max_cos_distances=max_cos_distances,
+    )
+    params_3 = flax.core.copy(params, {"cache": params_3["cache"]})
+    logits_3[:, 0, :], new_cache = decode_init_j(
+        params_3,
+        clip_embeddings=clip_embeddings,
+        max_cos_distances=max_cos_distances,
+    )
+    params_3 = flax.core.copy(params_3, {"cache": new_cache})
+    for i in range(mdl_nodec.image_tokens - 1):
+        logits_3[:, i + 1, :], new_cache = decode_step_j(
+            params_3,
+            toks=toks[:, i],
+            idx=jnp.array(i),
+        )
+        params_3 = flax.core.copy(params_3, {"cache": new_cache})
+
+    np.testing.assert_allclose(logits_1, logits_3, rtol=0, atol=1e-6)
 
 
 def test_clip_does_anything() -> None:
@@ -643,81 +750,125 @@ def test_clip_caps_do_anything() -> None:
     assert not jnp.allclose(logits_all, logits_full_range, rtol=0, atol=1e-3)
 
 
-@partial(jax.jit, static_argnums=(0,), inline=True)
+# _init_decode and _step_decode are morally part of sample() but they need to be defined at the top
+# level so the results of jitting them get cached.
+@partial(jax.jit, static_argnames=("mdl",))
+def _init_decode(
+    mdl: ImageModel,
+    params,
+    clip_embeddings: jax.Array,
+    max_cos_distances: jax.Array,
+    rngs: jax.Array,
+    top_p,
+):
+    """Do the first step of decoding, choosing the 0th token for every image. This is part of
+    sample() below."""
+    batch_size = clip_embeddings.shape[0]
+    if mdl.clip_conditioning and mdl.clip_caps:
+        assert clip_embeddings.shape == (batch_size, mdl.clip_cap_count, 768)
+        assert max_cos_distances.shape == (batch_size, mdl.clip_cap_count)
+    elif mdl.clip_conditioning and not mdl.clip_caps:
+        assert clip_embeddings.shape == (batch_size, 768)
+        assert max_cos_distances.shape == (batch_size, 0)
+    else:
+        assert clip_embeddings.shape == max_cos_distances.shape == (batch_size, 0)
+    assert rngs.shape == (batch_size, 2)
+
+    _, cache = mdl.apply(
+        params,
+        mutable=["cache"],
+        images=jnp.zeros((batch_size, mdl.image_tokens), dtype=jnp.int32),
+        clip_embeddings=clip_embeddings,
+        max_cos_distances=max_cos_distances,
+    )
+    params = flax.core.copy(params, cache)
+
+    logits_0, cache = mdl.apply(
+        params,
+        mutable=["cache"],
+        method=mdl.decode_init,
+        clip_embeddings=clip_embeddings,
+        max_cos_distances=max_cos_distances,
+    )
+
+    filtered_logits_0 = jax.vmap(_filter_top_p, in_axes=(0, None))(logits_0, top_p)
+    rngs_split = jax.vmap(jax.random.split, in_axes=(0, None))(rngs, 2)
+    rngs, rngs_sample = rngs_split[:, 0], rngs_split[:, 1]
+    toks_0 = jax.vmap(jax.random.categorical, in_axes=(0, 0))(
+        rngs_sample, filtered_logits_0
+    )
+    assert toks_0.shape == (batch_size,)
+
+    return toks_0, cache, rngs
+
+
+@partial(
+    jax.jit, static_argnames=("mdl",), donate_argnames=("cache", "image_toks", "rngs")
+)
+def _step_decode(mdl: ImageModel, params, cache, image_toks, idx, rngs, top_p):
+    """Do a single step of decoding for all images. This is part of sample() below."""
+    batch_size = image_toks.shape[0]
+
+    params = flax.core.copy(params, cache)
+
+    logits, new_cache = mdl.apply(
+        params,
+        mutable=["cache"],
+        method=mdl.decode_step,
+        toks=image_toks[:, idx],
+        idx=idx,
+    )
+    assert logits.shape == (batch_size, 8192)
+    filtered_logits = jax.vmap(_filter_top_p, in_axes=(0, None))(logits, top_p)
+    rngs_split = jax.vmap(jax.random.split, in_axes=(0, None))(rngs, 2)
+    rngs, rngs_sample = rngs_split[:, 0], rngs_split[:, 1]
+    toks = jax.vmap(jax.random.categorical, in_axes=(0, 0))(
+        rngs_sample, filtered_logits
+    )
+    assert toks.shape == (batch_size,)
+    image_toks = image_toks.at[:, idx + 1].set(toks)
+    return new_cache, image_toks, rngs
+
+
 def sample(
     mdl: ImageModel,
     params: dict[str, Any],
-    clip_embedding: jax.Array,
-    max_cos_distance: jax.Array,
-    rng: jax.Array,
+    clip_embeddings: jax.Array,
+    max_cos_distances: jax.Array,
+    rngs: jax.Array,
     top_p: float = 0.95,
 ) -> jax.Array:
     """Sample a single image from the model. Returns an array of codes to be passed to the
     LDM decoder."""
+    batch_size = clip_embeddings.shape[0]
     if mdl.clip_conditioning and mdl.clip_caps:
-        assert clip_embedding.shape == (mdl.clip_cap_count, 768)
-        assert max_cos_distance.shape == (mdl.clip_cap_count,)
+        assert clip_embeddings.shape == (batch_size, mdl.clip_cap_count, 768)
+        assert max_cos_distances.shape == (batch_size, mdl.clip_cap_count)
     elif mdl.clip_conditioning and not mdl.clip_caps:
-        assert clip_embedding.shape == (768,)
-        assert max_cos_distance.shape == (0,)
+        assert clip_embeddings.shape == (batch_size, 768)
+        assert max_cos_distances.shape == (batch_size, 0)
     else:
-        assert clip_embedding.shape == max_cos_distance.shape == (0,)
+        assert clip_embeddings.shape == max_cos_distances.shape == (batch_size, 0)
+    assert rngs.shape == (batch_size, 2)
 
     # Flash attention doesn't work with Flax's fast decoding. Something to do with how masks are
     # handled. Would be nice to fix it, but for now we just use the slower attention when sampling.
     mdl_decode = mdl.clone(decode=True, attn_method=AttnMethod.STANDARD, dropout=0.0)
-    params_fake = mdl_decode.init(
-        jax.random.PRNGKey(0),
-        images=jnp.zeros((1, mdl.image_tokens), dtype=jnp.int32),
-        clip_embeddings=clip_embedding[None, :],
-        max_cos_distances=max_cos_distance[None, :],
-    )
-    params = flax.core.copy(params, {"cache": params_fake["cache"]})
-    del params_fake
 
-    # This needs to be outside the linen module because the fori_loop combinator doesn't work
-    # inside them.
-    def loop_iter(
-        i: int, acc: Tuple[jax.Array, jax.Array]
-    ) -> Tuple[jax.Array, jax.Array, dict[str, Any]]:
-        image_toks, rng, params = acc
-        logits, new_cache = mdl_decode.apply(
-            params,
-            mutable=["cache"],
-            method=mdl_decode.decode_step,
-            tok=image_toks[i],
-            idx=i,
+    toks_0, cache, rngs = _init_decode(
+        mdl_decode, params, clip_embeddings, max_cos_distances, rngs, top_p
+    )
+
+    image_toks = (
+        jnp.zeros((batch_size, mdl.image_tokens), dtype=jnp.int32).at[:, 0].set(toks_0)
+    )
+
+    for i in range(mdl.image_tokens - 1):
+        cache, image_toks, rngs = _step_decode(
+            mdl_decode, params, cache, image_toks, i, rngs, top_p
         )
-        assert logits.shape == (8192,)
-        params = flax.core.copy(params, new_cache)
-        filtered_logits = _filter_top_p(logits, top_p)
-        rng_sample, rng_loop = jax.random.split(rng, 2)
-        tok = jax.random.categorical(rng_sample, filtered_logits)
-        image_toks = image_toks.at[i + 1].set(tok)
-        return (image_toks, rng_loop, params)
 
-    rng0, rng_loop = jax.random.split(rng, 2)
-    logits_0, cache = mdl_decode.apply(
-        params,
-        mutable=["cache"],
-        method=mdl_decode.decode_init,
-        clip_embedding=clip_embedding,
-        max_cos_distance=max_cos_distance,
-    )
-    assert logits_0.shape == (8192,)
-    filtered_logits_0 = _filter_top_p(logits_0, top_p)
-    tok_0 = jax.random.categorical(rng0, filtered_logits_0)
-
-    params = flax.core.copy(params, cache)
-
-    image_toks = jnp.zeros((mdl.image_tokens,), dtype=jnp.int32).at[0].set(tok_0)
-    image_toks, _, _ = jax.lax.fori_loop(  # type: ignore[no-untyped-call]
-        0,
-        mdl.image_tokens - 1,
-        loop_iter,
-        (image_toks, rng_loop, params),
-    )
-    return image_toks  # type: ignore[no-any-return]
+    return image_toks
 
 
 def _filter_top_p(logits: jax.Array, top_p: float) -> jax.Array:
@@ -1176,11 +1327,11 @@ def test_cap_train() -> None:
         toks = sample(
             mdl,
             params,
-            clips[i],
-            max_cos_distances[i],
-            sample_rng,
+            clips[i : i + 1],
+            max_cos_distances[i : i + 1],
+            sample_rng[None, :],
             top_p=0.25,
-        )
+        )[0]
         sampled_imgs.append(toks)
 
     sampled_imgs = jnp.stack(sampled_imgs, axis=0)
@@ -1281,9 +1432,9 @@ def test_learn_zeros(pre_norm: bool) -> None:
     sampled_arr = sample(
         mdl,
         params,
-        jnp.zeros((0,), dtype=jnp.float32),
-        jnp.array([], dtype=jnp.float32),
-        jax.random.PRNGKey(0),
+        jnp.zeros((1, 0), dtype=jnp.float32),
+        jnp.zeros((1, 0), dtype=jnp.float32),
+        jax.random.PRNGKey(0)[None, :],
     )
     assert jnp.all(sampled_arr == 0)
 
@@ -1307,24 +1458,26 @@ def test_learn_ranges(pre_norm: bool) -> None:
         warmup_steps=20,
     )
     assert loss < 0.6
-    empty_arr = jnp.zeros((0,), dtype=jnp.float32)
-    sample_jv = jax.jit(
-        lambda params, rng: jax.vmap(
-            lambda rng: sample(mdl, params, empty_arr, empty_arr, rng, top_p=0.98)
-        )(rng)
-    )
     print("Generating samples...")
     total_samples = 256
     samples_per_batch = 64
+    empty_arr = jnp.zeros((samples_per_batch, 0), dtype=jnp.float32)
     assert total_samples % samples_per_batch == 0
     sample_batches = []
     rng = jax.random.PRNGKey(0)
     for _ in trange(total_samples // samples_per_batch):
         rng, rng2 = jax.random.split(rng)
         sample_batches.append(
-            sample_jv(params, jax.random.split(rng2, samples_per_batch))
+            sample(
+                mdl,
+                params,
+                empty_arr,
+                empty_arr,
+                jax.random.split(rng2, samples_per_batch),
+            )
         )
     sampled_arr: jax.Array = jnp.concatenate(sample_batches, axis=0)
+    assert sampled_arr.shape == (total_samples, gpt_1_config.image_tokens)
     print(f"Generated samples, shape: {sampled_arr.shape}")
     counts = dict([(i, 0) for i in range(16)])
     for i, s in enumerate(sampled_arr):
@@ -1508,7 +1661,8 @@ def _test_clip_caps_overfit_samples(dset_test, mdl, params, rng):
     query_pts = jax.vmap(random_pt_with_cosine_similarity, in_axes=(0, 0, None))(
         jax.random.split(pt_rng, n_samples), embeddings, 0.8
     )
-    query_max_cos_distances = jnp.full((n_samples,), 0.25)
+    query_pts = query_pts.reshape((n_samples, 1, 768))
+    query_max_cos_distances = jnp.full((n_samples, 1), 0.25)
 
     matches = np.zeros((n_samples,), dtype=np.bool_)
     for i in trange(n_samples):
@@ -1518,9 +1672,9 @@ def _test_clip_caps_overfit_samples(dset_test, mdl, params, rng):
             params,
             query_pts[i : i + 1],
             query_max_cos_distances[i : i + 1],
-            sub_rng,
+            sub_rng[None, :],
             top_p=0.05,
-        )
+        )[0]
         matches[i] = np.array_equal(toks, examples["encoded_img"][i])
 
     print(f"Found {matches.sum()} matches out of {n_samples} samples")

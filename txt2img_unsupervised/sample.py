@@ -166,6 +166,8 @@ def sample_loop(
 
     assert model_cfg.clip_conditioning, "unconditioned model is deprecated"
     assert isinstance(cap_centers, np.ndarray)
+    assert len(cap_centers.shape) == 3
+    n_imgs = cap_centers.shape[0]
 
     devices = mesh_utils.create_device_mesh((jax.device_count(),))
     mesh = Mesh(devices, axis_names=("dev",))
@@ -175,13 +177,15 @@ def sample_loop(
         assert isinstance(max_cos_distances, np.ndarray)
         assert len(cap_centers.shape) == 3
         assert len(max_cos_distances.shape) == 2
-        assert cap_centers.shape[0] == max_cos_distances.shape[0]
-        assert cap_centers.shape[1] == model_cfg.clip_cap_count
-        assert max_cos_distances.shape[1] == model_cfg.clip_cap_count
+        assert cap_centers.shape[0] == max_cos_distances.shape[0] == n_imgs
+        assert (
+            cap_centers.shape[1]
+            == max_cos_distances.shape[1]
+            == model_cfg.clip_cap_count
+        )
     else:
         assert max_cos_distances is None
-        assert len(cap_centers.shape) == 2
-        assert cap_centers.shape[1] == 768
+        assert cap_centers.shape == (n_imgs, 768)
     assert batch_size % jax.device_count() == 0
     assert (len(cap_centers) % batch_size) % jax.device_count() == 0
 
@@ -191,45 +195,39 @@ def sample_loop(
         mdl = mdl.clone(activations_dtype=jnp.float32)
 
     # Sample from the transformer model
-    rngs = jax.random.split(rng, len(cap_centers))
     batches = batches_split(batch_size, len(cap_centers))
     sampled_codes_arrs = []
+    rngs = jax.random.split(rng, len(cap_centers))
     with tqdm(total=len(cap_centers), desc="sampling", unit="img") as pbar:
         ctr = 0
         for batch in batches:
-            rng, rng2 = jax.random.split(rng)
+            rngs_batch = rngs[ctr : ctr + batch]
+            rngs_sharded = jax.device_put(rngs_batch, sharding)
+            cap_centers_batch = cap_centers[ctr : ctr + batch]
+            cap_centers_sharded = jax.device_put(cap_centers_batch, sharding)
             if model_cfg.clip_caps:
-                cap_centers_batch = cap_centers[ctr : ctr + batch]
-                cap_centers_sharded = jax.device_put(cap_centers_batch, sharding)
                 max_cos_distances_batch = max_cos_distances[ctr : ctr + batch]
                 max_cos_distances_sharded = jax.device_put(
                     max_cos_distances_batch, sharding
                 )
-                rngs_batch = rngs[ctr : ctr + batch]
-                rngs_sharded = jax.device_put(rngs_batch, sharding)
-                codes = sample_jv(
+                codes = sample(
                     mdl,
                     params,
-                    top_p,
                     cap_centers_sharded,
                     max_cos_distances_sharded,
                     rngs_sharded,
+                    top_p,
                 )
-                sampled_codes_arrs.append(jax.device_get(codes))
             else:
-                cap_centers_batch = cap_centers[ctr : ctr + batch]
-                cap_centers_sharded = jax.device_put(cap_centers_batch, sharding)
-                rngs_batch = rngs[ctr : ctr + batch]
-                rngs_sharded = jax.device_put(rngs_batch, sharding)
-                codes = sample_jv(
+                codes = sample(
                     mdl,
                     params,
-                    top_p,
                     cap_centers_sharded,
                     jnp.zeros((batch, 0), dtype=jnp.float32),
-                    rngs_batch,
+                    rngs_sharded,
+                    top_p,
                 )
-                sampled_codes_arrs.append(jax.device_get(codes))
+            sampled_codes_arrs.append(jax.device_get(codes))
             pbar.update(batch)
             ctr += batch
 
@@ -400,7 +398,9 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--cond-img", type=str, nargs="*")
     parser.add_argument("--cond-txt", type=str, nargs="*")
-    parser.add_argument("--force-fp32", type=bool, default=True, help="Force float32 precision")
+    parser.add_argument(
+        "--force-fp32", type=bool, default=True, help="Force float32 precision"
+    )
     parser.add_argument("transformer_checkpoint_dir", type=Path)
     parser.add_argument("autoencoder_checkpoint", type=Path)
     parser.add_argument("autoencoder_cfg", type=Path)
@@ -464,7 +464,6 @@ def main():
     devices = mesh_utils.create_device_mesh((jax.device_count(),))
     mesh = Mesh(devices, axis_names=("dev",))
     im_params = jax.device_put(im_params, NamedSharding(mesh, PartitionSpec(None)))
-
 
     if model_cfg.clip_conditioning:
         print("Loading CLIP model...")
