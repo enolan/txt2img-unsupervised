@@ -3,6 +3,7 @@ import argparse
 import dacite
 import jax
 import jax.numpy as jnp
+import jax.tree_util as jtu
 import numpy as np
 import orbax.checkpoint as ocp
 import PIL.Image
@@ -449,20 +450,21 @@ def main():
         clip_embeddings=clip_embedding_dummy,
         max_cos_distances=max_cos_distance_dummy,
     )
+    template_shapes = jtu.tree_map(ocp.utils.to_shape_dtype_struct, template_params)
+    del template_params, clip_embedding_dummy, max_cos_distance_dummy
 
     print(
         f"Loading step {checkpoint_mngr.latest_step()} from {args.transformer_checkpoint_dir}"
     )
     im_params = checkpoint_mngr.restore(
         checkpoint_mngr.latest_step(),
-        args=ocp.args.Composite(params=ocp.args.StandardRestore(template_params)),
+        args=ocp.args.Composite(params=ocp.args.StandardRestore(template_shapes)),
     )["params"]
 
     devices = mesh_utils.create_device_mesh((jax.device_count(),))
     mesh = Mesh(devices, axis_names=("dev",))
     im_params = jax.device_put(im_params, NamedSharding(mesh, PartitionSpec(None)))
 
-    del template_params, clip_embedding_dummy, max_cos_distance_dummy
 
     if model_cfg.clip_conditioning:
         print("Loading CLIP model...")
