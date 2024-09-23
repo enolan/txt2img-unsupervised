@@ -425,7 +425,7 @@ def main():
         seed = randint(0, 2**32 - 1)
     rng = jax.random.PRNGKey(seed)
 
-    print("Loading transformer model...")
+    print("Loading transformer model metadata...")
     checkpoint_mngr = ocp.CheckpointManager(
         # Orbax chokes on relative paths for some godforsaken reason
         args.transformer_checkpoint_dir.absolute(),
@@ -434,36 +434,6 @@ def main():
 
     model_cfg = ModelConfig.from_json_dict(checkpoint_mngr.metadata()["model_cfg"])
     im_mdl = ImageModel(**model_cfg.__dict__)
-
-    if model_cfg.clip_conditioning and model_cfg.clip_caps:
-        clip_embedding_dummy = jnp.zeros((1, model_cfg.clip_cap_count, 768))
-        max_cos_distance_dummy = jnp.zeros((1, model_cfg.clip_cap_count))
-    elif model_cfg.clip_conditioning:
-        clip_embedding_dummy = jnp.zeros((1, 768))
-        max_cos_distance_dummy = jnp.zeros((1,))
-    else:
-        clip_embedding_dummy = jnp.zeros((1, 0))
-        max_cos_distance_dummy = jnp.zeros((1, 0))
-    template_params = im_mdl.init(
-        rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(0)},
-        images=jnp.zeros((1, model_cfg.image_tokens), dtype=jnp.int32),
-        clip_embeddings=clip_embedding_dummy,
-        max_cos_distances=max_cos_distance_dummy,
-    )
-    template_shapes = jtu.tree_map(ocp.utils.to_shape_dtype_struct, template_params)
-    del template_params, clip_embedding_dummy, max_cos_distance_dummy
-
-    print(
-        f"Loading step {checkpoint_mngr.latest_step()} from {args.transformer_checkpoint_dir}"
-    )
-    im_params = checkpoint_mngr.restore(
-        checkpoint_mngr.latest_step(),
-        args=ocp.args.Composite(params=ocp.args.StandardRestore(template_shapes)),
-    )["params"]
-
-    devices = mesh_utils.create_device_mesh((jax.device_count(),))
-    mesh = Mesh(devices, axis_names=("dev",))
-    im_params = jax.device_put(im_params, NamedSharding(mesh, PartitionSpec(None)))
 
     if model_cfg.clip_conditioning:
         print("Loading CLIP model...")
@@ -540,6 +510,39 @@ def main():
         assert (
             args.cond_img is None and args.cond_txt is None
         ), "Can't specify --cond-img or --cond-txt without CLIP conditioning"
+
+    print("Creating transformer model template params...")
+    if model_cfg.clip_conditioning and model_cfg.clip_caps:
+        clip_embedding_dummy = jnp.zeros((1, model_cfg.clip_cap_count, 768))
+        max_cos_distance_dummy = jnp.zeros((1, model_cfg.clip_cap_count))
+    elif model_cfg.clip_conditioning:
+        clip_embedding_dummy = jnp.zeros((1, 768))
+        max_cos_distance_dummy = jnp.zeros((1,))
+    else:
+        clip_embedding_dummy = jnp.zeros((1, 0))
+        max_cos_distance_dummy = jnp.zeros((1, 0))
+    template_params = jax.jit(im_mdl.init)(
+        rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(0)},
+        images=jnp.zeros((1, model_cfg.image_tokens), dtype=jnp.int32),
+        clip_embeddings=clip_embedding_dummy,
+        max_cos_distances=max_cos_distance_dummy,
+    )
+    template_shapes = jtu.tree_map(ocp.utils.to_shape_dtype_struct, template_params)
+    del template_params, clip_embedding_dummy, max_cos_distance_dummy
+
+    print(
+        f"Loading transformer model step {checkpoint_mngr.latest_step()} from "
+        f"{args.transformer_checkpoint_dir}"
+    )
+    im_params = checkpoint_mngr.restore(
+        checkpoint_mngr.latest_step(),
+        args=ocp.args.Composite(params=ocp.args.StandardRestore(template_shapes)),
+    )["params"]
+
+    devices = mesh_utils.create_device_mesh((jax.device_count(),))
+    mesh = Mesh(devices, axis_names=("dev",))
+    im_params = jax.device_put(im_params, NamedSharding(mesh, PartitionSpec(None)))
+
 
     print("Loading autoencoder model...")
     ae_res = int(model_cfg.image_tokens**0.5)
