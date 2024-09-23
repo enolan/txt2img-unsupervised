@@ -11,5 +11,6 @@
   "pre_norm": true,
   "clip_conditioning": true,
   "clip_caps": true,
-  "clip_cap_count": 1
+  "clip_cap_count": 1,
+  "corrected_cap_projections": true
 }

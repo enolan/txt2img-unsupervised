@@ -7,5 +7,6 @@
   "image_tokens": 256,
   "use_biases": true,
   "activations_dtype": "float32",
-  "activation_function": "relu"
+  "activation_function": "relu",
+  "corrected_cap_projections": true
 }

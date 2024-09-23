@@ -8,5 +8,6 @@
   "use_biases": true,
   "activations_dtype": "float32",
   "activation_function": "relu",
-  "clip_conditioning": true
+  "clip_conditioning": true,
+  "corrected_cap_projections": true
 }

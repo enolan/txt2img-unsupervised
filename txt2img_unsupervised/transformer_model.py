@@ -44,6 +44,7 @@ class ImageModel(nn.Module):
     clip_conditioning: bool
     clip_caps: bool
     clip_cap_count: Optional[int]
+    corrected_cap_projections: bool
     use_biases: bool
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
@@ -100,23 +101,30 @@ class ImageModel(nn.Module):
             assert self.clip_cap_count is not None, "clip_cap_count must be set"
             assert self.clip_cap_count > 0, "clip_cap_count must be positive"
 
-        # The initializers for CLIP conditioning are chosen such that the projected clip emedding
-        # has the same distribution as the token embeddings and the projected max cosine distances
-        # have the same average magnitude as the token embeddings, assuming the distances are drawn
-        # from U[0, 2]. The max distances need to be converted into min similarities for the math
-        # to work.
+        # The initializers for CLIP conditioning are chosen such that the conditioning tokens have
+        # the same distribution as the token embeddings, assuming the clip embeddings are standard
+        # normally distributed and the max distances are drawn from U[0, 2]. See
+        # https://chatgpt.com/share/66f1ee03-0874-800c-a230-9f5784f6d898 for the derivation.
+
+        # We add the projections for the cap centers and the projections for the max cosine
+        # distances so we need to scale the standard deviations of the projection weights by
+        # sqrt(2) to ensure the variance is the same as it would be with a single projection.
+        clip_proj_stddev = (
+            default_stddev if not self.clip_caps else default_stddev / np.sqrt(2)
+        )
         self.clip_proj = nn.Dense(
             features=self.d_model,
             use_bias=self.use_biases,
             dtype=self.activations_dtype,
-            kernel_init=default_kernel_init,
+            kernel_init=nn.initializers.normal(stddev=clip_proj_stddev),
         )
         self.max_cos_distance_proj = nn.Dense(
             features=self.d_model,
             use_bias=self.use_biases,
             dtype=self.activations_dtype,
-            kernel_init=nn.initializers.normal(stddev=2 * default_stddev),
+            kernel_init=nn.initializers.normal(stddev=clip_proj_stddev),
         )
+
         self.positional_encoding = nn.Embed(
             num_embeddings=self.seq_len(),
             features=self.d_model,
@@ -217,9 +225,23 @@ class ImageModel(nn.Module):
                 max_cos_distances = rearrange(max_cos_distances, "b caps -> b caps 1")
 
                 res_cap_centers = self.clip_proj(clip_embeddings)
-                res_max_cos_distances = self.max_cos_distance_proj(
-                    1 - max_cos_distances
-                )
+
+                if self.corrected_cap_projections:
+                    # We assume the cosine distances are drawn from U[0, 2]. This isn't true in the
+                    # training data (I bias strongly towards max distances <= 1 because they're much
+                    # more informative about the relationship between the CLIP embeddings and the
+                    # images), but hopefully this will work well enough without adding additional
+                    # complexity.
+                    # The variance of U[0, 2] is 2^2/12 = 1/3 so if we want it to have unit variance
+                    # and mean 0 we do this:
+                    res_max_cos_distances = self.max_cos_distance_proj(
+                        jnp.sqrt(3) * (max_cos_distances - 1)
+                    )
+                else:
+                    # old behavior, kept around so we can still do inference with old checkpoints
+                    res_max_cos_distances = self.max_cos_distance_proj(
+                        1 - max_cos_distances
+                    )
                 assert res_cap_centers.shape == (
                     batch_size,
                     self.clip_cap_count,
@@ -230,7 +252,10 @@ class ImageModel(nn.Module):
                     self.clip_cap_count,
                     self.d_model,
                 )
-                res = (res_cap_centers + res_max_cos_distances) / 2
+                if self.corrected_cap_projections:
+                    res = res_max_cos_distances + res_cap_centers
+                else:
+                    res = (res_cap_centers + res_max_cos_distances) / 2
         assert res.shape == (batch_size, self.prepended_tokens(), self.d_model)
         return res
 
@@ -370,6 +395,121 @@ def _assert_dicts_equal(d1, d2, name) -> None:
             )
         else:
             assert False, f"unknown type {type(d1[k])} for {name}.{k}"
+
+
+def test_cap_cond_tokens_and_vqgan_embeds_are_same_distribution():
+    """Test that, at initialization, the embeddings for the caps generated with
+    gen_conditioning_tokens and the embeddings for the VQGAN tokens have the same mean, same mean
+    magnitude, same standard deviation, and same mean standard deviation. If this is true the model
+    should learn more gooder."""
+
+    cfg = copy(gpt_1_config)
+    cfg.dropout = None
+    cfg.clip_conditioning = True
+    cfg.clip_caps = True
+    cfg.clip_cap_count = 1
+    mdl = ImageModel(**cfg.__dict__)
+
+    n_samples = 1_000
+    n_models = 10
+
+    # Generate dummy parameters and test inputs outside the loop
+    dummy_img = jnp.zeros((1, 256), dtype=jnp.int32)
+    dummy_clip_embeddings = jnp.zeros((1, 1, 768), dtype=jnp.float32)
+    dummy_max_cos_distances = jnp.zeros((1, 1), dtype=jnp.float32)
+
+    clips_rng, dists_rng, embeds_rng = jax.random.split(jax.random.PRNGKey(0), 3)
+
+    # Generate random CLIP embeddings and max cosine distances
+    clip_embeddings = jax.random.normal(clips_rng, (n_samples, 1, 768))
+    clip_embeddings = clip_embeddings / jnp.linalg.norm(
+        clip_embeddings, axis=-1, keepdims=True
+    )
+    max_cos_distances = jax.random.uniform(
+        dists_rng, (n_samples, 1), minval=0, maxval=2
+    )
+
+    # Generate random VQGAN tokens
+    vqgan_tokens = jax.random.randint(embeds_rng, (n_samples, 256), 0, 8192)
+
+    # Initialize lists to store statistics for each model
+    cap_cond_means = []
+    vqgan_means = []
+    cap_cond_mean_magnitudes = []
+    vqgan_mean_magnitudes = []
+    cap_cond_stds = []
+    vqgan_stds = []
+    cap_cond_mean_stds = []
+    vqgan_mean_stds = []
+
+    gen_params = jax.jit(
+        lambda rng: mdl.init(
+            rng, dummy_img, dummy_clip_embeddings, dummy_max_cos_distances
+        )
+    )
+
+    for rng in jax.random.split(jax.random.PRNGKey(1), n_models):
+        # Initialize model
+
+        params = gen_params(rng)
+        mdl_bound = mdl.bind(params)
+
+        # Get cap conditioning tokens
+        cap_cond_tokens = mdl_bound.gen_conditioning_tokens(
+            clip_embeddings=clip_embeddings, max_cos_distances=max_cos_distances
+        )[:, 0, :]
+        assert cap_cond_tokens.shape == (n_samples, cfg.d_model)
+
+        # Get VQGAN token embeddings
+        vqgan_embeds = mdl_bound.in_embed(vqgan_tokens)
+        assert vqgan_embeds.shape == (n_samples, 256, cfg.d_model)
+
+        # Calculate and store statistics
+        cap_cond_means.append(np.mean(cap_cond_tokens))
+        vqgan_means.append(np.mean(vqgan_embeds))
+        cap_cond_mean_magnitudes.append(
+            np.mean(np.linalg.norm(cap_cond_tokens, axis=-1))
+        )
+        vqgan_mean_magnitudes.append(np.mean(np.linalg.norm(vqgan_embeds, axis=-1)))
+        cap_cond_stds.append(np.std(cap_cond_tokens))
+        vqgan_stds.append(np.std(vqgan_embeds))
+        cap_cond_mean_stds.append(np.mean(np.std(cap_cond_tokens, axis=1)))
+        vqgan_mean_stds.append(np.mean(np.std(vqgan_embeds, axis=2)))
+
+    # Calculate average statistics across all models
+    avg_cap_cond_mean = np.mean(cap_cond_means)
+    avg_vqgan_mean = np.mean(vqgan_means)
+    avg_cap_cond_mean_magnitude = np.mean(cap_cond_mean_magnitudes)
+    avg_vqgan_mean_magnitude = np.mean(vqgan_mean_magnitudes)
+    avg_cap_cond_std = np.mean(cap_cond_stds)
+    avg_vqgan_std = np.mean(vqgan_stds)
+    avg_cap_cond_mean_std = np.mean(cap_cond_mean_stds)
+    avg_vqgan_mean_std = np.mean(vqgan_mean_stds)
+
+    print(
+        f"Average cap_cond_mean: {avg_cap_cond_mean}, Average vqgan_mean: {avg_vqgan_mean}"
+    )
+    print(
+        f"Average cap_cond_mean_magnitude: {avg_cap_cond_mean_magnitude}, Average vqgan_mean_magnitude: {avg_vqgan_mean_magnitude}"
+    )
+    print(
+        f"Average cap_cond_std: {avg_cap_cond_std}, Average vqgan_std: {avg_vqgan_std}"
+    )
+    print(
+        f"Average cap_cond_mean_std: {avg_cap_cond_mean_std}, Average vqgan_mean_std: {avg_vqgan_mean_std}"
+    )
+
+    np.testing.assert_allclose(avg_cap_cond_mean, avg_vqgan_mean, atol=1e-4, rtol=0)
+    np.testing.assert_allclose(avg_cap_cond_mean, 0, atol=1e-4, rtol=0)
+    np.testing.assert_allclose(
+        avg_cap_cond_mean_magnitude, avg_vqgan_mean_magnitude, atol=0.02, rtol=0
+    )
+    np.testing.assert_allclose(avg_cap_cond_std, avg_vqgan_std, atol=0.01, rtol=0)
+    np.testing.assert_allclose(avg_cap_cond_std, 0.02, atol=0.005, rtol=0)
+    np.testing.assert_allclose(
+        avg_cap_cond_mean_std, avg_vqgan_mean_std, atol=0.005, rtol=0
+    )
+    np.testing.assert_allclose(avg_cap_cond_mean_std, 0.02, atol=0.005, rtol=0)
 
 
 def _setup_test_sample(
@@ -1246,6 +1386,7 @@ gpt_1_config = ModelConfig(
     use_biases=True,
     activation_function=jax.nn.relu,
     clip_conditioning=False,
+    corrected_cap_projections=True,
 )
 
 

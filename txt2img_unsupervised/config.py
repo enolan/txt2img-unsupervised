@@ -27,6 +27,8 @@ class ModelConfig:
     clip_conditioning: bool = False
     clip_caps: bool = False
     clip_cap_count: int = None
+    # Should always be true, defaults to false for backwards compatability
+    corrected_cap_projections: bool = False
 
     @staticmethod
     def from_json_dict(dict: dict[str, Any]) -> "ModelConfig":

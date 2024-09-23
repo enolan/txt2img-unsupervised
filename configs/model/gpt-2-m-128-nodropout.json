@@ -9,5 +9,6 @@
   "activations_dtype": "bfloat16",
   "activation_function": "gelu",
   "clip_conditioning": true,
-  "clip_caps": false
+  "clip_caps": false,
+  "corrected_cap_projections": true
 }

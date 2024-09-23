@@ -8,5 +8,6 @@
   "use_biases": true,
   "activations_dtype": "bfloat16",
   "activation_function": "gelu",
-  "clip_conditioning": true
+  "clip_conditioning": true,
+  "corrected_cap_projections": true
 }
