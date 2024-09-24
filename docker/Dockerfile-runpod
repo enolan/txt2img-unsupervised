@@ -6,15 +6,13 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
     libsqlite3-dev curl libncursesw5-dev xz-utils tk-dev libxml2-dev \
     libxmlsec1-dev libffi-dev liblzma-dev rclone magic-wormhole zstd atop fish \
-    unzip git wget htop nano tmux less
+    unzip git wget htop nano tmux less vmtouch jq
 
 RUN usermod -s /bin/fish root
 
 # https://ommer-lab.com/files/latent-diffusion/vq-f4.zip
 ADD vq-f4.zip /root/vq-f4.zip
 RUN unzip /root/vq-f4.zip -d /root/vq-f4
-
-ADD setup-repo.sh /root/setup-repo.sh
 
 RUN curl https://pyenv.run | bash
 ENV PATH="/root/.pyenv/bin:/root/.pyenv/shims:$PATH"
@@ -25,3 +23,6 @@ RUN pyenv install 3.11.8 && pyenv global 3.11.8
 ADD fish-pyenv.fish /root/.config/fish/conf.d/fish-pyenv.fish
 
 RUN pip install poetry
+
+ADD setup-repo.sh /root/setup-repo.sh
+ADD get-dataset.sh /root/get-dataset.sh
