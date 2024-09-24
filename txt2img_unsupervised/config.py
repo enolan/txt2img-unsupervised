@@ -115,7 +115,8 @@ def test_modelconfig_roundtrip_from_json() -> None:
         "pre_norm": false,
         "clip_cap_count": null,
         "clip_caps": false,
-        "clip_conditioning": false
+        "clip_conditioning": false,
+        "corrected_cap_projections": true
         }"""
     cfg = ModelConfig.from_json_dict(json.loads(json_str))
     assert ModelConfig.to_json_dict(cfg) == json.loads(json_str)
