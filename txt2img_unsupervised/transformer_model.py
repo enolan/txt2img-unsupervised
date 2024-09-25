@@ -51,6 +51,9 @@ class ImageModel(nn.Module):
     pre_norm: bool
     decode: bool = False
     attn_method: Optional[AttnMethod] = None
+    record_attention_weights: bool = (
+        False  # whether to record attention weights for visualization
+    )
 
     def setup(self) -> None:
         default_stddev = 0.02
@@ -150,7 +153,8 @@ class ImageModel(nn.Module):
         # optimization in JAX or XLA.
         self.transformer_layers = nn.scan(
             nn.remat(TransformerLayer),
-            variable_axes={"params": 0, "cache": 0},
+            variable_axes={"params": 0, "cache": 0}
+            | ({"intermediates": 0} if self.record_attention_weights else {}),
             variable_broadcast=False,
             split_rngs={"params": True, "dropout": True},
             length=self.n_layers,
@@ -167,6 +171,7 @@ class ImageModel(nn.Module):
             out_proj_kernel_init=out_proj_kernel_init,
             decode=self.decode,
             attn_method=attn_method,
+            record_attention_weights=self.record_attention_weights,
         )
 
         if self.pre_norm:
@@ -1092,9 +1097,13 @@ class TransformerLayer(nn.Module):
     out_proj_kernel_init: Callable[..., jnp.ndarray]
     decode: bool
     attn_method: AttnMethod
+    record_attention_weights: bool = False
 
     def setup(self) -> None:
-        if self.attn_method == AttnMethod.FLASH_JAX:
+        if self.record_attention_weights:
+            # Recording attention weights requires vanilla attention
+            attn_function = nn.attention.dot_product_attention
+        elif self.attn_method == AttnMethod.FLASH_JAX:
             # Use fast flash attention implementation
             def attn_function(
                 q,
@@ -1236,7 +1245,7 @@ class TransformerLayer(nn.Module):
         if (
             self.attn_method == AttnMethod.FLASH_JAX
             or self.attn_method == AttnMethod.FLASH_CPP
-        ):
+        ) and not self.record_attention_weights:
             mask = None
         else:
             mask = jnp.tril(
@@ -1245,7 +1254,9 @@ class TransformerLayer(nn.Module):
 
         if self.pre_norm:
             embeds = self.layer_norm_1(embeds)
-        attn_output = self.mha(embeds, mask=mask)
+        attn_output = self.mha(
+            embeds, mask=mask, sow_weights=self.record_attention_weights
+        )
         if not self.pre_norm:
             attn_output = self.layer_norm_1(attn_output)
         embeds = embeds + self.dropout_layer(attn_output)

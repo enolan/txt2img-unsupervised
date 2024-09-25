@@ -3,10 +3,18 @@ import argparse
 import datetime
 import flax.core
 import importlib.util
+
+import os
+
+# neccessary to use more of the GPU's memory. Default is 0.75. It's supposed to be able to
+# dynamically allocate more, but there are fragmentation issues since we allocate ginormous arrays.
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
+
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import json
+import matplotlib.pyplot as plt
 import numpy as np
 import optax  # type:ignore[import]
 import optax.contrib
@@ -21,7 +29,7 @@ import wandb
 from copy import copy
 from datasets import Dataset
 from distutils.util import strtobool
-from einops import rearrange, repeat
+from einops import rearrange, reduce, repeat
 from flax.training import train_state
 from functools import partial
 from itertools import islice
@@ -543,17 +551,12 @@ def get_clip_mdl():
 clip_mdl, clip_processor = get_clip_mdl()
 
 
-def get_image_prompt_clip_embeddings(
-    clip_mdl, clip_processor, n: int, dset
-) -> jax.Array:
-    """Find n hopefully SFW CLIP embeddings to use for diagnostic sampling."""
-
+def find_sfw_indices(clip_mdl, clip_processor, dset, n: int):
+    """Find indices of n hopefully SFW images based on CLIP embeddings."""
     text_tokens = clip_processor.tokenizer("nsfw", return_tensors="jax", padding=True)
     nsfw_text_features = clip_mdl.get_text_features(**text_tokens)
     nsfw_text_embeds = nsfw_text_features / jnp.linalg.norm(nsfw_text_features)
 
-    # compute cosine similarity between images in dset and nsfw_text_embeds and
-    # take the first n images with similarity < 0.2
     clip_embeds = dset["clip_embedding"]
     sims = jnp.dot(clip_embeds, nsfw_text_embeds.T)
     ok_sims = sims < 0.2
@@ -562,10 +565,16 @@ def get_image_prompt_clip_embeddings(
     assert (
         len(ok_indices) >= n
     ), f"Found {len(ok_indices)} images with similarity < 0.2, expected at least {n}"
-    print(f"Using {[dset['name'][i] for i in ok_indices[:n]]} for diagnostic sampling")
+    return jax.device_get(ok_indices[:n])
+
+
+def get_image_prompt_clip_embeddings(indices: np.ndarray, dset: Dataset) -> jax.Array:
+    """Find n hopefully SFW CLIP embeddings to use for diagnostic sampling."""
+
+    print(f"Using {[dset['name'][i] for i in indices]} for diagnostic sampling")
     return {
-        "clip_embedding": clip_embeds[ok_indices[:n]],
-        "name": dset["name"][ok_indices[:n]],
+        "clip_embedding": dset["clip_embedding"][indices],
+        "name": dset["name"][indices],
     }
 
 
@@ -592,9 +601,11 @@ def get_clip_text_embeddings_to_sample(n: int) -> jax.Array:
     }
 
 
-image_prompt_clips = get_image_prompt_clip_embeddings(
-    clip_mdl, clip_processor, image_prompts_to_sample, test_imgs[:2048]
+sfw_indices = find_sfw_indices(
+    clip_mdl, clip_processor, test_imgs[:2048], image_prompts_to_sample
 )
+attn_visualization_img = test_imgs[int(sfw_indices[0])]
+image_prompt_clips = get_image_prompt_clip_embeddings(sfw_indices, test_imgs[:2048])
 text_prompt_clips = get_clip_text_embeddings_to_sample(8)
 
 del clip_mdl, clip_processor
@@ -973,6 +984,72 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
         wandb.log(to_log)
 
 
+def log_attention_maps(ts: TrainState, test_img, global_step):
+    """Generate heatmaps of the attention weights for a test image."""
+    mdl_record = mdl.copy(record_attention_weights=True)
+    params = get_eval_params(ts.opt_state, ts.params)
+
+    if mdl_record.clip_conditioning and mdl_record.clip_caps:
+        clip_embeddings = test_img["cap_center"][None, :]
+        max_cos_distances = test_img["cap_max_cos_distance"][None, ...]
+        clip_embeddings, max_cos_distances = rearrange_batch_caps(
+            clip_embeddings,
+            max_cos_distances,
+            model_cfg.clip_cap_count,
+            0,
+            is_test=True,
+        )
+    elif mdl_record.clip_conditioning and not mdl_record.clip_caps:
+        clip_embeddings = test_img["clip_embedding"][None, :]
+        max_cos_distances = jnp.zeros((1, 0), dtype=jnp.float32)
+    else:
+        clip_embeddings = jnp.zeros((1, 0), dtype=jnp.float32)
+        max_cos_distances = jnp.zeros((1, 0), dtype=jnp.float32)
+
+    logits, intermediates = mdl_record.apply(
+        params,
+        mutable=["intermediates"],
+        images=test_img["encoded_img"][None, :],
+        clip_embeddings=clip_embeddings,
+        max_cos_distances=max_cos_distances,
+    )
+    weights = intermediates["intermediates"]["transformer_layers"]["mha"][
+        "attention_weights"
+    ][0]
+
+    assert len(weights.shape) == 5
+    n_layers = weights.shape[0]
+    assert weights.shape == (
+        n_layers,
+        1,
+        mdl.num_heads,
+        mdl.image_tokens,
+        mdl.image_tokens,
+    )
+
+    # average across all heads
+    weights = reduce(weights, "layers 1 head tok_q tok_k -> layers tok_q tok_k", "mean")
+    weights = jax.device_get(weights)
+
+    to_log = {"global_step": global_step}
+
+    for i, layer_attn_weights in enumerate(weights):
+        is_causal = np.allclose(np.triu(layer_attn_weights, k=1), 0)
+        if not is_causal:
+            tqdm.write(f"WARNING: attention weights at layer {i} are not causal")
+
+        fig, ax = plt.subplots()
+        ax.imshow(layer_attn_weights)
+        ax.set_title(f"Attention weights for {test_img['name']} at layer {i}")
+        ax.set_xlabel("Key token")
+        ax.set_ylabel("Query token")
+        fig.tight_layout()
+        to_log[f"attention_maps/layer_{i:03d}"] = fig
+        plt.close(fig)
+
+    wandb.log(to_log)
+
+
 last_cap_set = None  # We track the last one so we can print when it changes
 
 
@@ -1079,6 +1156,9 @@ def save_checkpoint_and_sample(
         tqdm.write("Sampling")
         sample_and_log(my_train_state, sample_batch_size, global_step)
         tqdm.write("Done sampling")
+        tqdm.write("Logging attention maps")
+        log_attention_maps(my_train_state, attn_visualization_img, global_step)
+        tqdm.write("Done logging attention maps")
     else:
         tqdm.write("Skipping sampling")
 
