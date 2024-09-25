@@ -812,7 +812,8 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
                 all_centers_for_sampling,
                 all_max_cos_distances_for_sampling,
                 ts.rng,
-                0.95,
+                logit_filter_method=transformer_model.LogitFilterMethod.TOP_P,
+                logit_filter_threshold=0.95,
             )
             # sample_loop returns a list of PIL image objects, but we want to rearrange them back
             # so we make a numpy array. Numpy is *very* overeager to convert the PIL objects into
@@ -893,7 +894,8 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
                 all_clip_embeddings_for_sampling,
                 None,
                 ts.rng,
-                0.95,
+                logit_filter_method=transformer_model.LogitFilterMethod.TOP_P,
+                logit_filter_threshold=0.95,
             )
 
             imgs = np.empty((len(imgs_list),), dtype=object)
