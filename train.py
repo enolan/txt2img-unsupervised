@@ -1015,7 +1015,7 @@ def log_attention_maps(ts: TrainState, test_img, global_step):
     )
     weights = intermediates["intermediates"]["transformer_layers"]["mha"][
         "attention_weights"
-    ][0]
+    ][0].astype(jnp.float32)
 
     assert len(weights.shape) == 5
     n_layers = weights.shape[0]
@@ -1028,24 +1028,42 @@ def log_attention_maps(ts: TrainState, test_img, global_step):
     )
 
     # average across all heads
-    weights = reduce(weights, "layers 1 head tok_q tok_k -> layers tok_q tok_k", "mean")
-    weights = jax.device_get(weights)
+    weights_avgd = reduce(
+        weights, "layers 1 head tok_q tok_k -> layers tok_q tok_k", "mean"
+    )
+    weights_avgd = jax.device_get(weights_avgd)
+    weights_head0 = jax.device_get(weights[:, 0, 0])
 
     to_log = {"global_step": global_step}
 
-    for i, layer_attn_weights in enumerate(weights):
-        is_causal = np.allclose(np.triu(layer_attn_weights, k=1), 0)
-        if not is_causal:
-            tqdm.write(f"WARNING: attention weights at layer {i} are not causal")
+    for i in range(n_layers):
+        layer_attn_weights_avgd = weights_avgd[i]
+        layer_attn_weights_head0 = weights_head0[i]
 
-        fig, ax = plt.subplots()
-        ax.imshow(layer_attn_weights)
-        ax.set_title(f"Attention weights for {test_img['name']} at layer {i}")
-        ax.set_xlabel("Key token")
-        ax.set_ylabel("Query token")
-        fig.tight_layout()
-        to_log[f"attention_maps/layer_{i:03d}"] = fig
-        plt.close(fig)
+        for weights, title, wandb_name in [
+            (
+                layer_attn_weights_avgd,
+                f"Attention weights for {test_img['name']}, all heads, layer {i}",
+                f"attention_maps/avgd_layer_{i:03d}",
+            ),
+            (
+                layer_attn_weights_head0,
+                f"Attention weights for {test_img['name']}, head 0, layer {i}",
+                f"attention_maps/head0_layer_{i:03d}",
+            ),
+        ]:
+            is_causal = np.allclose(np.triu(weights, k=1), 0)
+            if not is_causal:
+                tqdm.write(f"WARNING: attention weights at layer {i} are not causal")
+
+            fig, ax = plt.subplots()
+            ax.imshow(weights)
+            ax.set_title(title)
+            ax.set_xlabel("Key token")
+            ax.set_ylabel("Query token")
+            fig.tight_layout()
+            to_log[wandb_name] = fig
+            plt.close(fig)
 
     wandb.log(to_log)
 
