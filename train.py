@@ -138,7 +138,7 @@ def setup_cfg_and_wandb():
     """Set up our ModelConfig and TrainingConfig and initialize wandb."""
     checkpoint_options = ocp.CheckpointManagerOptions(
         max_to_keep=3,
-        keep_time_interval=datetime.timedelta(hours=24),
+        keep_time_interval=datetime.timedelta(hours=6),
         # Async checkpointing can hide out of disk errors, so we disable it.
         enable_async_checkpointing=False,
     )
