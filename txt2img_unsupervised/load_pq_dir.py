@@ -11,7 +11,7 @@ import pyarrow.parquet as pq
 
 def load_pq_dir(dir_path):
     pq_paths = [str(p) for p in sorted(dir_path.glob("**/*.parquet"))]
-    return Dataset.from_parquet(pq_paths).with_format("numpy")
+    return Dataset.from_parquet(pq_paths, num_proc=16).with_format("numpy")
 
 
 def load_pq_dir_to_infinidata(dir_path):
