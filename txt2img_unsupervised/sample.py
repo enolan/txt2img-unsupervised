@@ -23,7 +23,13 @@ from typing import Tuple
 
 from . import ldm_autoencoder
 from .ldm_autoencoder import LDMAutoencoder
-from .transformer_model import ImageModel, ModelConfig, gpt_1_config, sample
+from .transformer_model import (
+    ImageModel,
+    LogitFilterMethod,
+    ModelConfig,
+    gpt_1_config,
+    sample,
+)
 
 
 def can_make_grid(n: int) -> bool:
@@ -156,7 +162,9 @@ def sample_loop(
     cap_centers,
     max_cos_distances,
     rng,
-    top_p,
+    logit_filter_method,
+    logit_filter_threshold,
+    temperature=1.0,
     force_f32=True,
 ):
     """Sample a bunch of images and return PIL images. cap_centers should have shape
@@ -216,7 +224,9 @@ def sample_loop(
                     cap_centers_sharded,
                     max_cos_distances_sharded,
                     rngs_sharded,
-                    top_p,
+                    logit_filter_method,
+                    logit_filter_threshold,
+                    temperature,
                 )
             else:
                 codes = sample(
@@ -225,7 +235,9 @@ def sample_loop(
                     cap_centers_sharded,
                     jnp.zeros((batch, 0), dtype=jnp.float32),
                     rngs_sharded,
-                    top_p,
+                    logit_filter_method,
+                    logit_filter_threshold,
+                    temperature,
                 )
             sampled_codes_arrs.append(jax.device_get(codes))
             pbar.update(batch)
@@ -344,6 +356,7 @@ def test_sample_loop_batch_equivalence():
         cap_centers,
         max_cos_distances,
         sample_rng,
+        LogitFilterMethod.TOP_P,
         0.9,
     )
 
@@ -393,7 +406,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n", type=int, default=1)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument(
+        "--logit-filter-method", type=str, choices=["top_p", "min_p"], default="top_p"
+    )
+    parser.add_argument("--logit-filter-threshold", type=float, default=0.9)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--make-grids", action="store_true")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--cond-img", type=str, nargs="*")
@@ -543,7 +560,6 @@ def main():
     mesh = Mesh(devices, axis_names=("dev",))
     im_params = jax.device_put(im_params, NamedSharding(mesh, PartitionSpec(None)))
 
-
     print("Loading autoencoder model...")
     ae_res = int(model_cfg.image_tokens**0.5)
     assert ae_res**2 == model_cfg.image_tokens, "Image tokens must be a square number"
@@ -555,6 +571,8 @@ def main():
         torch.load(args.autoencoder_checkpoint, map_location="cpu"), cfg=ae_cfg
     )
 
+    logit_filter_method = LogitFilterMethod[args.logit_filter_method.upper()]
+
     imgs = sample_loop(
         mdl=im_mdl,
         model_cfg=model_cfg,
@@ -565,7 +583,9 @@ def main():
         cap_centers=cap_centers,
         max_cos_distances=max_cos_distances,
         rng=rng,
-        top_p=args.top_p,
+        logit_filter_method=logit_filter_method,
+        logit_filter_threshold=args.logit_filter_threshold,
+        temperature=args.temperature,
         force_f32=args.force_fp32,
     )
 

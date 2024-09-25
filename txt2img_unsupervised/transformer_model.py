@@ -895,16 +895,21 @@ def test_clip_caps_do_anything() -> None:
     assert not jnp.allclose(logits_all, logits_full_range, rtol=0, atol=1e-3)
 
 
+LogitFilterMethod = Enum("LogitFilterMethod", ["TOP_P", "MIN_P"])
+
+
 # _init_decode and _step_decode are morally part of sample() but they need to be defined at the top
 # level so the results of jitting them get cached.
-@partial(jax.jit, static_argnames=("mdl",))
+@partial(jax.jit, static_argnames=("mdl", "filter_method"))
 def _init_decode(
     mdl: ImageModel,
     params,
     clip_embeddings: jax.Array,
     max_cos_distances: jax.Array,
     rngs: jax.Array,
-    top_p,
+    filter_method: LogitFilterMethod,
+    filter_threshold: float,
+    temperature: float,
 ):
     """Do the first step of decoding, choosing the 0th token for every image. This is part of
     sample() below."""
@@ -936,7 +941,9 @@ def _init_decode(
         max_cos_distances=max_cos_distances,
     )
 
-    filtered_logits_0 = jax.vmap(_filter_top_p, in_axes=(0, None))(logits_0, top_p)
+    filtered_logits_0 = jax.vmap(_filter_logits, in_axes=(0, None, None, None))(
+        logits_0, filter_method, filter_threshold, temperature
+    )
     rngs_split = jax.vmap(jax.random.split, in_axes=(0, None))(rngs, 2)
     rngs, rngs_sample = rngs_split[:, 0], rngs_split[:, 1]
     toks_0 = jax.vmap(jax.random.categorical, in_axes=(0, 0))(
@@ -948,9 +955,21 @@ def _init_decode(
 
 
 @partial(
-    jax.jit, static_argnames=("mdl",), donate_argnames=("cache", "image_toks", "rngs")
+    jax.jit,
+    static_argnames=("mdl", "filter_method"),
+    donate_argnames=("cache", "image_toks", "rngs"),
 )
-def _step_decode(mdl: ImageModel, params, cache, image_toks, idx, rngs, top_p):
+def _step_decode(
+    mdl: ImageModel,
+    params,
+    cache,
+    image_toks,
+    idx,
+    rngs,
+    filter_method: LogitFilterMethod,
+    filter_threshold: float,
+    temperature: float,
+):
     """Do a single step of decoding for all images. This is part of sample() below."""
     batch_size = image_toks.shape[0]
 
@@ -964,7 +983,9 @@ def _step_decode(mdl: ImageModel, params, cache, image_toks, idx, rngs, top_p):
         idx=idx,
     )
     assert logits.shape == (batch_size, 8192)
-    filtered_logits = jax.vmap(_filter_top_p, in_axes=(0, None))(logits, top_p)
+    filtered_logits = jax.vmap(_filter_logits, in_axes=(0, None, None, None))(
+        logits, filter_method, filter_threshold, temperature
+    )
     rngs_split = jax.vmap(jax.random.split, in_axes=(0, None))(rngs, 2)
     rngs, rngs_sample = rngs_split[:, 0], rngs_split[:, 1]
     toks = jax.vmap(jax.random.categorical, in_axes=(0, 0))(
@@ -981,7 +1002,9 @@ def sample(
     clip_embeddings: jax.Array,
     max_cos_distances: jax.Array,
     rngs: jax.Array,
-    top_p: float = 0.95,
+    filter_method: LogitFilterMethod = LogitFilterMethod.TOP_P,
+    filter_threshold: float = 0.95,
+    temperature: float = 1.0,
 ) -> jax.Array:
     """Sample a single image from the model. Returns an array of codes to be passed to the
     LDM decoder."""
@@ -1001,7 +1024,14 @@ def sample(
     mdl_decode = mdl.clone(decode=True, attn_method=AttnMethod.STANDARD, dropout=0.0)
 
     toks_0, cache, rngs = _init_decode(
-        mdl_decode, params, clip_embeddings, max_cos_distances, rngs, top_p
+        mdl_decode,
+        params,
+        clip_embeddings,
+        max_cos_distances,
+        rngs,
+        filter_method,
+        filter_threshold,
+        temperature,
     )
 
     image_toks = (
@@ -1010,10 +1040,31 @@ def sample(
 
     for i in range(mdl.image_tokens - 1):
         cache, image_toks, rngs = _step_decode(
-            mdl_decode, params, cache, image_toks, i, rngs, top_p
+            mdl_decode,
+            params,
+            cache,
+            image_toks,
+            i,
+            rngs,
+            filter_method,
+            filter_threshold,
+            temperature,
         )
 
     return image_toks
+
+
+def _filter_logits(
+    logits: jax.Array, method: LogitFilterMethod, p: float, temperature: float = 1.0
+) -> jax.Array:
+    """Filter an array of logits using the specified method. Returns the filtered array."""
+    if method == LogitFilterMethod.TOP_P:
+        logits = _filter_top_p(logits, p)
+    elif method == LogitFilterMethod.MIN_P:
+        logits = _filter_min_p(logits, p)
+    else:
+        raise ValueError(f"Invalid logit filter method: {method}")
+    return logits / temperature
 
 
 def _filter_top_p(logits: jax.Array, top_p: float) -> jax.Array:
@@ -1080,6 +1131,43 @@ def test_filter_top_p_out_of_order() -> None:
     np.testing.assert_allclose(filtered_probabilities[small_indices], 0.0)
     np.testing.assert_allclose(filtered_probabilities[medium_indices], 0.2 / 0.9)
     np.testing.assert_allclose(filtered_probabilities[big_indices], 0.25 / 0.9)
+
+
+def _filter_min_p(logits: jax.Array, min_p: float) -> jax.Array:
+    """
+    Filter an array of logits to include only those possibilities that have probability >= min_p *
+    the probability of the most probable token. Returns the filtered array.
+    """
+    probs = jax.nn.softmax(logits)
+    min_prob = min_p * jnp.max(probs)
+    return jnp.where(probs >= min_prob, logits, -np.inf)
+
+
+def test_filter_min_p_identity():
+    """Test that filter_min_p is the identity function when min_p = 0."""
+    logits = jnp.array([1.0, 2.0, 3.0, 4.0])
+    filtered_logits = _filter_min_p(logits, 0.0)
+    np.testing.assert_allclose(filtered_logits, logits, rtol=1e-5, atol=1e-5)
+
+
+def test_filter_min_p_threshold():
+    """Test that filter_min_p correctly applies the threshold."""
+    probs = jnp.array([0.1, 0.3, 0.5, 0.1])
+    logits = jnp.log(probs)
+    filtered_logits = _filter_min_p(logits, 0.5)
+    filtered_probs = jax.nn.softmax(filtered_logits)
+    np.testing.assert_allclose(
+        filtered_probs, np.array([0.0, 0.3 / 0.8, 0.5 / 0.8, 0.0])
+    )
+
+
+def test_filter_min_p_all_filtered():
+    """Test that filter_min_p filters out all tokens when min_p = 1."""
+    probs = jnp.array([0.4, 0.1, 0.3, 0.2])
+    logits = jnp.log(probs)
+    filtered_logits = _filter_min_p(logits, 1.0)
+    filtered_probs = jax.nn.softmax(filtered_logits)
+    np.testing.assert_allclose(filtered_probs, np.array([1.0, 0, 0, 0]))
 
 
 class TransformerLayer(nn.Module):
@@ -1482,7 +1570,8 @@ def test_cap_train() -> None:
             clips[i : i + 1],
             max_cos_distances[i : i + 1],
             sample_rng[None, :],
-            top_p=0.25,
+            filter_method=LogitFilterMethod.TOP_P,
+            filter_threshold=0.25,
         )[0]
         sampled_imgs.append(toks)
 
@@ -1825,7 +1914,8 @@ def _test_clip_caps_overfit_samples(dset_test, mdl, params, rng):
             query_pts[i : i + 1],
             query_max_cos_distances[i : i + 1],
             sub_rng[None, :],
-            top_p=0.05,
+            filter_method=LogitFilterMethod.TOP_P,
+            filter_threshold=0.05,
         )[0]
         matches[i] = np.array_equal(toks, examples["encoded_img"][i])
 
