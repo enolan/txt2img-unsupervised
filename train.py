@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import json
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import optax  # type:ignore[import]
@@ -1057,11 +1058,45 @@ def log_attention_maps(ts: TrainState, test_img, global_step):
             if not is_causal:
                 tqdm.write(f"WARNING: attention weights at layer {i} are not causal")
 
+            # The plots are super hard to read with a linear color scale, since tok 0 always puts
+            # 100% of its attention weight on tok 0, meaning the max value is always 1. The min
+            # value is always nearly 0, so the maps for relatively flat layers/heads are basically
+            # a solid color. So we log transform and use a norm scheme that puts the median in
+            # the middle.
+            eps = 1e-10
+            weights_log = np.log(weights + eps)
+
+            # Mask the upper triangle to avoid it affecting the scale
+            mask = np.triu(np.ones_like(weights_log), k=1)
+            masked_weights_log = np.ma.array(weights_log, mask=mask)
+
+            # ensure vmin < vmedian < vmax. it's possible for one of the endpoints to be the median
+            # and the scaling will error out in that case.
+            vmin = np.min(masked_weights_log) - eps
+            vmedian = np.ma.median(masked_weights_log)
+            vmax = np.max(masked_weights_log) + eps
+
             fig, ax = plt.subplots()
-            ax.imshow(weights)
+            im = ax.imshow(
+                weights_log,
+                cmap="RdBu",
+                aspect="auto",
+                norm=mcolors.TwoSlopeNorm(vmin=vmin, vcenter=vmedian, vmax=vmax),
+            )
             ax.set_title(title)
             ax.set_xlabel("Key token")
             ax.set_ylabel("Query token")
+
+            # colorbar with original scale labels
+            cbar = fig.colorbar(im, ax=ax)
+            cbar.set_label("Attention weight")
+            log_tick_locations = np.sort(
+                np.concatenate([np.linspace(vmin, vmax, 4), np.array([vmedian])])
+            )
+            original_tick_locations = np.exp(log_tick_locations) - eps
+            cbar.set_ticks(log_tick_locations)
+            cbar.set_ticklabels([f"{loc:.2e}" for loc in original_tick_locations])
+
             fig.tight_layout()
             to_log[wandb_name] = fig
             plt.close(fig)
