@@ -2,6 +2,7 @@
 import argparse
 import datetime
 import flax.core
+import gc
 import importlib.util
 
 import os
@@ -1179,6 +1180,10 @@ def save_checkpoint_and_sample(
         tqdm.write("Done logging attention maps")
     else:
         tqdm.write("Skipping sampling")
+    # The attention maps are very large (~3G for a single set with gpt-2-m) so we need to make sure
+    # the VRAM is freed before we try training again. My kingdom for predictable memory
+    # deallocation...
+    gc.collect()
 
 
 assert global_step < batches_total, "training run is over my dude"
