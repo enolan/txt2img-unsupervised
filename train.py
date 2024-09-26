@@ -1107,11 +1107,11 @@ def log_attention_maps(ts: TrainState, test_img, global_step):
     wandb.log(to_log)
 
 
-loss_batch_tokens_j = jax.jit(partial(transformer_model.loss_batch_tokens, mdl))
+mdl_forward_j = jax.jit(mdl.apply)
 
 
 def log_token_loss_visualization(ts: TrainState, test_imgs, global_step):
-    """Log a chart of the per token loss for a set of test images"""
+    """Log charts of the per token loss and entropy for a set of test images"""
     img_cnt = test_imgs["encoded_img"].shape[0]
     params = get_eval_params(ts.opt_state, ts.params)
 
@@ -1130,22 +1130,30 @@ def log_token_loss_visualization(ts: TrainState, test_imgs, global_step):
         clip_embeddings = jnp.zeros((img_cnt, 0), dtype=jnp.float32)
         max_cos_distances = jnp.zeros((img_cnt, 0), dtype=jnp.float32)
 
-    losses = loss_batch_tokens_j(
+    logits = mdl_forward_j(
         params,
-        ts.rng,
-        test_imgs["encoded_img"],
-        clip_embeddings,
-        max_cos_distances,
+        rngs=ts.rng,
+        images=test_imgs["encoded_img"],
+        clip_embeddings=clip_embeddings,
+        max_cos_distances=max_cos_distances,
     )
-    assert losses.shape == (img_cnt, mdl.image_tokens)
+    losses = optax.softmax_cross_entropy(
+        logits, jax.nn.one_hot(test_imgs["encoded_img"], 8192)
+    )
 
-    losses = jax.device_get(losses)
+    # Calculate entropies
+    probs = jax.nn.softmax(logits, axis=-1)
+    entropies = -jnp.sum(probs * jnp.log(probs + 1e-10), axis=-1)
 
-    # Generate a scatter plot for token losses
-    fig, ax = plt.subplots(figsize=(12, 8))
+    assert losses.shape == entropies.shape == (img_cnt, mdl.image_tokens)
+
+    losses, entropies = jax.device_get((losses, entropies))
+
+    # Generate scatter plot for token losses
+    fig_loss, ax_loss = plt.subplots(figsize=(12, 8))
 
     for i in range(img_cnt):
-        ax.scatter(
+        ax_loss.scatter(
             range(mdl.image_tokens),
             losses[i],
             label=test_imgs["name"][i],
@@ -1153,17 +1161,44 @@ def log_token_loss_visualization(ts: TrainState, test_imgs, global_step):
             s=10,
         )
 
-    ax.set_xlabel("Token #")
-    ax.set_ylabel("Loss")
-    ax.set_title(f"Per-Token Loss for Test Images (step {global_step})")
-    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+    ax_loss.set_xlabel("Token #")
+    ax_loss.set_ylabel("Loss")
+    ax_loss.set_title(f"Per-Token Loss for Test Images (step {global_step})")
+    ax_loss.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
 
     plt.tight_layout()
 
     wandb.log(
-        {"global_step": global_step, "token_loss_visualization": wandb.Image(fig)}
+        {"global_step": global_step, "token_loss_visualization": wandb.Image(fig_loss)}
     )
-    plt.close(fig)
+    plt.close(fig_loss)
+
+    # Generate scatter plot for token entropies
+    fig_entropy, ax_entropy = plt.subplots(figsize=(12, 8))
+
+    for i in range(img_cnt):
+        ax_entropy.scatter(
+            range(mdl.image_tokens),
+            entropies[i],
+            label=test_imgs["name"][i],
+            alpha=0.5,
+            s=10,
+        )
+
+    ax_entropy.set_xlabel("Token #")
+    ax_entropy.set_ylabel("Entropy")
+    ax_entropy.set_title(f"Per-Token Entropy for Test Images (step {global_step})")
+    ax_entropy.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+
+    plt.tight_layout()
+
+    wandb.log(
+        {
+            "global_step": global_step,
+            "token_entropy_visualization": wandb.Image(fig_entropy),
+        }
+    )
+    plt.close(fig_entropy)
 
 
 last_cap_set = None  # We track the last one so we can print when it changes
