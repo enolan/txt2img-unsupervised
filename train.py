@@ -1136,7 +1136,7 @@ def log_token_loss_visualization(ts: TrainState, test_imgs, global_step):
         images=test_imgs["encoded_img"],
         clip_embeddings=clip_embeddings,
         max_cos_distances=max_cos_distances,
-    )
+    ).astype(jnp.float32)
     losses = optax.softmax_cross_entropy(
         logits, jax.nn.one_hot(test_imgs["encoded_img"], 8192)
     )
