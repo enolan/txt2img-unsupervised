@@ -60,13 +60,6 @@ import txt2img_unsupervised.sample as sample
 import txt2img_unsupervised.transformer_model as transformer_model
 
 
-# TODO next sweep:
-# - learning rate
-# - gradient accumulation
-# - gradient clipping
-# - biases
-# - alt activation functions
-
 parser = argparse.ArgumentParser()
 
 
