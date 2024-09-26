@@ -607,6 +607,7 @@ sfw_indices = find_sfw_indices(
     clip_mdl, clip_processor, test_imgs[:2048], image_prompts_to_sample
 )
 attn_visualization_img = test_imgs[int(sfw_indices[0])]
+token_loss_visualization_imgs = test_imgs[sfw_indices[:8]]
 image_prompt_clips = get_image_prompt_clip_embeddings(sfw_indices, test_imgs[:2048])
 text_prompt_clips = get_clip_text_embeddings_to_sample(8)
 
@@ -1047,12 +1048,12 @@ def log_attention_maps(ts: TrainState, test_img, global_step):
         for weights, title, wandb_name in [
             (
                 layer_attn_weights_avgd,
-                f"Attention weights for {test_img['name']}, all heads, layer {i}",
+                f"Attention weights for {test_img['name']}, all heads, layer {i} (step {global_step})",
                 f"attention_maps/avgd_layer_{i:03d}",
             ),
             (
                 layer_attn_weights_head0,
-                f"Attention weights for {test_img['name']}, head 0, layer {i}",
+                f"Attention weights for {test_img['name']}, head 0, layer {i} (step {global_step})",
                 f"attention_maps/head0_layer_{i:03d}",
             ),
         ]:
@@ -1104,6 +1105,65 @@ def log_attention_maps(ts: TrainState, test_img, global_step):
             plt.close(fig)
 
     wandb.log(to_log)
+
+
+loss_batch_tokens_j = jax.jit(partial(transformer_model.loss_batch_tokens, mdl))
+
+
+def log_token_loss_visualization(ts: TrainState, test_imgs, global_step):
+    """Log a chart of the per token loss for a set of test images"""
+    img_cnt = test_imgs["encoded_img"].shape[0]
+    params = get_eval_params(ts.opt_state, ts.params)
+
+    if mdl.clip_conditioning and mdl.clip_caps:
+        clip_embeddings, max_cos_distances = rearrange_batch_caps(
+            test_imgs["cap_center"],
+            test_imgs["cap_max_cos_distance"],
+            model_cfg.clip_cap_count,
+            0,
+            is_test=True,
+        )
+    elif mdl.clip_conditioning and not mdl.clip_caps:
+        clip_embeddings = test_imgs["clip_embedding"]
+        max_cos_distances = jnp.zeros((img_cnt, 0), dtype=jnp.float32)
+    else:
+        clip_embeddings = jnp.zeros((img_cnt, 0), dtype=jnp.float32)
+        max_cos_distances = jnp.zeros((img_cnt, 0), dtype=jnp.float32)
+
+    losses = loss_batch_tokens_j(
+        params,
+        ts.rng,
+        test_imgs["encoded_img"],
+        clip_embeddings,
+        max_cos_distances,
+    )
+    assert losses.shape == (img_cnt, mdl.image_tokens)
+
+    losses = jax.device_get(losses)
+
+    # Generate a scatter plot for token losses
+    fig, ax = plt.subplots(figsize=(12, 8))
+
+    for i in range(img_cnt):
+        ax.scatter(
+            range(mdl.image_tokens),
+            losses[i],
+            label=test_imgs["name"][i],
+            alpha=0.5,
+            s=10,
+        )
+
+    ax.set_xlabel("Token #")
+    ax.set_ylabel("Loss")
+    ax.set_title(f"Per-Token Loss for Test Images (step {global_step})")
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+
+    plt.tight_layout()
+
+    wandb.log(
+        {"global_step": global_step, "token_loss_visualization": wandb.Image(fig)}
+    )
+    plt.close(fig)
 
 
 last_cap_set = None  # We track the last one so we can print when it changes
@@ -1215,12 +1275,17 @@ def save_checkpoint_and_sample(
         tqdm.write("Logging attention maps")
         log_attention_maps(my_train_state, attn_visualization_img, global_step)
         tqdm.write("Done logging attention maps")
+        # The attention maps are very large (~3G for a single set with gpt-2-m) so we need to make sure
+        # the VRAM is freed before we try training again. My kingdom for predictable memory
+        # deallocation...
+        gc.collect()
+        tqdm.write("Logging token loss visualization")
+        log_token_loss_visualization(
+            my_train_state, token_loss_visualization_imgs, global_step
+        )
+        tqdm.write("Done logging token loss visualization")
     else:
         tqdm.write("Skipping sampling")
-    # The attention maps are very large (~3G for a single set with gpt-2-m) so we need to make sure
-    # the VRAM is freed before we try training again. My kingdom for predictable memory
-    # deallocation...
-    gc.collect()
 
 
 assert global_step < batches_total, "training run is over my dude"
