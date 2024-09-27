@@ -982,12 +982,43 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
         wandb.log(to_log)
 
 
-def log_attention_maps(ts: TrainState, test_img, global_step):
-    """Generate heatmaps of the attention weights for a test image."""
+@jax.jit
+def get_attention_weights(ts, img, clips, max_cos_distances):
     mdl_record = mdl.copy(record_attention_weights=True)
     params = get_eval_params(ts.opt_state, ts.params)
 
-    if mdl_record.clip_conditioning and mdl_record.clip_caps:
+    logits, intermediates = mdl_record.apply(
+        params,
+        mutable=["intermediates"],
+        images=img[None, ...],
+        clip_embeddings=clips,
+        max_cos_distances=max_cos_distances,
+    )
+    weights = intermediates["intermediates"]["transformer_layers"]["mha"][
+        "attention_weights"
+    ][0].astype(jnp.float32)
+    assert weights.shape == (
+        mdl.n_layers,
+        1,
+        mdl.num_heads,
+        mdl.image_tokens,
+        mdl.image_tokens,
+    )
+
+    weights_avgd = reduce(
+        weights, "layers 1 head tok_q tok_k -> layers tok_q tok_k", "mean"
+    )
+    weights_head0 = weights[:, 0, 0]
+    assert weights_avgd.shape == (mdl.n_layers, mdl.image_tokens, mdl.image_tokens)
+    assert weights_head0.shape == (mdl.n_layers, mdl.image_tokens, mdl.image_tokens)
+
+    return weights_avgd, weights_head0
+
+
+def log_attention_maps(ts: TrainState, test_img, global_step):
+    """Generate heatmaps of the attention weights for a test image."""
+
+    if mdl.clip_conditioning and mdl.clip_caps:
         clip_embeddings = test_img["cap_center"][None, :]
         max_cos_distances = test_img["cap_max_cos_distance"][None, ...]
         clip_embeddings, max_cos_distances = rearrange_batch_caps(
@@ -997,44 +1028,20 @@ def log_attention_maps(ts: TrainState, test_img, global_step):
             0,
             is_test=True,
         )
-    elif mdl_record.clip_conditioning and not mdl_record.clip_caps:
+    elif mdl.clip_conditioning and not mdl.clip_caps:
         clip_embeddings = test_img["clip_embedding"][None, :]
         max_cos_distances = jnp.zeros((1, 0), dtype=jnp.float32)
     else:
         clip_embeddings = jnp.zeros((1, 0), dtype=jnp.float32)
         max_cos_distances = jnp.zeros((1, 0), dtype=jnp.float32)
 
-    logits, intermediates = mdl_record.apply(
-        params,
-        mutable=["intermediates"],
-        images=test_img["encoded_img"][None, :],
-        clip_embeddings=clip_embeddings,
-        max_cos_distances=max_cos_distances,
+    weights_avgd, weights_head0 = get_attention_weights(
+        ts, test_img["encoded_img"], clip_embeddings, max_cos_distances
     )
-    weights = intermediates["intermediates"]["transformer_layers"]["mha"][
-        "attention_weights"
-    ][0].astype(jnp.float32)
-
-    assert len(weights.shape) == 5
-    n_layers = weights.shape[0]
-    assert weights.shape == (
-        n_layers,
-        1,
-        mdl.num_heads,
-        mdl.image_tokens,
-        mdl.image_tokens,
-    )
-
-    # average across all heads
-    weights_avgd = reduce(
-        weights, "layers 1 head tok_q tok_k -> layers tok_q tok_k", "mean"
-    )
-    weights_avgd = jax.device_get(weights_avgd)
-    weights_head0 = jax.device_get(weights[:, 0, 0])
 
     to_log = {"global_step": global_step}
 
-    for i in range(n_layers):
+    for i in range(mdl.n_layers):
         layer_attn_weights_avgd = weights_avgd[i]
         layer_attn_weights_head0 = weights_head0[i]
 
