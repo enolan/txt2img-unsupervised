@@ -7,9 +7,10 @@ import jax.tree_util as jtu
 import numpy as np
 import orbax.checkpoint as ocp
 import PIL.Image
+import subprocess
 import torch
 import transformers
-from copy import copy
+from copy import copy, deepcopy
 from einops import rearrange, repeat
 from flax.core import freeze
 from functools import partial
@@ -17,9 +18,10 @@ from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from omegaconf import OmegaConf
 from pathlib import Path
+from PIL.PngImagePlugin import PngInfo
 from random import randint
 from tqdm import tqdm, trange
-from typing import Tuple
+from typing import List, Tuple
 
 from . import ldm_autoencoder
 from .ldm_autoencoder import LDMAutoencoder
@@ -118,9 +120,9 @@ def print_cond_debug(d: dict, name: str) -> None:
     )
 
 
-def parse_cond_img(s: str, clip_mdl, clip_processor) -> dict:
-    """Parse a string for conditioning on an image."""
-    d = parse_cond_str(s)
+def parse_cond_img(d: dict, clip_mdl, clip_processor) -> dict:
+    """Compute a dictionary of conditioning info for an image."""
+    d = deepcopy(d)
     path = Path(d["cond"])
     del d["cond"]
 
@@ -136,9 +138,9 @@ def parse_cond_img(s: str, clip_mdl, clip_processor) -> dict:
     return d
 
 
-def parse_cond_txt(s: str, clip_mdl, clip_processor) -> dict:
-    """Parse a string for conditioning on text."""
-    d = parse_cond_str(s)
+def parse_cond_txt(d: dict, clip_mdl, clip_processor) -> dict:
+    """Compute a dictionary of conditioning info for text."""
+    d = deepcopy(d)
     txt = d["cond"]
     del d["cond"]
 
@@ -402,6 +404,40 @@ def mk_filler_caps(model_cfg, n_cap_sets, n_used_caps, rng):
     return np.asarray(centers), max_cos_distances
 
 
+def mk_png_metadata(
+    seed: int,
+    logit_filter_method: LogitFilterMethod,
+    logit_filter_threshold: float,
+    temperature: float,
+    force_f32: bool,
+    cond_imgs: List[Tuple[str, float]],
+    cond_txts: List[Tuple[str, float]],
+    checkpoint: str,
+    checkpoint_step: int,
+) -> PngInfo:
+    """Make some metadata to save with PNGs."""
+    metadata = PngInfo()
+
+    try:
+        commit_hash = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], encoding="utf-8"
+        ).strip()
+    except subprocess.CalledProcessError:
+        commit_hash = "unknown"
+
+    metadata.add_text("seed", str(seed))
+    metadata.add_text("logit_filter_method", logit_filter_method.name)
+    metadata.add_text("logit_filter_threshold", str(logit_filter_threshold))
+    metadata.add_text("temperature", str(temperature))
+    metadata.add_text("force_f32", str(force_f32))
+    metadata.add_text("cond_imgs", str(cond_imgs))
+    metadata.add_text("cond_txts", str(cond_txts))
+    metadata.add_text("checkpoint", str(checkpoint))
+    metadata.add_text("checkpoint_step", str(checkpoint_step))
+    metadata.add_text("commit_hash", commit_hash)
+    return metadata
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n", type=int, default=1)
@@ -462,11 +498,13 @@ def main():
         clip_processor = transformers.AutoProcessor.from_pretrained(clip_mdl_name)
 
         print("Computing CLIP embeddings...")
+        cond_img_inputs = [parse_cond_str(s) for s in (args.cond_img or [])]
+        cond_txt_inputs = [parse_cond_str(s) for s in (args.cond_txt or [])]
         cond_img_dicts = [
-            parse_cond_img(s, clip_mdl, clip_processor) for s in (args.cond_img or [])
+            parse_cond_img(s, clip_mdl, clip_processor) for s in cond_img_inputs
         ]
         cond_txt_dicts = [
-            parse_cond_txt(s, clip_mdl, clip_processor) for s in (args.cond_txt or [])
+            parse_cond_txt(s, clip_mdl, clip_processor) for s in cond_txt_inputs
         ]
         cond_dicts = cond_img_dicts + cond_txt_dicts
         del clip_mdl, clip_processor
@@ -527,6 +565,7 @@ def main():
         assert (
             args.cond_img is None and args.cond_txt is None
         ), "Can't specify --cond-img or --cond-txt without CLIP conditioning"
+        cond_img_inputs, cond_txt_inputs = [], []
 
     print("Creating transformer model template params...")
     if model_cfg.clip_conditioning and model_cfg.clip_caps:
@@ -591,15 +630,28 @@ def main():
 
     args.out_dir.mkdir(exist_ok=True, parents=True)
 
+    metadata = mk_png_metadata(
+        seed,
+        logit_filter_method,
+        args.logit_filter_threshold,
+        args.temperature,
+        args.force_fp32,
+        [(d["cond"], float(d["max_cos_distance"])) for d in cond_img_inputs],
+        [(d["cond"], float(d["max_cos_distance"])) for d in cond_txt_inputs],
+        args.transformer_checkpoint_dir.name,
+        checkpoint_mngr.latest_step(),
+    )
     print("Saving images...")
     for i, img in enumerate(tqdm(imgs, unit="img")):
-        img.save(args.out_dir / f"{i:04d}.png")
+        img.save(args.out_dir / f"{i:04d}.png", pnginfo=metadata)
 
     if args.make_grids:
         print(f"Making {len(grid_img_idxs)} grids...")
         for i, indices in tqdm(enumerate(grid_img_idxs)):
             grid_imgs = [imgs[i] for i in indices]
-            make_grid(grid_imgs).save(args.out_dir / f"grid_{i:04d}.png")
+            make_grid(grid_imgs).save(
+                args.out_dir / f"grid_{i:04d}.png", pnginfo=metadata
+            )
 
 
 if __name__ == "__main__":
