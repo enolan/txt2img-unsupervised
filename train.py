@@ -1085,7 +1085,15 @@ def log_attention_maps(ts: TrainState, test_img, global_step):
                 cmap="RdBu",
                 aspect="auto",
                 norm=mcolors.TwoSlopeNorm(vmin=vmin, vcenter=vmedian, vmax=vmax),
+                # align so the center of each pixel corresponds exactly to a token index
+                extent=(-0.5, weights.shape[1] - 0.5, weights.shape[0] - 0.5, -0.5),
             )
+
+            # Add margins to make sure we can clearly see token 0
+            margin = 5.5
+            ax.set_xlim(-margin, weights.shape[1] - 1 + margin)
+            ax.set_ylim(weights.shape[0] - 1 + margin, -margin)
+
             ax.set_title(title)
             ax.set_xlabel("Key token")
             ax.set_ylabel("Query token")
