@@ -1467,18 +1467,51 @@ for epoch in trange(
                 # not the same as the params used for inference, we want to test with the inference
                 # params occasionally for charting.
                 eval_params = get_eval_params(opt_state, my_train_state.params)
-                eval_loss = jax.device_get(
-                    loss_fn(
+                to_log = {"global_step": global_step}
+                eval_loss_weighted = loss_fn(
+                    eval_params,
+                    training_cfg.loss_decay_constant,
+                    my_train_state.rng,
+                    batch_imgs,
+                    batch_clips,
+                    batch_max_cos_distances,
+                )
+                if training_cfg.loss_decay_constant != 1.0:
+                    eval_loss_unweighted = loss_fn(
                         eval_params,
-                        training_cfg.loss_decay_constant,
+                        1.0,
+                        my_train_state.rng,
+                        batch_imgs,
+                        batch_clips,
+                        batch_max_cos_distances,
+                    )
+                    eval_loss_weighted, eval_loss_unweighted = jax.device_get(
+                        (eval_loss_weighted, eval_loss_unweighted)
+                    )
+                    to_log["eval/loss"] = eval_loss_weighted
+                    to_log["eval/loss_unweighted"] = eval_loss_unweighted
+                else:
+                    to_log["eval/loss"] = jax.device_get(eval_loss_weighted)
+                eval_loss = eval_loss_weighted
+                del eval_params
+                wandb.log(to_log)
+            if global_step % 20 == 0 and training_cfg.loss_decay_constant != 1.0:
+                train_loss_unweighted = jax.device_get(
+                    loss_fn(
+                        my_train_state.params,
+                        1.0,
                         my_train_state.rng,
                         batch_imgs,
                         batch_clips,
                         batch_max_cos_distances,
                     )
                 )
-                del eval_params
-                wandb.log({"global_step": global_step, "eval/loss": eval_loss})
+                wandb.log(
+                    {
+                        "global_step": global_step,
+                        "train/loss_unweighted": train_loss_unweighted,
+                    }
+                )
             if (
                 training_cfg.learning_rate_schedule
                 == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
