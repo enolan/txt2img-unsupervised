@@ -1098,6 +1098,16 @@ def log_attention_maps(ts: TrainState, test_img, global_step):
             ax.set_xlabel("Key token")
             ax.set_ylabel("Query token")
 
+            # Set tick marks at 0, 1/4, 1/2, 3/4, and all of the total token count. it bothers my
+            # programmer brain when they show up as 0, 250, 500, 750, 1000 instead of 0, 256, 512,
+            # 768, 1024.
+            token_count = weights.shape[0]
+            tick_positions = [x * token_count // 4 for x in range(5)]
+            ax.set_xticks(tick_positions)
+            ax.set_yticks(tick_positions)
+            ax.set_xticklabels(tick_positions)
+            ax.set_yticklabels(tick_positions)
+
             # colorbar with original scale labels
             cbar = fig.colorbar(im, ax=ax)
             cbar.set_label("Attention weight")
@@ -1172,6 +1182,9 @@ def log_token_loss_visualization(ts: TrainState, test_imgs, global_step):
     ax_loss.set_xlabel("Token #")
     ax_loss.set_ylabel("Loss")
     ax_loss.set_title(f"Per-Token Loss for Test Images (step {global_step})")
+    tick_positions = [x * mdl.image_tokens // 8 for x in range(9)]
+    ax_loss.set_xticks(tick_positions)
+    ax_loss.set_xticklabels(tick_positions)
     ax_loss.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
 
     plt.tight_layout()
