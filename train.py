@@ -133,8 +133,9 @@ def json_pretty(dict):
     return json.dumps(dict, indent=2)
 
 
-def setup_cfg_and_wandb():
-    """Set up our ModelConfig and TrainingConfig and initialize wandb."""
+def init_train_state():
+    """Set up our ModelConfig and TrainingConfig, initialize wandb, and create our initial
+    TrainState."""
     checkpoint_options = ocp.CheckpointManagerOptions(
         max_to_keep=3,
         keep_time_interval=datetime.timedelta(hours=6),
@@ -148,7 +149,6 @@ def setup_cfg_and_wandb():
         checkpoint_manager = mk_checkpoint_manager(checkpoint_dir)
         # Checkpoint saved after step n, so we start at step n+1
         global_step = checkpoint_manager.latest_step() + 1
-        restoring = True
         metadata = checkpoint_manager.metadata()
         model_cfg = ModelConfig.from_json_dict(metadata["model_cfg"])
         training_cfg = TrainingConfig.from_json_dict(metadata["training_cfg"])
@@ -171,7 +171,6 @@ def setup_cfg_and_wandb():
         wandb.init()
 
         global_step = 0
-        restoring = False
         # Load model configuration
         with open(args.model_config) as f:
             model_cfg = ModelConfig.from_json_dict(json.load(f))
@@ -226,7 +225,6 @@ def setup_cfg_and_wandb():
         training_cfg,
         sample_batch_size,
         checkpoint_manager,
-        restoring,
         train_state,
         mdl,
     )
@@ -238,10 +236,9 @@ def setup_cfg_and_wandb():
     training_cfg,
     sample_batch_size,
     checkpoint_manager,
-    restoring,
     train_state,
     mdl,
-) = setup_cfg_and_wandb()
+) = init_train_state()
 
 
 def load_dataset(dir: Path) -> Tuple[Dataset, Dataset]:
