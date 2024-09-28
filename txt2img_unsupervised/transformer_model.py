@@ -816,7 +816,7 @@ def test_batched_decode_consistency() -> None:
     )
 
     # Test batch size 1
-    for i in range(imgs_to_test):
+    for i in trange(imgs_to_test, desc="Testing batch size 1"):
         params_1 = flax.core.copy(params, {"cache": cache_1})
         logits_1[i, 0], new_cache = decode_init_j(
             params_1,
@@ -824,7 +824,11 @@ def test_batched_decode_consistency() -> None:
             max_cos_distances=max_cos_distances[i : i + 1],
         )
         params_1 = flax.core.copy(params_1, {"cache": new_cache})
-        for j in range(mdl_nodec.image_tokens - 1):
+        for j in trange(
+            mdl_nodec.image_tokens - 1,
+            desc=f"Processing tokens for image {i+1}",
+            leave=False,
+        ):
             logits_1[i, j + 1], new_cache = decode_step_j(
                 params_1,
                 toks=toks[i : i + 1, j],
@@ -846,7 +850,7 @@ def test_batched_decode_consistency() -> None:
         max_cos_distances=max_cos_distances,
     )
     params_3 = flax.core.copy(params_3, {"cache": new_cache})
-    for i in range(mdl_nodec.image_tokens - 1):
+    for i in trange(mdl_nodec.image_tokens - 1, desc="Testing batch size 3"):
         logits_3[:, i + 1, :], new_cache = decode_step_j(
             params_3,
             toks=toks[:, i],
