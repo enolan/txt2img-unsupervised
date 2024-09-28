@@ -95,6 +95,7 @@ parser.add_argument("--gradient-accumulation-steps", type=int)
 parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--gradient-clipping", type=float, default=None)
 parser.add_argument("--loss-decay-constant", type=float, default=1.0)
+parser.add_argument("--image-dropout", type=float, default=None)
 parser.add_argument("--ae-cfg", type=Path, required=True)
 parser.add_argument("--ae-ckpt", type=Path, required=True)
 parser.add_argument("--activations-dtype", type=argparse_from_dict(str_to_dtype))
@@ -984,7 +985,9 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
 
 @jax.jit
 def get_attention_weights(ts, img, clips, max_cos_distances):
-    mdl_record = mdl.copy(record_attention_weights=True)
+    mdl_record = mdl.copy(
+        record_attention_weights=True, dropout=None, image_dropout=None
+    )
     params = get_eval_params(ts.opt_state, ts.params)
 
     logits, intermediates = mdl_record.apply(
@@ -1125,7 +1128,16 @@ def log_attention_maps(ts: TrainState, test_img, global_step):
     wandb.log(to_log)
 
 
-mdl_forward_j = jax.jit(mdl.apply)
+mdl_forward_j = jax.jit(
+    lambda mdl, params, rngs, images, clip_embeddings, max_cos_distances: mdl.apply(
+        params,
+        rngs=rngs,
+        images=images,
+        clip_embeddings=clip_embeddings,
+        max_cos_distances=max_cos_distances,
+    ),
+    static_argnames=["mdl"],
+)
 
 
 def log_token_loss_visualization(ts: TrainState, test_imgs, global_step):
@@ -1147,8 +1159,9 @@ def log_token_loss_visualization(ts: TrainState, test_imgs, global_step):
     else:
         clip_embeddings = jnp.zeros((img_cnt, 0), dtype=jnp.float32)
         max_cos_distances = jnp.zeros((img_cnt, 0), dtype=jnp.float32)
-
+    test_mdl = mdl.clone(dropout=None, image_dropout=None)
     logits = mdl_forward_j(
+        test_mdl,
         params,
         rngs=ts.rng,
         images=test_imgs["encoded_img"],

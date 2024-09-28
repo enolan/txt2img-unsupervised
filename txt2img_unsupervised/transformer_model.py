@@ -39,6 +39,7 @@ class ImageModel(nn.Module):
     num_heads: int
     ff_dim: int
     dropout: Optional[float]
+    image_dropout: Optional[float]
     n_layers: int
     image_tokens: int
     clip_conditioning: bool
@@ -66,6 +67,13 @@ class ImageModel(nn.Module):
             embedding_init=default_kernel_init,
             dtype=self.activations_dtype,
         )
+
+        if self.image_dropout is not None:
+            self.image_dropout_layer = nn.Dropout(
+                rate=self.image_dropout, deterministic=False
+            )
+        else:
+            self.image_dropout_layer = nn.Dropout(rate=0, deterministic=True)
         # A note on how CLIP conditioning works:
         # There are three modes:
         # 1) No conditioning. We prepend a zero token to the input sequence.
@@ -296,6 +304,7 @@ class ImageModel(nn.Module):
 
         embeds = self.in_embed(images)
         assert embeds.shape == (batch_size, self.image_tokens, self.d_model)
+        embeds = self.image_dropout_layer(embeds)
 
         cond_tokens = self.gen_conditioning_tokens(clip_embeddings, max_cos_distances)
         assert cond_tokens.shape == (batch_size, self.prepended_tokens(), self.d_model)
@@ -1021,7 +1030,9 @@ def sample(
 
     # Flash attention doesn't work with Flax's fast decoding. Something to do with how masks are
     # handled. Would be nice to fix it, but for now we just use the slower attention when sampling.
-    mdl_decode = mdl.clone(decode=True, attn_method=AttnMethod.STANDARD, dropout=0.0)
+    mdl_decode = mdl.clone(
+        decode=True, attn_method=AttnMethod.STANDARD, dropout=None, image_dropout=None
+    )
 
     toks_0, cache, rngs = _init_decode(
         mdl_decode,

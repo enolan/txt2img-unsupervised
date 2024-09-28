@@ -29,6 +29,7 @@ class ModelConfig:
     clip_cap_count: int = None
     # Should always be true, defaults to false for backwards compatability
     corrected_cap_projections: bool = False
+    image_dropout: Optional[float] = None
 
     @staticmethod
     def from_json_dict(dict: dict[str, Any]) -> "ModelConfig":
@@ -107,6 +108,7 @@ def test_modelconfig_roundtrip_from_json() -> None:
         "num_heads": 8,
         "ff_dim": 2048,
         "dropout": 0.1,
+        "image_dropout": 0.5,
         "n_layers": 6,
         "image_tokens": 2048,
         "use_biases": true,
