@@ -1,6 +1,7 @@
 """Train the image model."""
 
 import os
+
 # neccessary to use more of the GPU's memory. Default is 0.75. It's supposed to be able to
 # dynamically allocate more, but there are fragmentation issues since we allocate ginormous arrays.
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
@@ -103,6 +104,7 @@ parser.add_argument("--clip-conditioning", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--clip-caps", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--clip-cap-count", type=int)
 parser.add_argument("--resume", type=Path)
+parser.add_argument("--finetune", type=Path)
 parser.add_argument(
     "--skip-sampling", action="store_true", help="Skip sampling during training"
 )
@@ -136,7 +138,9 @@ def init_train_state():
         # Async checkpointing can hide out of disk errors, so we disable it.
         enable_async_checkpointing=False,
     )
-
+    assert ((args.resume is None) != (args.finetune is None)) or (
+        args.resume is None and args.finetune is None
+    ), "Must specify one of --resume or --finetune or neither, not both"
     if args.resume is not None:
         print(f"Resuming from checkpoint {args.resume}...")
         checkpoint_dir = args.resume.absolute()
@@ -188,6 +192,12 @@ def init_train_state():
             0 < training_cfg.loss_decay_constant <= 1
         ), "loss_decay_constant must be in (0, 1]"
 
+        if args.finetune is not None:
+            finetune_src_checkpoint_dir = args.finetune.absolute()
+            finetune_src_checkpoint_manager = mk_checkpoint_manager(
+                finetune_src_checkpoint_dir
+            )
+
         # Set up checkpoint manager and initial state
         checkpoint_dir = Path(f"checkpoints/{wandb.run.id}").absolute()
         checkpoint_manager, train_state = setup_checkpoint_manager_and_initial_state(
@@ -198,7 +208,36 @@ def init_train_state():
             training_cfg,
             jax.random.PRNGKey(1337),
             1,  # We don't know the total number of batches until we load the dataset
+            extra_metadata=(
+                "finetune_src_config",
+                finetune_src_checkpoint_manager.metadata(),
+            ),
         )
+
+        if args.finetune is not None:
+            train_state = train_state.replace(params=None)
+            gc.collect()
+            print(f"Loading params from {args.finetune} for finetuning...")
+
+            finetune_src_ts, finetune_src_mdl = TrainState.load_from_checkpoint(
+                finetune_src_checkpoint_manager,
+                finetune_src_checkpoint_manager.latest_step(),
+                1,
+            )
+            finetune_src_params = finetune_src_ts.get_eval_params()
+            del finetune_src_ts
+            gc.collect()
+
+            train_state = train_state.replace(params=finetune_src_params)
+            print(
+                "Finetuning parameters loaded successfully. Overwriting initial checkpoint."
+            )
+            train_state.save_checkpoint(checkpoint_manager, 0)
+            print("Done.")
+            wandb.config.update(
+                {"finetune_src_metadata": finetune_src_checkpoint_manager.metadata()}
+            )
+
         mdl = transformer_model.ImageModel(**model_cfg.__dict__)
 
     train_state = train_state.replicate_for_multi_gpu()

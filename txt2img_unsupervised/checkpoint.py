@@ -13,7 +13,7 @@ from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from pathlib import Path
 from tqdm import tqdm
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from .config import LearningRateSchedule, ModelConfig, TrainingConfig
 from .transformer_model import ImageModel
@@ -319,6 +319,7 @@ def setup_checkpoint_manager_and_initial_state(
     training_cfg: TrainingConfig,
     rng: jax.random.PRNGKey,
     batches_total: int,
+    extra_metadata: Optional[Tuple[str, Any]] = None,
 ) -> Tuple[ocp.CheckpointManager, TrainState]:
     """
     Set up a CheckpointManager and create an initial TrainState with a saved checkpoint.
@@ -346,6 +347,11 @@ def setup_checkpoint_manager_and_initial_state(
     except subprocess.CalledProcessError:
         commit_hash = "unknown"
 
+    if extra_metadata is not None:
+        extra_metadata = {extra_metadata[0]: extra_metadata[1]}
+    else:
+        extra_metadata = {}
+
     # Set up the CheckpointManager
     checkpoint_manager = ocp.CheckpointManager(
         checkpoint_dir,
@@ -356,7 +362,8 @@ def setup_checkpoint_manager_and_initial_state(
             "training_cfg": training_cfg.to_json_dict(),
             "run_id": run_id,
             "commit_hash": commit_hash,
-        },
+        }
+        | extra_metadata,
     )
 
     # Create the initial TrainState
