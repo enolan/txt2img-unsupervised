@@ -23,8 +23,6 @@ import optax.contrib
 import orbax.checkpoint as ocp
 import PIL.Image
 import signal
-import subprocess
-import time
 import torch
 import transformers
 import wandb
@@ -33,7 +31,6 @@ from datasets import Dataset
 from distutils.util import strtobool
 from einops import rearrange, reduce, repeat
 from functools import partial
-from itertools import islice
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from omegaconf import OmegaConf
@@ -58,9 +55,7 @@ from txt2img_unsupervised.config import (
 )
 from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
 from txt2img_unsupervised.load_pq_dir import load_pq_dir
-from txt2img_unsupervised.triangle_schedule import triangle_schedule
 import txt2img_unsupervised.config as config
-import txt2img_unsupervised.ldm_autoencoder as ldm_autoencoder
 import txt2img_unsupervised.sample as sample
 import txt2img_unsupervised.transformer_model as transformer_model
 
