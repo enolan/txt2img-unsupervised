@@ -32,7 +32,6 @@ from copy import copy
 from datasets import Dataset
 from distutils.util import strtobool
 from einops import rearrange, reduce, repeat
-from flax.training import train_state
 from functools import partial
 from itertools import islice
 from jax.experimental import mesh_utils
@@ -43,6 +42,12 @@ from sys import exit
 from tqdm import tqdm, trange
 from typing import Any, Callable, Tuple
 
+from txt2img_unsupervised.checkpoint import (
+    mk_checkpoint_manager,
+    setup_checkpoint_manager_and_initial_state,
+    setup_optimizer,
+    TrainState,
+)
 from txt2img_unsupervised.config import (
     LearningRateSchedule,
     ModelConfig,
@@ -136,15 +141,11 @@ def setup_cfg_and_wandb():
         # Async checkpointing can hide out of disk errors, so we disable it.
         enable_async_checkpointing=False,
     )
-    checkpoint_manager_items = ("params", "opt_state", "rng")
+
     if args.resume is not None:
         print(f"Resuming from checkpoint {args.resume}...")
         checkpoint_dir = args.resume.absolute()
-        checkpoint_manager = ocp.CheckpointManager(
-            checkpoint_dir,
-            options=checkpoint_options,
-            item_names=checkpoint_manager_items,
-        )
+        checkpoint_manager = mk_checkpoint_manager(checkpoint_dir)
         # Checkpoint saved after step n, so we start at step n+1
         global_step = checkpoint_manager.latest_step() + 1
         restoring = True
@@ -154,11 +155,17 @@ def setup_cfg_and_wandb():
         run_id = metadata["run_id"]
         print(f"Resuming run {run_id}")
         print(
-            "ALL TRAINING AND MODEL PARAMETERS PASSED ON THE COMMAND LINE WILL BE IGNORNED."
+            "ALL TRAINING AND MODEL PARAMETERS PASSED ON THE COMMAND LINE WILL BE IGNORED."
         )
         print(f"ModelConfig {json_pretty(model_cfg.to_json_dict())}")
         print(f"TrainingConfig {json_pretty(training_cfg.to_json_dict())}")
         wandb.init(id=run_id, resume="must")
+
+        train_state, mdl = TrainState.load_from_checkpoint(
+            checkpoint_manager,
+            global_step - 1,
+            1,  # batches total will be update after we load the dataset
+        )
     else:
         print("Starting new run...")
         wandb.init()
@@ -188,33 +195,26 @@ def setup_cfg_and_wandb():
             0 < training_cfg.loss_decay_constant <= 1
         ), "loss_decay_constant must be in (0, 1]"
 
-        # get git commit
-        try:
-            commit_hash = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], encoding="utf-8"
-            ).strip()
-        except subprocess.CalledProcessError:
-            commit_hash = "unknown"
-
-        # Set up checkpoint manager
+        # Set up checkpoint manager and initial state
         checkpoint_dir = Path(f"checkpoints/{wandb.run.id}").absolute()
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_manager = ocp.CheckpointManager(
+        checkpoint_manager, train_state = setup_checkpoint_manager_and_initial_state(
+            checkpoint_options,
             checkpoint_dir,
-            options=checkpoint_options,
-            item_names=checkpoint_manager_items,
-            metadata={
-                "model_cfg": model_cfg.to_json_dict(),
-                "training_cfg": training_cfg.to_json_dict(),
-                "run_id": wandb.run.id,
-                "commit_hash": commit_hash,
-            },
+            wandb.run.id,
+            model_cfg,
+            training_cfg,
+            jax.random.PRNGKey(1337),
+            1,  # We don't know the total number of batches until we load the dataset
         )
+        mdl = transformer_model.ImageModel(**model_cfg.__dict__)
 
+    train_state = train_state.replicate_for_multi_gpu()
     if args.sample_batch_size is None:
         sample_batch_size = training_cfg.batch_size
     else:
         sample_batch_size = args.sample_batch_size
+
+    print(mdl.tabulate(jax.random.PRNGKey(0), *mdl.dummy_inputs()))
 
     wandb.define_metric("*", step_metric="global_step")
     wandb.define_metric("test/loss", summary="last")
@@ -227,6 +227,8 @@ def setup_cfg_and_wandb():
         sample_batch_size,
         checkpoint_manager,
         restoring,
+        train_state,
+        mdl,
     )
 
 
@@ -237,6 +239,8 @@ def setup_cfg_and_wandb():
     sample_batch_size,
     checkpoint_manager,
     restoring,
+    train_state,
+    mdl,
 ) = setup_cfg_and_wandb()
 
 
@@ -259,11 +263,7 @@ train_imgs, test_imgs = load_dataset(args.pq_dir)
 jax.config.update("jax_threefry_partitionable", True)
 
 
-class TrainState(train_state.TrainState):  # type:ignore[no-untyped-call]
-    rng: jax.Array  # type:ignore[misc]
-
-
-def calculate_steps(train_set_size, training_cfg):
+def calculate_steps(train_set_size, training_cfg, train_state):
     """Calculate the number of steps and epochs to do."""
 
     batches_for_image_count = training_cfg.training_images // training_cfg.batch_size
@@ -281,178 +281,35 @@ def calculate_steps(train_set_size, training_cfg):
     print(
         f"Training for {batches_total * training_cfg.batch_size} images in {batches_total} steps over {image_count_epochs + training_cfg.epochs} full epochs plus {extra_batches} extra batches"
     )
-    return batches_total, epochs_total, batches_per_epoch, extra_batches
+    # Reconfigure optimizer now that we know the total number of batches
+    opt = setup_optimizer(training_cfg, batches_total)
+    opt_state = opt.init(train_state.params)
+    train_state = train_state.replace(opt_state=opt_state, tx=opt)
+    return batches_total, epochs_total, batches_per_epoch, extra_batches, train_state
 
 
-batches_total, epochs_total, batches_per_epoch, extra_batches = calculate_steps(
-    train_imgs.shape[0], training_cfg
-)
+(
+    batches_total,
+    epochs_total,
+    batches_per_epoch,
+    extra_batches,
+    train_state,
+) = calculate_steps(train_imgs.shape[0], training_cfg, train_state)
 
 
-def setup_optimizer(
-    model_cfg, training_cfg, batches_total, checkpoint_manager, global_step, restoring
-):
-    """Set up a model and create a - possibly restored from disk - TrainState to begin training
-    with."""
-
-    # Set up model
-    mdl = transformer_model.ImageModel(**model_cfg.__dict__)
-
-    # Set up optimizer
-    get_eval_params_identity = lambda opt_state, params: params
-    assert_msg = (
-        lambda name, warmup, beta1: f"{name} requires warmup_steps to be {'set' if warmup else 'unset'} and schedule_free_beta1 to be {'set' if beta1 else 'unset'}"
-    )
-    if training_cfg.learning_rate_schedule == LearningRateSchedule.CONSTANT:
-        assert (
-            training_cfg.warmup_steps is None
-            and training_cfg.schedule_free_beta1 is None
-        ), assert_msg("constant schedule", False, False)
-        opt = optax.adam(learning_rate=training_cfg.learning_rate)
-        get_eval_params_inner = get_eval_params_identity
-    elif training_cfg.learning_rate_schedule == LearningRateSchedule.TRIANGLE:
-        assert (
-            training_cfg.warmup_steps is None
-            and training_cfg.schedule_free_beta1 is None
-        ), assert_msg("triangle schedule", False, False)
-        opt = optax.adam(
-            learning_rate=triangle_schedule(
-                training_cfg.learning_rate,
-                batches_total,
-            )
-        )
-        get_eval_params_inner = get_eval_params_identity
-    elif training_cfg.learning_rate_schedule == LearningRateSchedule.WARMUP_PLUS_COSINE:
-        assert (
-            training_cfg.warmup_steps is not None
-            and training_cfg.schedule_free_beta1 is None
-        ), assert_msg("warmup plus cosine schedule", True, False)
-        opt = optax.adam(
-            learning_rate=optax.warmup_cosine_decay_schedule(
-                init_value=0.0,
-                peak_value=training_cfg.learning_rate,
-                warmup_steps=training_cfg.warmup_steps,
-                decay_steps=batches_total,
-                end_value=training_cfg.learning_rate * 0.05,
-            )
-        )
-        get_eval_params_inner = get_eval_params_identity
-    elif (
-        training_cfg.learning_rate_schedule
-        == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
-    ):
-        assert (
-            training_cfg.warmup_steps is not None
-            and training_cfg.schedule_free_beta1 is not None
-        ), assert_msg("warmup plus schedule-free", True, True)
-        opt = optax.contrib.schedule_free_adamw(
-            learning_rate=training_cfg.learning_rate,
-            warmup_steps=training_cfg.warmup_steps,
-            b1=training_cfg.schedule_free_beta1,
-        )
-        get_eval_params_inner = (
-            lambda opt_state, params: optax.contrib.schedule_free_eval_params(
-                opt_state, params
-            )
-        )
-    else:
-        raise ValueError(
-            f"Unknown learning rate schedule {training_cfg.learning_rate_schedule}"
-        )
-
-    state_getter_fns = []  # Functions to run to get the state of the inner optimizer
-    assert training_cfg.gradient_accumulation_steps > 0
-    if training_cfg.gradient_accumulation_steps > 1:
-        opt = optax.MultiSteps(
-            opt, every_k_schedule=training_cfg.gradient_accumulation_steps
-        )
-        state_getter_fns.append(lambda opt_state: opt_state.inner_opt_state)
-    if training_cfg.gradient_clipping is not None:
-        clip = optax.clip_by_global_norm(training_cfg.gradient_clipping)
-    else:
-        clip = optax.identity()
-    opt = optax.apply_if_finite(optax.chain(clip, opt), 20)
-    state_getter_fns.append(lambda opt_state: opt_state.inner_state[1])
-
-    @jax.jit
-    def get_eval_params(opt_state, params):
-        for fn in state_getter_fns[::-1]:
-            opt_state = fn(opt_state)
-        return get_eval_params_inner(opt_state, params)
-
-    # We need template inputs to get initial parameters, regardless of if we're loading or starting
-    # anew.
-    params_init = mdl.init(
-        {"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
-        *mdl.dummy_inputs(),
-    )
-    table_str = mdl.tabulate(
-        {"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
-        *mdl.dummy_inputs(),
-    )
-    print(table_str)
-
-    # Set up sharding
+def setup_sharding():
     print(
         f"Sharding batches of {training_cfg.batch_size} across {jax.device_count()} devices, {training_cfg.batch_size / jax.device_count()} per device"
     )
     assert training_cfg.batch_size % jax.device_count() == 0
-    # NamedSharding is overkill for the simple batch parallelism we do, but it's necessary to get orbax
-    # to save checkpoints correctly.
+    # NamedSharding is overkill for the simple batch parallelism we do, but it's necessary to get
+    # orbax to save checkpoints correctly.
     devices = mesh_utils.create_device_mesh((jax.device_count(),))
     mesh = Mesh(devices, axis_names=("dev",))
-    # replicate network parameters across all GPUs
-    params_init = jax.device_put(params_init, NamedSharding(mesh, PartitionSpec(None)))
-
-    ts = TrainState.create(
-        apply_fn=mdl.apply,
-        params=params_init,
-        tx=opt,
-        rng=jax.random.PRNGKey(1337),
-    )
-    del params_init  # Ensure these params are freed as soon as this ts is
-
-    if restoring:
-        # Ensure we free the VRAM from the original TrainState
-        params_template = jtu.tree_map(ocp.utils.to_shape_dtype_struct, ts.params)
-        opt_state_template = jtu.tree_map(ocp.utils.to_shape_dtype_struct, ts.opt_state)
-        rng_template = ocp.utils.to_shape_dtype_struct(ts.rng)
-        del ts
-        restored = checkpoint_manager.restore(
-            # global_step is the step we start on, so the checkpoint was saved at global_step - 1
-            global_step - 1,
-            args=ocp.args.Composite(
-                params=ocp.args.StandardRestore(params_template),
-                opt_state=ocp.args.StandardRestore(opt_state_template),
-                rng=ocp.args.ArrayRestore(rng_template),
-            ),
-        )
-
-        # For whatever reason, things come back committed to whatever device they're on even
-        # if they weren't when they were saved. Roundtripping the optimizer state to RAM and back
-        # un-commits it. If we don't do this JAX can't move it and when can't train the model.
-        # Since we do the roundtrip thing, we also want to make sure we don't keep an extra copy
-        # of the optimizer state in VRAM.
-        opt_state = jax.device_get(restored["opt_state"])
-        params = restored["params"]
-        rng = restored["rng"]
-        del restored
-        opt_state = jax.device_put(opt_state)
-        ts = TrainState(
-            apply_fn=mdl.apply,
-            params=params,
-            tx=opt,
-            rng=rng,
-            step=global_step,
-            opt_state=opt_state,
-        )
-
-    return mdl, ts, get_eval_params, mesh
+    return mesh
 
 
-mdl, my_train_state, get_eval_params, mesh = setup_optimizer(
-    model_cfg, training_cfg, batches_total, checkpoint_manager, global_step, restoring
-)
+mesh = setup_sharding()
 
 
 loss_grad_fn = jax.value_and_grad(transformer_model.loss_batch, argnums=1)
@@ -699,7 +556,7 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
     """Sample from the model and log to wandb."""
 
     ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
-    eval_params = get_eval_params(ts.opt_state, ts.params)
+    eval_params = ts.get_eval_params()
 
     if model_cfg.clip_conditioning:
         # Create a grid of samples for each set of conditions.
@@ -752,7 +609,6 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
 
             imgs_list = sample.sample_loop(
                 mdl,
-                model_cfg,
                 eval_params,
                 ae_mdl,
                 ae_params,
@@ -941,7 +797,7 @@ def get_attention_weights(ts, img, clips, max_cos_distances):
     mdl_record = mdl.copy(
         record_attention_weights=True, dropout=None, image_dropout=None
     )
-    params = get_eval_params(ts.opt_state, ts.params)
+    params = ts.get_eval_params()
 
     logits, intermediates = mdl_record.apply(
         params,
@@ -1096,7 +952,7 @@ mdl_forward_j = jax.jit(
 def log_token_loss_visualization(ts: TrainState, test_imgs, global_step):
     """Log charts of the per token loss and entropy for a set of test images"""
     img_cnt = test_imgs["encoded_img"].shape[0]
-    params = get_eval_params(ts.opt_state, ts.params)
+    params = ts.get_eval_params()
 
     if mdl.clip_conditioning and mdl.clip_caps:
         clip_embeddings, max_cos_distances = rearrange_batch_caps(
@@ -1269,26 +1125,11 @@ def train_step(
 last_checkpoint_time = None
 
 
-def save_checkpoint_and_sample(
+def save_checkpoint_and_log_images(
     my_train_state, sample_batch_size, global_step, skip_sampling
 ) -> None:
     # TPU VMs run out of disk space a lot. Retrying in a loop lets me manually clean up the disk
-    tqdm.write("Attempting to save checkpoint")
-    while True:
-        try:
-            checkpoint_manager.save(
-                global_step,
-                args=ocp.args.Composite(
-                    params=ocp.args.StandardSave(my_train_state.params),
-                    opt_state=ocp.args.StandardSave(my_train_state.opt_state),
-                    rng=ocp.args.ArraySave(my_train_state.rng),
-                ),
-            )
-            break
-        except (OSError, ValueError) as e:
-            tqdm.write(f"Error saving checkpoint: {e}")
-            tqdm.write("Retrying in 60 seconds")
-            time.sleep(60)
+    my_train_state.save_checkpoint(checkpoint_manager, global_step)
     tqdm.write("Saved checkpoint")
     if not skip_sampling:
         tqdm.write("Sampling")
@@ -1400,14 +1241,14 @@ for epoch in trange(
                 batch_max_cos_distances = jax.device_put(
                     jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
                 )
-            my_train_state, train_loss, norm = train_step(
-                my_train_state,
+            train_state, train_loss, norm = train_step(
+                train_state,
                 training_cfg.loss_decay_constant,
                 batch_imgs,
                 batch_clips,
                 batch_max_cos_distances,
             )
-            opt_state = my_train_state.opt_state
+            opt_state = train_state.opt_state
             train_loss, notfinite_count, norm = jax.device_get(
                 (train_loss, opt_state.notfinite_count, norm)
             )
@@ -1426,8 +1267,8 @@ for epoch in trange(
             if last_checkpoint_time is None or (
                 datetime.datetime.now() - last_checkpoint_time
             ) > datetime.timedelta(minutes=30):
-                save_checkpoint_and_sample(
-                    my_train_state,
+                save_checkpoint_and_log_images(
+                    train_state,
                     sample_batch_size,
                     global_step,
                     args.skip_sampling,
@@ -1445,12 +1286,12 @@ for epoch in trange(
                 # Since the params used for gradient computation with a schedule-free optimizer are
                 # not the same as the params used for inference, we want to test with the inference
                 # params occasionally for charting.
-                eval_params = get_eval_params(opt_state, my_train_state.params)
+                eval_params = train_state.get_eval_params()
                 to_log = {"global_step": global_step}
                 eval_loss_weighted = loss_fn(
                     eval_params,
                     training_cfg.loss_decay_constant,
-                    my_train_state.rng,
+                    train_state.rng,
                     batch_imgs,
                     batch_clips,
                     batch_max_cos_distances,
@@ -1459,7 +1300,7 @@ for epoch in trange(
                     eval_loss_unweighted = loss_fn(
                         eval_params,
                         1.0,
-                        my_train_state.rng,
+                        train_state.rng,
                         batch_imgs,
                         batch_clips,
                         batch_max_cos_distances,
@@ -1477,9 +1318,9 @@ for epoch in trange(
             if global_step % 20 == 0 and training_cfg.loss_decay_constant != 1.0:
                 train_loss_unweighted = jax.device_get(
                     loss_fn(
-                        my_train_state.params,
+                        train_state.params,
                         1.0,
-                        my_train_state.rng,
+                        train_state.rng,
                         batch_imgs,
                         batch_clips,
                         batch_max_cos_distances,
@@ -1504,14 +1345,14 @@ for epoch in trange(
             pbar.update()
             if exit_requested:
                 tqdm.write("Saving checkpoint and exiting early")
-                save_checkpoint_and_sample(
-                    my_train_state, sample_batch_size, global_step, skip_sampling=True
+                save_checkpoint_and_log_images(
+                    train_state, sample_batch_size, global_step, skip_sampling=True
                 )
                 exit(0)
             global_step += 1
     # Evaluate on test set
     losses = []
-    eval_params = get_eval_params(opt_state, my_train_state.params)
+    eval_params = train_state.get_eval_params()
     for batch in tqdm(
         # The last batch needs to be a multiple of the number of devices, and it isn't guaranteed
         # to be, so we drop it. Shouldn't matter much when even 1% of the dataset is thousands of
@@ -1520,8 +1361,8 @@ for epoch in trange(
         total=len(test_imgs) // training_cfg.batch_size,
         desc="test batches",
     ):
-        dropout_rng, rng = jax.random.split(my_train_state.rng, 2)
-        my_train_state = my_train_state.replace(rng=rng)
+        dropout_rng, rng = jax.random.split(train_state.rng, 2)
+        train_state = train_state.replace(rng=rng)
         batch_imgs = jax.device_put(batch["encoded_img"], examples_sharding)
         if model_cfg.clip_conditioning:
             if model_cfg.clip_caps:
@@ -1565,7 +1406,7 @@ for epoch in trange(
         f"Epoch {epoch} done, train loss: {train_loss:.4f}, test loss {test_loss:.4f}",
         end="",
     )
-    save_checkpoint_and_sample(
-        my_train_state, sample_batch_size, global_step, skip_sampling=False
+    save_checkpoint_and_log_images(
+        train_state, sample_batch_size, global_step, skip_sampling=False
     )
     last_checkpoint_time = datetime.datetime.now()

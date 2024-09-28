@@ -24,6 +24,7 @@ from tqdm import tqdm, trange
 from typing import List, Tuple
 
 from . import ldm_autoencoder
+from .checkpoint import get_imagemodel_from_checkpoint, load_eval_params
 from .ldm_autoencoder import LDMAutoencoder
 from .transformer_model import (
     ImageModel,
@@ -156,7 +157,6 @@ def parse_cond_txt(d: dict, clip_mdl, clip_processor) -> dict:
 
 def sample_loop(
     mdl,
-    model_cfg,
     params,
     ae_mdl,
     ae_params,
@@ -174,7 +174,7 @@ def sample_loop(
     number of images to sample, unless clip caps is off, in which case the cap centers dimension
     disappears from cap_centers and max_cos_distances should be None."""
 
-    assert model_cfg.clip_conditioning, "unconditioned model is deprecated"
+    assert mdl.clip_conditioning, "unconditioned model is deprecated"
     assert isinstance(cap_centers, np.ndarray)
     assert len(cap_centers.shape) == 3
     n_imgs = cap_centers.shape[0]
@@ -183,16 +183,12 @@ def sample_loop(
     mesh = Mesh(devices, axis_names=("dev",))
     sharding = NamedSharding(mesh, PartitionSpec("dev"))
 
-    if model_cfg.clip_caps:
+    if mdl.clip_caps:
         assert isinstance(max_cos_distances, np.ndarray)
         assert len(cap_centers.shape) == 3
         assert len(max_cos_distances.shape) == 2
         assert cap_centers.shape[0] == max_cos_distances.shape[0] == n_imgs
-        assert (
-            cap_centers.shape[1]
-            == max_cos_distances.shape[1]
-            == model_cfg.clip_cap_count
-        )
+        assert cap_centers.shape[1] == max_cos_distances.shape[1] == mdl.clip_cap_count
     else:
         assert max_cos_distances is None
         assert cap_centers.shape == (n_imgs, 768)
@@ -215,7 +211,7 @@ def sample_loop(
             rngs_sharded = jax.device_put(rngs_batch, sharding)
             cap_centers_batch = cap_centers[ctr : ctr + batch]
             cap_centers_sharded = jax.device_put(cap_centers_batch, sharding)
-            if model_cfg.clip_caps:
+            if mdl.clip_caps:
                 max_cos_distances_batch = max_cos_distances[ctr : ctr + batch]
                 max_cos_distances_sharded = jax.device_put(
                     max_cos_distances_batch, sharding
@@ -248,10 +244,10 @@ def sample_loop(
     sampled_codes = np.concatenate(sampled_codes_arrs, axis=0)
     assert sampled_codes.shape == (
         len(cap_centers),
-        model_cfg.image_tokens,
-    ), f"{sampled_codes.shape} != {(len(cap_centers), model_cfg.image_tokens)}"
+        mdl.image_tokens,
+    ), f"{sampled_codes.shape} != {(len(cap_centers), mdl.image_tokens)}"
 
-    ae_res = int(model_cfg.image_tokens**0.5)
+    ae_res = int(mdl.image_tokens**0.5)
     decoded_imgs = []
     # Decode the sampled codes
     with tqdm(total=len(cap_centers), desc="decoding", unit="img") as pbar:
@@ -343,7 +339,6 @@ def test_sample_loop_batch_equivalence():
     # Sample
     sample_bs = lambda bs: sample_loop(
         mdl,
-        model_cfg,
         params,
         ae_mdl,
         ae_params,
@@ -472,16 +467,11 @@ def main():
     rng = jax.random.PRNGKey(seed)
 
     print("Loading transformer model metadata...")
-    checkpoint_mngr = ocp.CheckpointManager(
-        # Orbax chokes on relative paths for some godforsaken reason
-        args.transformer_checkpoint_dir.absolute(),
-        item_names=("params",),
-    )
+    # We need to minimize VRAM usage, so we don't load the transformer parameters until after
+    # computing CLIP embeddings.
+    im_mdl = get_imagemodel_from_checkpoint(args.transformer_checkpoint_dir)
 
-    model_cfg = ModelConfig.from_json_dict(checkpoint_mngr.metadata()["model_cfg"])
-    im_mdl = ImageModel(**model_cfg.__dict__)
-
-    if model_cfg.clip_conditioning:
+    if im_mdl.clip_conditioning:
         print("Loading CLIP model...")
 
         clip_mdl_name = "openai/clip-vit-large-patch14"
@@ -502,13 +492,13 @@ def main():
         cond_dicts = cond_img_dicts + cond_txt_dicts
         del clip_mdl, clip_processor
 
-        if model_cfg.clip_caps:
+        if im_mdl.clip_caps:
             total_conds = len(cond_dicts)
             assert all(
                 [d["max_cos_distance"] is not None for d in cond_dicts]
             ), "Must specify max cosine distance"
             assert (
-                total_conds <= model_cfg.clip_cap_count
+                total_conds <= im_mdl.clip_cap_count
             ), "Too many CLIP embeddings for the number of caps"
 
             if total_conds == 0:
@@ -527,7 +517,7 @@ def main():
 
             rng, rng2 = jax.random.split(rng)
             fill_cap_centers, fill_max_cos_distances = mk_filler_caps(
-                model_cfg, 1, total_conds, rng2
+                im_mdl, 1, total_conds, rng2
             )
             fill_cap_centers = rearrange(fill_cap_centers, "1 cap clip -> cap clip")
             fill_max_cos_distances = rearrange(fill_max_cos_distances, "1 cap -> cap")
@@ -538,8 +528,8 @@ def main():
                 [max_cos_distances_cond, fill_max_cos_distances]
             )
 
-            assert cap_centers.shape == (model_cfg.clip_cap_count, 768)
-            assert max_cos_distances.shape == (model_cfg.clip_cap_count,)
+            assert cap_centers.shape == (im_mdl.clip_cap_count, 768)
+            assert max_cos_distances.shape == (im_mdl.clip_cap_count,)
             cap_centers = repeat(cap_centers, "cap clip -> n cap clip", n=args.n)
             max_cos_distances = repeat(max_cos_distances, "cap -> n cap", n=args.n)
         else:
@@ -560,30 +550,23 @@ def main():
         ), "Can't specify --cond-img or --cond-txt without CLIP conditioning"
         cond_img_inputs, cond_txt_inputs = [], []
 
-    print("Creating transformer model template params...")
-    template_params = jax.jit(im_mdl.init)(
-        {"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(0)},
-        *im_mdl.dummy_inputs(),
+    # Load the transformer model parameters
+    im_params, checkpoint_step, im_mdl = load_eval_params(
+        args.transformer_checkpoint_dir
     )
-    template_shapes = jtu.tree_map(ocp.utils.to_shape_dtype_struct, template_params)
-    del template_params
 
     print(
-        f"Loading transformer model step {checkpoint_mngr.latest_step()} from "
+        f"Loaded transformer model step {checkpoint_step} from "
         f"{args.transformer_checkpoint_dir}"
     )
-    im_params = checkpoint_mngr.restore(
-        checkpoint_mngr.latest_step(),
-        args=ocp.args.Composite(params=ocp.args.StandardRestore(template_shapes)),
-    )["params"]
 
     devices = mesh_utils.create_device_mesh((jax.device_count(),))
     mesh = Mesh(devices, axis_names=("dev",))
     im_params = jax.device_put(im_params, NamedSharding(mesh, PartitionSpec(None)))
 
     print("Loading autoencoder model...")
-    ae_res = int(model_cfg.image_tokens**0.5)
-    assert ae_res**2 == model_cfg.image_tokens, "Image tokens must be a square number"
+    ae_res = int(im_mdl.image_tokens**0.5)
+    assert ae_res**2 == im_mdl.image_tokens, "Image tokens must be a square number"
     ae_cfg = OmegaConf.load(args.autoencoder_cfg)["model"][
         "params"
     ]  # type:ignore[index]
@@ -596,7 +579,6 @@ def main():
 
     imgs = sample_loop(
         mdl=im_mdl,
-        model_cfg=model_cfg,
         params=im_params,
         ae_mdl=ae_mdl,
         ae_params=ae_params,
@@ -621,7 +603,7 @@ def main():
         [(d["cond"], float(d["max_cos_distance"])) for d in cond_img_inputs],
         [(d["cond"], float(d["max_cos_distance"])) for d in cond_txt_inputs],
         args.transformer_checkpoint_dir.name,
-        checkpoint_mngr.latest_step(),
+        checkpoint_step,
     )
     print("Saving images...")
     for i, img in enumerate(tqdm(imgs, unit="img")):
