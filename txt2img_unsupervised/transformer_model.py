@@ -9,7 +9,7 @@ import numpy as np
 import optax  # type: ignore[import]
 import pytest
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from einops import rearrange, repeat
@@ -394,6 +394,40 @@ class ImageModel(nn.Module):
         h, _ = self.transformer_layers(h[:, None, :], None)
         assert h.shape == (batch_size, 1, self.d_model)
         return self.logits_decoder(h[:, 0, :])  # type: ignore[no-any-return]
+
+    def dummy_inputs(self):
+        images_dummy = jnp.zeros((1, self.image_tokens), dtype=jnp.int32)
+        if self.clip_conditioning and self.clip_caps:
+            max_cos_distance_dummy = jnp.zeros(
+                (1, self.clip_cap_count), dtype=jnp.float32
+            )
+            clip_embeddings_dummy = jnp.zeros(
+                (1, self.clip_cap_count, 768), dtype=jnp.float32
+            )
+        elif self.clip_conditioning and not self.clip_caps:
+            clip_embeddings_dummy = jnp.zeros((1, 768), dtype=jnp.float32)
+            max_cos_distance_dummy = jnp.zeros((1, 0), dtype=jnp.float32)
+        else:
+            clip_embeddings_dummy = jnp.zeros((1, 0), dtype=jnp.float32)
+            max_cos_distance_dummy = jnp.zeros((1, 0), dtype=jnp.float32)
+        return images_dummy, clip_embeddings_dummy, max_cos_distance_dummy
+
+
+@pytest.mark.parametrize(
+    "config_modifications",
+    [
+        {},
+        {"clip_conditioning": True},
+        {"clip_conditioning": True, "clip_caps": True, "clip_cap_count": 4},
+    ],
+)
+def test_model_initialization_with_various_configs(config_modifications):
+    """Test that the model can be initialized with different configurations."""
+    config = replace(gpt_1_config, **config_modifications)
+    model = ImageModel(**config.__dict__)
+
+    rng = jax.random.PRNGKey(0)
+    model.init(rng, *model.dummy_inputs())
 
 
 def _assert_dicts_equal(d1, d2, name) -> None:
@@ -1534,10 +1568,7 @@ def test_cap_train() -> None:
     )
 
     params = mdl.init(
-        {"params": params_rng, "dropout": jax.random.PRNGKey(0)},
-        images=jnp.zeros((1, mdl.image_tokens), dtype=jnp.int32),
-        clip_embeddings=jnp.zeros((1, mdl.clip_cap_count, 768), dtype=jnp.float32),
-        max_cos_distances=jnp.zeros((1, mdl.clip_cap_count), dtype=jnp.float32),
+        {"params": params_rng, "dropout": jax.random.PRNGKey(0)}, *mdl.dummy_inputs()
     )
 
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
@@ -1625,11 +1656,10 @@ def train_loop_simple(
     assert len(data.shape) == 2
     batch_size = data.shape[0]
     assert data.shape == (batch_size, mdl.image_tokens)
+
     params = mdl.init(
-        rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
-        images=jnp.zeros((1, gpt_1_config.image_tokens), dtype=jnp.int32),
-        clip_embeddings=jnp.zeros((1, 0), dtype=jnp.float32),
-        max_cos_distances=jnp.zeros((1, 0), dtype=jnp.float32),
+        {"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
+        *mdl.dummy_inputs(),
     )
     if warmup_steps is None:
         warmup_steps = iters // 10
@@ -1823,12 +1853,7 @@ def _train_clip_caps_overfit(dset_train, mdl, rng):
     """Train a test model"""
     params_rng, dropout_rng = jax.random.split(rng, 2)
 
-    params = mdl.init(
-        {"params": params_rng},
-        images=jnp.zeros((1, mdl.image_tokens), dtype=jnp.int32),
-        clip_embeddings=jnp.zeros((1, mdl.clip_cap_count, 768), dtype=jnp.float32),
-        max_cos_distances=jnp.zeros((1, mdl.clip_cap_count), dtype=jnp.float32),
-    )
+    params = mdl.init({"params": params_rng}, *mdl.dummy_inputs())
 
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
 

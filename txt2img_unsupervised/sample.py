@@ -302,14 +302,7 @@ def test_sample_loop_batch_equivalence():
         jax.random.PRNGKey(0), 4
     )
 
-    params = mdl.init(
-        rngs={"params": im_params_rng},
-        images=jnp.zeros((1, model_cfg.image_tokens), dtype=jnp.int32),
-        clip_embeddings=jnp.zeros(
-            (1, model_cfg.clip_cap_count, 768), dtype=jnp.float32
-        ),
-        max_cos_distances=jnp.zeros((1, model_cfg.clip_cap_count), dtype=jnp.float32),
-    )
+    params = jax.jit(mdl.init)({"params": im_params_rng}, *mdl.dummy_inputs())
 
     # Set up LDMAutoencoder
     ae_cfg = {
@@ -568,23 +561,12 @@ def main():
         cond_img_inputs, cond_txt_inputs = [], []
 
     print("Creating transformer model template params...")
-    if model_cfg.clip_conditioning and model_cfg.clip_caps:
-        clip_embedding_dummy = jnp.zeros((1, model_cfg.clip_cap_count, 768))
-        max_cos_distance_dummy = jnp.zeros((1, model_cfg.clip_cap_count))
-    elif model_cfg.clip_conditioning:
-        clip_embedding_dummy = jnp.zeros((1, 768))
-        max_cos_distance_dummy = jnp.zeros((1,))
-    else:
-        clip_embedding_dummy = jnp.zeros((1, 0))
-        max_cos_distance_dummy = jnp.zeros((1, 0))
     template_params = jax.jit(im_mdl.init)(
-        rngs={"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(0)},
-        images=jnp.zeros((1, model_cfg.image_tokens), dtype=jnp.int32),
-        clip_embeddings=clip_embedding_dummy,
-        max_cos_distances=max_cos_distance_dummy,
+        {"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(0)},
+        *im_mdl.dummy_inputs(),
     )
     template_shapes = jtu.tree_map(ocp.utils.to_shape_dtype_struct, template_params)
-    del template_params, clip_embedding_dummy, max_cos_distance_dummy
+    del template_params
 
     print(
         f"Loading transformer model step {checkpoint_mngr.latest_step()} from "
