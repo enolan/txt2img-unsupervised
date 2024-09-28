@@ -1,16 +1,15 @@
 """Train the image model."""
+
+import os
+# neccessary to use more of the GPU's memory. Default is 0.75. It's supposed to be able to
+# dynamically allocate more, but there are fragmentation issues since we allocate ginormous arrays.
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
+
 import argparse
 import datetime
 import flax.core
 import gc
 import importlib.util
-
-import os
-
-# neccessary to use more of the GPU's memory. Default is 0.75. It's supposed to be able to
-# dynamically allocate more, but there are fragmentation issues since we allocate ginormous arrays.
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
-
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
