@@ -1107,6 +1107,9 @@ def rearrange_batch_caps(
         dset_cap_count % model_cap_count == 0
     ), f"Dataset cap count {dset_cap_count} not divisible by model cap count {model_cap_count}"
 
+    # This just feeds all the non-overlapping contiguous subsequences of the dataset caps to the
+    # model sequentially - one subsequence per epoch. Ideally we'd go through all the permutations
+    # in a smart order - non-overlapping sets first, but that's more complicated.
     distinct_cap_sets = dset_cap_count // model_cap_count
     this_cap_set = epoch % distinct_cap_sets
     this_cap_set_start = this_cap_set * model_cap_count
