@@ -138,6 +138,7 @@ def init_train_state():
         # Async checkpointing can hide out of disk errors, so we disable it.
         enable_async_checkpointing=False,
     )
+    wandb_settings = wandb.Settings(code_dir="txt2img_unsupervised")
     assert ((args.resume is None) != (args.finetune is None)) or (
         args.resume is None and args.finetune is None
     ), "Must specify one of --resume or --finetune or neither, not both"
@@ -157,7 +158,7 @@ def init_train_state():
         )
         print(f"ModelConfig {json_pretty(model_cfg.to_json_dict())}")
         print(f"TrainingConfig {json_pretty(training_cfg.to_json_dict())}")
-        wandb.init(id=run_id, resume="must")
+        wandb.init(id=run_id, resume="must", settings=wandb_settings)
 
         train_state, mdl = TrainState.load_from_checkpoint(
             checkpoint_manager,
@@ -166,7 +167,7 @@ def init_train_state():
         )
     else:
         print("Starting new run...")
-        wandb.init()
+        wandb.init(settings=wandb_settings)
 
         global_step = 0
         # Load model configuration
