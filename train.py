@@ -7,6 +7,7 @@ import os
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
 
 import argparse
+import datasets
 import datetime
 import flax.core
 import gc
@@ -106,6 +107,12 @@ parser.add_argument("--clip-cap-count", type=int)
 parser.add_argument("--resume", type=Path)
 parser.add_argument("--finetune", type=Path)
 parser.add_argument(
+    "--start-where-finetune-source-left-off",
+    type=lambda x: bool(strtobool(x)),
+    help="start the training data from where the finetune source run left off",
+    default=False,
+)
+parser.add_argument(
     "--skip-sampling", action="store_true", help="Skip sampling during training"
 )
 args, _unknown = parser.parse_known_args()
@@ -152,6 +159,7 @@ def init_train_state():
         model_cfg = ModelConfig.from_json_dict(metadata["model_cfg"])
         training_cfg = TrainingConfig.from_json_dict(metadata["training_cfg"])
         run_id = metadata["run_id"]
+        data_step_offset = metadata.get("data_step_offset", 0)
         print(f"Resuming run {run_id}")
         print(
             "ALL TRAINING AND MODEL PARAMETERS PASSED ON THE COMMAND LINE WILL BE IGNORED."
@@ -198,8 +206,19 @@ def init_train_state():
             finetune_src_checkpoint_manager = mk_checkpoint_manager(
                 finetune_src_checkpoint_dir
             )
-
+            if args.start_where_finetune_source_left_off:
+                data_step_offset = finetune_src_checkpoint_manager.latest_step() + 1
+            else:
+                data_step_offset = 0
+            extra_metadata = (
+                "finetune_src_config",
+                finetune_src_checkpoint_manager.metadata(),
+            )
+        else:
+            data_step_offset = 0
+            extra_metadata = None
         # Set up checkpoint manager and initial state
+
         checkpoint_dir = Path(f"checkpoints/{wandb.run.id}").absolute()
         checkpoint_manager, train_state = setup_checkpoint_manager_and_initial_state(
             checkpoint_options,
@@ -209,10 +228,8 @@ def init_train_state():
             training_cfg,
             jax.random.PRNGKey(1337),
             1,  # We don't know the total number of batches until we load the dataset
-            extra_metadata=(
-                "finetune_src_config",
-                finetune_src_checkpoint_manager.metadata(),
-            ),
+            data_step_offset=data_step_offset,
+            extra_metadata=extra_metadata,
         )
 
         if args.finetune is not None:
@@ -261,6 +278,7 @@ def init_train_state():
         checkpoint_manager,
         train_state,
         mdl,
+        data_step_offset,
     )
 
 
@@ -272,6 +290,7 @@ def init_train_state():
     checkpoint_manager,
     train_state,
     mdl,
+    data_step_offset,
 ) = init_train_state()
 
 
@@ -1186,7 +1205,14 @@ def save_checkpoint_and_log_images(
 
 
 assert global_step < batches_total, "training run is over my dude"
+# to support --start-where-finetune-source-left-off, we need to track the progress in the *run*
+# separately from the progress through the dataset, which will be offset.
 start_epoch = global_step // batches_per_epoch
+start_data_epoch = (global_step + data_step_offset) // batches_per_epoch
+if data_step_offset > 0:
+    print(
+        f"Using data offset for finetuning: epoch {start_data_epoch}, step {data_step_offset % batches_per_epoch}"
+    )
 start_step = global_step % batches_per_epoch
 tqdm.write(f"Starting at epoch {start_epoch}, step {start_step}")
 
@@ -1215,8 +1241,22 @@ for epoch in trange(
     total=epochs_total,
     desc="epochs",
 ):
-    # Consistent shuffle so resuming gets the same ordering
-    shuffled_train_imgs = train_imgs.shuffle(seed=epoch)
+    # We use a consistent shuffle so resuming gets the same ordering.
+
+    # Separately, to support --start-where-finetune-source-left-off, we concatenate the portion of
+    # the epoch that the source run didn't see with a shuffled version of the portion of the epoch
+    # it did see. So if the source run did 200 steps on a dataset with 300 batches per epoch, our
+    # first epoch is the 100 batches the source would've seen if it continued plus the 200 batches
+    # it did see.
+    intra_epoch_offset = data_step_offset % batches_per_epoch
+    shuffled_train_imgs = train_imgs.shuffle(seed=start_data_epoch)
+    epoch_part_1 = shuffled_train_imgs.select(
+        range(intra_epoch_offset, len(train_imgs))
+    )
+    epoch_part_2 = shuffled_train_imgs.select(
+        range(len(train_imgs) - intra_epoch_offset)
+    ).shuffle(seed=start_data_epoch + 1)
+    shuffled_train_imgs = datasets.concatenate_datasets([epoch_part_1, epoch_part_2])
 
     # If we're doing a partial epoch, set the number of batches to do
     if epoch == epochs_total - 1:
@@ -1262,7 +1302,7 @@ for epoch in trange(
                     batch["cap_center"],
                     batch["cap_max_cos_distance"],
                     model_cfg.clip_cap_count,
-                    epoch,
+                    (global_step + data_step_offset) // batches_per_epoch,
                 )
                 batch_clips = jax.device_put(batch_centers, examples_sharding)
                 batch_max_cos_distances = jax.device_put(
