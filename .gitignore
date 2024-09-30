@@ -1,1 +1,10 @@
 __pycache__/
+/.hypothesis/
+/checkpoints/
+/docker/vq-f4.zip
+/imgprompts/
+/samples/
+/taming/
+/test-images/capped-examples/
+/test-images/examples-100.pq
+/wandb/
