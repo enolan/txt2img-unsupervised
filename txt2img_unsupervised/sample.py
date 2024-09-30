@@ -7,6 +7,7 @@ import jax.tree_util as jtu
 import numpy as np
 import orbax.checkpoint as ocp
 import PIL.Image
+import PIL.ImageDraw
 import subprocess
 import torch
 import transformers
@@ -81,6 +82,21 @@ def make_grid(
     side_len_px = imgs[0].size[0] * side_len + spacing * (side_len - 1)
 
     grid_img = PIL.Image.new("RGB", (side_len_px, side_len_px), color=spacing_color)
+
+    # Create a checkerboard pattern for the spacing areas. Makes it easier to see the boundaries
+    # of the images.
+    checkerboard = PIL.Image.new("RGB", (spacing, spacing))
+    checkerboard_draw = PIL.ImageDraw.Draw(checkerboard)
+    checkerboard_draw.rectangle([0, 0, spacing//2, spacing//2], fill=(255, 255, 255))
+    checkerboard_draw.rectangle([spacing//2, 0, spacing, spacing//2], fill=(240, 240, 240))
+    checkerboard_draw.rectangle([0, spacing//2, spacing//2, spacing], fill=(240, 240, 240))
+    checkerboard_draw.rectangle([spacing//2, spacing//2, spacing, spacing], fill=(255, 255, 255))
+
+    # Fill the grid with the checkerboard pattern
+    for y in range(0, side_len_px, spacing):
+        for x in range(0, side_len_px, spacing):
+            grid_img.paste(checkerboard, (x, y))
+
     for y_img in range(side_len):
         for x_img in range(side_len):
             grid_img.paste(
