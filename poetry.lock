@@ -2356,8 +2356,8 @@ test = ["dm-tree (>=0.1.7)", "flax (>=0.5.3)", "scikit-learn", "scipy (>=1.7.1)"
 [package.source]
 type = "git"
 url = "https://github.com/enolan/optax.git"
-reference = "754470910729c7e0a789587d0096b263e9fa576e"
-resolved_reference = "754470910729c7e0a789587d0096b263e9fa576e"
+reference = "b60629df6d0323db984a425ca114a11ee1f012d9"
+resolved_reference = "b60629df6d0323db984a425ca114a11ee1f012d9"
 
 [[package]]
 name = "orbax-checkpoint"
@@ -4232,4 +4232,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.11.8"
-content-hash = "5937dd4d785c1a3ada86e49fc51a59bb04591a326063dbdcbc1bf191d4969581"
+content-hash = "703f47dc5905096eba27def83461cc81d6b3b4c39a017e5b33ae3f9121ef7b20"
