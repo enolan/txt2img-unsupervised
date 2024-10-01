@@ -130,6 +130,9 @@ def setup_profiling_server():
 
 setup_profiling_server()
 
+# Turn on JAX compilation cache
+jax.config.update("jax_compilation_cache_dir", "/tmp/t2i-u-jax-cache")
+
 
 def json_pretty(dict):
     """Print a dictionary as pretty JSON."""

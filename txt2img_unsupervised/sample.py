@@ -487,6 +487,9 @@ def main():
     # computing CLIP embeddings.
     im_mdl = get_imagemodel_from_checkpoint(args.transformer_checkpoint_dir)
 
+    # Turn on JAX compilation cache
+    jax.config.update("jax_compilation_cache_dir", "/tmp/t2i-u-jax-cache")
+
     if im_mdl.clip_conditioning:
         print("Loading CLIP model...")
 
