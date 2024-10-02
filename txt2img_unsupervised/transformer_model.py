@@ -70,6 +70,9 @@ class ImageModel(nn.Module):
 
         if self.image_dropout is not None:
             self.image_dropout_layer = nn.Dropout(
+                # This drops the features within the tokens, not entire tokens. Which makes less
+                # sense as a strategy for reducing the model's ability to focus on learning local
+                # structure, but empirically works substantially better.
                 rate=self.image_dropout, deterministic=False
             )
         else:
