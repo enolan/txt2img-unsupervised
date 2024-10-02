@@ -1,10 +1,10 @@
-FROM nvidia/cuda:12.6.1-cudnn-devel-ubuntu24.04
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
     libsqlite3-dev curl libncursesw5-dev xz-utils tk-dev libxml2-dev \
     libxmlsec1-dev libffi-dev liblzma-dev rclone magic-wormhole zstd atop fish \
-    unzip git wget htop nano vmtouch jq
+    unzip git wget htop nano vmtouch jq tmux
 
 RUN usermod -s /bin/fish root
 
