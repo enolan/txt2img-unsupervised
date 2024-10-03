@@ -17,9 +17,6 @@ imageio-ffmpeg = "^0.4.8"
 infinidata = { url = "https://github.com/enolan/infinidata/releases/download/v0.0.1-alpha2/infinidata-0.0.1a2-cp311-cp311-manylinux_2_34_x86_64.whl" }
 internetarchive = "^3.5.0"
 numpy = "1.*" # 2.x series is out, should probably upgrade at some point.
-# An older version of cudnn (9.1.something I think) has a weird bug when sampling with batch size 64 that doesn't occur with 1 or 2.
-# unpin at some point.
-nvidia-cudnn-cu12 = "9.3.0.75"
 omegaconf = "^2.3.0"
 # TODO: use regular release of optax
 # we can get rid of my special optax branch and use optax.contrib.schedule_free_adamw instead of the use_first_moment=False hack
