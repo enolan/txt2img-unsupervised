@@ -29,7 +29,7 @@ r2_path=${r2_path:-$default_r2_path}
 
 rclone config
 
-rclone -P --fast-list --transfers 32 copy "r2:$r2_path" /root/dataset
+rclone -P --fast-list --transfers 24 copy "r2:$r2_path" /root/dataset
 
 echo "Download done"
 
