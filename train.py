@@ -56,6 +56,10 @@ from txt2img_unsupervised.config import (
 )
 from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
 from txt2img_unsupervised.load_pq_dir import load_pq_dir
+from txt2img_unsupervised.training_visualizations import (
+    log_attention_maps,
+    log_token_loss_visualization,
+)
 import txt2img_unsupervised.config as config
 import txt2img_unsupervised.sample as sample
 import txt2img_unsupervised.transformer_model as transformer_model
@@ -466,8 +470,6 @@ def get_clip_text_embeddings_to_sample(n: int) -> jax.Array:
 sfw_indices = find_sfw_indices(
     clip_mdl, clip_processor, test_imgs[:2048], image_prompts_to_sample
 )
-attn_visualization_img = test_imgs[int(sfw_indices[0])]
-token_loss_visualization_imgs = test_imgs[sfw_indices[:8]]
 image_prompt_clips = get_image_prompt_clip_embeddings(sfw_indices, test_imgs[:2048])
 text_prompt_clips = get_clip_text_embeddings_to_sample(8)
 
@@ -848,258 +850,6 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
         wandb.log(to_log)
 
 
-@jax.jit
-def get_attention_weights(ts, img, clips, max_cos_distances):
-    mdl_record = mdl.copy(
-        record_attention_weights=True, dropout=None, image_dropout=None
-    )
-    params = ts.get_eval_params()
-
-    logits, intermediates = mdl_record.apply(
-        params,
-        mutable=["intermediates"],
-        images=img[None, ...],
-        clip_embeddings=clips,
-        max_cos_distances=max_cos_distances,
-    )
-    weights = intermediates["intermediates"]["transformer_layers"]["mha"][
-        "attention_weights"
-    ][0].astype(jnp.float32)
-    assert weights.shape == (
-        mdl.n_layers,
-        1,
-        mdl.num_heads,
-        mdl.image_tokens,
-        mdl.image_tokens,
-    )
-
-    weights_avgd = reduce(
-        weights, "layers 1 head tok_q tok_k -> layers tok_q tok_k", "mean"
-    )
-    weights_head0 = weights[:, 0, 0]
-    assert weights_avgd.shape == (mdl.n_layers, mdl.image_tokens, mdl.image_tokens)
-    assert weights_head0.shape == (mdl.n_layers, mdl.image_tokens, mdl.image_tokens)
-
-    return weights_avgd, weights_head0
-
-
-def log_attention_maps(ts: TrainState, test_img, global_step):
-    """Generate heatmaps of the attention weights for a test image."""
-
-    if mdl.clip_conditioning and mdl.clip_caps:
-        clip_embeddings = test_img["cap_center"][None, :]
-        max_cos_distances = test_img["cap_max_cos_distance"][None, ...]
-        clip_embeddings, max_cos_distances = rearrange_batch_caps(
-            clip_embeddings,
-            max_cos_distances,
-            model_cfg.clip_cap_count,
-            0,
-            is_test=True,
-        )
-    elif mdl.clip_conditioning and not mdl.clip_caps:
-        clip_embeddings = test_img["clip_embedding"][None, :]
-        max_cos_distances = jnp.zeros((1, 0), dtype=jnp.float32)
-    else:
-        clip_embeddings = jnp.zeros((1, 0), dtype=jnp.float32)
-        max_cos_distances = jnp.zeros((1, 0), dtype=jnp.float32)
-
-    weights_avgd, weights_head0 = get_attention_weights(
-        ts, test_img["encoded_img"], clip_embeddings, max_cos_distances
-    )
-
-    to_log = {"global_step": global_step}
-
-    for i in range(mdl.n_layers):
-        layer_attn_weights_avgd = weights_avgd[i]
-        layer_attn_weights_head0 = weights_head0[i]
-
-        for weights, title, wandb_name in [
-            (
-                layer_attn_weights_avgd,
-                f"Attention weights for {test_img['name']}, all heads, layer {i} (step {global_step})",
-                f"attention_maps/avgd_layer_{i:03d}",
-            ),
-            (
-                layer_attn_weights_head0,
-                f"Attention weights for {test_img['name']}, head 0, layer {i} (step {global_step})",
-                f"attention_maps/head0_layer_{i:03d}",
-            ),
-        ]:
-            is_causal = np.allclose(np.triu(weights, k=1), 0)
-            if not is_causal:
-                tqdm.write(f"WARNING: attention weights at layer {i} are not causal")
-
-            # The plots are super hard to read with a linear color scale, since tok 0 always puts
-            # 100% of its attention weight on tok 0, meaning the max value is always 1. The min
-            # value is always nearly 0, so the maps for relatively flat layers/heads are basically
-            # a solid color. So we log transform and use a norm scheme that puts the median in
-            # the middle.
-            eps = 1e-10
-            weights_log = np.log(weights + eps)
-
-            # Mask the upper triangle to avoid it affecting the scale
-            mask = np.triu(np.ones_like(weights_log), k=1)
-            masked_weights_log = np.ma.array(weights_log, mask=mask)
-
-            # ensure vmin < vmedian < vmax. it's possible for one of the endpoints to be the median
-            # and the scaling will error out in that case.
-            vmin = np.min(masked_weights_log) - eps
-            vmedian = np.ma.median(masked_weights_log)
-            vmax = np.max(masked_weights_log) + eps
-
-            fig, ax = plt.subplots()
-            im = ax.imshow(
-                weights_log,
-                cmap="RdBu",
-                aspect="auto",
-                norm=mcolors.TwoSlopeNorm(vmin=vmin, vcenter=vmedian, vmax=vmax),
-                # align so the center of each pixel corresponds exactly to a token index
-                extent=(-0.5, weights.shape[1] - 0.5, weights.shape[0] - 0.5, -0.5),
-            )
-
-            # Add margins to make sure we can clearly see token 0
-            margin = 5.5
-            ax.set_xlim(-margin, weights.shape[1] - 1 + margin)
-            ax.set_ylim(weights.shape[0] - 1 + margin, -margin)
-
-            ax.set_title(title)
-            ax.set_xlabel("Key token")
-            ax.set_ylabel("Query token")
-
-            # Set tick marks at 0, 1/4, 1/2, 3/4, and all of the total token count. it bothers my
-            # programmer brain when they show up as 0, 250, 500, 750, 1000 instead of 0, 256, 512,
-            # 768, 1024.
-            token_count = weights.shape[0]
-            tick_positions = [x * token_count // 4 for x in range(5)]
-            ax.set_xticks(tick_positions)
-            ax.set_yticks(tick_positions)
-            ax.set_xticklabels(tick_positions)
-            ax.set_yticklabels(tick_positions)
-
-            # colorbar with original scale labels
-            cbar = fig.colorbar(im, ax=ax)
-            cbar.set_label("Attention weight")
-            log_tick_locations = np.sort(
-                np.concatenate([np.linspace(vmin, vmax, 4), np.array([vmedian])])
-            )
-            original_tick_locations = np.exp(log_tick_locations) - eps
-            cbar.set_ticks(log_tick_locations)
-            cbar.set_ticklabels([f"{loc:.2e}" for loc in original_tick_locations])
-
-            fig.tight_layout()
-            to_log[wandb_name] = fig
-            plt.close(fig)
-
-    wandb.log(to_log)
-
-
-mdl_forward_j = jax.jit(
-    lambda mdl, params, rngs, images, clip_embeddings, max_cos_distances: mdl.apply(
-        params,
-        rngs=rngs,
-        images=images,
-        clip_embeddings=clip_embeddings,
-        max_cos_distances=max_cos_distances,
-    ),
-    static_argnames=["mdl"],
-)
-
-
-def log_token_loss_visualization(ts: TrainState, test_imgs, global_step):
-    """Log charts of the per token loss and entropy for a set of test images"""
-    img_cnt = test_imgs["encoded_img"].shape[0]
-    params = ts.get_eval_params()
-
-    if mdl.clip_conditioning and mdl.clip_caps:
-        clip_embeddings, max_cos_distances = rearrange_batch_caps(
-            test_imgs["cap_center"],
-            test_imgs["cap_max_cos_distance"],
-            model_cfg.clip_cap_count,
-            0,
-            is_test=True,
-        )
-    elif mdl.clip_conditioning and not mdl.clip_caps:
-        clip_embeddings = test_imgs["clip_embedding"]
-        max_cos_distances = jnp.zeros((img_cnt, 0), dtype=jnp.float32)
-    else:
-        clip_embeddings = jnp.zeros((img_cnt, 0), dtype=jnp.float32)
-        max_cos_distances = jnp.zeros((img_cnt, 0), dtype=jnp.float32)
-    test_mdl = mdl.clone(dropout=None, image_dropout=None)
-    logits = mdl_forward_j(
-        test_mdl,
-        params,
-        rngs=ts.rng,
-        images=test_imgs["encoded_img"],
-        clip_embeddings=clip_embeddings,
-        max_cos_distances=max_cos_distances,
-    ).astype(jnp.float32)
-    losses = optax.softmax_cross_entropy(
-        logits, jax.nn.one_hot(test_imgs["encoded_img"], 8192)
-    )
-
-    # Calculate entropies
-    probs = jax.nn.softmax(logits, axis=-1)
-    entropies = -jnp.sum(probs * jnp.log(probs + 1e-10), axis=-1)
-
-    assert losses.shape == entropies.shape == (img_cnt, mdl.image_tokens)
-
-    losses, entropies = jax.device_get((losses, entropies))
-
-    # Generate scatter plot for token losses
-    fig_loss, ax_loss = plt.subplots(figsize=(12, 8))
-
-    for i in range(img_cnt):
-        ax_loss.scatter(
-            range(mdl.image_tokens),
-            losses[i],
-            label=test_imgs["name"][i],
-            alpha=0.5,
-            s=10,
-        )
-
-    ax_loss.set_xlabel("Token #")
-    ax_loss.set_ylabel("Loss")
-    ax_loss.set_title(f"Per-Token Loss for Test Images (step {global_step})")
-    tick_positions = [x * mdl.image_tokens // 8 for x in range(9)]
-    ax_loss.set_xticks(tick_positions)
-    ax_loss.set_xticklabels(tick_positions)
-    ax_loss.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-
-    plt.tight_layout()
-
-    wandb.log(
-        {"global_step": global_step, "token_loss_visualization": wandb.Image(fig_loss)}
-    )
-    plt.close(fig_loss)
-
-    # Generate scatter plot for token entropies
-    fig_entropy, ax_entropy = plt.subplots(figsize=(12, 8))
-
-    for i in range(img_cnt):
-        ax_entropy.scatter(
-            range(mdl.image_tokens),
-            entropies[i],
-            label=test_imgs["name"][i],
-            alpha=0.5,
-            s=10,
-        )
-
-    ax_entropy.set_xlabel("Token #")
-    ax_entropy.set_ylabel("Entropy")
-    ax_entropy.set_title(f"Per-Token Entropy for Test Images (step {global_step})")
-    ax_entropy.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-
-    plt.tight_layout()
-
-    wandb.log(
-        {
-            "global_step": global_step,
-            "token_entropy_visualization": wandb.Image(fig_entropy),
-        }
-    )
-    plt.close(fig_entropy)
-
-
 last_cap_set = None  # We track the last one so we can print when it changes
 
 
@@ -1110,7 +860,7 @@ def rearrange_batch_caps(
     appropriate subset of the caps for the current epoch. For reasons, parquet does not support
     multidimensional arrays. Prints a message when the cap set changes, unless is_test is True, in
     which case it doesn't print anything."""
-    assert len(centers.shape) == 2
+    assert len(centers.shape) == 2, f"centers shape {centers.shape}"
     batch_size = centers.shape[0]
     assert centers.shape[1] % 768 == 0
     dset_cap_count = centers.shape[1] // 768
@@ -1194,16 +944,50 @@ def save_checkpoint_and_log_images(
         tqdm.write("Sampling")
         sample_and_log(my_train_state, sample_batch_size, global_step)
         tqdm.write("Done sampling")
+        visualization_imgs = test_imgs[sfw_indices[:8]]
+        visualization_img_names = visualization_imgs["name"]
+        visualization_img_encodings = visualization_imgs["encoded_img"]
+        if mdl.clip_conditioning and mdl.clip_caps:
+            (
+                visualization_embeddings,
+                visualization_max_cos_distances,
+            ) = rearrange_batch_caps(
+                visualization_imgs["cap_center"],
+                visualization_imgs["cap_max_cos_distance"],
+                mdl.clip_cap_count,
+                epoch=0,
+                is_test=True,
+            )
+        elif mdl.clip_conditioning and not mdl.clip_caps:
+            visualization_embeddings = visualization_imgs["clip_embedding"]
+            visualization_max_cos_distances = jnp.zeros((len(visualization_imgs), 0))
+        else:
+            visualization_embeddings = jnp.zeros((len(visualization_imgs), 0))
+            visualization_max_cos_distances = jnp.zeros((len(visualization_imgs), 0))
         tqdm.write("Logging attention maps")
-        log_attention_maps(my_train_state, attn_visualization_img, global_step)
+        log_attention_maps(
+            my_train_state,
+            mdl,
+            visualization_img_encodings[0],
+            visualization_img_names[0],
+            visualization_embeddings[0],
+            visualization_max_cos_distances[0],
+            global_step,
+        )
         tqdm.write("Done logging attention maps")
-        # The attention maps are very large (~3G for a single set with gpt-2-m) so we need to make sure
-        # the VRAM is freed before we try training again. My kingdom for predictable memory
+        # The attention maps are very large (~3G for a single set with gpt-2-m) so we need to make
+        # sure the VRAM is freed before we try training again. My kingdom for predictable memory
         # deallocation...
         gc.collect()
         tqdm.write("Logging token loss visualization")
         log_token_loss_visualization(
-            my_train_state, token_loss_visualization_imgs, global_step
+            my_train_state,
+            mdl,
+            visualization_img_encodings,
+            visualization_img_names,
+            visualization_embeddings,
+            visualization_max_cos_distances,
+            global_step,
         )
         tqdm.write("Done logging token loss visualization")
     else:
