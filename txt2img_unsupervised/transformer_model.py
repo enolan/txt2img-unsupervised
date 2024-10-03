@@ -1722,7 +1722,7 @@ def test_learn_zeros(pre_norm: bool) -> None:
     mdl = ImageModel(**mdl_cfg.__dict__)
     data = jnp.zeros((16, gpt_1_config.image_tokens), dtype=jnp.int32)
     loss, params = train_loop_simple(
-        data, mdl, iters=5, learning_rate=3e-2, warmup_steps=0
+        data, mdl, iters=5, learning_rate=3e-2, warmup_steps=1
     )
     assert loss < 1e-10
 
