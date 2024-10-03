@@ -160,8 +160,11 @@ def init_train_state():
         print(f"Resuming from checkpoint {args.resume}...")
         checkpoint_dir = args.resume.absolute()
         checkpoint_manager = mk_checkpoint_manager(checkpoint_dir)
-        # Checkpoint saved after step n, so we start at step n+1
-        global_step = checkpoint_manager.latest_step() + 1
+        # The step recorded in a checkpoint is the number of steps completed, so our starting step
+        # index is that number. If the checkpoint we're resuming from completed 0 steps, we start
+        # at step 0, if it completed 5 steps, that means it did 0-4 inclusive, so we start at step
+        # 5.
+        global_step = checkpoint_manager.latest_step()
         metadata = checkpoint_manager.metadata()
         model_cfg = ModelConfig.from_json_dict(metadata["model_cfg"])
         training_cfg = TrainingConfig.from_json_dict(metadata["training_cfg"])
@@ -177,7 +180,7 @@ def init_train_state():
 
         train_state, mdl = TrainState.load_from_checkpoint(
             checkpoint_manager,
-            global_step - 1,
+            global_step,
             1,  # batches total will be update after we load the dataset
         )
     else:
@@ -1126,18 +1129,6 @@ for epoch in trange(
                     "debug/notfinite_count": notfinite_count,
                 }
             )
-            # Save checkpoint every 30 minutes. This does one at step 0 too, which is nice so we
-            # don't have to wait half an hour to find out if it crashes.
-            if last_checkpoint_time is None or (
-                datetime.datetime.now() - last_checkpoint_time
-            ) > datetime.timedelta(minutes=30):
-                save_checkpoint_and_log_images(
-                    train_state,
-                    sample_batch_size,
-                    global_step,
-                    args.skip_sampling,
-                )
-                last_checkpoint_time = datetime.datetime.now()
 
             if notfinite_count > 50:
                 tqdm.write(f"Too many nonfinite values in gradients, giving up")
@@ -1207,13 +1198,23 @@ for epoch in trange(
             else:
                 pbar.set_postfix(train_loss=f"{train_loss:.4f}")
             pbar.update()
+            global_step += 1
             if exit_requested:
                 tqdm.write("Saving checkpoint and exiting early")
                 save_checkpoint_and_log_images(
                     train_state, sample_batch_size, global_step, skip_sampling=True
                 )
                 exit(0)
-            global_step += 1
+            # Save checkpoint every 30 minutes. This does one after step 0 too, which is nice so we
+            # don't have to wait half an hour to find out if it crashes.
+            if last_checkpoint_time is None or (
+                datetime.datetime.now() - last_checkpoint_time
+            ) > datetime.timedelta(minutes=30):
+                save_checkpoint_and_log_images(
+                    train_state, sample_batch_size, global_step, args.skip_sampling
+                )
+                last_checkpoint_time = datetime.datetime.now()
+
     # Evaluate on test set
     losses = []
     eval_params = train_state.get_eval_params()
