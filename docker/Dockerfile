@@ -1,10 +1,13 @@
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+# Generic parameterized Dockerfile for Vast.ai and RunPod
 
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# Install common packages
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
-    libsqlite3-dev curl libncursesw5-dev xz-utils tk-dev libxml2-dev \
-    libxmlsec1-dev libffi-dev liblzma-dev rclone magic-wormhole zstd atop fish \
-    unzip git wget htop nano vmtouch jq tmux
+    atop build-essential curl fish git htop jq less libbz2-dev libffi-dev liblzma-dev \
+    libncursesw5-dev libreadline-dev libsqlite3-dev libssl-dev libxml2-dev libxmlsec1-dev \
+    magic-wormhole nano rclone tk-dev tmux unzip vmtouch wget xz-utils zlib1g-dev zstd
 
 RUN usermod -s /bin/fish root
 
@@ -15,7 +18,6 @@ RUN unzip /root/vq-f4.zip -d /root/vq-f4
 RUN curl https://pyenv.run | bash
 ENV PATH="/root/.pyenv/bin:/root/.pyenv/shims:$PATH"
 RUN echo $(pyenv init) >> /root/.bashrc
-
 RUN pyenv install 3.11.8 && pyenv global 3.11.8
 
 ADD fish-pyenv.fish /root/.config/fish/conf.d/fish-pyenv.fish
