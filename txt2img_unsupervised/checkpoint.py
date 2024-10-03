@@ -147,10 +147,19 @@ class TrainState(train_state.TrainState):
         """Replicate parameters for multi-GPU training."""
         devices = mesh_utils.create_device_mesh((jax.device_count(),))
         mesh = Mesh(devices, axis_names=("dev",))
-        replicated_params = jax.device_put(
-            self.params, NamedSharding(mesh, PartitionSpec(None))
-        )
-        return self.replace(params=replicated_params)
+
+        def replicate_val(v):
+            if isinstance(v, int) or isinstance(v, float):
+                return jax.device_put(v, NamedSharding(mesh, PartitionSpec()))
+            elif isinstance(v, jax.Array):
+                if len(v.shape) == 0:
+                    return jax.device_put(v, NamedSharding(mesh, PartitionSpec()))
+                else:
+                    return jax.device_put(v, NamedSharding(mesh, PartitionSpec(None)))
+            else:
+                raise ValueError(f"Unsupported type: {type(v)}")
+
+        return jax.tree.map(replicate_val, self)
 
     @classmethod
     def load_from_checkpoint(
