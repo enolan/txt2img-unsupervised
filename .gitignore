@@ -8,3 +8,4 @@ __pycache__/
 /test-images/capped-examples/
 /test-images/examples-100.pq
 /wandb/
+/.infinidata_tmp
