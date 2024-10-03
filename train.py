@@ -210,6 +210,9 @@ def init_train_state():
                 finetune_src_checkpoint_dir
             )
             if args.start_where_finetune_source_left_off:
+                # data_step_offset is offset (in batches) we use into the training data, equal to
+                # the number of batches the source run trained on. We track this number so we don't
+                # repeat any training data the source run saw before we have to.
                 data_step_offset = finetune_src_checkpoint_manager.latest_step() + 1
             else:
                 data_step_offset = 0
