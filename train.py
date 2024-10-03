@@ -159,7 +159,7 @@ def init_train_state():
     if args.resume is not None:
         print(f"Resuming from checkpoint {args.resume}...")
         checkpoint_dir = args.resume.absolute()
-        checkpoint_manager = mk_checkpoint_manager(checkpoint_dir)
+        checkpoint_manager = mk_checkpoint_manager(checkpoint_dir, checkpoint_options)
         # The step recorded in a checkpoint is the number of steps completed, so our starting step
         # index is that number. If the checkpoint we're resuming from completed 0 steps, we start
         # at step 0, if it completed 5 steps, that means it did 0-4 inclusive, so we start at step

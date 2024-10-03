@@ -272,10 +272,17 @@ class TrainState(train_state.TrainState):
                 time.sleep(60)
 
 
-def mk_checkpoint_manager(checkpoint_dir: Path) -> ocp.CheckpointManager:
+def mk_checkpoint_manager(
+    checkpoint_dir: Path,
+    checkpoint_manager_options: Optional[ocp.CheckpointManagerOptions] = None,
+) -> ocp.CheckpointManager:
     """Create a CheckpointManager for a directory that already has checkpoints in it."""
     item_names = ("params", "opt_state", "rng")
-    return ocp.CheckpointManager(checkpoint_dir.absolute(), item_names=item_names)
+    return ocp.CheckpointManager(
+        checkpoint_dir.absolute(),
+        item_names=item_names,
+        options=checkpoint_manager_options,
+    )
 
 
 def get_imagemodel_from_checkpoint(checkpoint_dir: Path) -> ImageModel:
