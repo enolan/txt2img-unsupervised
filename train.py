@@ -34,6 +34,7 @@ from einops import rearrange, reduce, repeat
 from functools import partial
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from math import ceil
 from omegaconf import OmegaConf
 from pathlib import Path
 from sys import exit
@@ -56,6 +57,7 @@ from txt2img_unsupervised.config import (
 )
 from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
 from txt2img_unsupervised.load_pq_dir import load_pq_dir
+from txt2img_unsupervised.train_data_loading import get_batch
 from txt2img_unsupervised.training_visualizations import (
     log_attention_maps,
     log_token_loss_visualization,
@@ -169,7 +171,7 @@ def init_train_state():
         model_cfg = ModelConfig.from_json_dict(metadata["model_cfg"])
         training_cfg = TrainingConfig.from_json_dict(metadata["training_cfg"])
         run_id = metadata["run_id"]
-        data_step_offset = metadata.get("data_step_offset", 0)
+        data_offset = metadata.get("data_offset", 0)
         print(f"Resuming run {run_id}")
         print(
             "ALL TRAINING AND MODEL PARAMETERS PASSED ON THE COMMAND LINE WILL BE IGNORED."
@@ -217,18 +219,25 @@ def init_train_state():
                 finetune_src_checkpoint_dir
             )
             if args.start_where_finetune_source_left_off:
-                # data_step_offset is offset (in batches) we use into the training data, equal to
-                # the number of batches the source run trained on. We track this number so we don't
-                # repeat any training data the source run saw before we have to.
-                data_step_offset = finetune_src_checkpoint_manager.latest_step() + 1
+                # data_offset is the offset (in batches) we use into the training data, equal to the
+                # number of examples the source run trained on divided by our batch size, rounded
+                # up. We track this number so we don't repeat any training data the source run saw
+                # before we have to.
+                data_offset_examples = (
+                    finetune_src_checkpoint_manager.latest_step()
+                    * finetune_src_checkpoint_manager.metadata()["training_cfg"][
+                        "batch_size"
+                    ]
+                )
+                data_offset = ceil(data_offset_examples / training_cfg.batch_size)
             else:
-                data_step_offset = 0
+                data_offset = 0
             extra_metadata = (
                 "finetune_src_config",
                 finetune_src_checkpoint_manager.metadata(),
             )
         else:
-            data_step_offset = 0
+            data_offset = 0
             extra_metadata = None
         # Set up checkpoint manager and initial state
 
@@ -241,7 +250,7 @@ def init_train_state():
             training_cfg,
             jax.random.PRNGKey(1337),
             1,  # We don't know the total number of batches until we load the dataset
-            data_step_offset=data_step_offset,
+            data_offset=data_offset,
             extra_metadata=extra_metadata,
         )
 
@@ -291,7 +300,7 @@ def init_train_state():
         checkpoint_manager,
         train_state,
         mdl,
-        data_step_offset,
+        data_offset,
     )
 
 
@@ -303,13 +312,11 @@ def init_train_state():
     checkpoint_manager,
     train_state,
     mdl,
-    data_step_offset,
+    data_offset,
 ) = init_train_state()
 
 
 def load_dataset(dir: Path) -> Tuple[Dataset, Dataset]:
-    # The paths don't necessarily come out in the same order on every machine, so we sort to make the
-    # example order consistent.
     dset_all = load_pq_dir(dir)
     dset_split = dset_all.train_test_split(test_size=0.01, seed=19900515)
     train_imgs = dset_split["train"]
@@ -437,16 +444,6 @@ def find_sfw_indices(clip_mdl, clip_processor, dset, n: int):
     return jax.device_get(ok_indices[:n])
 
 
-def get_image_prompt_clip_embeddings(indices: np.ndarray, dset: Dataset) -> jax.Array:
-    """Find n hopefully SFW CLIP embeddings to use for diagnostic sampling."""
-
-    print(f"Using {[dset['name'][i] for i in indices]} for diagnostic sampling")
-    return {
-        "clip_embedding": dset["clip_embedding"][indices],
-        "name": dset["name"][indices],
-    }
-
-
 def get_clip_text_embeddings_to_sample(n: int) -> jax.Array:
     """Generate some text embeddings to test the model with."""
     prompts = [
@@ -473,7 +470,10 @@ def get_clip_text_embeddings_to_sample(n: int) -> jax.Array:
 sfw_indices = find_sfw_indices(
     clip_mdl, clip_processor, test_imgs[:2048], image_prompts_to_sample
 )
-image_prompt_clips = get_image_prompt_clip_embeddings(sfw_indices, test_imgs[:2048])
+visualization_dset = test_imgs.select(sfw_indices[:8])
+print(
+    f"Using {[visualization_dset['name'][i] for i in range(8)]} for visualization & sampling"
+)
 text_prompt_clips = get_clip_text_embeddings_to_sample(8)
 
 del clip_mdl, clip_processor
@@ -623,7 +623,7 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
         # Create a grid of samples for each set of conditions.
         grid_size = 9
 
-        image_prompt_names = image_prompt_clips["name"]
+        image_prompt_names = visualization_dset["name"]
         text_prompt_texts = text_prompt_clips["name"]
 
         if model_cfg.clip_caps:
@@ -632,7 +632,7 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
                 img_max_cos_distances,
                 img_max_cos_distance_choices,
             ) = mk_image_prompt_conditions(
-                image_prompt_clips["clip_embedding"], grid_size
+                visualization_dset["clip_embedding"], grid_size
             )
 
             img_centers_for_sampling = rearrange(
@@ -730,7 +730,7 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
             wandb.log(to_log)
         else:
             img_clip_embeddings, _ = mk_image_prompt_conditions(
-                image_prompt_clips["clip_embedding"], grid_size
+                visualization_dset["clip_embedding"], grid_size
             )
             img_clip_embeddings_for_sampling = rearrange(
                 img_clip_embeddings,
@@ -853,61 +853,6 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
         wandb.log(to_log)
 
 
-last_cap_set = None  # We track the last one so we can print when it changes
-
-
-def rearrange_batch_caps(
-    centers, max_cos_distances, model_cap_count, epoch, is_test=False
-):
-    """Rearrange the cap data from parquet into the shape expected by the model and select the
-    appropriate subset of the caps for the current epoch. For reasons, parquet does not support
-    multidimensional arrays. Prints a message when the cap set changes, unless is_test is True, in
-    which case it doesn't print anything."""
-    assert len(centers.shape) == 2, f"centers shape {centers.shape}"
-    batch_size = centers.shape[0]
-    assert centers.shape[1] % 768 == 0
-    dset_cap_count = centers.shape[1] // 768
-
-    # normalize max_cos_distances shape, one of the dimensions should be dset_cap_count
-    if dset_cap_count == 1:
-        assert max_cos_distances.shape == (
-            batch_size,
-        ), f"max_cos_distances batch shape {max_cos_distances.shape}, should be unidimensional if the dataset contains only a sinple cap"
-        max_cos_distances = rearrange(max_cos_distances, "b -> b 1")
-
-    assert max_cos_distances.shape[0] == batch_size
-    assert max_cos_distances.shape[1] == dset_cap_count
-
-    centers = rearrange(centers, "b (n c) -> b n c", n=dset_cap_count, c=768)
-
-    assert centers.shape[1] == max_cos_distances.shape[1]
-    dset_cap_count = centers.shape[1]
-    assert (
-        dset_cap_count % model_cap_count == 0
-    ), f"Dataset cap count {dset_cap_count} not divisible by model cap count {model_cap_count}"
-
-    # This just feeds all the non-overlapping contiguous subsequences of the dataset caps to the
-    # model sequentially - one subsequence per epoch. Ideally we'd go through all the permutations
-    # in a smart order - non-overlapping sets first, but that's more complicated.
-    distinct_cap_sets = dset_cap_count // model_cap_count
-    this_cap_set = epoch % distinct_cap_sets
-    this_cap_set_start = this_cap_set * model_cap_count
-    this_cap_set_end = this_cap_set_start + model_cap_count
-
-    if not is_test:
-        global last_cap_set
-        if last_cap_set != this_cap_set:
-            tqdm.write(
-                f"Switching to cap set #{this_cap_set} of {distinct_cap_sets} total - {this_cap_set_start}:{this_cap_set_end}"
-            )
-            last_cap_set = this_cap_set
-
-    centers = centers[:, this_cap_set_start:this_cap_set_end, :]
-    max_cos_distances = max_cos_distances[:, this_cap_set_start:this_cap_set_end]
-
-    return centers, max_cos_distances
-
-
 @partial(jax.jit, donate_argnames=["state"], static_argnames=["loss_decay_constant"])
 def train_step(
     state: TrainState,
@@ -949,24 +894,19 @@ def save_checkpoint_and_log_images(
         tqdm.write("Done sampling")
         visualization_imgs = test_imgs[sfw_indices[:8]]
         visualization_img_names = visualization_imgs["name"]
-        visualization_img_encodings = visualization_imgs["encoded_img"]
-        if mdl.clip_conditioning and mdl.clip_caps:
-            (
-                visualization_embeddings,
-                visualization_max_cos_distances,
-            ) = rearrange_batch_caps(
-                visualization_imgs["cap_center"],
-                visualization_imgs["cap_max_cos_distance"],
-                mdl.clip_cap_count,
-                epoch=0,
-                is_test=True,
-            )
-        elif mdl.clip_conditioning and not mdl.clip_caps:
-            visualization_embeddings = visualization_imgs["clip_embedding"]
-            visualization_max_cos_distances = jnp.zeros((len(visualization_imgs), 0))
-        else:
-            visualization_embeddings = jnp.zeros((len(visualization_imgs), 0))
-            visualization_max_cos_distances = jnp.zeros((len(visualization_imgs), 0))
+        (
+            visualization_img_encodings,
+            visualization_embeddings,
+            visualization_max_cos_distances,
+        ) = get_batch(
+            visualization_dset,
+            len(visualization_dset),
+            0,
+            clip_conditioning=mdl.clip_conditioning,
+            clip_caps=mdl.clip_caps,
+            clip_cap_count=mdl.clip_cap_count,
+            sharding=examples_sharding,
+        )
         tqdm.write("Logging attention maps")
         log_attention_maps(
             my_train_state,
@@ -998,14 +938,10 @@ def save_checkpoint_and_log_images(
 
 
 assert global_step < batches_total, "training run is over my dude"
-# to support --start-where-finetune-source-left-off, we need to track the progress in the *run*
-# separately from the progress through the dataset, which will be offset.
+
 start_epoch = global_step // batches_per_epoch
-start_data_epoch = (global_step + data_step_offset) // batches_per_epoch
-if data_step_offset > 0:
-    print(
-        f"Using data offset for finetuning: epoch {start_data_epoch}, step {data_step_offset % batches_per_epoch}"
-    )
+if data_offset > 0:
+    print(f"Using data offset for finetuning: {data_offset} batches")
 start_step = global_step % batches_per_epoch
 tqdm.write(f"Starting at epoch {start_epoch}, step {start_step}")
 
@@ -1034,23 +970,6 @@ for epoch in trange(
     total=epochs_total,
     desc="epochs",
 ):
-    # We use a consistent shuffle so resuming gets the same ordering.
-
-    # Separately, to support --start-where-finetune-source-left-off, we concatenate the portion of
-    # the epoch that the source run didn't see with a shuffled version of the portion of the epoch
-    # it did see. So if the source run did 200 steps on a dataset with 300 batches per epoch, our
-    # first epoch is the 100 batches the source would've seen if it continued plus the 200 batches
-    # it did see.
-    intra_epoch_offset = data_step_offset % batches_per_epoch
-    shuffled_train_imgs = train_imgs.shuffle(seed=start_data_epoch)
-    epoch_part_1 = shuffled_train_imgs.select(
-        range(intra_epoch_offset, len(train_imgs))
-    )
-    epoch_part_2 = shuffled_train_imgs.select(
-        range(len(train_imgs) - intra_epoch_offset)
-    ).shuffle(seed=start_data_epoch + 1)
-    shuffled_train_imgs = datasets.concatenate_datasets([epoch_part_1, epoch_part_2])
-
     # If we're doing a partial epoch, set the number of batches to do
     if epoch == epochs_total - 1:
         # The number of batches for the epoch, assuming we're not resuming
@@ -1064,16 +983,6 @@ for epoch in trange(
     actual_batches = batches_for_this_epoch - this_start_step
     this_end_step = this_start_step + actual_batches
 
-    # Much faster to skip leading examples this way than with islice
-    shuffled_train_imgs = shuffled_train_imgs.select(
-        range(
-            this_start_step * training_cfg.batch_size,
-            this_end_step * training_cfg.batch_size,
-        )
-    )
-    iter = shuffled_train_imgs.iter(
-        batch_size=training_cfg.batch_size, drop_last_batch=True
-    )
     tqdm.write(
         f"Epoch {epoch} starting at step {this_start_step}, doing {actual_batches} steps, ending at step {this_end_step}"
     )
@@ -1083,31 +992,20 @@ for epoch in trange(
         desc="train batches",
         initial=this_start_step,
     ) as pbar:
-        for batch in iter:
-            batch_imgs = jax.device_put(batch["encoded_img"], examples_sharding)
-            if model_cfg.clip_conditioning and not model_cfg.clip_caps:
-                batch_clips = jax.device_put(batch["clip_embedding"], examples_sharding)
-                batch_max_cos_distances = jax.device_put(
-                    jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
-                )
-            elif model_cfg.clip_conditioning and model_cfg.clip_caps:
-                batch_centers, batch_max_cos_distances = rearrange_batch_caps(
-                    batch["cap_center"],
-                    batch["cap_max_cos_distance"],
-                    model_cfg.clip_cap_count,
-                    (global_step + data_step_offset) // batches_per_epoch,
-                )
-                batch_clips = jax.device_put(batch_centers, examples_sharding)
-                batch_max_cos_distances = jax.device_put(
-                    batch_max_cos_distances, examples_sharding
-                )
-            else:
-                batch_clips = jax.device_put(
-                    jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
-                )
-                batch_max_cos_distances = jax.device_put(
-                    jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
-                )
+        for batch_idx in range(actual_batches):
+            # In order to support --start-where-finetune-source-left-off, we offset where we're
+            # reading the data from by the amount of examples seen in the source run (expressed in
+            # units of this run's batch size).
+            batch_imgs, batch_clips, batch_max_cos_distances = get_batch(
+                train_imgs,
+                training_cfg.batch_size,
+                global_step + data_offset,
+                clip_conditioning=mdl.clip_conditioning,
+                clip_caps=mdl.clip_caps,
+                clip_cap_count=mdl.clip_cap_count,
+                sharding=examples_sharding,
+            )
+            assert batch_imgs.shape == (training_cfg.batch_size, mdl.image_tokens)
             train_state, train_loss, norm = train_step(
                 train_state,
                 training_cfg.loss_decay_constant,
@@ -1218,42 +1116,21 @@ for epoch in trange(
     # Evaluate on test set
     losses = []
     eval_params = train_state.get_eval_params()
-    for batch in tqdm(
-        # The last batch needs to be a multiple of the number of devices, and it isn't guaranteed
-        # to be, so we drop it. Shouldn't matter much when even 1% of the dataset is thousands of
-        # images.
-        test_imgs.iter(batch_size=training_cfg.batch_size, drop_last_batch=True),
-        total=len(test_imgs) // training_cfg.batch_size,
+    for batch_idx in trange(
+        len(test_imgs) // training_cfg.batch_size,
         desc="test batches",
     ):
         dropout_rng, rng = jax.random.split(train_state.rng, 2)
         train_state = train_state.replace(rng=rng)
-        batch_imgs = jax.device_put(batch["encoded_img"], examples_sharding)
-        if model_cfg.clip_conditioning:
-            if model_cfg.clip_caps:
-                batch_cap_centers, batch_max_cos_distances = rearrange_batch_caps(
-                    batch["cap_center"],
-                    batch["cap_max_cos_distance"],
-                    model_cfg.clip_cap_count,
-                    epoch=0,  # could iterate and do every cap set but this is faster and fine with lots of test images
-                    is_test=True,
-                )
-                batch_clips = jax.device_put(batch_cap_centers, examples_sharding)
-                batch_max_cos_distances = jax.device_put(
-                    batch_max_cos_distances, examples_sharding
-                )
-            else:
-                batch_clips = jax.device_put(batch["clip_embedding"], examples_sharding)
-                batch_max_cos_distances = jax.device_put(
-                    jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
-                )
-        else:
-            batch_clips = jax.device_put(
-                jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
-            )
-            batch_max_cos_distances = jax.device_put(
-                jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
-            )
+        batch_imgs, batch_clips, batch_max_cos_distances = get_batch(
+            test_imgs,
+            training_cfg.batch_size,
+            batch_idx,
+            clip_conditioning=mdl.clip_conditioning,
+            clip_caps=mdl.clip_caps,
+            clip_cap_count=mdl.clip_cap_count,
+            sharding=examples_sharding,
+        )
         losses.append(
             loss_fn(
                 eval_params,

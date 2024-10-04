@@ -335,7 +335,7 @@ def setup_checkpoint_manager_and_initial_state(
     training_cfg: TrainingConfig,
     rng: jax.random.PRNGKey,
     batches_total: int,
-    data_step_offset: int = 0,
+    data_offset: int = 0,
     extra_metadata: Optional[Tuple[str, Any]] = None,
 ) -> Tuple[ocp.CheckpointManager, TrainState]:
     """
@@ -379,7 +379,7 @@ def setup_checkpoint_manager_and_initial_state(
             "training_cfg": training_cfg.to_json_dict(),
             "run_id": run_id,
             "commit_hash": commit_hash,
-            "data_step_offset": data_step_offset,
+            "data_offset": data_offset,
         }
         | extra_metadata,
     )
