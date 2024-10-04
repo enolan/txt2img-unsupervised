@@ -28,7 +28,7 @@ if [[ "$checkpoint_path" == "checkpoints/" || "$checkpoint_path" == "checkpoints
     exit 1
 fi
 
-rclone_path="r2:txt2img-unsupervised-checkpoints/$(basename "$checkpoint_path")"
+rclone_path="r2-ckpt:txt2img-unsupervised-checkpoints/$(basename "$checkpoint_path")"
 
 
 echo "Will sync $checkpoint_path to $rclone_path"
