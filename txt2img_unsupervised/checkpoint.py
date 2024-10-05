@@ -2,8 +2,10 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import orbax.checkpoint as ocp
+import pytest
 import time
 import subprocess
 
@@ -230,20 +232,19 @@ class TrainState(train_state.TrainState):
 
         return train_state, mdl
 
+    @jax.jit
     def get_eval_params(self):
         """Get the parameters for evaluation. With schedule-free optimizers this is different than
         the params used for training."""
         # Find the innermost optimizer state
         if isinstance(self.opt_state, optax.ApplyIfFiniteState):
-            opt_state = self.opt_state.inner_state[
-                1
-            ]  # The main optimizer state is the second element
+            opt_state = self.opt_state.inner_state
 
-        # Handle chain (for gradient clipping)
-        if isinstance(opt_state, list):
+        # chain for gradient clipping
+        if isinstance(opt_state, tuple):
             opt_state = opt_state[-1]  # The main optimizer is the last in the chain
 
-        # Handle gradient accumulation
+        # gradient accumulation
         if isinstance(opt_state, optax.MultiStepsState):
             opt_state = opt_state.inner_opt_state
 
@@ -251,7 +252,7 @@ class TrainState(train_state.TrainState):
         if isinstance(opt_state, optax.contrib.ScheduleFreeState):
             return optax.contrib.schedule_free_eval_params(opt_state, self.params)
 
-        # For all other cases, return the regular params
+        # For scheduleful optimizers, return the regular params
         return self.params
 
     def save_checkpoint(
@@ -392,3 +393,61 @@ def setup_checkpoint_manager_and_initial_state(
     initial_state.save_checkpoint(checkpoint_manager, global_step=0)
 
     return checkpoint_manager, initial_state
+
+
+@pytest.mark.parametrize("schedule_free", [True, False])
+@pytest.mark.parametrize("gradient_accumulation_steps", [1, 2])
+@pytest.mark.parametrize("gradient_clipping", [None, 1.0])
+def test_get_eval_params(gradient_clipping, gradient_accumulation_steps, schedule_free):
+    # Set up a TrainState with either schedule-free or non-schedule-free optimizer
+    rng = jax.random.PRNGKey(0)
+
+    if schedule_free:
+        training_cfg = TrainingConfig(
+            learning_rate_schedule=LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE,
+            schedule_free_beta1=0.9,
+            warmup_steps=100,
+            learning_rate=1e-4,
+            batch_size=128,
+            epochs=1,
+            gradient_clipping=gradient_clipping,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
+    else:
+        training_cfg = TrainingConfig(
+            learning_rate_schedule=LearningRateSchedule.CONSTANT,
+            learning_rate=1e-4,
+            batch_size=128,
+            epochs=1,
+            gradient_clipping=gradient_clipping,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
+
+    optimizer = setup_optimizer(training_cfg, batches_total=1000)
+
+    # Initialize parameters with random values
+    params = jax.random.normal(rng, (10,))
+
+    state = TrainState.create(
+        apply_fn=lambda x: x,  # dummy apply function
+        params=params,
+        tx=optimizer,
+        rng=rng,
+    )
+
+    # We have to do some steps for the average to potentially diverge from the original params
+    step_grads = jax.jit(
+        lambda state: state.apply_gradients(grads=jnp.ones_like(params))
+    )
+    for _ in range(10 * gradient_accumulation_steps):
+        state = step_grads(state)
+
+    # Get eval params
+    eval_params = state.get_eval_params()
+
+    if schedule_free:
+        # schedule-free eval params should be different from the params for gradient computation
+        assert not jnp.allclose(eval_params, state.params)
+    else:
+        # scheduleful eval params should be the same
+        np.testing.assert_array_equal(eval_params, state.params)
