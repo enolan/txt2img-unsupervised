@@ -183,7 +183,10 @@ def init_train_state():
         train_state, mdl = TrainState.load_from_checkpoint(
             checkpoint_manager,
             global_step,
-            1,  # batches total will be update after we load the dataset
+            # we don't know the total number of batches until calculate_steps
+            training_cfg.warmup_steps + 1
+            if training_cfg.warmup_steps is not None
+            else 1,
         )
     else:
         print("Starting new run...")
@@ -249,7 +252,10 @@ def init_train_state():
             model_cfg,
             training_cfg,
             jax.random.PRNGKey(1337),
-            1,  # We don't know the total number of batches until we load the dataset
+            # we don't know the total number of batches until calculate_steps
+            training_cfg.warmup_steps + 1
+            if training_cfg.warmup_steps is not None
+            else 1,
             data_offset=data_offset,
             extra_metadata=extra_metadata,
         )
