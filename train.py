@@ -102,6 +102,11 @@ parser.add_argument("--gradient-accumulation-steps", type=int)
 parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--gradient-clipping", type=float, default=None)
 parser.add_argument("--loss-decay-constant", type=float, default=1.0)
+parser.add_argument("--adaptive-gradient-skip", type=lambda x: bool(strtobool(x)))
+parser.add_argument("--adaptive-gradient-skip-history-len", type=int, default=None)
+parser.add_argument(
+    "--adaptive-gradient-skip-threshold-factor", type=float, default=None
+)
 parser.add_argument("--image-dropout", type=float, default=None)
 parser.add_argument("--ae-cfg", type=Path, required=True)
 parser.add_argument("--ae-ckpt", type=Path, required=True)
@@ -1023,9 +1028,28 @@ for epoch in trange(
                 batch_max_cos_distances,
             )
             opt_state = train_state.opt_state
-            train_loss, notfinite_count, norm = jax.device_get(
-                (train_loss, opt_state.notfinite_count, norm)
-            )
+            if training_cfg.adaptive_gradient_skip:
+                (
+                    train_loss,
+                    notfinite_count,
+                    norm,
+                    skipped_last,
+                    skip_count,
+                ) = jax.device_get(
+                    (
+                        train_loss,
+                        opt_state.notfinite_count,
+                        norm,
+                        opt_state.inner_state.skipped_last,
+                        opt_state.inner_state.skip_count,
+                    )
+                )
+            else:
+                train_loss, notfinite_count, norm = jax.device_get(
+                    (train_loss, opt_state.notfinite_count, norm)
+                )
+                skipped_last = False
+                skip_count = 0
             if not jnp.isfinite(train_loss):
                 tqdm.write(f"Loss nonfinite 😢 ({train_loss})")
             wandb.log(
@@ -1034,9 +1058,11 @@ for epoch in trange(
                     "train/loss": train_loss,
                     "grad_global_norm": norm,
                     "debug/notfinite_count": notfinite_count,
+                    "debug/skipped_updates": skip_count,
                 }
             )
-
+            if skipped_last:
+                tqdm.write(f"Skipped update due to large gradient norm: {norm}")
             if notfinite_count > 50:
                 tqdm.write(f"Too many nonfinite values in gradients, giving up")
                 exit(1)
