@@ -345,9 +345,12 @@ def calculate_steps(train_set_size, training_cfg, train_state):
         f"Training for {batches_total * training_cfg.batch_size} images in {batches_total} steps over {image_count_epochs + training_cfg.epochs} full epochs plus {extra_batches} extra batches"
     )
     # Reconfigure optimizer now that we know the total number of batches
+    # TODO this is a super dubious thing to be doing. We should ideally always set the optimizer
+    # state and the optimizer itself at the same time. It's fine so long as the shape of the
+    # optimizer state doesn't depend on batches_total, but we should really get all the info needed
+    # to set up the optimizer before we set up the optimizer.
     opt = setup_optimizer(training_cfg, batches_total)
-    opt_state = opt.init(train_state.params)
-    train_state = train_state.replace(opt_state=opt_state, tx=opt)
+    train_state = train_state.replace(tx=opt)
     return batches_total, epochs_total, batches_per_epoch, extra_batches, train_state
 
 
