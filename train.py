@@ -977,6 +977,66 @@ def exit_early_signal_handler(signum, frame):
 signal.signal(signal.SIGTERM, exit_early_signal_handler)
 signal.signal(signal.SIGINT, exit_early_signal_handler)
 
+
+# In order to ensure the GPU doesn't wait on CPU stuff, we ensure that there's always at least one
+# batch in flight. So at the beginning of each inner loop we enqueue the next step before doing
+# anything that would wait for the current step to finish.
+def prefetch_and_train(current_state, current_step):
+    """Prefetch next batch and enqueue next train step."""
+
+    batch_imgs, batch_clips, batch_max_cos_distances = get_batch(
+        train_imgs,
+        training_cfg.batch_size,
+        # In order to support --start-where-finetune-source-left-off, we offset where we're
+        # reading the data from by the amount of examples seen in the source run (expressed in
+        # units of this run's batch size).
+        current_step + data_offset,
+        clip_conditioning=mdl.clip_conditioning,
+        clip_caps=mdl.clip_caps,
+        clip_cap_count=mdl.clip_cap_count,
+        sharding=examples_sharding,
+    )
+
+    train_state, loss, norm = train_step(
+        current_state,
+        training_cfg.loss_decay_constant,
+        batch_imgs,
+        batch_clips,
+        batch_max_cos_distances,
+    )
+    opt_state = train_state.opt_state
+
+    to_log = {
+        "train/loss": loss,
+        "grad_global_norm": norm,
+    }
+    # The train state, including the optimizer state and the rng, is donated to train_step, so we
+    # need to copy any values within it that we want to use after beginning the next step. Note
+    # these values are *JAX arrays*, and get copied back to host RAM when needed, after this
+    # function returns.
+    to_log["debug/notfinite_count"] = opt_state.notfinite_count.copy()
+    if training_cfg.adaptive_gradient_skip:
+        to_log["debug/skipped_updates"] = opt_state.inner_state.skip_count.copy()
+        skipped_last = opt_state.inner_state.skipped_last.copy()
+    else:
+        to_log["debug/skipped_updates"] = 0
+        skipped_last = False
+
+    # The example data is used for auxillary loss logging (eval loss, unweighted loss) so we return
+    # it, even though it's not used for training outside this function.
+    return (
+        train_state,
+        train_state.rng.copy(),
+        batch_imgs,
+        batch_clips,
+        batch_max_cos_distances,
+        to_log,
+        skipped_last,
+    )
+
+
+next_train_step_outputs = None
+
 for epoch in trange(
     start_epoch,
     epochs_total,
@@ -1007,130 +1067,71 @@ for epoch in trange(
         initial=this_start_step,
     ) as pbar:
         for batch_idx in range(actual_batches):
-            # In order to support --start-where-finetune-source-left-off, we offset where we're
-            # reading the data from by the amount of examples seen in the source run (expressed in
-            # units of this run's batch size).
-            batch_imgs, batch_clips, batch_max_cos_distances = get_batch(
-                train_imgs,
-                training_cfg.batch_size,
-                global_step + data_offset,
-                clip_conditioning=mdl.clip_conditioning,
-                clip_caps=mdl.clip_caps,
-                clip_cap_count=mdl.clip_cap_count,
-                sharding=examples_sharding,
-            )
-            assert batch_imgs.shape == (training_cfg.batch_size, mdl.image_tokens)
-            train_state, train_loss, norm = train_step(
-                train_state,
-                training_cfg.loss_decay_constant,
-                batch_imgs,
-                batch_clips,
-                batch_max_cos_distances,
-            )
-            opt_state = train_state.opt_state
-            if training_cfg.adaptive_gradient_skip:
+            if next_train_step_outputs is not None:
+                # The step we enqueued last time is now the current step
                 (
-                    train_loss,
-                    notfinite_count,
-                    norm,
-                    skipped_last,
-                    skip_count,
-                ) = jax.device_get(
-                    (
-                        train_loss,
-                        opt_state.notfinite_count,
-                        norm,
-                        opt_state.inner_state.skipped_last,
-                        opt_state.inner_state.skip_count,
-                    )
-                )
-            else:
-                train_loss, notfinite_count, norm = jax.device_get(
-                    (train_loss, opt_state.notfinite_count, norm)
-                )
-                skipped_last = False
-                skip_count = 0
-            if not jnp.isfinite(train_loss):
-                tqdm.write(f"Loss nonfinite 😢 ({train_loss})")
-            wandb.log(
-                {
-                    "global_step": global_step,
-                    "train/loss": train_loss,
-                    "grad_global_norm": norm,
-                    "debug/notfinite_count": notfinite_count,
-                    "debug/skipped_updates": skip_count,
-                }
-            )
-            if skipped_last:
-                tqdm.write(f"Skipped update due to large gradient norm: {norm}")
-            if notfinite_count > 50:
-                tqdm.write(f"Too many nonfinite values in gradients, giving up")
-                exit(1)
-            if (
-                global_step % 20 == 0
-                and training_cfg.learning_rate_schedule
-                == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
-            ):
-                # Since the params used for gradient computation with a schedule-free optimizer are
-                # not the same as the params used for inference, we want to test with the inference
-                # params occasionally for charting.
-                eval_params = train_state.get_eval_params()
-                to_log = {"global_step": global_step}
-                eval_loss_weighted = loss_fn(
-                    eval_params,
-                    training_cfg.loss_decay_constant,
-                    train_state.rng,
+                    train_state,
+                    train_rng,
                     batch_imgs,
                     batch_clips,
                     batch_max_cos_distances,
-                )
-                if training_cfg.loss_decay_constant != 1.0:
-                    eval_loss_unweighted = loss_fn(
+                    train_step_to_log,
+                    skipped_last,
+                ) = next_train_step_outputs
+                next_train_step_outputs = None
+            else:
+                (
+                    train_state,
+                    train_rng,
+                    batch_imgs,
+                    batch_clips,
+                    batch_max_cos_distances,
+                    train_step_to_log,
+                    skipped_last,
+                ) = prefetch_and_train(train_state, global_step)
+
+            train_step_to_log["global_step"] = global_step
+            if global_step % 20 == 0:
+                extra_to_log = {"global_step": global_step}
+                if (
+                    training_cfg.learning_rate_schedule
+                    == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+                ):
+                    # Since the params used for gradient computation with a schedule-free optimizer
+                    # are not the same as the params used for inference, we want to test with the
+                    # inference params occasionally for charting.
+                    eval_params = train_state.get_eval_params()
+                    eval_loss = loss_fn(
                         eval_params,
-                        1.0,
-                        train_state.rng,
+                        training_cfg.loss_decay_constant,
+                        train_rng,
                         batch_imgs,
                         batch_clips,
                         batch_max_cos_distances,
                     )
-                    eval_loss_weighted, eval_loss_unweighted = jax.device_get(
-                        (eval_loss_weighted, eval_loss_unweighted)
-                    )
-                    to_log["eval/loss"] = eval_loss_weighted
-                    to_log["eval/loss_unweighted"] = eval_loss_unweighted
-                else:
-                    to_log["eval/loss"] = jax.device_get(eval_loss_weighted)
-                eval_loss = eval_loss_weighted
-                del eval_params
-                wandb.log(to_log)
-            if global_step % 20 == 0 and training_cfg.loss_decay_constant != 1.0:
-                train_loss_unweighted = jax.device_get(
-                    loss_fn(
+                    extra_to_log["eval/loss"] = eval_loss
+                    if training_cfg.loss_decay_constant != 1.0:
+                        extra_to_log["eval/loss_unweighted"] = loss_fn(
+                            eval_params,
+                            1.0,
+                            train_rng,
+                            batch_imgs,
+                            batch_clips,
+                            batch_max_cos_distances,
+                        )
+                    del eval_params
+
+                if training_cfg.loss_decay_constant != 1.0:
+                    extra_to_log["train/loss_unweighted"] = loss_fn(
                         train_state.params,
                         1.0,
-                        train_state.rng,
+                        train_rng,
                         batch_imgs,
                         batch_clips,
                         batch_max_cos_distances,
                     )
-                )
-                wandb.log(
-                    {
-                        "global_step": global_step,
-                        "train/loss_unweighted": train_loss_unweighted,
-                    }
-                )
-            if (
-                training_cfg.learning_rate_schedule
-                == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
-                and eval_loss is not None  # can be None if resuming from checkpoint
-            ):
-                pbar.set_postfix(
-                    train_loss=f"{train_loss:.4f}", eval_loss=f"{eval_loss:.4f}"
-                )
             else:
-                pbar.set_postfix(train_loss=f"{train_loss:.4f}")
-            pbar.update()
+                extra_to_log = None
             global_step += 1
             if exit_requested:
                 tqdm.write("Saving checkpoint and exiting early")
@@ -1148,6 +1149,43 @@ for epoch in trange(
                 )
                 last_checkpoint_time = datetime.datetime.now()
 
+            if batch_idx + 1 < actual_batches:
+                next_train_step_outputs = prefetch_and_train(train_state, global_step)
+            # At this point we've enqueued all the work for this step and queued the next step, so
+            # we can block on the current step and be sure the GPU will have stuff to do. There's a
+            # small but real perf improvement to be had by fetching only train_step_to_log at this
+            # point and waiting a bit before fetching extra_to_log.
+            skipped_last, train_step_to_log = jax.device_get(
+                (skipped_last, train_step_to_log)
+            )
+
+            if not np.isfinite(train_step_to_log["train/loss"]):
+                tqdm.write(f"Loss nonfinite 😢 ({train_step_to_log['train/loss']})")
+            if skipped_last:
+                tqdm.write(
+                    f"Skipped update due to large gradient norm: {train_step_to_log['grad_global_norm']}"
+                )
+            if train_step_to_log["debug/notfinite_count"] > 50:
+                tqdm.write(f"Too many nonfinite values in gradients, giving up")
+                exit(1)
+            wandb.log(train_step_to_log)
+            if extra_to_log is not None:
+                # If we actually got any extra stuff to log, fetch it now and do the logging.
+                extra_to_log, eval_loss = jax.device_get((extra_to_log, eval_loss))
+                wandb.log(extra_to_log)
+            if (
+                training_cfg.learning_rate_schedule
+                == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+                and eval_loss is not None  # can be None if resuming from checkpoint
+            ):
+                pbar.set_postfix(
+                    train_loss=f"{train_step_to_log['train/loss']:.4f}",
+                    eval_loss=f"{eval_loss:.4f}",
+                )
+            else:
+                pbar.set_postfix(train_loss=f"{train_step_to_log['train/loss']:.4f}")
+            pbar.update()
+
     # Evaluate on test set
     losses = []
     eval_params = train_state.get_eval_params()
@@ -1155,7 +1193,7 @@ for epoch in trange(
         len(test_imgs) // training_cfg.batch_size,
         desc="test batches",
     ):
-        dropout_rng, rng = jax.random.split(train_state.rng, 2)
+        dropout_rng, rng = jax.random.split(train_rng, 2)
         train_state = train_state.replace(rng=rng)
         batch_imgs, batch_clips, batch_max_cos_distances = get_batch(
             test_imgs,
@@ -1180,7 +1218,7 @@ for epoch in trange(
     test_loss = jnp.mean(jnp.stack(losses))
     wandb.log({"global_step": global_step, "test/loss": test_loss})
     tqdm.write(
-        f"Epoch {epoch} done, train loss: {train_loss:.4f}, test loss {test_loss:.4f}",
+        f"Epoch {epoch} done, train loss: {train_step_to_log['train/loss']:.4f}, test loss {test_loss:.4f}",
         end="",
     )
     save_checkpoint_and_log_images(
