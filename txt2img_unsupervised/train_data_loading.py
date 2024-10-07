@@ -18,19 +18,30 @@ _MAX_SHUFFLED_DATASET_CACHE_SIZE = 4
 
 
 @lru_cache(maxsize=_MAX_SHUFFLED_DATASET_CACHE_SIZE)
-def _prepare_shuffled_dataset(dataset: Dataset, epoch: int) -> Dataset:
+def _prepare_shuffled_dataset(
+    dataset: Dataset, epoch: int, clip_conditioning: bool, clip_caps: bool
+) -> Dataset:
     """
-    Reproducibly shuffle a dataset.
+    Reproducibly shuffle a dataset and select the appropriate columns.
 
     Args:
         dataset: The dataset to shuffle.
         epoch: The epoch number.
+        clip_conditioning: Whether to include clip conditioning data.
+        clip_caps: Whether to include clip caps data.
 
     Returns:
-        A shuffled dataset.
+        A shuffled dataset with selected columns.
     """
     tqdm.write(f"Cache miss: shuffling dataset {id(dataset)} for epoch {epoch}")
-    return dataset.shuffle(seed=epoch).with_format("numpy")
+
+    cols = ["encoded_img"]
+    if clip_conditioning and not clip_caps:
+        cols.append("clip_embedding")
+    elif clip_conditioning and clip_caps:
+        cols.extend(["cap_center", "cap_max_cos_distance"])
+
+    return dataset.shuffle(seed=epoch).select_columns(cols).with_format("numpy")
 
 
 def get_batch(
@@ -65,16 +76,9 @@ def get_batch(
 
     epoch = idx_start // effective_dataset_size
 
-    dataset = _prepare_shuffled_dataset(dataset, epoch)
-
-    cols = ["encoded_img"]
-    if clip_conditioning and not clip_caps:
-        cols.append("clip_embedding")
-    elif clip_conditioning and clip_caps:
-        cols.extend(["cap_center", "cap_max_cos_distance"])
+    dataset = _prepare_shuffled_dataset(dataset, epoch, clip_conditioning, clip_caps)
 
     idx_start_in_epoch = idx_start % effective_dataset_size
-    dataset = dataset.select_columns(cols)
     batch_dict = dataset[idx_start_in_epoch : idx_start_in_epoch + batch_size]
 
     imgs = batch_dict["encoded_img"]
