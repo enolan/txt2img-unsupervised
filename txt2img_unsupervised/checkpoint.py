@@ -208,6 +208,10 @@ class TrainState(train_state.TrainState):
         if isinstance(self.opt_state, optax.ApplyIfFiniteState):
             opt_state = self.opt_state.inner_state
 
+        # adaptive gradient skip
+        if isinstance(opt_state, AdaptiveGradientSkipState):
+            opt_state = opt_state.inner_state
+
         # chain for gradient clipping
         if isinstance(opt_state, tuple):
             opt_state = opt_state[-1]  # The main optimizer is the last in the chain
@@ -366,9 +370,19 @@ def setup_checkpoint_manager_and_initial_state(
 @pytest.mark.parametrize("schedule_free", [True, False])
 @pytest.mark.parametrize("gradient_accumulation_steps", [1, 2])
 @pytest.mark.parametrize("gradient_clipping", [None, 1.0])
-def test_get_eval_params(gradient_clipping, gradient_accumulation_steps, schedule_free):
+@pytest.mark.parametrize("adaptive_gradient_skip", [True, False])
+def test_get_eval_params(adaptive_gradient_skip, gradient_clipping, gradient_accumulation_steps, schedule_free):
     # Set up a TrainState with either schedule-free or non-schedule-free optimizer
     rng = jax.random.PRNGKey(0)
+
+    if adaptive_gradient_skip:
+        adaptive_gradient_skip_cfg = {
+            "adaptive_gradient_skip": True,
+            "adaptive_gradient_skip_history_len": 100,
+            "adaptive_gradient_skip_threshold_factor": 1.1,
+        }
+    else:
+        adaptive_gradient_skip_cfg = {}
 
     if schedule_free:
         training_cfg = TrainingConfig(
@@ -380,6 +394,7 @@ def test_get_eval_params(gradient_clipping, gradient_accumulation_steps, schedul
             epochs=1,
             gradient_clipping=gradient_clipping,
             gradient_accumulation_steps=gradient_accumulation_steps,
+            **adaptive_gradient_skip_cfg,
         )
     else:
         training_cfg = TrainingConfig(
@@ -389,6 +404,7 @@ def test_get_eval_params(gradient_clipping, gradient_accumulation_steps, schedul
             epochs=1,
             gradient_clipping=gradient_clipping,
             gradient_accumulation_steps=gradient_accumulation_steps,
+            **adaptive_gradient_skip_cfg,
         )
 
     optimizer = setup_optimizer(training_cfg, batches_total=1000)
