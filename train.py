@@ -107,6 +107,7 @@ parser.add_argument("--adaptive-gradient-skip-history-len", type=int, default=No
 parser.add_argument(
     "--adaptive-gradient-skip-threshold-factor", type=float, default=None
 )
+parser.add_argument("--adaptive-gradient-skip-quantile", type=float, default=None)
 parser.add_argument("--image-dropout", type=float, default=None)
 parser.add_argument("--ae-cfg", type=Path, required=True)
 parser.add_argument("--ae-ckpt", type=Path, required=True)

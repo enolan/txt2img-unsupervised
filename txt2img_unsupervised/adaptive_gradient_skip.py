@@ -30,16 +30,20 @@ def adaptive_gradient_skip(
     inner_optimizer: optax.GradientTransformation,
     history_len: int = 100,
     threshold_factor: float = 1.5,
+    quantile: float = 1.0,
 ) -> optax.GradientTransformation:
-    """Wraps an optimizer to skip updates that exceed the largest gradient norm among the past
-    history_len updates by at least a factor of threshold_factor. No skipping occurs until
+    """Wraps an optimizer to skip updates that exceed the specified quantile value of the past
+    gradient norms by at least a factor of threshold_factor. For example if history_len is 100,
+    quantile is 0.95 and threshold_factor is 1.5, any updates with norm greater than 1.5 times the
+    95th percentile of the past 100 gradient norms will be skipped. No skipping occurs until
     history_len steps have been taken.
 
     Args:
         inner_optimizer: The optimizer to wrap.
         history_len: The number of past gradient norms to keep track of.
-        threshold_factor: The factor by which the maximum historical gradient norm is scaled to
+        threshold_factor: The factor by which the quantile of historical gradient norms is scaled to
             determine the threshold for skipping updates.
+        quantile: The quantile to use for determining the threshold (default: 1.0, which is the maximum).
 
     Returns:
         A `GradientTransformation` object.
@@ -48,6 +52,8 @@ def adaptive_gradient_skip(
         raise ValueError("history_len must be positive")
     if threshold_factor < 1:
         raise ValueError("threshold_factor must be >= 1")
+    if not 0 < quantile <= 1:
+        raise ValueError("quantile must be in the range (0, 1]")
 
     def init_fn(params):
         return AdaptiveGradientSkipState(
@@ -60,7 +66,8 @@ def adaptive_gradient_skip(
         )
 
     def update_fn(updates, state, params=None):
-        skip_threshold = jnp.max(state.historical_norms) * threshold_factor
+        quantile_norm = jnp.quantile(state.historical_norms, quantile)
+        skip_threshold = quantile_norm * threshold_factor
         this_norm = optax.global_norm(updates)
 
         next_idx = (state.last_idx + 1) % history_len
@@ -97,11 +104,14 @@ def adaptive_gradient_skip(
     return optax.GradientTransformation(init_fn, update_fn)
 
 
+@pytest.mark.parametrize("quantile", [0.5, 0.9, 1.0])
 @pytest.mark.parametrize("jit", [True, False])
-def test_doesnt_skip_below_threshold(jit):
+def test_doesnt_skip_below_threshold(quantile, jit):
     """Test that the optimizer doesn't skip updates when the gradient norm is below the threshold."""
     inner_opt = optax.sgd(learning_rate=0.1)
-    opt = adaptive_gradient_skip(inner_opt, history_len=10, threshold_factor=2.0)
+    opt = adaptive_gradient_skip(
+        inner_opt, history_len=10, threshold_factor=2.0, quantile=quantile
+    )
     update_fn = jax.jit(opt.update, donate_argnums=(1, 2)) if jit else opt.update
     params = jnp.ones(10)
     state = opt.init(params)
@@ -113,11 +123,14 @@ def test_doesnt_skip_below_threshold(jit):
         params = optax.apply_updates(params, updates)
 
 
+@pytest.mark.parametrize("quantile", [1.0, 0.95, 0.5])
 @pytest.mark.parametrize("jit", [True, False])
-def test_skips_above_threshold(jit):
+def test_skips_above_threshold(jit, quantile):
     """Test that the optimizer skips updates when the gradient norm is above the threshold."""
     inner_opt = optax.adam(learning_rate=0.1)
-    opt = adaptive_gradient_skip(inner_opt, history_len=3, threshold_factor=1.5)
+    opt = adaptive_gradient_skip(
+        inner_opt, history_len=3, threshold_factor=1.5, quantile=quantile
+    )
     update_fn = jax.jit(opt.update, donate_argnums=(1, 2)) if jit else opt.update
     params = jnp.ones(10)
     state = opt.init(params)
@@ -126,8 +139,11 @@ def test_skips_above_threshold(jit):
 
     # Do a bunch of steps that shouldn't be skipped, checking that regular adam and the wrapped adam
     # do the same thing.
-    normal_grads = [jnp.full_like(params, v) for v in [0.1, 1.1, 0.1, 1.1]]
-    for grad in normal_grads:
+    normal_grads = {}
+    normal_grads[1.0] = [jnp.full_like(params, v) for v in [0.1, 1.1, 0.1, 1.1]]
+    normal_grads[0.95] = [jnp.full_like(params, v) for v in [0.1, 1.1, 0.1, 1.1]]
+    normal_grads[0.5] = [jnp.full_like(params, v) for v in [0.1, 1.1, 0.1, 0.14]]
+    for grad in normal_grads[quantile]:
         updates, state = update_fn(grad, state, params)
         adam_updates, adam_state = inner_opt.update(grad, adam_state, adam_params)
         np.testing.assert_allclose(updates, adam_updates)
@@ -139,8 +155,11 @@ def test_skips_above_threshold(jit):
     assert state.total_steps == 4
 
     # Do a couple of steps that should be skipped
-    skip_grads = [jnp.full_like(params, v) for v in [2.1, 3.5]]
-    for grad in skip_grads:
+    skip_grads = {}
+    skip_grads[1.0] = [jnp.full_like(params, v) for v in [1.67, 3.5]]
+    skip_grads[0.95] = [jnp.full_like(params, v) for v in [1.67, 3.5]]
+    skip_grads[0.5] = [jnp.full_like(params, v) for v in [0.25, 0.22]]
+    for grad in skip_grads[quantile]:
         updates, state = update_fn(grad, state, params)
         adam_updates, adam_state = inner_opt.update(grad, adam_state, adam_params)
         params = optax.apply_updates(params, updates)

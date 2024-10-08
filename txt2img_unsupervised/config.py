@@ -24,6 +24,7 @@ class ModelConfig:
     use_biases: bool
     activation_function: Callable[[jax.Array], jax.Array]
     activations_dtype: jnp.dtype = jnp.float32
+    weights_dtype: jnp.dtype = jnp.float32
     pre_norm: bool = False
     clip_conditioning: bool = False
     clip_caps: bool = False
@@ -45,11 +46,19 @@ class ModelConfig:
         out["activations_dtype"] = str_to_x_or_valueerror(
             dict["activations_dtype"], str_to_dtype, "activations dtype"
         )
+        if "weights_dtype" not in dict:
+            out["weights_dtype"] = jnp.float32
+        else:
+            out["weights_dtype"] = str_to_x_or_valueerror(
+                dict["weights_dtype"], str_to_dtype, "weights dtype"
+            )
         if "image_tokens" not in dict and "seq_len" in dict:
             out["image_tokens"] = dict["seq_len"]
-        return dacite.from_dict(
+        out = dacite.from_dict(
             data_class=ModelConfig, data=out, config=dacite.Config(check_types=False)
         )
+        out.validate()
+        return out
 
     def to_json_dict(self) -> dict[str, Any]:
         """Convert a ModelConfig object to a dictionary that can be serialized to JSON."""
@@ -60,7 +69,24 @@ class ModelConfig:
         out["activations_dtype"] = x_to_str_or_valueerror(
             self.activations_dtype, dtype_to_str, "dtype"
         )
+        out["weights_dtype"] = x_to_str_or_valueerror(
+            self.weights_dtype, dtype_to_str, "dtype"
+        )
         return out
+
+    def validate(self):
+        """Validate the configuration."""
+        if self.activations_dtype != self.weights_dtype:
+            if (
+                self.activations_dtype == jnp.float16
+                or self.activations_dtype == jnp.bfloat16
+            ):
+                if self.weights_dtype != jnp.float32:
+                    raise ValueError(
+                        "float16 and bfloat16 activations must be used with weights of the same "
+                        f"dtype or float32, got activations in {self.activations_dtype} and "
+                        f"weights in {self.weights_dtype}"
+                    )
 
 
 def invert_dict(d: dict[Any, Any]) -> dict[Any, Any]:
@@ -115,6 +141,7 @@ def test_modelconfig_roundtrip_from_json() -> None:
         "use_biases": true,
         "activations_dtype": "float32",
         "activation_function": "relu",
+        "weights_dtype": "float32",
         "pre_norm": false,
         "clip_cap_count": null,
         "clip_caps": false,
@@ -189,6 +216,7 @@ class TrainingConfig:
     adaptive_gradient_skip: bool = False
     adaptive_gradient_skip_history_len: Optional[int] = None
     adaptive_gradient_skip_threshold_factor: Optional[float] = None
+    adaptive_gradient_skip_quantile: Optional[float] = None
 
     @staticmethod
     def from_json_dict(dict: dict[str, Any]) -> "TrainingConfig":
@@ -215,20 +243,22 @@ class TrainingConfig:
             if (
                 self.adaptive_gradient_skip_history_len is None
                 or self.adaptive_gradient_skip_threshold_factor is None
+                or self.adaptive_gradient_skip_quantile is None
             ):
                 raise ValueError(
-                    "adaptive_gradient_skip_history_len and "
-                    "adaptive_gradient_skip_threshold_factor must be set when "
-                    "adaptive_gradient_skip is enabled"
+                    "adaptive_gradient_skip_history_len, adaptive_gradient_skip_threshold_factor, "
+                    "and adaptive_gradient_skip_quantile must be set when adaptive_gradient_skip "
+                    "is enabled"
                 )
         else:
             if (
                 self.adaptive_gradient_skip_history_len is not None
                 or self.adaptive_gradient_skip_threshold_factor is not None
+                or self.adaptive_gradient_skip_quantile is not None
             ):
                 raise ValueError(
-                    "adaptive_gradient_skip_history_len and "
-                    "adaptive_gradient_skip_threshold_factor should not be set when "
+                    "adaptive_gradient_skip_history_len, adaptive_gradient_skip_threshold_factor, "
+                    "and adaptive_gradient_skip_quantile should not be set when "
                     "adaptive_gradient_skip is disabled"
                 )
 
@@ -309,7 +339,8 @@ _test_json_strs = [
         "loss_decay_constant": 0.25,
         "adaptive_gradient_skip": true,
         "adaptive_gradient_skip_history_len": 100,
-        "adaptive_gradient_skip_threshold_factor": 1.1
+        "adaptive_gradient_skip_threshold_factor": 1.1,
+        "adaptive_gradient_skip_quantile": 0.95
         }""",
     """{
         "learning_rate": 1e-4,
