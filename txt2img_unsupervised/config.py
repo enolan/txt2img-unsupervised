@@ -24,7 +24,6 @@ class ModelConfig:
     use_biases: bool
     activation_function: Callable[[jax.Array], jax.Array]
     activations_dtype: jnp.dtype = jnp.float32
-    weights_dtype: jnp.dtype = jnp.float32
     pre_norm: bool = False
     clip_conditioning: bool = False
     clip_caps: bool = False
@@ -46,19 +45,11 @@ class ModelConfig:
         out["activations_dtype"] = str_to_x_or_valueerror(
             dict["activations_dtype"], str_to_dtype, "activations dtype"
         )
-        if "weights_dtype" not in dict:
-            out["weights_dtype"] = jnp.float32
-        else:
-            out["weights_dtype"] = str_to_x_or_valueerror(
-                dict["weights_dtype"], str_to_dtype, "weights dtype"
-            )
         if "image_tokens" not in dict and "seq_len" in dict:
             out["image_tokens"] = dict["seq_len"]
-        out = dacite.from_dict(
+        return dacite.from_dict(
             data_class=ModelConfig, data=out, config=dacite.Config(check_types=False)
         )
-        out.validate()
-        return out
 
     def to_json_dict(self) -> dict[str, Any]:
         """Convert a ModelConfig object to a dictionary that can be serialized to JSON."""
@@ -69,24 +60,7 @@ class ModelConfig:
         out["activations_dtype"] = x_to_str_or_valueerror(
             self.activations_dtype, dtype_to_str, "dtype"
         )
-        out["weights_dtype"] = x_to_str_or_valueerror(
-            self.weights_dtype, dtype_to_str, "dtype"
-        )
         return out
-
-    def validate(self):
-        """Validate the configuration."""
-        if self.activations_dtype != self.weights_dtype:
-            if (
-                self.activations_dtype == jnp.float16
-                or self.activations_dtype == jnp.bfloat16
-            ):
-                if self.weights_dtype != jnp.float32:
-                    raise ValueError(
-                        "float16 and bfloat16 activations must be used with weights of the same "
-                        f"dtype or float32, got activations in {self.activations_dtype} and "
-                        f"weights in {self.weights_dtype}"
-                    )
 
 
 def invert_dict(d: dict[Any, Any]) -> dict[Any, Any]:
@@ -141,7 +115,6 @@ def test_modelconfig_roundtrip_from_json() -> None:
         "use_biases": true,
         "activations_dtype": "float32",
         "activation_function": "relu",
-        "weights_dtype": "float32",
         "pre_norm": false,
         "clip_cap_count": null,
         "clip_caps": false,
