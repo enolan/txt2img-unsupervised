@@ -34,6 +34,7 @@ from einops import rearrange, reduce, repeat
 from functools import partial
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from math import ceil
 from omegaconf import OmegaConf
 from pathlib import Path
 from sys import exit
@@ -56,6 +57,7 @@ from txt2img_unsupervised.config import (
 )
 from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
 from txt2img_unsupervised.load_pq_dir import load_pq_dir
+from txt2img_unsupervised.train_data_loading import get_batch
 from txt2img_unsupervised.training_visualizations import (
     log_attention_maps,
     log_token_loss_visualization,
@@ -100,6 +102,11 @@ parser.add_argument("--gradient-accumulation-steps", type=int)
 parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--gradient-clipping", type=float, default=None)
 parser.add_argument("--loss-decay-constant", type=float, default=1.0)
+parser.add_argument("--adaptive-gradient-skip", type=lambda x: bool(strtobool(x)))
+parser.add_argument("--adaptive-gradient-skip-history-len", type=int, default=None)
+parser.add_argument(
+    "--adaptive-gradient-skip-threshold-factor", type=float, default=None
+)
 parser.add_argument("--image-dropout", type=float, default=None)
 parser.add_argument("--ae-cfg", type=Path, required=True)
 parser.add_argument("--ae-ckpt", type=Path, required=True)
@@ -169,7 +176,7 @@ def init_train_state():
         model_cfg = ModelConfig.from_json_dict(metadata["model_cfg"])
         training_cfg = TrainingConfig.from_json_dict(metadata["training_cfg"])
         run_id = metadata["run_id"]
-        data_step_offset = metadata.get("data_step_offset", 0)
+        data_offset = metadata.get("data_offset", 0)
         print(f"Resuming run {run_id}")
         print(
             "ALL TRAINING AND MODEL PARAMETERS PASSED ON THE COMMAND LINE WILL BE IGNORED."
@@ -181,7 +188,10 @@ def init_train_state():
         train_state, mdl = TrainState.load_from_checkpoint(
             checkpoint_manager,
             global_step,
-            1,  # batches total will be update after we load the dataset
+            # we don't know the total number of batches until calculate_steps
+            training_cfg.warmup_steps + 1
+            if training_cfg.warmup_steps is not None
+            else 1,
         )
     else:
         print("Starting new run...")
@@ -217,18 +227,25 @@ def init_train_state():
                 finetune_src_checkpoint_dir
             )
             if args.start_where_finetune_source_left_off:
-                # data_step_offset is offset (in batches) we use into the training data, equal to
-                # the number of batches the source run trained on. We track this number so we don't
-                # repeat any training data the source run saw before we have to.
-                data_step_offset = finetune_src_checkpoint_manager.latest_step() + 1
+                # data_offset is the offset (in batches) we use into the training data, equal to the
+                # number of examples the source run trained on divided by our batch size, rounded
+                # up. We track this number so we don't repeat any training data the source run saw
+                # before we have to.
+                data_offset_examples = (
+                    finetune_src_checkpoint_manager.latest_step()
+                    * finetune_src_checkpoint_manager.metadata()["training_cfg"][
+                        "batch_size"
+                    ]
+                )
+                data_offset = ceil(data_offset_examples / training_cfg.batch_size)
             else:
-                data_step_offset = 0
+                data_offset = 0
             extra_metadata = (
                 "finetune_src_config",
                 finetune_src_checkpoint_manager.metadata(),
             )
         else:
-            data_step_offset = 0
+            data_offset = 0
             extra_metadata = None
         # Set up checkpoint manager and initial state
 
@@ -240,8 +257,11 @@ def init_train_state():
             model_cfg,
             training_cfg,
             jax.random.PRNGKey(1337),
-            1,  # We don't know the total number of batches until we load the dataset
-            data_step_offset=data_step_offset,
+            # we don't know the total number of batches until calculate_steps
+            training_cfg.warmup_steps + 1
+            if training_cfg.warmup_steps is not None
+            else 1,
+            data_offset=data_offset,
             extra_metadata=extra_metadata,
         )
 
@@ -291,7 +311,7 @@ def init_train_state():
         checkpoint_manager,
         train_state,
         mdl,
-        data_step_offset,
+        data_offset,
     )
 
 
@@ -303,13 +323,11 @@ def init_train_state():
     checkpoint_manager,
     train_state,
     mdl,
-    data_step_offset,
+    data_offset,
 ) = init_train_state()
 
 
 def load_dataset(dir: Path) -> Tuple[Dataset, Dataset]:
-    # The paths don't necessarily come out in the same order on every machine, so we sort to make the
-    # example order consistent.
     dset_all = load_pq_dir(dir)
     dset_split = dset_all.train_test_split(test_size=0.01, seed=19900515)
     train_imgs = dset_split["train"]
@@ -440,16 +458,6 @@ def find_sfw_indices(clip_mdl, clip_processor, dset, n: int):
     return jax.device_get(ok_indices[:n])
 
 
-def get_image_prompt_clip_embeddings(indices: np.ndarray, dset: Dataset) -> jax.Array:
-    """Find n hopefully SFW CLIP embeddings to use for diagnostic sampling."""
-
-    print(f"Using {[dset['name'][i] for i in indices]} for diagnostic sampling")
-    return {
-        "clip_embedding": dset["clip_embedding"][indices],
-        "name": dset["name"][indices],
-    }
-
-
 def get_clip_text_embeddings_to_sample(n: int) -> jax.Array:
     """Generate some text embeddings to test the model with."""
     prompts = [
@@ -476,7 +484,10 @@ def get_clip_text_embeddings_to_sample(n: int) -> jax.Array:
 sfw_indices = find_sfw_indices(
     clip_mdl, clip_processor, test_imgs[:2048], image_prompts_to_sample
 )
-image_prompt_clips = get_image_prompt_clip_embeddings(sfw_indices, test_imgs[:2048])
+visualization_dset = test_imgs.select(sfw_indices[:8])
+print(
+    f"Using {[visualization_dset['name'][i] for i in range(8)]} for visualization & sampling"
+)
 text_prompt_clips = get_clip_text_embeddings_to_sample(8)
 
 del clip_mdl, clip_processor
@@ -626,7 +637,7 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
         # Create a grid of samples for each set of conditions.
         grid_size = 9
 
-        image_prompt_names = image_prompt_clips["name"]
+        image_prompt_names = visualization_dset["name"]
         text_prompt_texts = text_prompt_clips["name"]
 
         if model_cfg.clip_caps:
@@ -635,7 +646,7 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
                 img_max_cos_distances,
                 img_max_cos_distance_choices,
             ) = mk_image_prompt_conditions(
-                image_prompt_clips["clip_embedding"], grid_size
+                visualization_dset["clip_embedding"], grid_size
             )
 
             img_centers_for_sampling = rearrange(
@@ -733,7 +744,7 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
             wandb.log(to_log)
         else:
             img_clip_embeddings, _ = mk_image_prompt_conditions(
-                image_prompt_clips["clip_embedding"], grid_size
+                visualization_dset["clip_embedding"], grid_size
             )
             img_clip_embeddings_for_sampling = rearrange(
                 img_clip_embeddings,
@@ -856,61 +867,6 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
         wandb.log(to_log)
 
 
-last_cap_set = None  # We track the last one so we can print when it changes
-
-
-def rearrange_batch_caps(
-    centers, max_cos_distances, model_cap_count, epoch, is_test=False
-):
-    """Rearrange the cap data from parquet into the shape expected by the model and select the
-    appropriate subset of the caps for the current epoch. For reasons, parquet does not support
-    multidimensional arrays. Prints a message when the cap set changes, unless is_test is True, in
-    which case it doesn't print anything."""
-    assert len(centers.shape) == 2, f"centers shape {centers.shape}"
-    batch_size = centers.shape[0]
-    assert centers.shape[1] % 768 == 0
-    dset_cap_count = centers.shape[1] // 768
-
-    # normalize max_cos_distances shape, one of the dimensions should be dset_cap_count
-    if dset_cap_count == 1:
-        assert max_cos_distances.shape == (
-            batch_size,
-        ), f"max_cos_distances batch shape {max_cos_distances.shape}, should be unidimensional if the dataset contains only a sinple cap"
-        max_cos_distances = rearrange(max_cos_distances, "b -> b 1")
-
-    assert max_cos_distances.shape[0] == batch_size
-    assert max_cos_distances.shape[1] == dset_cap_count
-
-    centers = rearrange(centers, "b (n c) -> b n c", n=dset_cap_count, c=768)
-
-    assert centers.shape[1] == max_cos_distances.shape[1]
-    dset_cap_count = centers.shape[1]
-    assert (
-        dset_cap_count % model_cap_count == 0
-    ), f"Dataset cap count {dset_cap_count} not divisible by model cap count {model_cap_count}"
-
-    # This just feeds all the non-overlapping contiguous subsequences of the dataset caps to the
-    # model sequentially - one subsequence per epoch. Ideally we'd go through all the permutations
-    # in a smart order - non-overlapping sets first, but that's more complicated.
-    distinct_cap_sets = dset_cap_count // model_cap_count
-    this_cap_set = epoch % distinct_cap_sets
-    this_cap_set_start = this_cap_set * model_cap_count
-    this_cap_set_end = this_cap_set_start + model_cap_count
-
-    if not is_test:
-        global last_cap_set
-        if last_cap_set != this_cap_set:
-            tqdm.write(
-                f"Switching to cap set #{this_cap_set} of {distinct_cap_sets} total - {this_cap_set_start}:{this_cap_set_end}"
-            )
-            last_cap_set = this_cap_set
-
-    centers = centers[:, this_cap_set_start:this_cap_set_end, :]
-    max_cos_distances = max_cos_distances[:, this_cap_set_start:this_cap_set_end]
-
-    return centers, max_cos_distances
-
-
 @partial(jax.jit, donate_argnames=["state"], static_argnames=["loss_decay_constant"])
 def train_step(
     state: TrainState,
@@ -952,24 +908,19 @@ def save_checkpoint_and_log_images(
         tqdm.write("Done sampling")
         visualization_imgs = test_imgs[sfw_indices[:8]]
         visualization_img_names = visualization_imgs["name"]
-        visualization_img_encodings = visualization_imgs["encoded_img"]
-        if mdl.clip_conditioning and mdl.clip_caps:
-            (
-                visualization_embeddings,
-                visualization_max_cos_distances,
-            ) = rearrange_batch_caps(
-                visualization_imgs["cap_center"],
-                visualization_imgs["cap_max_cos_distance"],
-                mdl.clip_cap_count,
-                epoch=0,
-                is_test=True,
-            )
-        elif mdl.clip_conditioning and not mdl.clip_caps:
-            visualization_embeddings = visualization_imgs["clip_embedding"]
-            visualization_max_cos_distances = jnp.zeros((len(visualization_imgs), 0))
-        else:
-            visualization_embeddings = jnp.zeros((len(visualization_imgs), 0))
-            visualization_max_cos_distances = jnp.zeros((len(visualization_imgs), 0))
+        (
+            visualization_img_encodings,
+            visualization_embeddings,
+            visualization_max_cos_distances,
+        ) = get_batch(
+            visualization_dset,
+            len(visualization_dset),
+            0,
+            clip_conditioning=mdl.clip_conditioning,
+            clip_caps=mdl.clip_caps,
+            clip_cap_count=mdl.clip_cap_count,
+            sharding=examples_sharding,
+        )
         tqdm.write("Logging attention maps")
         log_attention_maps(
             my_train_state,
@@ -1001,14 +952,10 @@ def save_checkpoint_and_log_images(
 
 
 assert global_step < batches_total, "training run is over my dude"
-# to support --start-where-finetune-source-left-off, we need to track the progress in the *run*
-# separately from the progress through the dataset, which will be offset.
+
 start_epoch = global_step // batches_per_epoch
-start_data_epoch = (global_step + data_step_offset) // batches_per_epoch
-if data_step_offset > 0:
-    print(
-        f"Using data offset for finetuning: epoch {start_data_epoch}, step {data_step_offset % batches_per_epoch}"
-    )
+if data_offset > 0:
+    print(f"Using data offset for finetuning: {data_offset} batches")
 start_step = global_step % batches_per_epoch
 tqdm.write(f"Starting at epoch {start_epoch}, step {start_step}")
 
@@ -1030,6 +977,66 @@ def exit_early_signal_handler(signum, frame):
 signal.signal(signal.SIGTERM, exit_early_signal_handler)
 signal.signal(signal.SIGINT, exit_early_signal_handler)
 
+
+# In order to ensure the GPU doesn't wait on CPU stuff, we ensure that there's always at least one
+# batch in flight. So at the beginning of each inner loop we enqueue the next step before doing
+# anything that would wait for the current step to finish.
+def prefetch_and_train(current_state, current_step):
+    """Prefetch next batch and enqueue next train step."""
+
+    batch_imgs, batch_clips, batch_max_cos_distances = get_batch(
+        train_imgs,
+        training_cfg.batch_size,
+        # In order to support --start-where-finetune-source-left-off, we offset where we're
+        # reading the data from by the amount of examples seen in the source run (expressed in
+        # units of this run's batch size).
+        current_step + data_offset,
+        clip_conditioning=mdl.clip_conditioning,
+        clip_caps=mdl.clip_caps,
+        clip_cap_count=mdl.clip_cap_count,
+        sharding=examples_sharding,
+    )
+
+    train_state, loss, norm = train_step(
+        current_state,
+        training_cfg.loss_decay_constant,
+        batch_imgs,
+        batch_clips,
+        batch_max_cos_distances,
+    )
+    opt_state = train_state.opt_state
+
+    to_log = {
+        "train/loss": loss,
+        "grad_global_norm": norm,
+    }
+    # The train state, including the optimizer state and the rng, is donated to train_step, so we
+    # need to copy any values within it that we want to use after beginning the next step. Note
+    # these values are *JAX arrays*, and get copied back to host RAM when needed, after this
+    # function returns.
+    to_log["debug/notfinite_count"] = opt_state.notfinite_count.copy()
+    if training_cfg.adaptive_gradient_skip:
+        to_log["debug/skipped_updates"] = opt_state.inner_state.skip_count.copy()
+        skipped_last = opt_state.inner_state.skipped_last.copy()
+    else:
+        to_log["debug/skipped_updates"] = 0
+        skipped_last = False
+
+    # The example data is used for auxillary loss logging (eval loss, unweighted loss) so we return
+    # it, even though it's not used for training outside this function.
+    return (
+        train_state,
+        train_state.rng.copy(),
+        batch_imgs,
+        batch_clips,
+        batch_max_cos_distances,
+        to_log,
+        skipped_last,
+    )
+
+
+next_train_step_outputs = None
+
 for epoch in trange(
     start_epoch,
     epochs_total,
@@ -1037,23 +1044,6 @@ for epoch in trange(
     total=epochs_total,
     desc="epochs",
 ):
-    # We use a consistent shuffle so resuming gets the same ordering.
-
-    # Separately, to support --start-where-finetune-source-left-off, we concatenate the portion of
-    # the epoch that the source run didn't see with a shuffled version of the portion of the epoch
-    # it did see. So if the source run did 200 steps on a dataset with 300 batches per epoch, our
-    # first epoch is the 100 batches the source would've seen if it continued plus the 200 batches
-    # it did see.
-    intra_epoch_offset = data_step_offset % batches_per_epoch
-    shuffled_train_imgs = train_imgs.shuffle(seed=start_data_epoch)
-    epoch_part_1 = shuffled_train_imgs.select(
-        range(intra_epoch_offset, len(train_imgs))
-    )
-    epoch_part_2 = shuffled_train_imgs.select(
-        range(len(train_imgs) - intra_epoch_offset)
-    ).shuffle(seed=start_data_epoch + 1)
-    shuffled_train_imgs = datasets.concatenate_datasets([epoch_part_1, epoch_part_2])
-
     # If we're doing a partial epoch, set the number of batches to do
     if epoch == epochs_total - 1:
         # The number of batches for the epoch, assuming we're not resuming
@@ -1067,16 +1057,6 @@ for epoch in trange(
     actual_batches = batches_for_this_epoch - this_start_step
     this_end_step = this_start_step + actual_batches
 
-    # Much faster to skip leading examples this way than with islice
-    shuffled_train_imgs = shuffled_train_imgs.select(
-        range(
-            this_start_step * training_cfg.batch_size,
-            this_end_step * training_cfg.batch_size,
-        )
-    )
-    iter = shuffled_train_imgs.iter(
-        batch_size=training_cfg.batch_size, drop_last_batch=True
-    )
     tqdm.write(
         f"Epoch {epoch} starting at step {this_start_step}, doing {actual_batches} steps, ending at step {this_end_step}"
     )
@@ -1086,121 +1066,72 @@ for epoch in trange(
         desc="train batches",
         initial=this_start_step,
     ) as pbar:
-        for batch in iter:
-            batch_imgs = jax.device_put(batch["encoded_img"], examples_sharding)
-            if model_cfg.clip_conditioning and not model_cfg.clip_caps:
-                batch_clips = jax.device_put(batch["clip_embedding"], examples_sharding)
-                batch_max_cos_distances = jax.device_put(
-                    jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
-                )
-            elif model_cfg.clip_conditioning and model_cfg.clip_caps:
-                batch_centers, batch_max_cos_distances = rearrange_batch_caps(
-                    batch["cap_center"],
-                    batch["cap_max_cos_distance"],
-                    model_cfg.clip_cap_count,
-                    (global_step + data_step_offset) // batches_per_epoch,
-                )
-                batch_clips = jax.device_put(batch_centers, examples_sharding)
-                batch_max_cos_distances = jax.device_put(
-                    batch_max_cos_distances, examples_sharding
-                )
-            else:
-                batch_clips = jax.device_put(
-                    jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
-                )
-                batch_max_cos_distances = jax.device_put(
-                    jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
-                )
-            train_state, train_loss, norm = train_step(
-                train_state,
-                training_cfg.loss_decay_constant,
-                batch_imgs,
-                batch_clips,
-                batch_max_cos_distances,
-            )
-            opt_state = train_state.opt_state
-            train_loss, notfinite_count, norm = jax.device_get(
-                (train_loss, opt_state.notfinite_count, norm)
-            )
-            if not jnp.isfinite(train_loss):
-                tqdm.write(f"Loss nonfinite 😢 ({train_loss})")
-            wandb.log(
-                {
-                    "global_step": global_step,
-                    "train/loss": train_loss,
-                    "grad_global_norm": norm,
-                    "debug/notfinite_count": notfinite_count,
-                }
-            )
-
-            if notfinite_count > 50:
-                tqdm.write(f"Too many nonfinite values in gradients, giving up")
-                exit(1)
-            if (
-                global_step % 20 == 0
-                and training_cfg.learning_rate_schedule
-                == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
-            ):
-                # Since the params used for gradient computation with a schedule-free optimizer are
-                # not the same as the params used for inference, we want to test with the inference
-                # params occasionally for charting.
-                eval_params = train_state.get_eval_params()
-                to_log = {"global_step": global_step}
-                eval_loss_weighted = loss_fn(
-                    eval_params,
-                    training_cfg.loss_decay_constant,
-                    train_state.rng,
+        for batch_idx in range(actual_batches):
+            if next_train_step_outputs is not None:
+                # The step we enqueued last time is now the current step
+                (
+                    train_state,
+                    train_rng,
                     batch_imgs,
                     batch_clips,
                     batch_max_cos_distances,
-                )
-                if training_cfg.loss_decay_constant != 1.0:
-                    eval_loss_unweighted = loss_fn(
+                    train_step_to_log,
+                    skipped_last,
+                ) = next_train_step_outputs
+                next_train_step_outputs = None
+            else:
+                (
+                    train_state,
+                    train_rng,
+                    batch_imgs,
+                    batch_clips,
+                    batch_max_cos_distances,
+                    train_step_to_log,
+                    skipped_last,
+                ) = prefetch_and_train(train_state, global_step)
+
+            train_step_to_log["global_step"] = global_step
+            if global_step % 20 == 0:
+                extra_to_log = {"global_step": global_step}
+                if (
+                    training_cfg.learning_rate_schedule
+                    == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+                ):
+                    # Since the params used for gradient computation with a schedule-free optimizer
+                    # are not the same as the params used for inference, we want to test with the
+                    # inference params occasionally for charting.
+                    eval_params = train_state.get_eval_params()
+                    eval_loss = loss_fn(
                         eval_params,
-                        1.0,
-                        train_state.rng,
+                        training_cfg.loss_decay_constant,
+                        train_rng,
                         batch_imgs,
                         batch_clips,
                         batch_max_cos_distances,
                     )
-                    eval_loss_weighted, eval_loss_unweighted = jax.device_get(
-                        (eval_loss_weighted, eval_loss_unweighted)
-                    )
-                    to_log["eval/loss"] = eval_loss_weighted
-                    to_log["eval/loss_unweighted"] = eval_loss_unweighted
-                else:
-                    to_log["eval/loss"] = jax.device_get(eval_loss_weighted)
-                eval_loss = eval_loss_weighted
-                del eval_params
-                wandb.log(to_log)
-            if global_step % 20 == 0 and training_cfg.loss_decay_constant != 1.0:
-                train_loss_unweighted = jax.device_get(
-                    loss_fn(
+                    extra_to_log["eval/loss"] = eval_loss
+                    if training_cfg.loss_decay_constant != 1.0:
+                        extra_to_log["eval/loss_unweighted"] = loss_fn(
+                            eval_params,
+                            1.0,
+                            train_rng,
+                            batch_imgs,
+                            batch_clips,
+                            batch_max_cos_distances,
+                        )
+                    del eval_params
+
+                if training_cfg.loss_decay_constant != 1.0:
+                    extra_to_log["train/loss_unweighted"] = loss_fn(
                         train_state.params,
                         1.0,
-                        train_state.rng,
+                        train_rng,
                         batch_imgs,
                         batch_clips,
                         batch_max_cos_distances,
                     )
-                )
-                wandb.log(
-                    {
-                        "global_step": global_step,
-                        "train/loss_unweighted": train_loss_unweighted,
-                    }
-                )
-            if (
-                training_cfg.learning_rate_schedule
-                == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
-                and eval_loss is not None  # can be None if resuming from checkpoint
-            ):
-                pbar.set_postfix(
-                    train_loss=f"{train_loss:.4f}", eval_loss=f"{eval_loss:.4f}"
-                )
             else:
-                pbar.set_postfix(train_loss=f"{train_loss:.4f}")
-            pbar.update()
+                extra_to_log = None
             global_step += 1
             if exit_requested:
                 tqdm.write("Saving checkpoint and exiting early")
@@ -1218,45 +1149,61 @@ for epoch in trange(
                 )
                 last_checkpoint_time = datetime.datetime.now()
 
+            if batch_idx + 1 < actual_batches:
+                next_train_step_outputs = prefetch_and_train(train_state, global_step)
+            # At this point we've enqueued all the work for this step and queued the next step, so
+            # we can block on the current step and be sure the GPU will have stuff to do. There's a
+            # small but real perf improvement to be had by fetching only train_step_to_log at this
+            # point and waiting a bit before fetching extra_to_log.
+            skipped_last, train_step_to_log = jax.device_get(
+                (skipped_last, train_step_to_log)
+            )
+
+            if not np.isfinite(train_step_to_log["train/loss"]):
+                tqdm.write(f"Loss nonfinite 😢 ({train_step_to_log['train/loss']})")
+            if skipped_last:
+                tqdm.write(
+                    f"Skipped update due to large gradient norm: {train_step_to_log['grad_global_norm']}"
+                )
+            if train_step_to_log["debug/notfinite_count"] > 50:
+                tqdm.write(f"Too many nonfinite values in gradients, giving up")
+                exit(1)
+            wandb.log(train_step_to_log)
+            if extra_to_log is not None:
+                # If we actually got any extra stuff to log, fetch it now and do the logging.
+                extra_to_log, eval_loss = jax.device_get((extra_to_log, eval_loss))
+                wandb.log(extra_to_log)
+            if (
+                training_cfg.learning_rate_schedule
+                == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+                and eval_loss is not None  # can be None if resuming from checkpoint
+            ):
+                pbar.set_postfix(
+                    train_loss=f"{train_step_to_log['train/loss']:.4f}",
+                    eval_loss=f"{eval_loss:.4f}",
+                )
+            else:
+                pbar.set_postfix(train_loss=f"{train_step_to_log['train/loss']:.4f}")
+            pbar.update()
+
     # Evaluate on test set
     losses = []
     eval_params = train_state.get_eval_params()
-    for batch in tqdm(
-        # The last batch needs to be a multiple of the number of devices, and it isn't guaranteed
-        # to be, so we drop it. Shouldn't matter much when even 1% of the dataset is thousands of
-        # images.
-        test_imgs.iter(batch_size=training_cfg.batch_size, drop_last_batch=True),
-        total=len(test_imgs) // training_cfg.batch_size,
+    for batch_idx in trange(
+        len(test_imgs) // training_cfg.batch_size,
         desc="test batches",
     ):
-        dropout_rng, rng = jax.random.split(train_state.rng, 2)
+        dropout_rng, rng = jax.random.split(train_rng, 2)
         train_state = train_state.replace(rng=rng)
-        batch_imgs = jax.device_put(batch["encoded_img"], examples_sharding)
-        if model_cfg.clip_conditioning:
-            if model_cfg.clip_caps:
-                batch_cap_centers, batch_max_cos_distances = rearrange_batch_caps(
-                    batch["cap_center"],
-                    batch["cap_max_cos_distance"],
-                    model_cfg.clip_cap_count,
-                    epoch=0,  # could iterate and do every cap set but this is faster and fine with lots of test images
-                    is_test=True,
-                )
-                batch_clips = jax.device_put(batch_cap_centers, examples_sharding)
-                batch_max_cos_distances = jax.device_put(
-                    batch_max_cos_distances, examples_sharding
-                )
-            else:
-                batch_clips = jax.device_put(batch["clip_embedding"], examples_sharding)
-                batch_max_cos_distances = jax.device_put(
-                    jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
-                )
-        else:
-            batch_clips = jax.device_put(
-                jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
-            )
-            batch_max_cos_distances = jax.device_put(
-                jnp.zeros((batch_imgs.shape[0], 0)), examples_sharding
-            )
+        batch_imgs, batch_clips, batch_max_cos_distances = get_batch(
+            test_imgs,
+            training_cfg.batch_size,
+            batch_idx,
+            clip_conditioning=mdl.clip_conditioning,
+            clip_caps=mdl.clip_caps,
+            clip_cap_count=mdl.clip_cap_count,
+            sharding=examples_sharding,
+        )
         losses.append(
             loss_fn(
                 eval_params,
@@ -1271,7 +1218,7 @@ for epoch in trange(
     test_loss = jnp.mean(jnp.stack(losses))
     wandb.log({"global_step": global_step, "test/loss": test_loss})
     tqdm.write(
-        f"Epoch {epoch} done, train loss: {train_loss:.4f}, test loss {test_loss:.4f}",
+        f"Epoch {epoch} done, train loss: {train_step_to_log['train/loss']:.4f}, test loss {test_loss:.4f}",
         end="",
     )
     save_checkpoint_and_log_images(

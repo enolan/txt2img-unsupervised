@@ -10,6 +10,8 @@ import pyarrow.parquet as pq
 
 
 def load_pq_dir(dir_path):
+    # The paths don't necessarily come out in the same order on every machine, so we sort to make
+    # the example order consistent.
     pq_paths = [str(p) for p in sorted(dir_path.glob("**/*.parquet"))]
     return Dataset.from_parquet(pq_paths, num_proc=16).with_format("numpy")
 

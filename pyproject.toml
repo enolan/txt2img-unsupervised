@@ -9,7 +9,7 @@ readme = "README.md"
 [tool.poetry.dependencies]
 CloseableQueue-py3 = "^0.9.2"
 dacite = "^1.8.1"
-datasets = "^2.14.6"
+datasets = "^3.0.1"
 einops = "^0.7.0"
 flash-attention-jax = { git = "https://github.com/enolan/flash-attention-jax.git", rev = "20621388795614de137c159a5c07abec5c475388"}
 flax = "^0.8.3"

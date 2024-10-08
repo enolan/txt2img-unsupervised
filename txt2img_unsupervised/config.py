@@ -4,6 +4,7 @@ import dacite
 import jax
 import jax.numpy as jnp
 import json
+import pytest
 from copy import copy
 from enum import Enum
 from dataclasses import dataclass
@@ -185,6 +186,9 @@ class TrainingConfig:
     loss_decay_constant: float = (
         1.0  # How much to decay the loss to weight later tokens less. in (0, 1]
     )
+    adaptive_gradient_skip: bool = False
+    adaptive_gradient_skip_history_len: Optional[int] = None
+    adaptive_gradient_skip_threshold_factor: Optional[float] = None
 
     @staticmethod
     def from_json_dict(dict: dict[str, Any]) -> "TrainingConfig":
@@ -195,13 +199,67 @@ class TrainingConfig:
             str_to_learning_rate_schedule,
             "learning rate schedule",
         )
-        return dacite.from_dict(data_class=TrainingConfig, data=dict)
+        config = dacite.from_dict(data_class=TrainingConfig, data=dict)
+        config.validate()
+        return config
 
     def to_json_dict(self) -> dict[str, Any]:
         """Convert a TrainingConfig object to a dictionary that can be serialized to JSON."""
         dict = remove_nones_from_dict(copy(self.__dict__))
         dict["learning_rate_schedule"] = self.learning_rate_schedule.value
         return dict
+
+    def validate(self):
+        """Validate the configuration."""
+        if self.adaptive_gradient_skip:
+            if (
+                self.adaptive_gradient_skip_history_len is None
+                or self.adaptive_gradient_skip_threshold_factor is None
+            ):
+                raise ValueError(
+                    "adaptive_gradient_skip_history_len and "
+                    "adaptive_gradient_skip_threshold_factor must be set when "
+                    "adaptive_gradient_skip is enabled"
+                )
+        else:
+            if (
+                self.adaptive_gradient_skip_history_len is not None
+                or self.adaptive_gradient_skip_threshold_factor is not None
+            ):
+                raise ValueError(
+                    "adaptive_gradient_skip_history_len and "
+                    "adaptive_gradient_skip_threshold_factor should not be set when "
+                    "adaptive_gradient_skip is disabled"
+                )
+
+        def get_schedule_error_message(schedule, warmup_required, beta1_required):
+            warmup_state = "set" if warmup_required else "unset"
+            beta1_state = "set" if beta1_required else "unset"
+            return f"{schedule} schedule requires warmup_steps to be {warmup_state} and schedule_free_beta1 to be {beta1_state}"
+
+        if self.learning_rate_schedule == LearningRateSchedule.CONSTANT:
+            if self.warmup_steps is not None or self.schedule_free_beta1 is not None:
+                raise ValueError(get_schedule_error_message("constant", False, False))
+        elif self.learning_rate_schedule == LearningRateSchedule.TRIANGLE:
+            if self.warmup_steps is not None or self.schedule_free_beta1 is not None:
+                raise ValueError(get_schedule_error_message("triangle", False, False))
+        elif self.learning_rate_schedule == LearningRateSchedule.WARMUP_PLUS_COSINE:
+            if self.warmup_steps is None or self.schedule_free_beta1 is not None:
+                raise ValueError(
+                    get_schedule_error_message("warmup plus cosine", True, False)
+                )
+        elif (
+            self.learning_rate_schedule
+            == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+        ):
+            if self.warmup_steps is None or self.schedule_free_beta1 is None:
+                raise ValueError(
+                    get_schedule_error_message("warmup plus schedule-free", True, True)
+                )
+        else:
+            raise ValueError(
+                f"Unknown learning rate schedule {self.learning_rate_schedule}"
+            )
 
 
 def merge_attrs(data_class, args: Any) -> None:
@@ -240,16 +298,37 @@ def test_trainingconfig_merge_argparse() -> None:
     )
 
 
-def test_trainingconfig_roundtrip_from_json() -> None:
-    """Test that converting from json and back is the identity."""
-    json_str = """{
+_test_json_strs = [
+    """{
         "learning_rate": 1e-4,
         "batch_size": 4,
         "epochs": 100,
         "training_images": 0,
         "learning_rate_schedule": "triangle",
         "gradient_accumulation_steps": 1,
-        "loss_decay_constant": 0.25}"""
+        "loss_decay_constant": 0.25,
+        "adaptive_gradient_skip": true,
+        "adaptive_gradient_skip_history_len": 100,
+        "adaptive_gradient_skip_threshold_factor": 1.1
+        }""",
+    """{
+        "learning_rate": 1e-4,
+        "batch_size": 4,
+        "epochs": 100,
+        "training_images": 0,
+        "learning_rate_schedule": "warmup_plus_schedule_free",
+        "warmup_steps": 100,
+        "schedule_free_beta1": 0.9,
+        "gradient_accumulation_steps": 1,
+        "loss_decay_constant": 0.25,
+        "adaptive_gradient_skip": false
+        }""",
+]
+
+
+@pytest.mark.parametrize("json_str", _test_json_strs)
+def test_trainingconfig_roundtrip_from_json(json_str: str) -> None:
+    """Test that converting from json and back is the identity."""
     cfg = TrainingConfig.from_json_dict(json.loads(json_str))
     assert TrainingConfig.to_json_dict(cfg) == json.loads(json_str)
 

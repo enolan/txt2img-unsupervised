@@ -17,6 +17,7 @@ from pathlib import Path
 from tqdm import tqdm
 from typing import Any, Optional, Tuple
 
+from .adaptive_gradient_skip import AdaptiveGradientSkipState, adaptive_gradient_skip
 from .config import LearningRateSchedule, ModelConfig, TrainingConfig
 from .transformer_model import ImageModel
 from .triangle_schedule import triangle_schedule
@@ -30,47 +31,6 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int):
     Returns:
         An optax optimizer.
     """
-
-    def get_schedule_error_message(schedule, warmup_required, beta1_required):
-        warmup_state = "set" if warmup_required else "unset"
-        beta1_state = "set" if beta1_required else "unset"
-        return f"{schedule} schedule requires warmup_steps to be {warmup_state} and schedule_free_beta1 to be {beta1_state}"
-
-    if training_cfg.learning_rate_schedule == LearningRateSchedule.CONSTANT:
-        if (
-            training_cfg.warmup_steps is not None
-            or training_cfg.schedule_free_beta1 is not None
-        ):
-            raise ValueError(get_schedule_error_message("constant", False, False))
-    elif training_cfg.learning_rate_schedule == LearningRateSchedule.TRIANGLE:
-        if (
-            training_cfg.warmup_steps is not None
-            or training_cfg.schedule_free_beta1 is not None
-        ):
-            raise ValueError(get_schedule_error_message("triangle", False, False))
-    elif training_cfg.learning_rate_schedule == LearningRateSchedule.WARMUP_PLUS_COSINE:
-        if (
-            training_cfg.warmup_steps is None
-            or training_cfg.schedule_free_beta1 is not None
-        ):
-            raise ValueError(
-                get_schedule_error_message("warmup plus cosine", True, False)
-            )
-    elif (
-        training_cfg.learning_rate_schedule
-        == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
-    ):
-        if (
-            training_cfg.warmup_steps is None
-            or training_cfg.schedule_free_beta1 is None
-        ):
-            raise ValueError(
-                get_schedule_error_message("warmup plus schedule-free", True, True)
-            )
-    else:
-        raise ValueError(
-            f"Unknown learning rate schedule {training_cfg.learning_rate_schedule}"
-        )
     if training_cfg.learning_rate_schedule == LearningRateSchedule.CONSTANT:
         opt = optax.adam(learning_rate=training_cfg.learning_rate)
     elif training_cfg.learning_rate_schedule == LearningRateSchedule.TRIANGLE:
@@ -116,6 +76,14 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int):
     else:
         clip = optax.identity()
     opt = optax.chain(clip, opt)
+
+    # Apply adaptive gradient skip if needed
+    if training_cfg.adaptive_gradient_skip:
+        opt = adaptive_gradient_skip(
+            opt,
+            training_cfg.adaptive_gradient_skip_history_len,
+            training_cfg.adaptive_gradient_skip_threshold_factor,
+        )
 
     # Apply finite check
     opt = optax.apply_if_finite(opt, 20)
@@ -336,7 +304,7 @@ def setup_checkpoint_manager_and_initial_state(
     training_cfg: TrainingConfig,
     rng: jax.random.PRNGKey,
     batches_total: int,
-    data_step_offset: int = 0,
+    data_offset: int = 0,
     extra_metadata: Optional[Tuple[str, Any]] = None,
 ) -> Tuple[ocp.CheckpointManager, TrainState]:
     """
@@ -380,7 +348,7 @@ def setup_checkpoint_manager_and_initial_state(
             "training_cfg": training_cfg.to_json_dict(),
             "run_id": run_id,
             "commit_hash": commit_hash,
-            "data_step_offset": data_step_offset,
+            "data_offset": data_offset,
         }
         | extra_metadata,
     )
