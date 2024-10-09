@@ -1,6 +1,11 @@
 """Script for sampling from the model, plus associated utilities."""
+
+import os
+
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
+
 import argparse
-import dacite
+import gc
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
@@ -510,6 +515,7 @@ def main():
         ]
         cond_dicts = cond_img_dicts + cond_txt_dicts
         del clip_mdl, clip_processor
+        gc.collect()
 
         if im_mdl.clip_caps:
             total_conds = len(cond_dicts)

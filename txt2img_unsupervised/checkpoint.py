@@ -1,5 +1,6 @@
 """Create, load, and save TrainStates and checkpoints."""
 
+import gc
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -257,9 +258,10 @@ class TrainState(train_state.TrainState):
 def mk_checkpoint_manager(
     checkpoint_dir: Path,
     checkpoint_manager_options: Optional[ocp.CheckpointManagerOptions] = None,
+    for_training: bool = True,
 ) -> ocp.CheckpointManager:
     """Create a CheckpointManager for a directory that already has checkpoints in it."""
-    item_names = ("params", "opt_state", "rng")
+    item_names = ("params", "rng", "opt_state") if for_training else ("params",)
     return ocp.CheckpointManager(
         checkpoint_dir.absolute(),
         item_names=item_names,
@@ -292,12 +294,28 @@ def load_eval_params(
         - The step number
         - The ImageModel instance
     """
-    checkpoint_manager = mk_checkpoint_manager(checkpoint_dir)
+    # FIXME this loads the params, not the eval params. maybe should rename. also have checkpoint
+    # processor script that computes eval params and discards everything else.
+    checkpoint_manager = mk_checkpoint_manager(checkpoint_dir, for_training=False)
     if step is None:
         step = checkpoint_manager.latest_step()
-    ts, mdl = TrainState.load_from_checkpoint(checkpoint_manager, step)
-    ts = ts.replicate_for_multi_gpu()
-    return ts.get_eval_params(), step, mdl
+    mdl_config = ModelConfig.from_json_dict(checkpoint_manager.metadata()["model_cfg"])
+    mdl = ImageModel(**mdl_config.__dict__)
+    params_template = jax.jit(mdl.init)(jax.random.PRNGKey(0), *mdl.dummy_inputs())
+    params_template = jax.tree.map(ocp.utils.to_shape_dtype_struct, params_template)
+    gc.collect()
+    restored = checkpoint_manager.restore(
+        step,
+        args=ocp.args.Composite(
+            params=ocp.args.StandardRestore(params_template),
+        ),
+    )
+
+    # Replicate params for multi-GPU inference
+    devices = mesh_utils.create_device_mesh((jax.device_count(),))
+    mesh = Mesh(devices, axis_names=("dev",))
+    params = jax.device_put(restored.params, NamedSharding(mesh, PartitionSpec(None)))
+    return params, step, mdl
 
 
 def setup_checkpoint_manager_and_initial_state(
