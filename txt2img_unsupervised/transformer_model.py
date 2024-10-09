@@ -49,6 +49,7 @@ class ImageModel(nn.Module):
     use_biases: bool
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
+    weights_dtype: jnp.dtype
     pre_norm: bool
     decode: bool = False
     attn_method: Optional[AttnMethod] = None
@@ -66,6 +67,7 @@ class ImageModel(nn.Module):
             features=self.d_model,
             embedding_init=default_kernel_init,
             dtype=self.activations_dtype,
+            param_dtype=self.weights_dtype,
         )
 
         if self.image_dropout is not None:
@@ -73,7 +75,8 @@ class ImageModel(nn.Module):
                 # This drops the features within the tokens, not entire tokens. Which makes less
                 # sense as a strategy for reducing the model's ability to focus on learning local
                 # structure, but empirically works substantially better.
-                rate=self.image_dropout, deterministic=False
+                rate=self.image_dropout,
+                deterministic=False,
             )
         else:
             self.image_dropout_layer = nn.Dropout(rate=0, deterministic=True)
@@ -138,12 +141,14 @@ class ImageModel(nn.Module):
             features=self.d_model,
             use_bias=self.use_biases,
             dtype=self.activations_dtype,
+            param_dtype=self.weights_dtype,
             kernel_init=nn.initializers.normal(stddev=clip_proj_stddev),
         )
         self.max_cos_distance_proj = nn.Dense(
             features=self.d_model,
             use_bias=self.use_biases,
             dtype=self.activations_dtype,
+            param_dtype=self.weights_dtype,
             kernel_init=nn.initializers.normal(stddev=clip_proj_stddev),
         )
 
@@ -152,6 +157,7 @@ class ImageModel(nn.Module):
             features=self.d_model,
             embedding_init=default_kernel_init,
             dtype=self.activations_dtype,
+            param_dtype=self.weights_dtype,
         )
 
         # Detect best available attention method
@@ -184,6 +190,7 @@ class ImageModel(nn.Module):
             dropout=self.dropout,
             use_biases=self.use_biases,
             activations_dtype=self.activations_dtype,
+            weights_dtype=self.weights_dtype,
             activation_function=self.activation_function,
             pre_norm=self.pre_norm,
             kernel_init=default_kernel_init,
@@ -194,13 +201,19 @@ class ImageModel(nn.Module):
         )
 
         if self.pre_norm:
-            self.final_layer_norm = nn.LayerNorm(dtype=self.activations_dtype)
+            self.final_layer_norm = nn.LayerNorm(
+                # LLaMA uses float32 for layer norms and bf16 for the rest of the weights.
+                # Presumably they know what they're doing.
+                dtype=self.activations_dtype,
+                param_dtype=jnp.float32,
+            )
 
         self.logits_decoder = nn.Dense(
             features=8192,
             kernel_init=default_kernel_init,
             use_bias=self.use_biases,
             dtype=self.activations_dtype,
+            param_dtype=self.weights_dtype,
         )
 
         tokens_res = int(self.image_tokens**0.5)
@@ -1244,6 +1257,7 @@ class TransformerLayer(nn.Module):
     use_biases: bool
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
+    weights_dtype: jnp.dtype
     pre_norm: bool
     kernel_init: Callable[..., jnp.ndarray]
     out_proj_kernel_init: Callable[..., jnp.ndarray]
@@ -1361,25 +1375,32 @@ class TransformerLayer(nn.Module):
             deterministic=False,
             use_bias=self.use_biases,
             dtype=self.activations_dtype,
+            param_dtype=self.weights_dtype,
             kernel_init=self.kernel_init,
             out_kernel_init=self.out_proj_kernel_init,
             decode=self.decode,
             attention_fn=attn_function,
         )
-        self.layer_norm_1 = nn.LayerNorm(dtype=self.activations_dtype)
+        self.layer_norm_1 = nn.LayerNorm(
+            dtype=self.activations_dtype, param_dtype=jnp.float32
+        )
         self.linear_1 = nn.Dense(
             features=self.ff_dim,
             use_bias=self.use_biases,
             kernel_init=self.kernel_init,
             dtype=self.activations_dtype,
+            param_dtype=self.weights_dtype,
         )
         self.linear_2 = nn.Dense(
             features=self.d_model,
             use_bias=self.use_biases,
             kernel_init=self.out_proj_kernel_init,
             dtype=self.activations_dtype,
+            param_dtype=self.weights_dtype,
         )
-        self.layer_norm_2 = nn.LayerNorm(dtype=self.activations_dtype)
+        self.layer_norm_2 = nn.LayerNorm(
+            dtype=self.activations_dtype, param_dtype=jnp.float32
+        )
         if self.dropout is not None:
             self.dropout_layer = nn.Dropout(self.dropout, deterministic=False)
         else:
@@ -1444,6 +1465,7 @@ def test_flash_attention_equals_standard(flash_method: AttnMethod) -> None:
         use_biases=False,
         activations_dtype=activations_dtype,
         activation_function=jax.nn.relu,
+        weights_dtype=jnp.float32,
         pre_norm=False,
         kernel_init=nn.initializers.normal(stddev=0.02),
         out_proj_kernel_init=nn.initializers.normal(stddev=0.02 / jnp.sqrt(2 * 12)),
@@ -1718,15 +1740,18 @@ def train_loop_simple(
     return loss, params  # type:ignore[return-value]
 
 
+@pytest.mark.parametrize("weights_dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("pre_norm", [True, False])
-def test_learn_zeros(pre_norm: bool) -> None:
+def test_learn_zeros(pre_norm: bool, weights_dtype: jnp.dtype) -> None:
     """Test whether the model can learn to predict all zeros."""
     mdl_cfg = copy(gpt_1_config)
     mdl_cfg.pre_norm = pre_norm
+    mdl_cfg.activations_dtype = weights_dtype
+    mdl_cfg.weights_dtype = weights_dtype
     mdl = ImageModel(**mdl_cfg.__dict__)
     data = jnp.zeros((16, gpt_1_config.image_tokens), dtype=jnp.int32)
     loss, params = train_loop_simple(
-        data, mdl, iters=5, learning_rate=3e-2, warmup_steps=1
+        data, mdl, iters=7, learning_rate=3e-2, warmup_steps=1
     )
     assert loss < 1e-10
 
@@ -1740,11 +1765,14 @@ def test_learn_zeros(pre_norm: bool) -> None:
     assert jnp.all(sampled_arr == 0)
 
 
+@pytest.mark.parametrize("weights_dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("pre_norm", [True, False])
-def test_learn_ranges(pre_norm: bool) -> None:
+def test_learn_ranges(pre_norm: bool, weights_dtype: jnp.dtype) -> None:
     """Test whether the model can memorize ranges of integers."""
     mdl_cfg = copy(gpt_1_config)
     mdl_cfg.pre_norm = pre_norm
+    mdl_cfg.activations_dtype = weights_dtype
+    mdl_cfg.weights_dtype = weights_dtype
     mdl = ImageModel(**mdl_cfg.__dict__)
     # The numbers are sequential but there's nothing about the way the model works that tells it
     # the ordering of the tokens in the codebook, so this is a pure memorization test.
@@ -1754,9 +1782,9 @@ def test_learn_ranges(pre_norm: bool) -> None:
     loss, params = train_loop_simple(
         data,
         mdl,
-        iters=100 if pre_norm else 250,
+        iters=100 if pre_norm else 400,
         learning_rate=1e-3 if pre_norm else 1e-4,
-        warmup_steps=20,
+        warmup_steps=20 if pre_norm else 100,
     )
     assert loss < 0.6
     print("Generating samples...")
