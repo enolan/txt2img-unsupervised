@@ -1083,33 +1083,37 @@ def sample(
         decode=True, attn_method=AttnMethod.STANDARD, dropout=None, image_dropout=None
     )
 
-    toks_0, cache, rngs = _init_decode(
-        mdl_decode,
-        params,
-        clip_embeddings,
-        max_cos_distances,
-        rngs,
-        filter_method,
-        filter_threshold,
-        temperature,
-    )
-
-    image_toks = (
-        jnp.zeros((batch_size, mdl.image_tokens), dtype=jnp.int32).at[:, 0].set(toks_0)
-    )
-
-    for i in range(mdl.image_tokens - 1):
-        cache, image_toks, rngs = _step_decode(
+    with tqdm(total=mdl.image_tokens, unit="token", leave=False) as pbar:
+        toks_0, cache, rngs = _init_decode(
             mdl_decode,
             params,
-            cache,
-            image_toks,
-            i,
+            clip_embeddings,
+            max_cos_distances,
             rngs,
             filter_method,
             filter_threshold,
             temperature,
         )
+        pbar.update()
+        image_toks = (
+            jnp.zeros((batch_size, mdl.image_tokens), dtype=jnp.int32)
+            .at[:, 0]
+            .set(toks_0)
+        )
+
+        for i in range(mdl.image_tokens - 1):
+            cache, image_toks, rngs = _step_decode(
+                mdl_decode,
+                params,
+                cache,
+                image_toks,
+                i,
+                rngs,
+                filter_method,
+                filter_threshold,
+                temperature,
+            )
+            pbar.update()
 
     return image_toks
 
