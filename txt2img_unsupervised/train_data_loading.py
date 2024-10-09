@@ -1,6 +1,5 @@
 """Functions for loading training data."""
 
-import datasets
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -9,8 +8,6 @@ import pytest
 from datasets import Dataset
 from einops import rearrange
 from functools import lru_cache
-from sortedcontainers import SortedList
-from time import monotonic
 from tqdm import tqdm
 from typing import Optional, Tuple
 
