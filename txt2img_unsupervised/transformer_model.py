@@ -1396,6 +1396,10 @@ class TransformerLayer(nn.Module):
                 assert (
                     dropout_rate == 0.0
                 ), "attention dropout not implemented for cudnn attention"
+                assert dtype in [
+                    jnp.bfloat16,
+                    jnp.float16,
+                ], "cudnn attention only supports half precision"
                 res = jax.nn.dot_product_attention(
                     q,
                     k,
