@@ -114,23 +114,10 @@ class TrainState(train_state.TrainState):
             rng=rng,
         )
 
-    def replicate_for_multi_gpu(self):
+    def replicate_for_multi_gpu(self, mesh: Mesh):
         """Replicate parameters for multi-GPU training."""
-        devices = mesh_utils.create_device_mesh((jax.device_count(),))
-        mesh = Mesh(devices, axis_names=("dev",))
 
-        def replicate_val(v):
-            if isinstance(v, int) or isinstance(v, float):
-                return jax.device_put(v, NamedSharding(mesh, PartitionSpec()))
-            elif isinstance(v, jax.Array):
-                if len(v.shape) == 0:
-                    return jax.device_put(v, NamedSharding(mesh, PartitionSpec()))
-                else:
-                    return jax.device_put(v, NamedSharding(mesh, PartitionSpec(None)))
-            else:
-                raise ValueError(f"Unsupported type: {type(v)}")
-
-        return jax.tree.map(replicate_val, self)
+        return jax.device_put(self, NamedSharding(mesh, PartitionSpec()))
 
     @classmethod
     def load_from_checkpoint(
@@ -177,25 +164,14 @@ class TrainState(train_state.TrainState):
             ),
         )
 
-        # Normalize placement of the restored values. Orbax records the sharding in the checkpoint
-        # and when you load a checkpoint the arrays are committed to whatever device they were on
-        # when it was saved. Sometimes this breaks things.
-        params, opt_state, rng = jax.device_get(
-            (restored.params, restored.opt_state, restored.rng)
-        )
-        del restored
-        params, opt_state, rng = map(
-            lambda x: jax.device_put(x), (params, opt_state, rng)
-        )
-
         opt = setup_optimizer(training_cfg, batches_total)
 
         train_state = cls(
             apply_fn=mdl.apply,
-            params=params,
+            params=restored.params,
             tx=opt,
-            opt_state=opt_state,
-            rng=rng,
+            opt_state=restored.opt_state,
+            rng=restored.rng,
             step=step,
         )
 

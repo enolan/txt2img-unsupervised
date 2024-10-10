@@ -293,7 +293,6 @@ def init_train_state():
 
         mdl = transformer_model.ImageModel(**model_cfg.__dict__)
 
-    train_state = train_state.replicate_for_multi_gpu()
     if args.sample_batch_size is None:
         sample_batch_size = training_cfg.batch_size
     else:
@@ -396,7 +395,7 @@ def setup_sharding():
 
 
 mesh = setup_sharding()
-
+train_state = train_state.replicate_for_multi_gpu(mesh)
 
 loss_grad_fn = jax.value_and_grad(transformer_model.loss_batch, argnums=1)
 loss_fn = jax.jit(

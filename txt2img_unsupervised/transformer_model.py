@@ -163,7 +163,11 @@ class ImageModel(nn.Module):
         # Detect best available attention method
         if self.attn_method is None:
             if gpu_is_ampere_or_newer():
-                attn_method = AttnMethod.FLASH_CPP
+                if jax.local_device_count("gpu") > 1 and "H100" in jax.devices("gpu")[0].device_kind:
+                    print("Warning: using pure JAX flash attention to work around H100 deadlock bug")
+                    attn_method = AttnMethod.FLASH_JAX
+                else:
+                    attn_method = AttnMethod.FLASH_CPP
             else:
                 print(
                     "Warning: falling back to pure JAX flash attention because no >= Ampere architecture GPU was detected."
