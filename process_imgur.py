@@ -47,7 +47,9 @@ def setup_db(db_path: Path) -> sqlite3.Connection:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_file_blake2b ON files (blake2b)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_file_warc ON files (warc)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_blake2b_processed ON files (blake2b) WHERE processed = 1")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_blake2b_processed ON files (blake2b) WHERE processed = 1"
+    )
     return conn
 
 

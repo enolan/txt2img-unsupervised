@@ -365,7 +365,12 @@ def setup_checkpoint_manager_and_initial_state(
 @pytest.mark.parametrize("gradient_accumulation_steps", [1, 2])
 @pytest.mark.parametrize("gradient_clipping", [None, 1.0])
 @pytest.mark.parametrize("adaptive_gradient_skip", [True, False])
-def test_get_eval_params(adaptive_gradient_skip, gradient_clipping, gradient_accumulation_steps, schedule_free):
+def test_get_eval_params(
+    adaptive_gradient_skip,
+    gradient_clipping,
+    gradient_accumulation_steps,
+    schedule_free,
+):
     # Set up a TrainState with either schedule-free or non-schedule-free optimizer
     rng = jax.random.PRNGKey(0)
 

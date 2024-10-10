@@ -91,9 +91,7 @@ class ModelConfig:
             elif self.activations_dtype == jnp.float32:
                 raise ValueError(dtypes_error)
             else:
-                raise ValueError(
-                    f"Unknown activations_dtype {self.activations_dtype}"
-                )
+                raise ValueError(f"Unknown activations_dtype {self.activations_dtype}")
 
 
 def invert_dict(d: dict[Any, Any]) -> dict[Any, Any]:

@@ -92,10 +92,18 @@ def make_grid(
     # of the images.
     checkerboard = PIL.Image.new("RGB", (spacing, spacing))
     checkerboard_draw = PIL.ImageDraw.Draw(checkerboard)
-    checkerboard_draw.rectangle([0, 0, spacing//2, spacing//2], fill=(255, 255, 255))
-    checkerboard_draw.rectangle([spacing//2, 0, spacing, spacing//2], fill=(240, 240, 240))
-    checkerboard_draw.rectangle([0, spacing//2, spacing//2, spacing], fill=(240, 240, 240))
-    checkerboard_draw.rectangle([spacing//2, spacing//2, spacing, spacing], fill=(255, 255, 255))
+    checkerboard_draw.rectangle(
+        [0, 0, spacing // 2, spacing // 2], fill=(255, 255, 255)
+    )
+    checkerboard_draw.rectangle(
+        [spacing // 2, 0, spacing, spacing // 2], fill=(240, 240, 240)
+    )
+    checkerboard_draw.rectangle(
+        [0, spacing // 2, spacing // 2, spacing], fill=(240, 240, 240)
+    )
+    checkerboard_draw.rectangle(
+        [spacing // 2, spacing // 2, spacing, spacing], fill=(255, 255, 255)
+    )
 
     # Fill the grid with the checkerboard pattern
     for y in range(0, side_len_px, spacing):

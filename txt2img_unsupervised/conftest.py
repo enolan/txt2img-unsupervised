@@ -2,9 +2,11 @@ import pytest
 
 from .gpu_check import gpu_is_ampere_or_newer
 
+
 def pytest_configure(config):
     config.addinivalue_line(
-        "markers", "requires_ampere_or_newer: mark test as needing Ampere or newer GPU microarchitecture"
+        "markers",
+        "requires_ampere_or_newer: mark test as needing Ampere or newer GPU microarchitecture",
     )
 
 

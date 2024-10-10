@@ -47,9 +47,7 @@ def gen_params(used_params):
 
 
 def params_to_path(params):
-    return Path("/mnt/sweeps") / "-".join(
-        f"{k}={v}" for k, v in sorted(params.items())
-    )
+    return Path("/mnt/sweeps") / "-".join(f"{k}={v}" for k, v in sorted(params.items()))
 
 
 def build_tree(params):
@@ -155,6 +153,7 @@ def main():
         print(f"Deleting {tree_dir} and {ex_path}")
         shutil.rmtree(tree_dir)
         ex_path.unlink()
+
 
 if __name__ == "__main__":
     main()
