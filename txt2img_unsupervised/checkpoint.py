@@ -177,25 +177,14 @@ class TrainState(train_state.TrainState):
             ),
         )
 
-        # Normalize placement of the restored values. Orbax records the sharding in the checkpoint
-        # and when you load a checkpoint the arrays are committed to whatever device they were on
-        # when it was saved. Sometimes this breaks things.
-        params, opt_state, rng = jax.device_get(
-            (restored.params, restored.opt_state, restored.rng)
-        )
-        del restored
-        params, opt_state, rng = map(
-            lambda x: jax.device_put(x), (params, opt_state, rng)
-        )
-
         opt = setup_optimizer(training_cfg, batches_total)
 
         train_state = cls(
             apply_fn=mdl.apply,
-            params=params,
+            params=restored.params,
             tx=opt,
-            opt_state=opt_state,
-            rng=rng,
+            opt_state=restored.opt_state,
+            rng=restored.rng,
             step=step,
         )
 
