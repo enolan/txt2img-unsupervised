@@ -114,10 +114,8 @@ class TrainState(train_state.TrainState):
             rng=rng,
         )
 
-    def replicate_for_multi_gpu(self):
+    def replicate_for_multi_gpu(self, mesh: Mesh):
         """Replicate parameters for multi-GPU training."""
-        devices = mesh_utils.create_device_mesh((jax.device_count(),))
-        mesh = Mesh(devices, axis_names=("dev",))
 
         def replicate_val(v):
             if isinstance(v, int) or isinstance(v, float):
