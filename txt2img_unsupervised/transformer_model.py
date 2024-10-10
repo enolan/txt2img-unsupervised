@@ -29,7 +29,7 @@ from .spherical_space_partitioning import CapTree
 from .triangle_schedule import triangle_schedule
 
 
-AttnMethod = Enum("AttnMethod", ["STANDARD", "FLASH_JAX", "FLASH_CPP"])
+AttnMethod = Enum("AttnMethod", ["STANDARD", "FLASH_JAX", "FLASH_CPP", "CUDNN"])
 
 
 class ImageModel(nn.Module):
@@ -1368,6 +1368,37 @@ class TransformerLayer(nn.Module):
                 assert res.shape == v.shape
                 return res
 
+        elif self.attn_method == AttnMethod.CUDNN:
+
+            def attn_function(
+                q,
+                k,
+                v,
+                bias=None,
+                mask=None,
+                broadcast_dropout=True,
+                dropout_rng=None,
+                dropout_rate=0.0,
+                deterministic=False,
+                dtype=None,
+                precision=None,
+            ):
+                assert mask is None, "attention mask should be None for cudnn attention"
+                assert (
+                    dropout_rate == 0.0
+                ), "attention dropout not implemented for cudnn attention"
+                res = jax.nn.dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    bias=bias,
+                    mask=None,
+                    is_causal=True,
+                    implementation="cudnn",
+                )
+                assert res.shape == v.shape
+                return res
+
         elif self.attn_method == AttnMethod.STANDARD:
             attn_function = nn.attention.dot_product_attention
         else:
@@ -1426,6 +1457,7 @@ class TransformerLayer(nn.Module):
         if (
             self.attn_method == AttnMethod.FLASH_JAX
             or self.attn_method == AttnMethod.FLASH_CPP
+            or self.attn_method == AttnMethod.CUDNN
         ) and not self.record_attention_weights:
             mask = None
         else:
@@ -1458,6 +1490,7 @@ class TransformerLayer(nn.Module):
     [
         pytest.param(AttnMethod.FLASH_JAX),
         pytest.param(AttnMethod.FLASH_CPP, marks=pytest.mark.requires_ampere_or_newer),
+        pytest.param(AttnMethod.CUDNN, marks=pytest.mark.requires_ampere_or_newer),
     ],
 )
 def test_flash_attention_equals_standard(flash_method: AttnMethod) -> None:
