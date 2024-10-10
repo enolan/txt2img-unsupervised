@@ -1096,7 +1096,7 @@ def sample(
         decode=True, attn_method=AttnMethod.STANDARD, dropout=None, image_dropout=None
     )
 
-    with tqdm(total=mdl.image_tokens, unit="token", leave=False) as pbar:
+    with tqdm(total=mdl.image_tokens * batch_size, unit="token", leave=False) as pbar:
         toks_0, cache, rngs = _init_decode(
             mdl_decode,
             params,
@@ -1107,7 +1107,7 @@ def sample(
             filter_threshold,
             temperature,
         )
-        pbar.update()
+        pbar.update(batch_size)
         image_toks = (
             jnp.zeros((batch_size, mdl.image_tokens), dtype=jnp.int32)
             .at[:, 0]
@@ -1126,7 +1126,7 @@ def sample(
                 filter_threshold,
                 temperature,
             )
-            pbar.update()
+            pbar.update(batch_size)
 
     return image_toks
 
