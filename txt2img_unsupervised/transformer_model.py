@@ -889,7 +889,7 @@ def test_batched_decode_consistency() -> None:
             clip_embeddings=clip_embeddings[i : i + 1],
             max_cos_distances=max_cos_distances[i : i + 1],
         )
-        params_1 = flax.core.copy(params_1, {"cache": new_cache})
+        params_1 = flax.core.copy(params_1, new_cache)
         for j in trange(
             mdl_nodec.image_tokens - 1,
             desc=f"Processing tokens for image {i+1}",
@@ -900,7 +900,7 @@ def test_batched_decode_consistency() -> None:
                 toks=toks[i : i + 1, j],
                 idx=jnp.array(j),
             )
-            params_1 = flax.core.copy(params_1, {"cache": new_cache})
+            params_1 = flax.core.copy(params_1, new_cache)
 
     # Test batch size 3
     params_3 = mdl_dec.init(
@@ -915,14 +915,14 @@ def test_batched_decode_consistency() -> None:
         clip_embeddings=clip_embeddings,
         max_cos_distances=max_cos_distances,
     )
-    params_3 = flax.core.copy(params_3, {"cache": new_cache})
+    params_3 = flax.core.copy(params_3, new_cache)
     for i in trange(mdl_nodec.image_tokens - 1, desc="Testing batch size 3"):
         logits_3[:, i + 1, :], new_cache = decode_step_j(
             params_3,
             toks=toks[:, i],
             idx=jnp.array(i),
         )
-        params_3 = flax.core.copy(params_3, {"cache": new_cache})
+        params_3 = flax.core.copy(params_3, new_cache)
 
     np.testing.assert_allclose(logits_1, logits_3, rtol=0, atol=1e-6)
 
