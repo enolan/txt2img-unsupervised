@@ -117,18 +117,7 @@ class TrainState(train_state.TrainState):
     def replicate_for_multi_gpu(self, mesh: Mesh):
         """Replicate parameters for multi-GPU training."""
 
-        def replicate_val(v):
-            if isinstance(v, int) or isinstance(v, float):
-                return jax.device_put(v, NamedSharding(mesh, PartitionSpec()))
-            elif isinstance(v, jax.Array):
-                if len(v.shape) == 0:
-                    return jax.device_put(v, NamedSharding(mesh, PartitionSpec()))
-                else:
-                    return jax.device_put(v, NamedSharding(mesh, PartitionSpec(None)))
-            else:
-                raise ValueError(f"Unsupported type: {type(v)}")
-
-        return jax.tree.map(replicate_val, self)
+        return jax.device_put(self, NamedSharding(mesh, PartitionSpec()))
 
     @classmethod
     def load_from_checkpoint(
