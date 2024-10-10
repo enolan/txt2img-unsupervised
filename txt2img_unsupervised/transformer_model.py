@@ -162,19 +162,28 @@ class ImageModel(nn.Module):
         # Detect best available attention method
         if self.attn_method is None:
             if gpu_is_ampere_or_newer():
-                if (
-                    jax.local_device_count("gpu") > 1
-                    and "H100" in jax.devices("gpu")[0].device_kind
-                ):
+                if self.activations_dtype in [jnp.float16, jnp.bfloat16]:
+                    if (
+                        jax.local_device_count("gpu") > 1
+                        and "H100" in jax.devices("gpu")[0].device_kind
+                    ):
+                        print(
+                            "Using CUDNN flash attention to work around H100 deadlock bug"
+                        )
+                        attn_method = AttnMethod.CUDNN
+                    else:
+                        attn_method = AttnMethod.FLASH_CPP
+                else:
                     print(
-                        "Warning: using pure JAX flash attention to work around H100 deadlock bug"
+                        f"Warning: GPU is eligible for faster attention but activations_dtype "
+                        f"is {self.activations_dtype}. Must be half precision for CUDNN or Tri Dao "
+                        "flash attention to work, using pure JAX flash attention instead."
                     )
                     attn_method = AttnMethod.FLASH_JAX
-                else:
-                    attn_method = AttnMethod.FLASH_CPP
             else:
                 print(
-                    "Warning: falling back to pure JAX flash attention because no >= Ampere architecture GPU was detected."
+                    "Warning: falling back to pure JAX flash attention because no >= Ampere "
+                    "architecture GPU was detected."
                 )
                 attn_method = AttnMethod.FLASH_JAX
         else:
