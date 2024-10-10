@@ -972,7 +972,12 @@ def exit_early_signal_handler(signum, frame):
     # step), so we use a flag and check for it rather than exiting immediately upon recieving the
     # signal.
     global exit_requested
-    exit_requested = True
+    if exit_requested:
+        tqdm.write("CTRL-C pressed twice, exiting immediately without checkpointing")
+        exit(1)
+    else:
+        tqdm.write("CTRL-C pressed, doing clean exit after checkpointing")
+        exit_requested = True
 
 
 signal.signal(signal.SIGTERM, exit_early_signal_handler)
