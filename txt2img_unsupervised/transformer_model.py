@@ -1819,12 +1819,15 @@ def test_learn_zeros(pre_norm: bool, weights_dtype: jnp.dtype) -> None:
     assert jnp.all(sampled_arr == 0)
 
 
-@pytest.mark.parametrize("weights_dtype, pre_norm", [
-    pytest.param(jnp.float32, True, id="float32-prenorm"),
-    pytest.param(jnp.bfloat16, True, id="bfloat16-prenorm"),
-    pytest.param(jnp.float32, False, id="float32-no-prenorm"),
-    # bf16 post-norm is really finicky and slow
-])
+@pytest.mark.parametrize(
+    "weights_dtype, pre_norm",
+    [
+        pytest.param(jnp.float32, True, id="float32-prenorm"),
+        pytest.param(jnp.bfloat16, True, id="bfloat16-prenorm"),
+        pytest.param(jnp.float32, False, id="float32-no-prenorm"),
+        # bf16 post-norm is really finicky and slow
+    ],
+)
 def test_learn_ranges(pre_norm: bool, weights_dtype: jnp.dtype) -> None:
     """Test whether the model can memorize ranges of integers."""
     mdl_cfg = copy(gpt_1_config)
