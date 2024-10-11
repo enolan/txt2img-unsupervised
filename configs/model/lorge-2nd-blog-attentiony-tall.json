@@ -1,0 +1,18 @@
+{
+  "d_model": 1792,
+  "num_heads": 28,
+  "ff_dim": 7168,
+  "n_layers": 56,
+  "image_dropout": 0.3,
+  "dropout": null,
+  "image_tokens": 1024,
+  "use_biases": true,
+  "activation_function": "gelu",
+  "activations_dtype": "bfloat16",
+  "weights_dtype": "bfloat16",
+  "pre_norm": true,
+  "clip_conditioning": true,
+  "clip_caps": true,
+  "clip_cap_count": 1,
+  "corrected_cap_projections": true
+}
