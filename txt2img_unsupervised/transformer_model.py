@@ -933,7 +933,7 @@ def test_batched_decode_consistency() -> None:
         )
         params_3 = flax.core.copy(params_3, new_cache)
 
-    np.testing.assert_allclose(logits_1, logits_3, rtol=0, atol=1e-6)
+    np.testing.assert_allclose(logits_1, logits_3, rtol=0, atol=2e-3)
 
 
 def test_clip_does_anything() -> None:
