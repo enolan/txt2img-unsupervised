@@ -1920,7 +1920,15 @@ def test_loss_weighting() -> None:
     assert loss_weighted_first_half < 0.1
 
 
-def test_clip_caps_overfit():
+@pytest.mark.parametrize(
+    "weights_dtype, activations_dtype",
+    [
+        pytest.param(jnp.bfloat16, jnp.bfloat16, id="wbf16-abf16"),
+        pytest.param(jnp.float32, jnp.bfloat16, id="wf32-abf16"),
+        pytest.param(jnp.float32, jnp.float32, id="wf32-af32"),
+    ],
+)
+def test_clip_caps_overfit(weights_dtype: jnp.dtype, activations_dtype: jnp.dtype):
     """Using a collection of ~100k, cap-image pair training examples, train a model and check test
     loss, then sample and check the generated samples. The training data is 100k pairs generated
     from 100 images (drawn with replacement). This tests the model's ability to memorize a small
@@ -1942,6 +1950,8 @@ def test_clip_caps_overfit():
     mdl_cfg.clip_cap_count = 1
     mdl_cfg.dropout = None
     mdl_cfg.activation_function = jax.nn.gelu
+    mdl_cfg.activations_dtype = activations_dtype
+    mdl_cfg.weights_dtype = weights_dtype
     mdl_cfg.pre_norm = True
 
     mdl = ImageModel(**mdl_cfg.__dict__)
