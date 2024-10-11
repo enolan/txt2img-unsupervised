@@ -503,7 +503,7 @@ def main():
     # Turn on JAX compilation cache
     jax.config.update("jax_compilation_cache_dir", "/tmp/t2i-u-jax-cache")
 
-    if im_mdl.clip_conditioning:
+    if im_mdl.clip_conditioning and (args.cond_img or args.cond_txt):
         print("Loading CLIP model...")
 
         clip_mdl_name = "openai/clip-vit-large-patch14"
@@ -534,17 +534,10 @@ def main():
                 total_conds <= im_mdl.clip_cap_count
             ), "Too many CLIP embeddings for the number of caps"
 
-            if total_conds == 0:
-                # unconditioned sampling
-                clip_embeddings_cond = np.zeros((0, 768))
-                max_cos_distances_cond = np.zeros(0)
-            else:
-                clip_embeddings_cond = np.stack(
-                    [d["clip_embedding"] for d in cond_dicts]
-                )
-                max_cos_distances_cond = np.stack(
-                    [d["max_cos_distance"] for d in cond_dicts]
-                )
+            clip_embeddings_cond = np.stack([d["clip_embedding"] for d in cond_dicts])
+            max_cos_distances_cond = np.stack(
+                [d["max_cos_distance"] for d in cond_dicts]
+            )
             assert clip_embeddings_cond.shape == (total_conds, 768)
             assert max_cos_distances_cond.shape == (total_conds,)
 
@@ -576,8 +569,17 @@ def main():
             ), "Can't specify max cosine distance without clip caps"
             cap_centers = repeat(clip_embeddings, "clip -> n clip", n=args.n)
             max_cos_distances = None
-
+    elif im_mdl.clip_conditioning:
+        # Unconditioned sampling
+        if im_mdl.clip_caps:
+            rng, rng2 = jax.random.split(rng)
+            cap_centers, max_cos_distances = mk_filler_caps(im_mdl, args.n, 0, rng2)
+            cond_img_inputs, cond_txt_inputs = [], []
+        else:
+            assert False, "Unconditioned sampling with no clip caps doesn't make sense"
     else:
+        cap_centers = None
+        max_cos_distances = None
         assert (
             args.cond_img is None and args.cond_txt is None
         ), "Can't specify --cond-img or --cond-txt without CLIP conditioning"
