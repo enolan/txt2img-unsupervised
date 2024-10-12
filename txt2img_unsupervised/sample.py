@@ -477,6 +477,9 @@ def main():
     parser.add_argument("out_dir", type=Path)
     args = parser.parse_args()
 
+    # Turn on JAX compilation cache
+    jax.config.update("jax_compilation_cache_dir", "/tmp/t2i-u-jax-cache")
+
     # check if grids are possible, and if so how many to make of what dimensions. We make 1 or 2 square
     # grids.
     if args.make_grids:
@@ -499,9 +502,6 @@ def main():
     # We need to minimize VRAM usage, so we don't load the transformer parameters until after
     # computing CLIP embeddings.
     im_mdl = get_imagemodel_from_checkpoint(args.transformer_checkpoint_dir)
-
-    # Turn on JAX compilation cache
-    jax.config.update("jax_compilation_cache_dir", "/tmp/t2i-u-jax-cache")
 
     if im_mdl.clip_conditioning and (args.cond_img or args.cond_txt):
         print("Loading CLIP model...")
