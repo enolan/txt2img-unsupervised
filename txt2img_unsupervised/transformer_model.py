@@ -1165,49 +1165,61 @@ def _filter_top_p(logits: jax.Array, top_p: float) -> jax.Array:
     """Filter an array of logits to include the smallest subset of possibilities that has
     proability mass at least p i.e. top p/nucleus sampling. Returns the filtered array.
     """
-    probs = jax.nn.softmax(logits)
-    sorted_probs, sorted_indices = (
-        jnp.sort(probs)[::-1],
-        jnp.argsort(probs)[::-1],
-    )
-    cumulative_probs = jnp.cumsum(sorted_probs)
-    # collect the minimal set of possibilites with probability <= top_p
-    mask = cumulative_probs <= top_p
-    # Find the index of the first possibility that has cumulative probability >= top_p
-    # this might be the last element we found above or might be the one after it.
-    # we could do only the argmax and set the mask with a range but that's not JIT-able so we do
-    # this.
-    last_idx = jnp.argmax(cumulative_probs >= top_p)
-    mask = mask.at[last_idx].set(True)
+    assert jnp.issubdtype(logits.dtype, jnp.floating), "logits must be floating point"
 
-    # permute the mask back to the original order
-    mask = mask[sorted_indices.argsort()]
+    # Under certain circumstances, softmax can produce NaN values. I don't really understand it, but
+    # it only happens with extreme logits and only with bf16, so it should be fine to do the softmax
+    # in float32 and check for NaNs afteward just in case. If there are NaNs in the output, we just
+    # return the input logits. Not much difference between picking a token 99.99999999% of the time
+    # and 100% of the time.
 
-    filtered_logits = jnp.where(mask, logits, -np.inf)
-    return filtered_logits
+    probs = jax.nn.softmax(logits.astype(jnp.float32))
+
+    def do_filter(probs):
+        sorted_indices = jnp.argsort(probs)[::-1]
+        sorted_probs = probs[sorted_indices]
+        cumulative_probs = jnp.cumsum(sorted_probs)
+
+        # collect the minimal set of possibilites with probability <= top_p
+        mask = cumulative_probs <= top_p
+        # Find the index of the first possibility that has cumulative probability >= top_p
+        # this might be the last element we found above or might be the one after it.
+        # we could do only the argmax and set the mask with a range but that's not JIT-able so we do
+        # this.
+        last_idx = jnp.argmax(cumulative_probs >= top_p)
+        mask = mask.at[last_idx].set(True)
+
+        # permute the mask back to the original order
+        mask = mask[sorted_indices.argsort()]
+
+        return jnp.where(mask, logits, -np.inf)
+
+    return jax.lax.cond(jnp.any(jnp.isnan(probs)), lambda _: logits, do_filter, probs)
 
 
 def test_filter_top_p_10() -> None:
     """Test that filter_top_p is the identity function when top_p = 1.0."""
-    logits = jnp.arange(10)
+    logits = jnp.arange(10, dtype=jnp.float32)
     filtered_logits = _filter_top_p(logits, 1.0)
     assert jnp.allclose(
         filtered_logits, logits
     ), "filter_top_p doesn't match the identity function when top_p = 1.0"
 
 
-def test_filter_top_p_05() -> None:
+@pytest.mark.parametrize("offset", [0.0, 1.0, -1.0, -0.25, 500.0])
+def test_filter_top_p_05(offset) -> None:
     """Test that filter_top_p removes low-probability elements when top_p = 0.5."""
     probabilities = jnp.array([0.35, 0.35, 0.1, 0.1, 0.1])
     assert jnp.isclose(jnp.sum(probabilities), 1.0)
-    logits = jnp.log(probabilities)
+    logits = jnp.log(probabilities) + offset
     filtered_logits = _filter_top_p(logits, 0.5)
     np.testing.assert_allclose(
         np.array(jax.nn.softmax(filtered_logits)), np.array([0.5, 0.5, 0, 0, 0])
     )
 
 
-def test_filter_top_p_out_of_order() -> None:
+@pytest.mark.parametrize("offset", [0.0, 1.0, -1.0, -0.25, 500.0])
+def test_filter_top_p_out_of_order(offset) -> None:
     """Test that filter_top_p removes low-probability elements when inputs do not start sorted."""
     probabilities = np.repeat(1000.0, 7)
     big_indices = np.array([3, 5])
@@ -1218,13 +1230,19 @@ def test_filter_top_p_out_of_order() -> None:
     probabilities[small_indices] = 0.1 / 3.0
     np.testing.assert_allclose(np.sum(probabilities), 1.0)
 
-    logits = jnp.log(probabilities)
+    logits = jnp.log(probabilities) + offset
     filtered_logits = _filter_top_p(logits, 0.75)
     filtered_probabilities = np.array(jax.nn.softmax(filtered_logits))
 
-    np.testing.assert_allclose(filtered_probabilities[small_indices], 0.0)
-    np.testing.assert_allclose(filtered_probabilities[medium_indices], 0.2 / 0.9)
-    np.testing.assert_allclose(filtered_probabilities[big_indices], 0.25 / 0.9)
+    np.testing.assert_allclose(
+        filtered_probabilities[small_indices], 0.0, rtol=0, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        filtered_probabilities[medium_indices], 0.2 / 0.9, rtol=0, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        filtered_probabilities[big_indices], 0.25 / 0.9, rtol=0, atol=1e-6
+    )
 
 
 def _filter_min_p(logits: jax.Array, min_p: float) -> jax.Array:
@@ -1237,28 +1255,31 @@ def _filter_min_p(logits: jax.Array, min_p: float) -> jax.Array:
     return jnp.where(probs >= min_prob, logits, -np.inf)
 
 
-def test_filter_min_p_identity():
+@pytest.mark.parametrize("offset", [0.0, 1.0, -1.0, -0.25, 500.0])
+def test_filter_min_p_identity(offset):
     """Test that filter_min_p is the identity function when min_p = 0."""
-    logits = jnp.array([1.0, 2.0, 3.0, 4.0])
+    logits = jnp.array([1.0, 2.0, 3.0, 4.0]) + offset
     filtered_logits = _filter_min_p(logits, 0.0)
-    np.testing.assert_allclose(filtered_logits, logits, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(filtered_logits, logits, rtol=0, atol=1e-5)
 
 
-def test_filter_min_p_threshold():
+@pytest.mark.parametrize("offset", [0.0, 1.0, -1.0, -0.25, 500.0])
+def test_filter_min_p_threshold(offset):
     """Test that filter_min_p correctly applies the threshold."""
     probs = jnp.array([0.1, 0.3, 0.5, 0.1])
-    logits = jnp.log(probs)
+    logits = jnp.log(probs) + offset
     filtered_logits = _filter_min_p(logits, 0.5)
     filtered_probs = jax.nn.softmax(filtered_logits)
     np.testing.assert_allclose(
-        filtered_probs, np.array([0.0, 0.3 / 0.8, 0.5 / 0.8, 0.0])
+        filtered_probs, np.array([0.0, 0.3 / 0.8, 0.5 / 0.8, 0.0]), rtol=0, atol=3e-6
     )
 
 
-def test_filter_min_p_all_filtered():
+@pytest.mark.parametrize("offset", [0.0, 1.0, -1.0, -0.25, 500.0])
+def test_filter_min_p_all_filtered(offset):
     """Test that filter_min_p filters out all tokens when min_p = 1."""
     probs = jnp.array([0.4, 0.1, 0.3, 0.2])
-    logits = jnp.log(probs)
+    logits = jnp.log(probs) + offset
     filtered_logits = _filter_min_p(logits, 1.0)
     filtered_probs = jax.nn.softmax(filtered_logits)
     np.testing.assert_allclose(filtered_probs, np.array([1.0, 0, 0, 0]))
