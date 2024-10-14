@@ -101,7 +101,6 @@ parser.add_argument("--schedule-free-beta1", type=float, default=None)
 parser.add_argument("--gradient-accumulation-steps", type=int)
 parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--gradient-clipping", type=float, default=None)
-parser.add_argument("--loss-decay-constant", type=float, default=1.0)
 parser.add_argument("--adaptive-gradient-skip", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--adaptive-gradient-skip-history-len", type=int, default=None)
 parser.add_argument(
@@ -218,10 +217,6 @@ def init_train_state():
         training_cfg = TrainingConfig.from_json_dict(wandb.config.as_dict())
         print(f"Model config post-wandb: {json_pretty(model_cfg.to_json_dict())}")
         print(f"Training config post-wandb: {json_pretty(training_cfg.to_json_dict())}")
-
-        assert (
-            0 < training_cfg.loss_decay_constant <= 1
-        ), "loss_decay_constant must be in (0, 1]"
 
         if args.finetune is not None:
             finetune_src_checkpoint_dir = args.finetune.absolute()
@@ -398,9 +393,7 @@ mesh = setup_sharding()
 train_state = train_state.replicate_for_multi_gpu(mesh)
 
 loss_grad_fn = jax.value_and_grad(transformer_model.loss_batch, argnums=1)
-loss_fn = jax.jit(
-    partial(transformer_model.loss_batch, mdl), static_argnames=["loss_decay_constant"]
-)
+loss_fn = jax.jit(partial(transformer_model.loss_batch, mdl))
 
 
 # TODO delete this, unnecessary now
@@ -868,10 +861,9 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
         wandb.log(to_log)
 
 
-@partial(jax.jit, donate_argnames=["state"], static_argnames=["loss_decay_constant"])
+@partial(jax.jit, donate_argnames=["state"])
 def train_step(
     state: TrainState,
-    loss_decay_constant: float,
     batch_imgs: jax.Array,
     batch_clips: jax.Array,
     batch_max_cos_distances: jax.Array,
@@ -881,7 +873,6 @@ def train_step(
     loss, grads = loss_grad_fn(
         mdl,
         state.params,
-        loss_decay_constant,
         dropout_rng,
         batch_imgs,
         batch_clips,
@@ -1005,7 +996,6 @@ def prefetch_and_train(current_state, current_step):
 
     train_state, loss, norm = train_step(
         current_state,
-        training_cfg.loss_decay_constant,
         batch_imgs,
         batch_clips,
         batch_max_cos_distances,
@@ -1109,33 +1099,14 @@ for epoch in trange(
                     eval_params = train_state.get_eval_params()
                     eval_loss = loss_fn(
                         eval_params,
-                        training_cfg.loss_decay_constant,
                         train_rng,
                         batch_imgs,
                         batch_clips,
                         batch_max_cos_distances,
                     )
                     extra_to_log["eval/loss"] = eval_loss
-                    if training_cfg.loss_decay_constant != 1.0:
-                        extra_to_log["eval/loss_unweighted"] = loss_fn(
-                            eval_params,
-                            1.0,
-                            train_rng,
-                            batch_imgs,
-                            batch_clips,
-                            batch_max_cos_distances,
-                        )
                     del eval_params
 
-                if training_cfg.loss_decay_constant != 1.0:
-                    extra_to_log["train/loss_unweighted"] = loss_fn(
-                        train_state.params,
-                        1.0,
-                        train_rng,
-                        batch_imgs,
-                        batch_clips,
-                        batch_max_cos_distances,
-                    )
             else:
                 extra_to_log = None
             global_step += 1
@@ -1213,7 +1184,6 @@ for epoch in trange(
         losses.append(
             loss_fn(
                 eval_params,
-                training_cfg.loss_decay_constant,
                 dropout_rng,
                 batch_imgs,
                 batch_clips,

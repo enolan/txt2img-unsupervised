@@ -215,9 +215,6 @@ class TrainingConfig:
     # Schedule-free beta1
     schedule_free_beta1: Optional[float] = None
     training_images: int = 0  # How many images to train for (in addition to epochs)
-    loss_decay_constant: float = (
-        1.0  # How much to decay the loss to weight later tokens less. in (0, 1]
-    )
     adaptive_gradient_skip: bool = False
     adaptive_gradient_skip_history_len: Optional[int] = None
     adaptive_gradient_skip_threshold_factor: Optional[float] = None
@@ -341,7 +338,6 @@ _test_json_strs = [
         "training_images": 0,
         "learning_rate_schedule": "triangle",
         "gradient_accumulation_steps": 1,
-        "loss_decay_constant": 0.25,
         "adaptive_gradient_skip": true,
         "adaptive_gradient_skip_history_len": 100,
         "adaptive_gradient_skip_threshold_factor": 1.1,
@@ -356,7 +352,6 @@ _test_json_strs = [
         "warmup_steps": 100,
         "schedule_free_beta1": 0.9,
         "gradient_accumulation_steps": 1,
-        "loss_decay_constant": 0.25,
         "adaptive_gradient_skip": false
         }""",
 ]

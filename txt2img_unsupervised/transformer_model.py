@@ -1604,33 +1604,16 @@ def loss_batch_tokens(
 def loss_batch(
     model: ImageModel,
     params: dict[str, Any],
-    loss_decay_constant: float,
     dropout_rng: jax.Array,
     batch_imgs: jax.Array,
     batch_clips: jax.Array,
     batch_max_cos_distances: jax.Array,
 ) -> jax.Array:
-    """Compute the weighted cross-entropy loss for a batch of examples. The loss is scaled by
-    loss_decay_constant such that the last token is weighted loss_decay_constant as much as the
-    first one and the rest are exponentially decayed in between. loss_decay_constant should be in
-    (0, 1] with 1 meaning no decay."""
+    """Compute the average cross-entropy loss for a batch of examples."""
     per_token_loss = loss_batch_tokens(
         model, params, dropout_rng, batch_imgs, batch_clips, batch_max_cos_distances
     )
-    token_weights = loss_decay_constant ** jnp.linspace(0, 1, num=model.image_tokens)
-    # Normalize so the total weight is always equal to what it'd be with no decay
-    token_weights = token_weights / token_weights.sum() * model.image_tokens
-    assert token_weights.shape == (
-        model.image_tokens,
-    ), f"token_weights.shape: {token_weights.shape}, expected: {(model.image_tokens,)}"
-    weighted_loss = per_token_loss * token_weights[None, :]
-    assert weighted_loss.shape == (
-        per_token_loss.shape[0],
-        model.image_tokens,
-    ), f"weighted_loss.shape: {weighted_loss.shape}, expected: {(per_token_loss.shape[0], model.image_tokens)}"
-    out = jnp.mean(weighted_loss)
-    assert out.shape == (), f"out.shape: {out.shape}, expected scalar"
-    return out
+    return jnp.mean(per_token_loss)
 
 
 # Parameters taken from GPT-1, except seq_len is 256 instead of 1024
@@ -1694,7 +1677,6 @@ def test_cap_train() -> None:
         loss, grads = loss_grad_fn(
             mdl,
             params,
-            1.0,
             dropout_rng,
             batch_imgs=imgs,
             batch_clips=clips,
@@ -1758,7 +1740,6 @@ def train_loop_simple(
     iters: int,
     learning_rate: float = 3e-5,
     warmup_steps: Optional[int] = None,
-    loss_decay_constant: float = 1.0,
 ) -> Tuple[jax.Array, dict[str, Any]]:
     """Train the model repeatedly on a single batch for testing."""
     assert mdl.clip_conditioning is False
@@ -1788,7 +1769,6 @@ def train_loop_simple(
         loss, grads = loss_grad_fn(
             mdl,
             params,
-            loss_decay_constant,
             dropout_rng,
             batch_imgs=batch_imgs,
             batch_clips=jnp.zeros((batch_imgs.shape[0], 0), dtype=jnp.float32),
@@ -1889,7 +1869,6 @@ def test_learn_sequential(
         loss, grads = loss_grad_fn(
             mdl,
             params,
-            1.0,
             dropout_rng,
             batch_imgs=batch_imgs,
             batch_clips=jnp.zeros((batch_size, 0), dtype=jnp.float32),
@@ -1925,7 +1904,6 @@ def test_learn_sequential(
         lambda imgs: loss_batch(
             test_mdl,
             params,
-            1.0,
             jax.random.PRNGKey(0),
             imgs,
             jnp.zeros((imgs.shape[0], 0), dtype=jnp.float32),
@@ -1971,51 +1949,6 @@ def test_learn_sequential(
     # Test that each row in sampled_arr is an increasing sequence
     expected = (sampled_arr[:, :1] + np.arange(gpt_1_config.image_tokens)) % 8192
     np.testing.assert_array_equal(np.array(sampled_arr), expected)
-
-
-@pytest.mark.skip(reason="Removing test loss weighting soon")
-def test_loss_weighting() -> None:
-    """Train a model with no weighting to memorize a random data set, and then one with strong
-    weighting and check that the weighted model learns the early tokens faster."""
-    mdl_cfg = copy(gpt_1_config)
-    mdl_cfg.pre_norm = True
-    mdl = ImageModel(**mdl_cfg.__dict__)
-    data = jax.random.randint(
-        jax.random.PRNGKey(0), (16, gpt_1_config.image_tokens), 0, 8192
-    )
-    (_loss_unweighted, params_unweighted), (_loss_weighted, params_weighted) = map(
-        lambda decay_constant: train_loop_simple(
-            data,
-            mdl,
-            iters=60,
-            warmup_steps=10,
-            learning_rate=3e-4,
-            loss_decay_constant=decay_constant,
-        ),
-        [1.0, 0.1],
-    )
-
-    def loss_first_half(params):
-        # Compute the loss on the first half of the tokens
-        losses = loss_batch_tokens(
-            mdl,
-            params,
-            jax.random.PRNGKey(0),
-            data,
-            jnp.zeros((16, 0), dtype=jnp.float32),
-            jnp.zeros((16, 0), dtype=jnp.float32),
-        )
-        assert losses.shape == (16, gpt_1_config.image_tokens)
-        losses_first_half = losses[:, : gpt_1_config.image_tokens // 2]
-        return jnp.mean(losses_first_half)
-
-    loss_unweighted_first_half = loss_first_half(params_unweighted)
-    loss_weighted_first_half = loss_first_half(params_weighted)
-    print(
-        f"first half losses: unweighted {loss_unweighted_first_half}, weighted {loss_weighted_first_half}"
-    )
-    assert loss_unweighted_first_half > loss_weighted_first_half
-    assert loss_weighted_first_half < 0.1
 
 
 @pytest.mark.skip("extremely slow and flaky")
@@ -2081,7 +2014,6 @@ def _train_clip_caps_overfit(dset_train, mdl, rng):
         loss, grads = loss_grad_fn(
             mdl,
             params,
-            1.0,
             dropout_rng,
             batch_imgs=images,
             batch_clips=clips,
@@ -2136,7 +2068,7 @@ def _test_clip_caps_overfit_test_loss(dset_test, mdl, params):
     imgs = examples["encoded_img"]
 
     computed_loss = loss_batch(
-        mdl, params, 1.0, jax.random.PRNGKey(0), imgs, cap_centers, max_cos_distances
+        mdl, params, jax.random.PRNGKey(0), imgs, cap_centers, max_cos_distances
     )
     print(f"test loss: {computed_loss}")
     assert computed_loss < 0.05
