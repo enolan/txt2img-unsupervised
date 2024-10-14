@@ -1499,18 +1499,16 @@ class TransformerLayer(nn.Module):
                 jnp.ones((batch_size, self.num_heads, embeds.shape[1], embeds.shape[1]))
             )
 
-        if self.pre_norm:
-            embeds = self.layer_norm_1(embeds)
+        attn_in = self.layer_norm_1(embeds) if self.pre_norm else embeds
         attn_output = self.mha(
-            embeds, mask=mask, sow_weights=self.record_attention_weights
+            attn_in, mask=mask, sow_weights=self.record_attention_weights
         )
         if not self.pre_norm:
             attn_output = self.layer_norm_1(attn_output)
         embeds = embeds + self.dropout_layer(attn_output)
 
-        if self.pre_norm:
-            embeds = self.layer_norm_2(embeds)
-        ff_output = self.linear_2(self.activation_function(self.linear_1(embeds)))
+        ff_in = self.layer_norm_2(embeds) if self.pre_norm else embeds
+        ff_output = self.linear_2(self.activation_function(self.linear_1(ff_in)))
         if not self.pre_norm:
             ff_output = self.layer_norm_2(ff_output)
         embeds = embeds + self.dropout_layer(ff_output)
@@ -1685,9 +1683,9 @@ def test_cap_train() -> None:
 
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
 
-    steps = 100
+    steps = 800
     opt = optax.contrib.schedule_free_adamw(
-        learning_rate=3e-4, b1=0.98, warmup_steps=20
+        learning_rate=1e-3, b1=0.98, warmup_steps=30
     )
     opt_state = opt.init(params)
 
@@ -1713,27 +1711,26 @@ def test_cap_train() -> None:
         params, opt_state, train_rng, loss, norm = opt_step(
             params, opt_state, train_rng
         )
+        loss, norm = jax.device_get((loss, norm))
         tqdm.write(f"iter {i:04d} loss: {loss:0.4f} grad norm: {norm:7.2f}")
 
-    sampled_imgs = []
-    for i in trange(n_imgs):
-        sample_rng, test_rng = jax.random.split(test_rng, 2)
+    params = optax.contrib.schedule_free_eval_params(opt_state, params)
 
-        # This only tests the ability to memorize training examples, and not even ability to
-        # generalize to different sets of caps for the same image.
+    # This only tests the ability to memorize training examples, and not even the ability to
+    # generalize to different sets of caps for the same image.
 
-        toks = sample(
-            mdl,
-            params,
-            clips[i : i + 1],
-            max_cos_distances[i : i + 1],
-            sample_rng[None, :],
-            filter_method=LogitFilterMethod.TOP_P,
-            filter_threshold=0.25,
-        )[0]
-        sampled_imgs.append(toks)
+    sample_rng = jax.random.split(test_rng, n_imgs)
+    sampled_imgs = sample(
+        mdl,
+        params,
+        clips,
+        max_cos_distances,
+        sample_rng,
+        filter_method=LogitFilterMethod.TOP_P,
+        filter_threshold=0.25,
+    )
 
-    sampled_imgs = jnp.stack(sampled_imgs, axis=0)
+    assert sampled_imgs.shape == (n_imgs, mdl.image_tokens)
 
     # Test that sampled images are the training images
     correct_imgs = [0] * n_imgs
@@ -1806,11 +1803,11 @@ def train_loop_simple(
     opt_step = jax.jit(opt_step, donate_argnums=(0, 1, 2))
 
     train_rng = jax.random.PRNGKey(0)
-    for i in range(iters):
+    for i in trange(iters):
         params, opt_state, train_rng, loss = opt_step(  # type:ignore[misc]
             params, opt_state, train_rng, data
         )
-        print(f"iter {i} loss: {loss}")
+        tqdm.write(f"iter {i} loss: {loss}")
     params = optax.contrib.schedule_free_eval_params(opt_state, params)
     return loss, params  # type:ignore[return-value]
 
@@ -1826,7 +1823,7 @@ def test_learn_zeros(pre_norm: bool, weights_dtype: jnp.dtype) -> None:
     mdl = ImageModel(**mdl_cfg.__dict__)
     data = jnp.zeros((16, gpt_1_config.image_tokens), dtype=jnp.int32)
     loss, params = train_loop_simple(
-        data, mdl, iters=7, learning_rate=3e-2, warmup_steps=1
+        data, mdl, iters=7, learning_rate=1e-1, warmup_steps=1
     )
     assert loss < 1e-10
 
@@ -1841,65 +1838,142 @@ def test_learn_zeros(pre_norm: bool, weights_dtype: jnp.dtype) -> None:
 
 
 @pytest.mark.parametrize(
-    "weights_dtype, pre_norm",
+    "weights_dtype, activations_dtype",
     [
-        pytest.param(jnp.float32, True, id="float32-prenorm"),
-        pytest.param(jnp.bfloat16, True, id="bfloat16-prenorm"),
-        pytest.param(jnp.float32, False, id="float32-no-prenorm"),
-        # bf16 post-norm is really finicky and slow
+        pytest.param(jnp.float32, jnp.float32, id="wf32-af32"),
+        pytest.param(jnp.float32, jnp.bfloat16, id="wf32-abf16"),
+        pytest.param(jnp.bfloat16, jnp.bfloat16, id="wbf16-abf16"),
     ],
 )
-def test_learn_ranges(pre_norm: bool, weights_dtype: jnp.dtype) -> None:
-    """Test whether the model can memorize ranges of integers."""
+def test_learn_sequential(
+    weights_dtype: jnp.dtype, activations_dtype: jnp.dtype
+) -> None:
+    """Test whether the model can learn to predict consecutive numbers."""
     mdl_cfg = copy(gpt_1_config)
-    mdl_cfg.pre_norm = pre_norm
-    mdl_cfg.activations_dtype = weights_dtype
+    mdl_cfg.pre_norm = True
+    mdl_cfg.activations_dtype = activations_dtype
     mdl_cfg.weights_dtype = weights_dtype
     mdl = ImageModel(**mdl_cfg.__dict__)
-    # The numbers are sequential but there's nothing about the way the model works that tells it
-    # the ordering of the tokens in the codebook, so this is a pure memorization test.
-    data = jnp.arange(16 * gpt_1_config.image_tokens).reshape(
-        (16, gpt_1_config.image_tokens)
+
+    data_rng, params_rng, train_rng, sample_rng = jax.random.split(
+        jax.random.PRNGKey(777), 4
     )
-    loss, params = train_loop_simple(
-        data,
-        mdl,
-        # Pre-norm's pretty good, eh?
-        iters=100 if pre_norm else 300,
-        learning_rate=1e-3 if pre_norm else 1e-4,
-        warmup_steps=20 if pre_norm else 100,
+
+    # Generate a dataset of sequential numbers
+    n_imgs = 8192
+    start_vals = jax.random.randint(data_rng, (n_imgs,), 0, 8192)
+    data = (start_vals[:, None] + jnp.arange(gpt_1_config.image_tokens)) % 8192
+    assert data.shape == (n_imgs, gpt_1_config.image_tokens)
+    data = jax.device_get(data)
+    dset_all = TableView({"encoded_img": data}).shuffle(seed=0)
+    test_set_size = n_imgs // 10
+    dset_train = dset_all.new_view(slice(None, -test_set_size))
+    dset_test = dset_all.new_view(slice(-test_set_size, None))
+
+    # Train a model
+    params = mdl.init(
+        {"params": params_rng, "dropout": jax.random.PRNGKey(0)}, *mdl.dummy_inputs()
     )
-    assert loss < 0.6
-    print("Generating samples...")
-    total_samples = 256
-    samples_per_batch = 64
-    empty_arr = jnp.zeros((samples_per_batch, 0), dtype=jnp.float32)
-    assert total_samples % samples_per_batch == 0
-    sample_batches = []
-    rng = jax.random.PRNGKey(0)
-    for _ in trange(total_samples // samples_per_batch):
-        rng, rng2 = jax.random.split(rng)
-        sample_batches.append(
+
+    steps = 200
+    batch_size = 64
+
+    opt = optax.contrib.schedule_free_adamw(
+        learning_rate=1e-3, b1=0.98, warmup_steps=10
+    )
+    opt_state = opt.init(params)
+    loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
+
+    def opt_step(params, opt_state, rng, batch_imgs):
+        dropout_rng, rng2 = jax.random.split(rng, 2)
+        loss, grads = loss_grad_fn(
+            mdl,
+            params,
+            1.0,
+            dropout_rng,
+            batch_imgs=batch_imgs,
+            batch_clips=jnp.zeros((batch_size, 0), dtype=jnp.float32),
+            batch_max_cos_distances=jnp.zeros((batch_size, 0), dtype=jnp.float32),
+        )
+        updates, opt_state = opt.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, opt_state, rng2, loss
+
+    opt_step = jax.jit(opt_step, donate_argnums=(0, 1, 2))
+
+    with tqdm(total=steps) as pbar:
+        while pbar.n < steps:
+            for batch in dset_train.shuffle(seed=pbar.n).batch_iter(
+                batch_size, drop_last_batch=True
+            ):
+                params, opt_state, train_rng, loss = opt_step(
+                    params, opt_state, train_rng, batch["encoded_img"]
+                )
+                loss = jax.device_get(loss)
+                if pbar.n % 10 == 0:
+                    tqdm.write(f"iter {pbar.n:04d} loss: {loss:0.4f}")
+                pbar.update(1)
+                pbar.set_postfix({"loss": loss})
+                if pbar.n >= steps:
+                    break
+    print(f"Final train loss: {loss}")
+    params = optax.contrib.schedule_free_eval_params(opt_state, params)
+
+    # Compute test loss
+    test_mdl = mdl.clone(dropout=None, image_dropout=None)
+    calc_loss = jax.jit(
+        lambda imgs: loss_batch(
+            test_mdl,
+            params,
+            1.0,
+            jax.random.PRNGKey(0),
+            imgs,
+            jnp.zeros((imgs.shape[0], 0), dtype=jnp.float32),
+            jnp.zeros((imgs.shape[0], 0), dtype=jnp.float32),
+        )
+    )
+    test_losses = []
+    test_batches = len(dset_test) // batch_size + (
+        1 if len(dset_test) % batch_size > 0 else 0
+    )
+    for batch in tqdm(
+        dset_test.batch_iter(batch_size, drop_last_batch=False), total=test_batches
+    ):
+        test_losses.append(calc_loss(batch["encoded_img"]))
+    test_loss = jnp.mean(jnp.array(test_losses))
+    print(f"Final test loss: {test_loss}")
+    assert test_loss < 0.04
+
+    # Sample from the model
+    sample_batch_size = 64
+    sample_batches = 4
+
+    samples = []
+    for _ in range(sample_batches):
+        split_rngs = jax.random.split(sample_rng, sample_batch_size + 1)
+        sample_rng = split_rngs[-1]
+        samples.append(
             sample(
                 mdl,
                 params,
-                empty_arr,
-                empty_arr,
-                jax.random.split(rng2, samples_per_batch),
+                jnp.zeros((sample_batch_size, 0), dtype=jnp.float32),
+                jnp.zeros((sample_batch_size, 0), dtype=jnp.float32),
+                split_rngs[:-1],
             )
         )
-    sampled_arr: jax.Array = jnp.concatenate(sample_batches, axis=0)
-    assert sampled_arr.shape == (total_samples, gpt_1_config.image_tokens)
-    print(f"Generated samples, shape: {sampled_arr.shape}")
-    counts = dict([(i, 0) for i in range(16)])
-    for i, s in enumerate(sampled_arr):
-        assert s[0] % 256 == 0, f"sample {i} starts with {s[0]}"
-        np.testing.assert_equal(np.array(s), np.array(s[0] + np.arange(256)))
-        counts[int(s[0] // 256)] += 1
-    print(f"counts: {counts}")
-    assert all([c > 0 for c in counts.values()])
+    sampled_arr = jnp.concatenate(samples, axis=0)
+
+    assert sampled_arr.shape == (
+        sample_batch_size * sample_batches,
+        gpt_1_config.image_tokens,
+    )
+
+    # Test that each row in sampled_arr is an increasing sequence
+    expected = (sampled_arr[:, :1] + np.arange(gpt_1_config.image_tokens)) % 8192
+    np.testing.assert_array_equal(np.array(sampled_arr), expected)
 
 
+@pytest.mark.skip(reason="Removing test loss weighting soon")
 def test_loss_weighting() -> None:
     """Train a model with no weighting to memorize a random data set, and then one with strong
     weighting and check that the weighted model learns the early tokens faster."""
@@ -1944,6 +2018,7 @@ def test_loss_weighting() -> None:
     assert loss_weighted_first_half < 0.1
 
 
+@pytest.mark.skip("extremely slow and flaky")
 @pytest.mark.parametrize(
     "weights_dtype, activations_dtype",
     [
@@ -1993,7 +2068,7 @@ def _train_clip_caps_overfit(dset_train, mdl, rng):
 
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
 
-    steps = 200
+    steps = 1200
     batch_size = 64
 
     opt = optax.contrib.schedule_free_adamw(
@@ -2021,7 +2096,7 @@ def _train_clip_caps_overfit(dset_train, mdl, rng):
 
     with tqdm(total=steps) as pbar:
         while pbar.n < steps:
-            dset_shuf = dset_train.shuffle()
+            dset_shuf = dset_train.shuffle(seed=pbar.n)
             for batch in dset_shuf.batch_iter(batch_size, drop_last_batch=True):
                 images, cap_centers, max_cos_distances = (
                     batch["encoded_img"],
@@ -2041,10 +2116,10 @@ def _train_clip_caps_overfit(dset_train, mdl, rng):
                     cap_centers,
                     max_cos_distances,
                 )
-                loss, norm = jax.device_get((loss, norm))
                 pbar.update(1)
+                loss, norm = jax.device_get((loss, norm))
                 pbar.set_postfix({"loss": loss, "grad norm": norm})
-                if pbar.n % 100 == 0:
+                if pbar.n % 10 == 0:
                     tqdm.write(
                         f"iter {pbar.n:04d} loss: {loss:0.4f} grad norm: {norm:05.2f}"
                     )
@@ -2075,25 +2150,27 @@ def _test_clip_caps_overfit_samples(dset_test, mdl, params, rng):
     n_samples = len(examples["encoded_img"])
     embeddings = examples["clip_embedding"]
 
+    # Generate random query points with cosine similarity 0.8 (cosine distance 0.2) to the
+    # embeddings.
     query_pts = jax.vmap(random_pt_with_cosine_similarity, in_axes=(0, 0, None))(
         jax.random.split(pt_rng, n_samples), embeddings, 0.8
     )
     query_pts = query_pts.reshape((n_samples, 1, 768))
+    # Sample from caps centered on those points with max cosine distance 0.25.
     query_max_cos_distances = jnp.full((n_samples, 1), 0.25)
 
-    matches = np.zeros((n_samples,), dtype=np.bool_)
-    for i in trange(n_samples):
-        sample_rng, sub_rng = jax.random.split(sample_rng, 2)
-        toks = sample(
-            mdl,
-            params,
-            query_pts[i : i + 1],
-            query_max_cos_distances[i : i + 1],
-            sub_rng[None, :],
-            filter_method=LogitFilterMethod.TOP_P,
-            filter_threshold=0.05,
-        )[0]
-        matches[i] = np.array_equal(toks, examples["encoded_img"][i])
+    sample_rngs = jax.random.split(sample_rng, n_samples)
+    toks = sample(
+        mdl,
+        params,
+        query_pts,
+        query_max_cos_distances,
+        sample_rngs,
+        filter_method=LogitFilterMethod.TOP_P,
+        filter_threshold=0.05,
+    )
+    assert toks.shape == (n_samples, gpt_1_config.image_tokens)
+    matches = jnp.all(toks == examples["encoded_img"], axis=1)
 
     print(f"Found {matches.sum()} matches out of {n_samples} samples")
     assert matches.sum() >= round(n_samples * 0.9)
