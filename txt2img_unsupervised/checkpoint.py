@@ -306,7 +306,8 @@ def setup_checkpoint_manager_and_initial_state(
     extra_metadata: Optional[Tuple[str, Any]] = None,
 ) -> Tuple[ocp.CheckpointManager, TrainState]:
     """
-    Set up a CheckpointManager and create an initial TrainState with a saved checkpoint.
+    Set up a CheckpointManager and create an initial TrainState. Does NOT save an initial
+    checkpoint.
 
     Args:
         checkpoint_options: Options for the CheckpointManager.
@@ -354,9 +355,6 @@ def setup_checkpoint_manager_and_initial_state(
     # Create the initial TrainState
     mdl = ImageModel(**model_cfg.__dict__)
     initial_state = TrainState.new(rng, mdl, training_cfg, batches_total)
-
-    # Save the initial checkpoint
-    initial_state.save_checkpoint(checkpoint_manager, global_step=0)
 
     return checkpoint_manager, initial_state
 
