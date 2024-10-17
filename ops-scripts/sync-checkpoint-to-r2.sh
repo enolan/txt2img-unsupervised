@@ -34,6 +34,11 @@ if [[ "$checkpoint_path" == "checkpoints/" || "$checkpoint_path" == "checkpoints
     exit 1
 fi
 
+if ! command -v bc &> /dev/null; then
+    echo "Error: 'bc' is not installed. Please install it to continue."
+    exit 1
+fi
+
 rclone_path="r2-ckpt:txt2img-unsupervised-checkpoints/$(basename "$checkpoint_path")"
 
 
@@ -49,16 +54,21 @@ fi
 echo "Starting sync process..."
 
 last_mod_time=0
-
 sync_if_changed() {
-    current_mod_time=$(find "$checkpoint_path" -type f -printf '%T@\n' | sort -n | tail -1)
+    # Get the latest mod time of a file that isn't one of the temporary files orbax makes while
+    # checkpointing is happening.
+    current_mod_time=$(find "$checkpoint_path" -type f -not -path '*.orbax-checkpoint-tmp-*' -printf '%T@\n' | sort -n | tail -1)
 
     if (( $(echo "$current_mod_time > $last_mod_time" | bc -l) )); then
         echo "Changes detected. Syncing at $(date)"
-        rclone sync -P --fast-list --transfers 24 "$checkpoint_path" "$rclone_path"
-        last_mod_time=$current_mod_time
-    else
-        echo "No changes detected at $(date)"
+        while true; do
+            if rclone sync -P --fast-list --transfers 24 "$checkpoint_path" "$rclone_path"; then
+                last_mod_time=$current_mod_time
+                break
+            else
+                echo "Sync failed. Retrying immediately..."
+            fi
+        done
     fi
 }
 
