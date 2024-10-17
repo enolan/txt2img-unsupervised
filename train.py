@@ -974,6 +974,18 @@ signal.signal(signal.SIGTERM, exit_early_signal_handler)
 signal.signal(signal.SIGINT, exit_early_signal_handler)
 
 
+early_checkpoint_requested = False
+
+
+def early_checkpoint_signal_handler(signum, frame):
+    # Same deal as exit_early_signal_handler, but we don't exit, just checkpoint.
+    global early_checkpoint_requested
+    early_checkpoint_requested = True
+
+
+signal.signal(signal.SIGUSR1, early_checkpoint_signal_handler)
+
+
 # In order to ensure the GPU doesn't wait on CPU stuff, we ensure that there's always at least one
 # batch in flight. So at the beginning of each inner loop we enqueue the next step before doing
 # anything that would wait for the current step to finish.
@@ -1117,14 +1129,17 @@ for epoch in trange(
                 exit(0)
             # Save checkpoint every 30 minutes. This does one after step 0 too, which is nice so we
             # don't have to wait half an hour to find out if it crashes.
-            if last_checkpoint_time is None or (
-                datetime.datetime.now() - last_checkpoint_time
-            ) > datetime.timedelta(minutes=30):
+            if (
+                last_checkpoint_time is None
+                or (datetime.datetime.now() - last_checkpoint_time)
+                > datetime.timedelta(minutes=30)
+                or early_checkpoint_requested
+            ):
                 save_checkpoint_and_log_images(
                     train_state, sample_batch_size, global_step, args.skip_sampling
                 )
                 last_checkpoint_time = datetime.datetime.now()
-
+                early_checkpoint_requested = False
             if batch_idx + 1 < actual_batches:
                 next_train_step_outputs = prefetch_and_train(train_state, global_step)
             # At this point we've enqueued all the work for this step and queued the next step, so
