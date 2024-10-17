@@ -215,6 +215,8 @@ class TrainState(train_state.TrainState):
         """
         tqdm.write("Attempting to save checkpoint")
         while True:
+            # VMs sometimes have small disks. Retrying in a loop gives me an opportunity to go and
+            # delete stuff.
             try:
                 save_args = ocp.args.Composite(
                     params=ocp.args.StandardSave(self.params),

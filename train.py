@@ -891,7 +891,6 @@ last_checkpoint_time = None
 def save_checkpoint_and_log_images(
     my_train_state, sample_batch_size, global_step, skip_sampling
 ) -> None:
-    # TPU VMs run out of disk space a lot. Retrying in a loop lets me manually clean up the disk
     my_train_state.save_checkpoint(checkpoint_manager, global_step)
     tqdm.write("Saved checkpoint")
     if not skip_sampling:
