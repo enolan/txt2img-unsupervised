@@ -22,8 +22,14 @@ if [[ ! "$checkpoint_path" =~ ^checkpoints/ ]]; then
     exit 1
 fi
 
+if [[ ! -d "$checkpoint_path" ]]; then
+    echo "Error: The checkpoint path must be a directory."
+    echo "Usage: $0 checkpoints/foo"
+    exit 1
+fi
+
 if [[ "$checkpoint_path" == "checkpoints/" || "$checkpoint_path" == "checkpoints" ]]; then
-    echo "Error: The checkpoint path must include a subdirectory or file after 'checkpoints/'."
+    echo "Error: The checkpoint path must include a subdirectory after 'checkpoints/'."
     echo "Usage: $0 checkpoints/foo"
     exit 1
 fi
@@ -42,16 +48,27 @@ fi
 
 echo "Starting sync process..."
 
-sync_function() {
-    echo "Syncing at $(date)"
-    rclone sync -P --fast-list --size-only --transfers 24 "$checkpoint_path" "$rclone_path"
+last_mod_time=0
+
+sync_if_changed() {
+    current_mod_time=$(find "$checkpoint_path" -type f -printf '%T@\n' | sort -n | tail -1)
+
+    if (( $(echo "$current_mod_time > $last_mod_time" | bc -l) )); then
+        echo "Changes detected. Syncing at $(date)"
+        rclone sync -P --fast-list --transfers 24 "$checkpoint_path" "$rclone_path"
+        last_mod_time=$current_mod_time
+    else
+        echo "No changes detected at $(date)"
+    fi
 }
 
 if $once_mode; then
-    sync_function
+    sync_if_changed
 else
+    echo "Starting continuous sync process..."
+    echo "Press Ctrl+C to stop the sync process."
     while true; do
-        sync_function
-        sleep 15m
+        sync_if_changed
+        sleep 5s
     done
 fi
