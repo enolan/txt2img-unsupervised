@@ -1177,6 +1177,12 @@ for epoch in trange(
                 pbar.set_postfix(train_loss=f"{train_step_to_log['train/loss']:.4f}")
             pbar.update()
 
+    # Save checkpoint at end of epoch
+    save_checkpoint_and_log_images(
+        train_state, sample_batch_size, global_step, skip_sampling=False
+    )
+    last_checkpoint_time = datetime.datetime.now()
+
     # Evaluate on test set
     losses = []
     eval_params = train_state.get_eval_params()
@@ -1211,7 +1217,3 @@ for epoch in trange(
         f"Epoch {epoch} done, train loss: {train_step_to_log['train/loss']:.4f}, test loss {test_loss:.4f}",
         end="",
     )
-    save_checkpoint_and_log_images(
-        train_state, sample_batch_size, global_step, skip_sampling=False
-    )
-    last_checkpoint_time = datetime.datetime.now()
