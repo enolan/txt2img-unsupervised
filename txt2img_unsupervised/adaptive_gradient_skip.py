@@ -79,18 +79,24 @@ def adaptive_gradient_skip(
         )
 
         def skip_updates():
-            new_updates = jax.tree.map(jnp.zeros_like, updates)
+            clipped_updates = jax.tree.map(
+                lambda p: p / this_norm * skip_threshold, updates
+            )
+            new_updates, new_inner_state = inner_optimizer.update(
+                clipped_updates, state.inner_state, params
+            )
             new_state = state._replace(
-                skipped_last=True, skip_count=state.skip_count + 1
+                skipped_last=True,
+                skip_count=state.skip_count + 1,
+                inner_state=new_inner_state,
             )
             return new_updates, new_state
 
         def do_updates():
-            new_state = state._replace(skipped_last=False)
             new_updates, new_inner_state = inner_optimizer.update(
-                updates, new_state.inner_state, params
+                updates, state.inner_state, params
             )
-            new_state = new_state._replace(inner_state=new_inner_state)
+            new_state = state._replace(skipped_last=False, inner_state=new_inner_state)
             return new_updates, new_state
 
         return jax.lax.cond(
@@ -125,19 +131,19 @@ def test_doesnt_skip_below_threshold(quantile, jit):
 
 @pytest.mark.parametrize("quantile", [1.0, 0.95, 0.5])
 @pytest.mark.parametrize("jit", [True, False])
-def test_skips_above_threshold(jit, quantile):
-    """Test that the optimizer skips updates when the gradient norm is above the threshold."""
-    inner_opt = optax.adam(learning_rate=0.1)
+def test_clips_above_threshold(jit, quantile):
+    """Test that the optimizer clips updates when the gradient norm is above the threshold."""
+    inner_opt = optax.sgd(learning_rate=0.1)
     opt = adaptive_gradient_skip(
         inner_opt, history_len=3, threshold_factor=1.5, quantile=quantile
     )
     update_fn = jax.jit(opt.update, donate_argnums=(1, 2)) if jit else opt.update
     params = jnp.ones(10)
     state = opt.init(params)
-    adam_state = inner_opt.init(params)
-    adam_params = params
+    sgd_state = inner_opt.init(params)
+    sgd_params = params
 
-    # Do a bunch of steps that shouldn't be skipped, checking that regular adam and the wrapped adam
+    # Do a bunch of steps that shouldn't be clipped, checking that regular sgd and the wrapped sgd
     # do the same thing.
     normal_grads = {}
     normal_grads[1.0] = [jnp.full_like(params, v) for v in [0.1, 1.1, 0.1, 1.1]]
@@ -145,33 +151,36 @@ def test_skips_above_threshold(jit, quantile):
     normal_grads[0.5] = [jnp.full_like(params, v) for v in [0.1, 1.1, 0.1, 0.14]]
     for grad in normal_grads[quantile]:
         updates, state = update_fn(grad, state, params)
-        adam_updates, adam_state = inner_opt.update(grad, adam_state, adam_params)
-        np.testing.assert_allclose(updates, adam_updates)
+        sgd_updates, sgd_state = inner_opt.update(grad, sgd_state, sgd_params)
+        np.testing.assert_allclose(updates, sgd_updates)
         params = optax.apply_updates(params, updates)
-        adam_params = optax.apply_updates(adam_params, adam_updates)
+        sgd_params = optax.apply_updates(sgd_params, sgd_updates)
         assert not state.skipped_last
 
     assert state.skip_count == 0
     assert state.total_steps == 4
 
-    # Do a couple of steps that should be skipped
-    skip_grads = {}
-    skip_grads[1.0] = [jnp.full_like(params, v) for v in [1.67, 3.5]]
-    skip_grads[0.95] = [jnp.full_like(params, v) for v in [1.67, 3.5]]
-    skip_grads[0.5] = [jnp.full_like(params, v) for v in [0.25, 0.22]]
-    for grad in skip_grads[quantile]:
+    # Do a couple of steps that should be clipped
+    clip_grads = {}
+    clip_grads[1.0] = [jnp.full_like(params, v) for v in [1.67, 3.5]]
+    clip_grads[0.95] = [jnp.full_like(params, v) for v in [1.67, 3.5]]
+    clip_grads[0.5] = [jnp.full_like(params, v) for v in [0.25, 0.22]]
+    for grad in clip_grads[quantile]:
         updates, state = update_fn(grad, state, params)
-        adam_updates, adam_state = inner_opt.update(grad, adam_state, adam_params)
+        sgd_updates, sgd_state = inner_opt.update(grad, sgd_state, sgd_params)
         params = optax.apply_updates(params, updates)
-        adam_params = optax.apply_updates(adam_params, adam_updates)
-        np.testing.assert_array_equal(updates, jnp.zeros_like(params))
-        assert not np.array_equal(adam_updates, jnp.zeros_like(adam_params))
+        sgd_params = optax.apply_updates(sgd_params, sgd_updates)
+
+        # Updates should be nonzero, but their norm should be clipped
+        assert not np.array_equal(updates, jnp.zeros_like(params))
+        assert optax.global_norm(updates) < optax.global_norm(sgd_updates)
+
         assert state.skipped_last
 
     assert state.skip_count == 2
     assert state.total_steps == 6
 
-    # one more step that shouldn't be skipped
+    # one more step that shouldn't be clipped
     updates, state = update_fn(jnp.full_like(params, 0.1), state, params)
     assert not np.array_equal(updates, jnp.zeros_like(params))
     assert not state.skipped_last
