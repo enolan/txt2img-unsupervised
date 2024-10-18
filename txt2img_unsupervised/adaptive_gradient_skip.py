@@ -80,7 +80,10 @@ def adaptive_gradient_skip(
 
         def skip_updates():
             clipped_updates = jax.tree.map(
-                lambda p: p / this_norm * skip_threshold, updates
+                lambda p: p
+                / this_norm.astype(p.dtype)
+                * skip_threshold.astype(p.dtype),
+                updates,
             )
             new_updates, new_inner_state = inner_optimizer.update(
                 clipped_updates, state.inner_state, params
@@ -110,22 +113,26 @@ def adaptive_gradient_skip(
     return optax.GradientTransformation(init_fn, update_fn)
 
 
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("quantile", [0.5, 0.9, 1.0])
 @pytest.mark.parametrize("jit", [True, False])
-def test_doesnt_skip_below_threshold(quantile, jit):
+def test_doesnt_skip_below_threshold(quantile, jit, dtype):
     """Test that the optimizer doesn't skip updates when the gradient norm is below the threshold."""
     inner_opt = optax.sgd(learning_rate=0.1)
     opt = adaptive_gradient_skip(
         inner_opt, history_len=10, threshold_factor=2.0, quantile=quantile
     )
     update_fn = jax.jit(opt.update, donate_argnums=(1, 2)) if jit else opt.update
-    params = jnp.ones(10)
+    params = jnp.ones(10, dtype=dtype)
     state = opt.init(params)
 
     for _ in range(20):
-        grads = jnp.full(10, 0.1)
+        grads = jnp.full(10, 0.1, dtype=dtype)
         updates, state = update_fn(grads, state, params)
-        np.testing.assert_allclose(updates, grads * -0.1)
+        # Need to convert since NumPy can't test bfloat16
+        np.testing.assert_allclose(
+            updates.astype(jnp.float32), grads.astype(jnp.float32) * -0.1
+        )
         params = optax.apply_updates(params, updates)
 
 
