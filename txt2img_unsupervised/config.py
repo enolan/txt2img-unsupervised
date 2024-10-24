@@ -213,6 +213,7 @@ class TrainingConfig:
     # the other schedules this value must be None
     warmup_steps: Optional[int] = None
     schedule_free_beta1: Optional[float] = None
+    weight_decay: float = 0.0
     training_images: int = 0  # How many images to train for (in addition to epochs)
     adaptive_gradient_skip: bool = False
     adaptive_gradient_skip_history_len: Optional[int] = None
@@ -340,7 +341,8 @@ _test_json_strs = [
         "adaptive_gradient_skip": true,
         "adaptive_gradient_skip_history_len": 100,
         "adaptive_gradient_skip_threshold_factor": 1.1,
-        "adaptive_gradient_skip_quantile": 0.95
+        "adaptive_gradient_skip_quantile": 0.95,
+        "weight_decay": 0.1
         }""",
     """{
         "learning_rate": 1e-4,
@@ -351,7 +353,8 @@ _test_json_strs = [
         "warmup_steps": 100,
         "schedule_free_beta1": 0.9,
         "gradient_accumulation_steps": 1,
-        "adaptive_gradient_skip": false
+        "adaptive_gradient_skip": false,
+        "weight_decay": 0.0
         }""",
 ]
 

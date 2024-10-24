@@ -33,23 +33,28 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int):
         An optax optimizer.
     """
     if training_cfg.learning_rate_schedule == LearningRateSchedule.CONSTANT:
-        opt = optax.adam(learning_rate=training_cfg.learning_rate)
+        opt = optax.adamw(
+            learning_rate=training_cfg.learning_rate,
+            weight_decay=training_cfg.weight_decay,
+        )
     elif training_cfg.learning_rate_schedule == LearningRateSchedule.TRIANGLE:
-        opt = optax.adam(
+        opt = optax.adamw(
             learning_rate=triangle_schedule(
                 training_cfg.learning_rate,
                 batches_total,
-            )
+            ),
+            weight_decay=training_cfg.weight_decay,
         )
     elif training_cfg.learning_rate_schedule == LearningRateSchedule.WARMUP_PLUS_COSINE:
-        opt = optax.adam(
+        opt = optax.adamw(
             learning_rate=optax.warmup_cosine_decay_schedule(
                 init_value=0.0,
                 peak_value=training_cfg.learning_rate,
                 warmup_steps=training_cfg.warmup_steps,
                 decay_steps=batches_total,
                 end_value=training_cfg.learning_rate * 0.05,
-            )
+            ),
+            weight_decay=training_cfg.weight_decay,
         )
     elif (
         training_cfg.learning_rate_schedule
@@ -59,6 +64,7 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int):
             learning_rate=training_cfg.learning_rate,
             warmup_steps=training_cfg.warmup_steps,
             b1=training_cfg.schedule_free_beta1,
+            weight_decay=training_cfg.weight_decay,
         )
     else:
         raise ValueError(

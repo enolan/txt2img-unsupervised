@@ -108,6 +108,7 @@ parser.add_argument(
 )
 parser.add_argument("--adaptive-gradient-skip-quantile", type=float, default=None)
 parser.add_argument("--image-dropout", type=float, default=None)
+parser.add_argument("--weight-decay", type=float, default=0.0)
 parser.add_argument("--ae-cfg", type=Path, required=True)
 parser.add_argument("--ae-ckpt", type=Path, required=True)
 parser.add_argument("--activations-dtype", type=argparse_from_dict(str_to_dtype))
