@@ -212,7 +212,6 @@ class TrainingConfig:
     # How many steps to linearly increase the learning rate when using WARMUP_PLUS_COSINE_LR. With
     # the other schedules this value must be None
     warmup_steps: Optional[int] = None
-    # Schedule-free beta1
     schedule_free_beta1: Optional[float] = None
     training_images: int = 0  # How many images to train for (in addition to epochs)
     adaptive_gradient_skip: bool = False
