@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from einops import rearrange, repeat
+from jax.ad_checkpoint import checkpoint_policies
 from flax import struct
 from functools import partial
 from infinidata import TableView
@@ -194,7 +195,7 @@ class ImageModel(nn.Module):
         # Might have to do with the fact that remat_scan creates a scan-of-scans? Could cause bad
         # optimization in JAX or XLA.
         self.transformer_layers = nn.scan(
-            nn.remat(TransformerLayer),
+            nn.remat(TransformerLayer, policy=checkpoint_policies.dots_with_no_batch_dims_saveable),
             variable_axes={"params": 0, "cache": 0}
             | ({"intermediates": 0} if self.record_attention_weights else {}),
             variable_broadcast=False,
