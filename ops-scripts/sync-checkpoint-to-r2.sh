@@ -53,17 +53,18 @@ fi
 
 echo "Starting sync process..."
 
-last_mod_time=0
+last_hash=""
 sync_if_changed() {
-    # Get the latest mod time of a file that isn't one of the temporary files orbax makes while
-    # checkpointing is happening.
-    current_mod_time=$(find "$checkpoint_path" -type f -not -path '*.orbax-checkpoint-tmp-*' -printf '%T@\n' | sort -n | tail -1)
+    # Create a list of every file along with its mod time, excluding temporary Orbax files
+    current_hash=$(find "$checkpoint_path" -type f -not -path '*.orbax-checkpoint-tmp-*' -printf '%P %T@\n' | sort | sha1sum | awk '{print $1}')
 
-    if (( $(echo "$current_mod_time > $last_mod_time" | bc -l) )); then
+    # If there are new files, files have been deleted, or files have been modified, the hash will
+    # have changed, so we sync.
+    if [ "$current_hash" != "$last_hash" ]; then
         echo "Changes detected. Syncing at $(date)"
         while true; do
             if rclone sync -P --fast-list --transfers 24 "$checkpoint_path" "$rclone_path"; then
-                last_mod_time=$current_mod_time
+                last_hash=$current_hash
                 break
             else
                 echo "Sync failed. Retrying immediately..."
