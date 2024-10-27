@@ -58,14 +58,13 @@ class ImageModel(nn.Module):
     )
 
     def setup(self) -> None:
-        default_stddev = 0.02
-        default_kernel_init = nn.initializers.normal(stddev=default_stddev)
-        out_proj_stddev = 0.02 / jnp.sqrt(2 * self.n_layers)
-        out_proj_kernel_init = nn.initializers.normal(stddev=out_proj_stddev)
+        default_kernel_init = nn.initializers.variance_scaling(
+            scale=1.0, mode="fan_in", distribution="normal"
+        )
         self.in_embed = nn.Embed(
             num_embeddings=8192,
             features=self.d_model,
-            embedding_init=default_kernel_init,
+            embedding_init=nn.initializers.normal(stddev=1.0),
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
         )
@@ -133,9 +132,7 @@ class ImageModel(nn.Module):
         # We add the projections for the cap centers and the projections for the max cosine
         # distances so we need to scale the standard deviations of the projection weights by
         # sqrt(2) to ensure the variance is the same as it would be with a single projection.
-        clip_proj_stddev = (
-            default_stddev if not self.clip_caps else default_stddev / np.sqrt(2)
-        )
+        clip_proj_stddev = 1.0 if not self.clip_caps else 1.0 / np.sqrt(2)
         self.clip_proj = nn.Dense(
             features=self.d_model,
             use_bias=self.use_biases,
@@ -154,7 +151,7 @@ class ImageModel(nn.Module):
         self.positional_encoding = nn.Embed(
             num_embeddings=self.seq_len(),
             features=self.d_model,
-            embedding_init=default_kernel_init,
+            embedding_init=nn.initializers.normal(stddev=1.0),
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
         )
@@ -211,7 +208,7 @@ class ImageModel(nn.Module):
             activation_function=self.activation_function,
             pre_norm=self.pre_norm,
             kernel_init=default_kernel_init,
-            out_proj_kernel_init=out_proj_kernel_init,
+            out_proj_kernel_init=default_kernel_init,
             decode=self.decode,
             attn_method=attn_method,
             record_attention_weights=self.record_attention_weights,
@@ -588,17 +585,17 @@ def test_cap_cond_tokens_and_vqgan_embeds_are_same_distribution():
         f"Average cap_cond_mean_std: {avg_cap_cond_mean_std}, Average vqgan_mean_std: {avg_vqgan_mean_std}"
     )
 
-    np.testing.assert_allclose(avg_cap_cond_mean, avg_vqgan_mean, atol=1e-4, rtol=0)
-    np.testing.assert_allclose(avg_cap_cond_mean, 0, atol=1e-4, rtol=0)
+    np.testing.assert_allclose(avg_cap_cond_mean, avg_vqgan_mean, atol=1e-3, rtol=0)
+    np.testing.assert_allclose(avg_cap_cond_mean, 0, atol=1e-3, rtol=0)
     np.testing.assert_allclose(
-        avg_cap_cond_mean_magnitude, avg_vqgan_mean_magnitude, atol=0.02, rtol=0
+        avg_cap_cond_mean_magnitude, avg_vqgan_mean_magnitude, atol=0, rtol=0.03
     )
     np.testing.assert_allclose(avg_cap_cond_std, avg_vqgan_std, atol=0.01, rtol=0)
-    np.testing.assert_allclose(avg_cap_cond_std, 0.02, atol=0.005, rtol=0)
+    np.testing.assert_allclose(avg_cap_cond_std, 1, atol=0.01, rtol=0)
     np.testing.assert_allclose(
-        avg_cap_cond_mean_std, avg_vqgan_mean_std, atol=0.005, rtol=0
+        avg_cap_cond_mean_std, avg_vqgan_mean_std, atol=0.03, rtol=0
     )
-    np.testing.assert_allclose(avg_cap_cond_mean_std, 0.02, atol=0.005, rtol=0)
+    np.testing.assert_allclose(avg_cap_cond_mean_std, 1, atol=0.03, rtol=0)
 
 
 def _setup_test_sample(
