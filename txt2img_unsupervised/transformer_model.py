@@ -58,6 +58,8 @@ class ImageModel(nn.Module):
     )
 
     def setup(self) -> None:
+        # Follows PaLM: "PaLM: Scaling Language Modeling with Pathways"
+        # https://arxiv.org/abs/2204.02311
         default_kernel_init = nn.initializers.variance_scaling(
             scale=1.0, mode="fan_in", distribution="normal"
         )
@@ -125,8 +127,8 @@ class ImageModel(nn.Module):
             assert self.clip_cap_count > 0, "clip_cap_count must be positive"
 
         # The initializers for CLIP conditioning are chosen such that the conditioning tokens have
-        # the same distribution as the token embeddings, assuming the clip embeddings are standard
-        # normally distributed and the max distances are drawn from U[0, 2]. See
+        # the same distribution as the token embeddings, assuming the clip embeddings are uniformly
+        # distributed on the unit sphere and the max distances are drawn from U[0, 2]. See
         # https://chatgpt.com/share/66f1ee03-0874-800c-a230-9f5784f6d898 for the derivation.
 
         # We add the projections for the cap centers and the projections for the max cosine
