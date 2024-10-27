@@ -128,6 +128,9 @@ parser.add_argument(
 parser.add_argument(
     "--skip-sampling", action="store_true", help="Skip sampling during training"
 )
+parser.add_argument(
+    "--skip-saving", action="store_true", help="Skip saving checkpoints during training"
+)
 args, _unknown = parser.parse_known_args()
 
 
@@ -890,10 +893,14 @@ last_checkpoint_time = None
 
 
 def save_checkpoint_and_log_images(
-    my_train_state, sample_batch_size, global_step, skip_sampling
+    my_train_state, sample_batch_size, global_step, skip_sampling, skip_saving
 ) -> None:
-    my_train_state.save_checkpoint(checkpoint_manager, global_step)
-    tqdm.write("Saved checkpoint")
+    if not skip_saving:
+        my_train_state.save_checkpoint(checkpoint_manager, global_step)
+        tqdm.write("Saved checkpoint")
+    else:
+        tqdm.write("Skipping checkpoint save")
+
     if not skip_sampling:
         tqdm.write("Sampling")
         sample_and_log(my_train_state, sample_batch_size, global_step)
@@ -1125,7 +1132,11 @@ for epoch in trange(
             if exit_requested:
                 tqdm.write("Saving checkpoint and exiting early")
                 save_checkpoint_and_log_images(
-                    train_state, sample_batch_size, global_step, skip_sampling=True
+                    train_state,
+                    sample_batch_size,
+                    global_step,
+                    skip_sampling=True,
+                    skip_saving=args.skip_saving,
                 )
                 exit(0)
             # Save checkpoint every 30 minutes. This does one after step 0 too, which is nice so we
@@ -1137,7 +1148,11 @@ for epoch in trange(
                 or early_checkpoint_requested
             ):
                 save_checkpoint_and_log_images(
-                    train_state, sample_batch_size, global_step, args.skip_sampling
+                    train_state,
+                    sample_batch_size,
+                    global_step,
+                    args.skip_sampling,
+                    args.skip_saving,
                 )
                 last_checkpoint_time = datetime.datetime.now()
                 early_checkpoint_requested = False
@@ -1180,7 +1195,11 @@ for epoch in trange(
 
     # Save checkpoint at end of epoch
     save_checkpoint_and_log_images(
-        train_state, sample_batch_size, global_step, skip_sampling=False
+        train_state,
+        sample_batch_size,
+        global_step,
+        skip_sampling=False,
+        skip_saving=args.skip_saving,
     )
     last_checkpoint_time = datetime.datetime.now()
 
