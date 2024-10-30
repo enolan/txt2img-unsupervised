@@ -30,7 +30,7 @@ from typing import Optional
 from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--batch-size", type=int)
+parser.add_argument("--batch-size", type=int, required=True)
 # batch sizes on 4090 (all reddit):
 # 128 (PIL threads default): 01:56 170.30it/s
 # 128 (PIL threads 32): 02:26 135.29it/s
@@ -43,8 +43,8 @@ parser.add_argument("--batch-size", type=int)
 # 32  (PIL threads default): 01:42 193.71it/s
 # 16  (PIL threads default): 01:51 178.18it/s
 parser.add_argument("--pil-threads", type=int, default=os.cpu_count() // 2)
-parser.add_argument("--ckpt", type=str)
-parser.add_argument("--autoencoder-cfg", type=str)
+parser.add_argument("--ckpt", type=str, required=True)
+parser.add_argument("--autoencoder-cfg", type=str, required=True)
 parser.add_argument("--res", type=int, required=True)
 parser.add_argument("--random-crop", action="store_true")
 parser.add_argument("in_dirs", type=Path, nargs="+")

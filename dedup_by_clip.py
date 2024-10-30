@@ -53,9 +53,11 @@ def gen_dup_list(dset):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--pq-dir", type=Path, help="Directory containing parquet files"
+        "--pq-dir", type=Path, help="Directory containing parquet files", required=True
     )
-    parser.add_argument("--out", type=Path, help="Path to write the duplicate list to")
+    parser.add_argument(
+        "--out", type=Path, help="Path to write the duplicate list to", required=True
+    )
 
     args = parser.parse_args()
 
