@@ -406,6 +406,8 @@ class ImageModel(nn.Module):
         last_toks = tf_out[:, 0, :]
         assert last_toks.shape == (batch_size, self.d_model)
 
+        if self.pre_norm:
+            last_toks = self.final_layer_norm(last_toks)
         logits_out = self.logits_decoder(last_toks)
         assert logits_out.shape == (batch_size, 8192)
         return logits_out
@@ -433,6 +435,8 @@ class ImageModel(nn.Module):
 
         h, _ = self.transformer_layers(h[:, None, :], None)
         assert h.shape == (batch_size, 1, self.d_model)
+        if self.pre_norm:
+            h = self.final_layer_norm(h)
         return self.logits_decoder(h[:, 0, :])  # type: ignore[no-any-return]
 
     def dummy_inputs(self):
@@ -604,6 +608,7 @@ def _setup_test_sample(
     clip_conditioning: bool = False,
     clip_caps: bool = False,
     clip_cap_count: Optional[int] = None,
+    pre_norm: bool = False,
     image_tokens: int = 256,
 ) -> Tuple[ImageModel, ImageModel, dict, jax.Array, jax.Array]:
     """Shared setup code for iterative sampling tests."""
@@ -621,6 +626,7 @@ def _setup_test_sample(
         if clip_cap_count is None:
             clip_cap_count = 2
         cfg_nodec.clip_cap_count = clip_cap_count
+    cfg_nodec.pre_norm = pre_norm
     mdl_nodec = ImageModel(**cfg_nodec.__dict__)
     mdl_dec = mdl_nodec.clone(decode=True, attn_method=AttnMethod.STANDARD)
 
@@ -677,8 +683,21 @@ def _setup_test_sample(
     )
 
 
-def _test_sample_tok_0(
-    clip_conditioning: bool, clip_caps: bool, clip_cap_count: Optional[int] = None
+@pytest.mark.parametrize("pre_norm", [False, True])
+@pytest.mark.parametrize(
+    "clip_conditioning,clip_caps,clip_cap_count",
+    [
+        (False, False, None),
+        (True, False, None),
+        (True, True, 1),
+        (True, True, 2),
+    ],
+)
+def test_sample_tok_0(
+    clip_conditioning: bool,
+    clip_caps: bool,
+    clip_cap_count: Optional[int],
+    pre_norm: bool,
 ) -> None:
     """Test that step-by-step decoding is equivalent to all at once for image token 0."""
     (
@@ -690,7 +709,7 @@ def _test_sample_tok_0(
         clip_embedding,
         max_cos_distance,
         logits_all,
-    ) = _setup_test_sample(clip_conditioning, clip_caps, clip_cap_count)
+    ) = _setup_test_sample(clip_conditioning, clip_caps, clip_cap_count, pre_norm)
 
     params = flax.core.copy(params, {"cache": cache})
     logits_0, cache = mdl_dec.apply(
@@ -705,23 +724,16 @@ def _test_sample_tok_0(
     np.testing.assert_allclose(logits_all[0], logits_0[0], rtol=0, atol=3e-3)
 
 
-def test_sample_tok_0_no_clip() -> None:
-    _test_sample_tok_0(False, False)
-
-
-def test_sample_tok_0_clip() -> None:
-    _test_sample_tok_0(True, False)
-
-
-def test_sample_tok_0_clip_caps_1() -> None:
-    _test_sample_tok_0(True, True, 1)
-
-
-def test_sample_tok_0_clip_caps_2() -> None:
-    _test_sample_tok_0(True, True, 2)
-
-
-def _test_sample_tok_1(clip_conditioning: bool, clip_caps: bool) -> None:
+@pytest.mark.parametrize("pre_norm", [False, True])
+@pytest.mark.parametrize(
+    "clip_conditioning,clip_caps",
+    [
+        (False, False),  # No CLIP
+        (True, False),  # CLIP without caps
+        (True, True),  # CLIP with caps
+    ],
+)
+def test_sample_tok_1(clip_conditioning: bool, clip_caps: bool, pre_norm: bool) -> None:
     """Test that step-by-step decoding is equivalent to all at once for token 1."""
     (
         mdl_nodec,
@@ -732,7 +744,7 @@ def _test_sample_tok_1(clip_conditioning: bool, clip_caps: bool) -> None:
         clip_embedding,
         max_cos_distance,
         logits_all,
-    ) = _setup_test_sample(clip_conditioning, clip_caps)
+    ) = _setup_test_sample(clip_conditioning, clip_caps, 1, pre_norm)
 
     params = flax.core.copy(params, {"cache": cache})
 
@@ -755,20 +767,18 @@ def _test_sample_tok_1(clip_conditioning: bool, clip_caps: bool) -> None:
     np.testing.assert_allclose(logits_all[1], logits_1[0], rtol=0, atol=1e-3)
 
 
-def test_sample_tok_1_no_clip() -> None:
-    _test_sample_tok_1(False, False)
-
-
-def test_sample_tok_1_clip() -> None:
-    _test_sample_tok_1(True, False)
-
-
-def test_sample_tok_1_clip_caps() -> None:
-    _test_sample_tok_1(True, True)
-
-
-def _test_sample_tok_all(
-    clip_conditioning: bool, clip_caps: bool, image_tokens: int = 256
+@pytest.mark.parametrize("pre_norm", [False, True])
+@pytest.mark.parametrize(
+    "clip_conditioning,clip_caps,image_tokens",
+    [
+        (False, False, 256),  # No CLIP
+        (True, False, 256),  # CLIP without caps
+        (True, True, 256),  # CLIP with caps
+        (True, True, 1024),  # Test longer sequence length
+    ],
+)
+def test_sample_tok_all(
+    clip_conditioning: bool, clip_caps: bool, image_tokens: int, pre_norm: bool
 ) -> None:
     """Test that step-by-step decoding is equivalent to all at once for all tokens."""
     (
@@ -780,7 +790,7 @@ def _test_sample_tok_all(
         clip_embedding,
         max_cos_distance,
         logits_all,
-    ) = _setup_test_sample(clip_conditioning, clip_caps, None, image_tokens)
+    ) = _setup_test_sample(clip_conditioning, clip_caps, None, pre_norm, image_tokens)
 
     decoded_logits = []
     params = flax.core.copy(params, {"cache": cache})
@@ -819,24 +829,6 @@ def _test_sample_tok_all(
     decoded_logits = jnp.stack(decoded_logits, axis=0)
     assert decoded_logits.shape == (image_tokens, 8192)
     np.testing.assert_allclose(logits_all, decoded_logits, rtol=0, atol=0.003)
-
-
-def test_sample_tok_all_no_clip() -> None:
-    _test_sample_tok_all(False, False)
-
-
-def test_sample_tok_all_clip() -> None:
-    _test_sample_tok_all(True, False)
-
-
-def test_sample_tok_all_clip_caps() -> None:
-    _test_sample_tok_all(True, True)
-
-
-def test_sample_tok_all_clip_caps_1024() -> None:
-    # There was a boundary issue with flash attention that broke with sequence lengths that > 1024
-    # & not multiples of 1024.
-    _test_sample_tok_all(True, True, 1024)
 
 
 def test_batched_decode_consistency() -> None:
