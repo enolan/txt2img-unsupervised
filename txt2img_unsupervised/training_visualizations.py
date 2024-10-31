@@ -117,6 +117,8 @@ def log_token_loss_visualization(
         )
 
     ax_entropy.set_xlabel("Token #")
+    ax_entropy.set_xticks(tick_positions)
+    ax_entropy.set_xticklabels(tick_positions)
     ax_entropy.set_ylabel("Entropy")
     ax_entropy.set_title(f"Per-Token Entropy for Test Images (step {global_step})")
     ax_entropy.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
