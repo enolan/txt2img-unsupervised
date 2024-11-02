@@ -3,11 +3,15 @@
   "num_heads": 12,
   "ff_dim": 3072,
   "dropout": 0.1,
+  "image_dropout": 0.1,
   "n_layers": 12,
   "image_tokens": 1024,
   "use_biases": true,
   "activations_dtype": "float32",
-  "activation_function": "relu",
+  "activation_function": "gelu",
   "clip_conditioning": true,
-  "corrected_cap_projections": true
+  "clip_caps": true,
+  "clip_cap_count": 1,
+  "corrected_cap_projections": true,
+  "pre_norm": true
 }
