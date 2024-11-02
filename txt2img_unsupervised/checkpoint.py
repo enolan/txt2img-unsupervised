@@ -265,7 +265,7 @@ def get_imagemodel_from_checkpoint(checkpoint_dir: Path) -> ImageModel:
     )
 
 
-def load_eval_params(
+def load_params(
     checkpoint_dir: Path, step: Optional[int] = None
 ) -> Tuple[dict, int, ImageModel]:
     """Load the evaluation parameters from a checkpoint.
@@ -278,8 +278,6 @@ def load_eval_params(
         - The step number
         - The ImageModel instance
     """
-    # FIXME this loads the params, not the eval params. maybe should rename. also have checkpoint
-    # processor script that computes eval params and discards everything else.
     checkpoint_manager = mk_checkpoint_manager(checkpoint_dir, for_training=False)
     if step is None:
         step = checkpoint_manager.latest_step()

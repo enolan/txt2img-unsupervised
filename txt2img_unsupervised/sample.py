@@ -30,7 +30,7 @@ from tqdm import tqdm, trange
 from typing import List, Tuple
 
 from . import ldm_autoencoder
-from .checkpoint import get_imagemodel_from_checkpoint, load_eval_params
+from .checkpoint import get_imagemodel_from_checkpoint, load_params
 from .ldm_autoencoder import LDMAutoencoder
 from .transformer_model import (
     ImageModel,
@@ -586,7 +586,7 @@ def main():
         cond_img_inputs, cond_txt_inputs = [], []
 
     # Load the transformer model parameters
-    im_params, checkpoint_step, im_mdl = load_eval_params(
+    im_params, checkpoint_step, im_mdl = load_params(
         args.transformer_checkpoint_dir
     )
 
