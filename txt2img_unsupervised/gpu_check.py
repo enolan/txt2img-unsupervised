@@ -4,7 +4,13 @@ import jax
 def gpu_is_ampere_or_newer() -> bool:
     """Check if the GPU is an Ampere or newer architecture. Warning: this will fail to detect GPUs
     released after ca September 2024."""
-    gpu_devices = jax.devices("gpu")
+    try:
+        gpu_devices = jax.devices("gpu")
+    except RuntimeError as e:
+        if "no platforms that are instances of gpu are present." in str(e):
+            return False
+        else:
+            raise
     if len(gpu_devices) == 0:
         return False
     device_kind = gpu_devices[0].device_kind
