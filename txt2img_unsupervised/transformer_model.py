@@ -342,27 +342,43 @@ class ImageModel(nn.Module):
         else:
             assert clip_embeddings.shape == max_cos_distances.shape == (batch_size, 0)
 
-        embeds = self.in_embed(images)
-        assert embeds.shape == (batch_size, self.image_tokens, self.d_model)
-        embeds = self.image_dropout_layer(embeds)
+        # Drop the last token from the images, it's not used to predict anything.
+        images = images[:, :-1]
 
-        cond_tokens = self.gen_conditioning_tokens(clip_embeddings, max_cos_distances)
-        assert cond_tokens.shape == (batch_size, self.prepended_tokens(), self.d_model)
-        toks = jnp.concatenate([cond_tokens, embeds[:, :-1]], axis=1)
-        assert toks.shape == (batch_size, self.seq_len(), self.d_model)
+        # Apply dropout to the VQGAN tokens and the positional encodings for them, but not to the
+        # conditioning tokens. We want to a) add a little bit of regularization b) add some noise to
+        # kick training off saddle points and c) encourage the model to learn global structure over
+        # local patterns/texture, and rely more on the conditioning tokens so prompting works
+        # better.
+        cond_embeds = self.gen_conditioning_tokens(clip_embeddings, max_cos_distances)
+        assert cond_embeds.shape == (batch_size, self.prepended_tokens(), self.d_model)
+        cond_pos_embeds = self.positional_encoding(jnp.arange(self.prepended_tokens()))
+        assert cond_pos_embeds.shape == (self.prepended_tokens(), self.d_model)
+        cond_embeds = cond_embeds + cond_pos_embeds
 
-        h: jax.Array = toks + self.positional_encoding(jnp.arange(self.seq_len()))
+        img_embeds = self.in_embed(images)
+        assert img_embeds.shape == (batch_size, self.image_tokens - 1, self.d_model)
+        img_pos_embeds = self.positional_encoding(
+            jnp.arange(self.image_tokens - 1) + self.prepended_tokens()
+        )
+        assert img_pos_embeds.shape == (self.image_tokens - 1, self.d_model)
+        img_embeds = img_embeds + img_pos_embeds
+        img_embeds = self.image_dropout_layer(img_embeds)
+        assert img_embeds.shape == (batch_size, self.image_tokens - 1, self.d_model)
+
+        h = jnp.concatenate([cond_embeds, img_embeds], axis=1)
         assert h.shape == (batch_size, self.seq_len(), self.d_model)
+
         h, _ = self.transformer_layers(h, None)
         assert h.shape == (batch_size, self.seq_len(), self.d_model)
         if self.pre_norm:
             h = self.final_layer_norm(h)
         h = h[:, self.prepended_tokens() - 1 :]
-        h = self.logits_decoder(h)
-        assert h.shape == (batch_size, self.image_tokens, 8192)
-        assert h.dtype == self.activations_dtype
+        logits = self.logits_decoder(h)
+        assert logits.shape == (batch_size, self.image_tokens, 8192)
+        assert logits.dtype == self.activations_dtype
 
-        return h
+        return logits
 
     def decode_init(
         self,
@@ -431,6 +447,7 @@ class ImageModel(nn.Module):
         assert embed.shape == (batch_size, self.d_model)
 
         h = embed + self.positional_encoding(idx + self.prepended_tokens())
+        h = self.image_dropout_layer(h)
         assert h.shape == (batch_size, self.d_model)
 
         h, _ = self.transformer_layers(h[:, None, :], None)
@@ -1846,7 +1863,7 @@ def test_learn_sequential(
         {"params": params_rng, "dropout": jax.random.PRNGKey(0)}, *mdl.dummy_inputs()
     )
 
-    steps = 200
+    steps = 300
     batch_size = 64
 
     opt = optax.contrib.schedule_free_adamw(
