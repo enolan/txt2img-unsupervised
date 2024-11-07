@@ -407,7 +407,8 @@ def test_sample_loop_batch_equivalence():
 def mk_filler_caps(model_cfg, n_cap_sets, n_used_caps, rng):
     """Make caps with max cosine distance 2 and random centers to fill in all but n_used_caps cap
     slots. These caps *should* have no effect on the output, since they don't restrict the space of
-    valid embeddings at all. Filler caps are necessary for prompting models with >1 cap slot.
+    valid embeddings at all. Filler caps are necessary for unconditioned sampling on cap models and
+    for prompting models with >1 cap slot with fewer than the full number of caps.
     """
     assert model_cfg.clip_caps
     assert n_used_caps <= model_cfg.clip_cap_count
