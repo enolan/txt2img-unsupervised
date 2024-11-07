@@ -587,9 +587,7 @@ def main():
         cond_img_inputs, cond_txt_inputs = [], []
 
     # Load the transformer model parameters
-    im_params, checkpoint_step, im_mdl = load_params(
-        args.transformer_checkpoint_dir
-    )
+    im_params, checkpoint_step, im_mdl = load_params(args.transformer_checkpoint_dir)
 
     print(
         f"Loaded transformer model step {checkpoint_step} from "

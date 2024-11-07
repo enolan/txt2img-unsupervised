@@ -32,7 +32,6 @@ def main():
     eval_params = ts.get_eval_params()
     jax.tree.map(lambda a: a.block_until_ready(), eval_params)
 
-
     print("Creating checkpoint manager for destination directory...")
     dst_checkpoint_manager = ocp.CheckpointManager(
         args.out_dir.absolute(),
@@ -43,6 +42,7 @@ def main():
     print("Saving checkpoint...")
     save_args = ocp.args.Composite(params=ocp.args.StandardSave(eval_params))
     dst_checkpoint_manager.save(step, args=save_args)
+
 
 if __name__ == "__main__":
     main()
