@@ -1253,12 +1253,12 @@ for epoch in trange(
     # Evaluate on test set
     losses = []
     eval_params = train_state.get_eval_params()
+    test_rng = jax.random.PRNGKey(7357)
     for batch_idx in trange(
         len(test_imgs) // training_cfg.batch_size,
         desc="test batches",
     ):
-        dropout_rng, cap_rng, rng = jax.random.split(train_state.rng, 3)
-        train_state = train_state.replace(rng=rng)
+        dropout_rng, cap_rng, test_rng = jax.random.split(test_rng, 3)
         batch_imgs, batch_clips = get_batch(
             test_imgs,
             training_cfg.batch_size,
@@ -1283,6 +1283,7 @@ for epoch in trange(
                 batch_max_cos_distances,
             )
         )
+    del test_rng
     del eval_params
     test_loss = jnp.mean(jnp.stack(losses))
     wandb.log({"global_step": global_step, "test/loss": test_loss})
