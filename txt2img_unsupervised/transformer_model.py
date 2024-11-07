@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 from tqdm import tqdm, trange
 
-from .cone_sampling import random_pt_with_cosine_similarity
+from .cap_sampling import random_pt_with_cosine_similarity
 from .config import ModelConfig
 from .gen_training_caps import gen_training_examples_from_tree
 from .gpu_check import gpu_is_ampere_or_newer

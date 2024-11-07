@@ -62,6 +62,7 @@ from txt2img_unsupervised.training_visualizations import (
     log_attention_maps,
     log_token_loss_visualization,
 )
+import txt2img_unsupervised.cap_sampling as cap_sampling
 import txt2img_unsupervised.config as config
 import txt2img_unsupervised.sample as sample
 import txt2img_unsupervised.transformer_model as transformer_model
@@ -910,16 +911,21 @@ def save_checkpoint_and_log_images(
         (
             visualization_img_encodings,
             visualization_embeddings,
-            visualization_max_cos_distances,
         ) = get_batch(
             visualization_dset,
             len(visualization_dset),
             0,
             clip_conditioning=mdl.clip_conditioning,
-            clip_caps=mdl.clip_caps,
-            clip_cap_count=mdl.clip_cap_count,
             sharding=examples_sharding,
         )
+        if mdl.clip_caps:
+            visualization_embeddings, visualization_max_cos_distances = gen_caps(
+                jax.random.PRNGKey(0), visualization_embeddings, mdl.clip_cap_count
+            )
+        else:
+            visualization_max_cos_distances = jnp.zeros(
+                (visualization_embeddings.shape[0], 0), dtype=jnp.float32
+            )
         tqdm.write("Logging attention maps")
         log_attention_maps(
             my_train_state,
@@ -993,6 +999,28 @@ def early_checkpoint_signal_handler(signum, frame):
 
 signal.signal(signal.SIGUSR1, early_checkpoint_signal_handler)
 
+cap_logits_table = cap_sampling.LogitsTable(767, 16384)
+
+
+@partial(jax.jit, static_argnames=["n_caps"])
+def gen_caps(rng, batch_clips, n_caps):
+    """Generate containing spherical caps for a batch of examples."""
+    ex_rngs = jax.random.split(rng, batch_clips.shape[0])
+
+    def caps_for_example(ex_rng, v):
+        return jax.vmap(
+            lambda rng: cap_sampling.sample_cap(
+                cap_logits_table, rng, v, bias_d_max=True
+            )
+        )(jax.random.split(ex_rng, n_caps))
+
+    cap_centers, cap_max_cos_distances = jax.vmap(caps_for_example, in_axes=(0, 0))(
+        ex_rngs, batch_clips
+    )
+    assert cap_centers.shape == (batch_clips.shape[0], n_caps, 768)
+    assert cap_max_cos_distances.shape == (batch_clips.shape[0], n_caps)
+    return cap_centers, cap_max_cos_distances
+
 
 # In order to ensure the GPU doesn't wait on CPU stuff, we ensure that there's always at least one
 # batch in flight. So at the beginning of each inner loop we enqueue the next step before doing
@@ -1000,7 +1028,7 @@ signal.signal(signal.SIGUSR1, early_checkpoint_signal_handler)
 def prefetch_and_train(current_state, current_step):
     """Prefetch next batch and enqueue next train step."""
 
-    batch_imgs, batch_clips, batch_max_cos_distances = get_batch(
+    batch_imgs, batch_clips = get_batch(
         train_imgs,
         training_cfg.batch_size,
         # In order to support --start-where-finetune-source-left-off, we offset where we're
@@ -1008,10 +1036,29 @@ def prefetch_and_train(current_state, current_step):
         # units of this run's batch size).
         current_step + data_offset,
         clip_conditioning=mdl.clip_conditioning,
-        clip_caps=mdl.clip_caps,
-        clip_cap_count=mdl.clip_cap_count,
         sharding=examples_sharding,
     )
+    assert batch_clips.shape == (training_cfg.batch_size, 768)
+    if mdl.clip_caps:
+        caps_rng, rng = jax.random.split(current_state.rng, 2)
+        current_state = current_state.replace(rng=rng)
+        batch_cap_centers, batch_max_cos_distances = gen_caps(
+            caps_rng, batch_clips, mdl.clip_cap_count
+        )
+        assert batch_cap_centers.shape == (
+            batch_clips.shape[0],
+            mdl.clip_cap_count,
+            768,
+        )
+        assert batch_max_cos_distances.shape == (
+            batch_clips.shape[0],
+            mdl.clip_cap_count,
+        )
+        batch_clips = batch_cap_centers
+    else:
+        batch_max_cos_distances = jnp.zeros(
+            (batch_clips.shape[0], 0), dtype=jnp.float32
+        )
 
     train_state, loss, norm = train_step(
         current_state,
@@ -1210,17 +1257,23 @@ for epoch in trange(
         len(test_imgs) // training_cfg.batch_size,
         desc="test batches",
     ):
-        dropout_rng, rng = jax.random.split(train_rng, 2)
+        dropout_rng, cap_rng, rng = jax.random.split(train_state.rng, 3)
         train_state = train_state.replace(rng=rng)
-        batch_imgs, batch_clips, batch_max_cos_distances = get_batch(
+        batch_imgs, batch_clips = get_batch(
             test_imgs,
             training_cfg.batch_size,
             batch_idx,
             clip_conditioning=mdl.clip_conditioning,
-            clip_caps=mdl.clip_caps,
-            clip_cap_count=mdl.clip_cap_count,
             sharding=examples_sharding,
         )
+        if mdl.clip_caps:
+            batch_clips, batch_max_cos_distances = gen_caps(
+                cap_rng, batch_clips, mdl.clip_cap_count
+            )
+        else:
+            batch_max_cos_distances = jnp.zeros(
+                (batch_clips.shape[0], 0), dtype=jnp.float32
+            )
         losses.append(
             loss_fn(
                 eval_params,
