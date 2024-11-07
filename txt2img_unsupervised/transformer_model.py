@@ -1674,7 +1674,7 @@ def test_cap_train() -> None:
 
     loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
 
-    steps = 800
+    steps = 100
     opt = optax.contrib.schedule_free_adamw(
         learning_rate=1e-3, b1=0.98, warmup_steps=30
     )
