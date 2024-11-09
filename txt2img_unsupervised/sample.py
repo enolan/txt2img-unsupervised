@@ -557,6 +557,11 @@ def main():
 
             assert cap_centers.shape == (im_mdl.clip_cap_count, 768)
             assert max_cos_distances.shape == (im_mdl.clip_cap_count,)
+
+            sort_idxs = np.argsort(max_cos_distances)
+            cap_centers = cap_centers[sort_idxs]
+            max_cos_distances = max_cos_distances[sort_idxs]
+
             cap_centers = repeat(cap_centers, "cap clip -> n cap clip", n=args.n)
             max_cos_distances = repeat(max_cos_distances, "cap -> n cap", n=args.n)
         else:

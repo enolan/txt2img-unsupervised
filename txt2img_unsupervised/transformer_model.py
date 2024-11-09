@@ -12,7 +12,7 @@ from copy import copy
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
-from einops import rearrange, repeat
+from einops import rearrange, reduce, repeat
 from flax import struct
 from functools import partial
 from infinidata import TableView
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 from tqdm import tqdm, trange
 
-from .cap_sampling import random_pt_with_cosine_similarity
+from .cap_sampling import LogitsTable, random_pt_with_cosine_similarity, sample_cap
 from .config import ModelConfig
 from .gen_training_caps import gen_training_examples_from_tree
 from .gpu_check import gpu_is_ampere_or_newer
@@ -137,14 +137,14 @@ class ImageModel(nn.Module):
         clip_proj_stddev = 1.0 if not self.clip_caps else 1.0 / np.sqrt(2)
         self.clip_proj = nn.Dense(
             features=self.d_model,
-            use_bias=self.use_biases,
+            use_bias=True,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
             kernel_init=nn.initializers.normal(stddev=clip_proj_stddev),
         )
         self.max_cos_distance_proj = nn.Dense(
             features=self.d_model,
-            use_bias=self.use_biases,
+            use_bias=True,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
             kernel_init=nn.initializers.normal(stddev=clip_proj_stddev),
@@ -472,6 +472,150 @@ class ImageModel(nn.Module):
             clip_embeddings_dummy = jnp.zeros((1, 0), dtype=jnp.float32)
             max_cos_distance_dummy = jnp.zeros((1, 0), dtype=jnp.float32)
         return images_dummy, clip_embeddings_dummy, max_cos_distance_dummy
+
+    def gen_training_caps(self, tbl, rng, clip_embedding):
+        """Generate random caps to use for training with a single example. 'self' MUST be a static
+        argument when JITting this."""
+        assert self.clip_caps
+        assert clip_embedding.shape == (768,)
+
+        n_caps_rng, caps_rng, fill_rng = jax.random.split(rng, 3)
+
+        # We draw the number of caps to use from a power law distribution, constrained such that
+        # P(X = 1) = 0.1. The PMF is strictly monotonically increasing so long as clip_cap_count
+        # < 10, constant if it's 10, and decreasing if it's larger. The principle here is that we
+        # want a decent fraction of examples to have a single cap, since that's the majority
+        # situation at inference time. But we also want most of them to have multiple caps, since
+        # it's useful to be able to condition on multiple concepts at once. And we want as many
+        # examples as possible to have lots, because an example with lots of caps is much more
+        # informative to the model as to the CLIP embedding of the image - we should learn more per
+        # example with more caps.
+
+        # I don't know that this distribution is ideal. As of 2024-11-08 I haven't done very many
+        # multi-cap experiments.
+
+        # Find an alpha value for a power law distribution that gives P(X = 1) = 0.1.
+        if self.clip_cap_count > 1:
+            lower = 0.0
+            upper = 10.0
+            for _ in range(20):
+                alpha = (lower + upper) / 2
+                probs = calculate_discrete_power_law_pmf(self.clip_cap_count, alpha)
+                if probs[0] < 0.1:
+                    upper = alpha
+                else:
+                    lower = alpha
+            np.testing.assert_allclose(probs[0], 0.1, atol=3e-6, rtol=0)
+        else:
+            probs = np.array([1.0])
+
+        # Draw a number of caps to use from the power law distribution.
+        n_caps = jax.random.choice(
+            n_caps_rng, jnp.arange(1, self.clip_cap_count + 1), p=probs
+        )
+
+        # Draw a complete set of caps. Because of JAX tracing constraints we can't only do n_caps
+        # caps, we have to generate a static number of caps and select afterward.
+        cap_centers, cap_d_maxes = jax.vmap(
+            lambda rng: sample_cap(tbl, rng, clip_embedding, bias_d_max=True)
+        )(jax.random.split(caps_rng, self.clip_cap_count))
+        assert cap_centers.shape == (self.clip_cap_count, 768)
+        assert cap_d_maxes.shape == (self.clip_cap_count,)
+
+        # Fill in the rest of the caps with ones that cover the entire sphere and have uniformly
+        # distributed centers
+        fill_centers = jax.random.normal(fill_rng, (self.clip_cap_count, 768))
+        fill_centers = fill_centers / jnp.linalg.norm(
+            fill_centers, axis=-1, keepdims=True
+        )
+        fill_d_maxes = jnp.full((self.clip_cap_count,), 2.0)
+
+        cap_mask = jnp.arange(self.clip_cap_count) < n_caps
+        cap_centers = jnp.where(cap_mask[:, None], cap_centers, fill_centers)
+        cap_d_maxes = jnp.where(cap_mask, cap_d_maxes, fill_d_maxes)
+        assert cap_centers.shape == (self.clip_cap_count, 768)
+        assert cap_d_maxes.shape == (self.clip_cap_count,)
+
+        # Order smallest to largest
+        sorted_idxs = jnp.argsort(cap_d_maxes)
+        cap_centers = cap_centers[sorted_idxs]
+        cap_d_maxes = cap_d_maxes[sorted_idxs]
+
+        return cap_centers, cap_d_maxes
+
+
+def calculate_discrete_power_law_pmf(n_max, alpha):
+    """Calculate the probability mass function (as an array) for a discrete power law distribution
+    over the integers 1 through n_max inclusive, with exponent alpha."""
+    probs = np.arange(1, n_max + 1) ** alpha
+    return probs / np.sum(probs)
+
+
+@pytest.mark.parametrize("n_caps", [1, 2, 3, 4, 10])
+@pytest.mark.parametrize("alpha", [0.5, 1.0, 4.0])
+def test_calculate_discrete_power_law_pmf_increasing(n_caps: int, alpha: float):
+    probs = calculate_discrete_power_law_pmf(n_caps, alpha)
+    assert jnp.all(
+        jnp.diff(probs) >= 0
+    ), "Probabilities must be monotonically increasing"
+
+
+@pytest.mark.parametrize("n_caps", [1, 2, 3, 4, 10])
+def test_gen_training_caps(n_caps: int):
+    tbl = LogitsTable(767, 8192)
+    n_samples = 1000
+    rng = jax.random.PRNGKey(0)
+    config = copy(gpt_1_config)
+    config.clip_caps = True
+    config.clip_cap_count = n_caps
+    mdl = ImageModel(**config.__dict__)
+
+    def gen_caps_and_example_embedding(rng, mdl):
+        ex_rng, cap_rng = jax.random.split(rng, 2)
+        embedding = jax.random.normal(ex_rng, (768,))
+        embedding = embedding / jnp.linalg.norm(embedding)
+        return embedding, mdl.gen_training_caps(tbl, cap_rng, embedding)
+
+    gen_caps_and_example_embedding_jv = jax.jit(
+        lambda rng, mdl: jax.vmap(
+            lambda rng_inner: gen_caps_and_example_embedding(rng_inner, mdl)
+        )(jax.random.split(rng, n_samples)),
+        static_argnames=["mdl"],
+    )
+
+    # Generate a bunch of caps and example embeddings
+    embeddings, (centers, d_maxes) = gen_caps_and_example_embedding_jv(rng, mdl)
+    assert embeddings.shape == (n_samples, 768)
+    assert centers.shape == (n_samples, n_caps, 768)
+    np.testing.assert_allclose(
+        jnp.linalg.norm(embeddings, axis=-1), 1.0, atol=1e-6, rtol=0
+    )
+    np.testing.assert_allclose(
+        jnp.linalg.norm(centers, axis=-1), 1.0, atol=1e-6, rtol=0
+    )
+    assert d_maxes.shape == (n_samples, n_caps)
+
+    # Check the example embeddings are inside the caps
+    sims = jnp.sum(embeddings[:, None, :] * centers, axis=-1)
+    dists = 1 - sims
+    assert dists.shape == (n_samples, n_caps)
+    embeddings_in_caps = dists <= d_maxes
+    assert embeddings_in_caps.shape == (n_samples, n_caps)
+    assert embeddings_in_caps.dtype == jnp.bool_
+    assert jnp.mean(embeddings_in_caps) > 0.9999
+
+    # Check that 10% of the time 1 cap is chosen
+    n_caps_chosen = reduce(d_maxes != 2.0, "ex cap -> ex", "sum")
+    assert n_caps_chosen.shape == (n_samples,)
+    if n_caps > 1:
+        np.testing.assert_allclose(jnp.mean(n_caps_chosen == 1), 0.1, atol=0.01, rtol=0)
+    else:
+        assert jnp.all(n_caps_chosen == 1)
+
+    # Check that cap sizes are monotonically increasing
+    diffs = jnp.diff(d_maxes, axis=1)
+    assert diffs.shape == (n_samples, n_caps - 1)
+    assert jnp.all(diffs >= 0)
 
 
 @pytest.mark.parametrize(

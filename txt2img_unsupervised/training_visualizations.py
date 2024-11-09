@@ -162,8 +162,8 @@ def _compute_attention_weights(
         mdl.n_layers,
         1,
         mdl.num_heads,
-        mdl.image_tokens,
-        mdl.image_tokens,
+        mdl.seq_len(),
+        mdl.seq_len(),
     )
 
     weights_avgd = reduce(
@@ -173,7 +173,7 @@ def _compute_attention_weights(
     assert (
         weights_avgd.shape
         == weights_head0.shape
-        == (mdl.n_layers, mdl.image_tokens, mdl.image_tokens)
+        == (mdl.n_layers, mdl.seq_len(), mdl.seq_len())
     )
 
     return weights_avgd, weights_head0

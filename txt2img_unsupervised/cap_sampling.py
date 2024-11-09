@@ -174,6 +174,20 @@ class LogitsTable:
         # We've sampled a height in [-1, d_max - 1]. Convert to a cosine distance.
         return sampled_height + 1
 
+    @partial(jax.jit, inline=True)
+    def log_cap_size(self, d_max):
+        """Calculate the log of the size of a cap with a given max cosine distance to its center, as
+        a fraction of the total surface area of the sphere.
+        """
+        # The table contains logged areas of slices, if we want logged fractions of the total we
+        # need to take the softmax.
+        log_area_fracs = jax.nn.log_softmax(self.table)
+        d_max_idx = self._height_to_idx(d_max - 1)
+        filtered_log_area_fracs = jnp.where(
+            jnp.arange(self.buckets) <= d_max_idx, log_area_fracs, -jnp.inf
+        )
+        return jax.nn.logsumexp(filtered_log_area_fracs)
+
 
 def test_height_idx_mapping():
     """Test that the height to index and index to height functions are inverses of each other."""

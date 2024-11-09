@@ -1007,16 +1007,9 @@ def gen_caps(rng, batch_clips, n_caps):
     """Generate containing spherical caps for a batch of examples."""
     ex_rngs = jax.random.split(rng, batch_clips.shape[0])
 
-    def caps_for_example(ex_rng, v):
-        return jax.vmap(
-            lambda rng: cap_sampling.sample_cap(
-                cap_logits_table, rng, v, bias_d_max=True
-            )
-        )(jax.random.split(ex_rng, n_caps))
-
-    cap_centers, cap_max_cos_distances = jax.vmap(caps_for_example, in_axes=(0, 0))(
-        ex_rngs, batch_clips
-    )
+    cap_centers, cap_max_cos_distances = jax.vmap(
+        lambda rng, embedding: mdl.gen_training_caps(cap_logits_table, rng, embedding)
+    )(ex_rngs, batch_clips)
     assert cap_centers.shape == (batch_clips.shape[0], n_caps, 768)
     assert cap_max_cos_distances.shape == (batch_clips.shape[0], n_caps)
     return cap_centers, cap_max_cos_distances
