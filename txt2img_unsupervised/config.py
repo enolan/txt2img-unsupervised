@@ -182,6 +182,7 @@ class LearningRateSchedule(Enum):
         "warmup_plus_cosine"  # Linear warmup for a fixed # of steps, then cosine decay.
     )
     WARMUP_PLUS_SCHEDULE_FREE = "warmup_plus_schedule_free"  # Linear warmup for a fixed # of steps, then schedule-free Adam.
+    WARMUP_PLUS_SCHEDULE_FREE_ADOPTW = "warmup_plus_schedule_free_adoptw"  # Linear warmup for a fixed # of steps, then schedule-free ADOPT-W.
 
 
 str_to_learning_rate_schedule = {
@@ -189,6 +190,7 @@ str_to_learning_rate_schedule = {
     "triangle": LearningRateSchedule.TRIANGLE,
     "warmup_plus_cosine": LearningRateSchedule.WARMUP_PLUS_COSINE,
     "warmup_plus_schedule_free": LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE,
+    "warmup_plus_schedule_free_adoptw": LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE_ADOPTW,
 }
 
 
@@ -283,6 +285,8 @@ class TrainingConfig:
         elif (
             self.learning_rate_schedule
             == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+            or self.learning_rate_schedule
+            == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE_ADOPTW
         ):
             if self.warmup_steps is None or self.schedule_free_beta1 is None:
                 raise ValueError(

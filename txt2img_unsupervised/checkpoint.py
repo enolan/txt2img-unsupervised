@@ -20,6 +20,7 @@ from typing import Any, Optional, Tuple
 
 from .adaptive_gradient_skip import AdaptiveGradientSkipState, adaptive_gradient_skip
 from .config import LearningRateSchedule, ModelConfig, TrainingConfig
+from .schedule_free_adoptw import schedule_free_adoptw
 from .transformer_model import ImageModel
 from .triangle_schedule import triangle_schedule
 
@@ -61,6 +62,16 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int):
         == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
     ):
         opt = optax.contrib.schedule_free_adamw(
+            learning_rate=training_cfg.learning_rate,
+            warmup_steps=training_cfg.warmup_steps,
+            b1=training_cfg.schedule_free_beta1,
+            weight_decay=training_cfg.weight_decay,
+        )
+    elif (
+        training_cfg.learning_rate_schedule
+        == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE_ADOPTW
+    ):
+        opt = schedule_free_adoptw(
             learning_rate=training_cfg.learning_rate,
             warmup_steps=training_cfg.warmup_steps,
             b1=training_cfg.schedule_free_beta1,

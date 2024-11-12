@@ -1151,6 +1151,8 @@ for epoch in trange(
                 if (
                     training_cfg.learning_rate_schedule
                     == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+                    or training_cfg.learning_rate_schedule
+                    == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE_ADOPTW
                 ):
                     # Since the params used for gradient computation with a schedule-free optimizer
                     # are not the same as the params used for inference, we want to test with the
@@ -1223,8 +1225,9 @@ for epoch in trange(
             if (
                 training_cfg.learning_rate_schedule
                 == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
-                and eval_loss is not None  # can be None if resuming from checkpoint
-            ):
+                or training_cfg.learning_rate_schedule
+                == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE_ADOPTW
+            ) and eval_loss is not None:  # can be None if resuming from checkpoint
                 pbar.set_postfix(
                     train_loss=f"{train_step_to_log['train/loss']:.4f}",
                     eval_loss=f"{eval_loss:.4f}",
