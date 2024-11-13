@@ -46,6 +46,7 @@ class ImageModel(nn.Module):
     clip_caps: bool
     clip_cap_count: Optional[int]
     corrected_cap_projections: bool
+    norm_cap_projections: bool
     use_biases: bool
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
@@ -135,20 +136,26 @@ class ImageModel(nn.Module):
         # distances so we need to scale the standard deviations of the projection weights by
         # sqrt(2) to ensure the variance is the same as it would be with a single projection.
         clip_proj_stddev = 1.0 if not self.clip_caps else 1.0 / np.sqrt(2)
+        # If the cap layer norm is on, biases in these linear layers are redundant.
         self.clip_proj = nn.Dense(
             features=self.d_model,
-            use_bias=True,
+            use_bias=not self.norm_cap_projections,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
             kernel_init=nn.initializers.normal(stddev=clip_proj_stddev),
         )
         self.max_cos_distance_proj = nn.Dense(
             features=self.d_model,
-            use_bias=True,
+            use_bias=not self.norm_cap_projections,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
             kernel_init=nn.initializers.normal(stddev=clip_proj_stddev),
         )
+        if self.norm_cap_projections:
+            self.cap_layer_norm = nn.LayerNorm(
+                dtype=self.activations_dtype,
+                param_dtype=jnp.float32,
+            )
 
         self.positional_encoding = nn.Embed(
             num_embeddings=self.seq_len(),
@@ -309,6 +316,8 @@ class ImageModel(nn.Module):
                     res = res_max_cos_distances + res_cap_centers
                 else:
                     res = (res_cap_centers + res_max_cos_distances) / 2
+        if self.norm_cap_projections:
+            res = self.cap_layer_norm(res)
         assert res.shape == (batch_size, self.prepended_tokens(), self.d_model)
         return res
 
