@@ -142,14 +142,14 @@ class ImageModel(nn.Module):
             use_bias=not self.norm_cap_projections,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
-            kernel_init=nn.initializers.normal(stddev=clip_proj_stddev),
+            kernel_init=nn.initializers.orthogonal(scale=np.sqrt(self.d_model / 2.0)),
         )
         self.max_cos_distance_proj = nn.Dense(
             features=self.d_model,
             use_bias=not self.norm_cap_projections,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
-            kernel_init=nn.initializers.normal(stddev=clip_proj_stddev),
+            kernel_init=nn.initializers.normal(stddev=clip_proj_stddev), #nn.initializers.constant(0.0),
         )
         if self.norm_cap_projections:
             self.cap_layer_norm = nn.LayerNorm(
@@ -659,7 +659,8 @@ def _assert_dicts_equal(d1, d2, name) -> None:
             assert False, f"unknown type {type(d1[k])} for {name}.{k}"
 
 
-def test_cap_cond_tokens_and_vqgan_embeds_are_same_distribution():
+@pytest.mark.parametrize("norm_cap_projections", [False, True])
+def test_cap_cond_tokens_and_vqgan_embeds_are_same_distribution(norm_cap_projections):
     """Test that, at initialization, the embeddings for the caps generated with
     gen_conditioning_tokens and the embeddings for the VQGAN tokens have the same mean, same mean
     magnitude, same standard deviation, and same mean standard deviation. If this is true the model
@@ -670,6 +671,7 @@ def test_cap_cond_tokens_and_vqgan_embeds_are_same_distribution():
     cfg.clip_conditioning = True
     cfg.clip_caps = True
     cfg.clip_cap_count = 1
+    cfg.norm_cap_projections = norm_cap_projections
     mdl = ImageModel(**cfg.__dict__)
 
     n_samples = 1_000
