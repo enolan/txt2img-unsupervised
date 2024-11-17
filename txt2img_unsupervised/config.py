@@ -31,6 +31,7 @@ class ModelConfig:
     clip_cap_count: int = None
     # Should always be true, defaults to false for backwards compatability
     corrected_cap_projections: bool = False
+    do_clip_feedforward: bool = False
     image_dropout: Optional[float] = None
 
     @staticmethod
@@ -151,7 +152,8 @@ def test_modelconfig_roundtrip_from_json() -> None:
         "clip_cap_count": null,
         "clip_caps": false,
         "clip_conditioning": false,
-        "corrected_cap_projections": true
+        "corrected_cap_projections": true,
+        "do_clip_feedforward": false
         }"""
     cfg = ModelConfig.from_json_dict(json.loads(json_str))
     assert ModelConfig.to_json_dict(cfg) == json.loads(json_str)

@@ -46,6 +46,7 @@ class ImageModel(nn.Module):
     clip_caps: bool
     clip_cap_count: Optional[int]
     corrected_cap_projections: bool
+    do_clip_feedforward: bool
     use_biases: bool
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
@@ -149,6 +150,24 @@ class ImageModel(nn.Module):
             param_dtype=self.weights_dtype,
             kernel_init=nn.initializers.normal(stddev=clip_proj_stddev),
         )
+
+        if self.do_clip_feedforward:
+            self.clip_ff_up = nn.Dense(
+                features=self.ff_dim,
+                kernel_init=default_kernel_init,
+                dtype=self.activations_dtype,
+                param_dtype=self.weights_dtype,
+            )
+            self.clip_ff_down = nn.Dense(
+                features=self.d_model,
+                kernel_init=default_kernel_init,
+                dtype=self.activations_dtype,
+                param_dtype=self.weights_dtype,
+            )
+            self.clip_layernorm = nn.LayerNorm(
+                dtype=self.activations_dtype,
+                param_dtype=jnp.float32,
+            )
 
         self.positional_encoding = nn.Embed(
             num_embeddings=self.seq_len(),
@@ -310,6 +329,13 @@ class ImageModel(nn.Module):
                 else:
                     res = (res_cap_centers + res_max_cos_distances) / 2
         assert res.shape == (batch_size, self.prepended_tokens(), self.d_model)
+        if self.do_clip_feedforward:
+            ff_out = self.activation_function(res)
+            ff_out = self.clip_ff_up(ff_out)
+            ff_out = self.activation_function(ff_out)
+            ff_out = self.clip_ff_down(ff_out)
+            res = self.clip_layernorm(res + ff_out)
+            assert res.shape == (batch_size, self.prepended_tokens(), self.d_model)
         return res
 
     def output_shape_tokens(self) -> int:
@@ -624,6 +650,12 @@ def test_gen_training_caps(n_caps: int):
         {},
         {"clip_conditioning": True},
         {"clip_conditioning": True, "clip_caps": True, "clip_cap_count": 4},
+        {
+            "clip_conditioning": True,
+            "clip_caps": True,
+            "clip_cap_count": 1,
+            "do_clip_feedforward": True,
+        },
     ],
 )
 def test_model_initialization_with_various_configs(config_modifications):
@@ -650,7 +682,8 @@ def _assert_dicts_equal(d1, d2, name) -> None:
             assert False, f"unknown type {type(d1[k])} for {name}.{k}"
 
 
-def test_cap_cond_tokens_and_vqgan_embeds_are_same_distribution():
+@pytest.mark.parametrize("do_clip_feedforward", [True, False])
+def test_cap_cond_tokens_and_vqgan_embeds_are_same_distribution(do_clip_feedforward):
     """Test that, at initialization, the embeddings for the caps generated with
     gen_conditioning_tokens and the embeddings for the VQGAN tokens have the same mean, same mean
     magnitude, same standard deviation, and same mean standard deviation. If this is true the model
@@ -661,6 +694,7 @@ def test_cap_cond_tokens_and_vqgan_embeds_are_same_distribution():
     cfg.clip_conditioning = True
     cfg.clip_caps = True
     cfg.clip_cap_count = 1
+    cfg.do_clip_feedforward = do_clip_feedforward
     mdl = ImageModel(**cfg.__dict__)
 
     n_samples = 1_000
