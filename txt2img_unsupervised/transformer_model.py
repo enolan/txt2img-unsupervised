@@ -47,6 +47,7 @@ class ImageModel(nn.Module):
     clip_cap_count: Optional[int]
     corrected_cap_projections: bool
     do_clip_feedforward: bool
+    norm_clip_embeddings: bool
     use_biases: bool
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
@@ -141,7 +142,13 @@ class ImageModel(nn.Module):
             use_bias=True,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
-            kernel_init=nn.initializers.normal(stddev=clip_proj_stddev),
+            # variance_scaling scale is in variance and normal stddev is in standard deviation, so
+            # we need to square the stddev.
+            kernel_init=nn.initializers.variance_scaling(
+                scale=clip_proj_stddev ** 2.0, mode="fan_in", distribution="normal"
+            )
+            if self.norm_clip_embeddings
+            else nn.initializers.normal(stddev=clip_proj_stddev),
         )
         self.max_cos_distance_proj = nn.Dense(
             features=self.d_model,
@@ -165,6 +172,12 @@ class ImageModel(nn.Module):
                 param_dtype=self.weights_dtype,
             )
             self.clip_layernorm = nn.LayerNorm(
+                dtype=self.activations_dtype,
+                param_dtype=jnp.float32,
+            )
+
+        if self.norm_clip_embeddings:
+            self.clip_embeddings_norm = nn.LayerNorm(
                 dtype=self.activations_dtype,
                 param_dtype=jnp.float32,
             )
@@ -282,6 +295,8 @@ class ImageModel(nn.Module):
             assert clip_embeddings.shape == max_cos_distances.shape == (batch_size, 0)
             res = jnp.zeros((batch_size, 1, self.d_model), dtype=self.activations_dtype)
         else:
+            if self.norm_clip_embeddings:
+                clip_embeddings = self.clip_embeddings_norm(clip_embeddings)
             if not self.clip_caps:
                 assert clip_embeddings.shape == (batch_size, 768)
                 assert max_cos_distances.shape == (batch_size, 0)
@@ -682,8 +697,17 @@ def _assert_dicts_equal(d1, d2, name) -> None:
             assert False, f"unknown type {type(d1[k])} for {name}.{k}"
 
 
-@pytest.mark.parametrize("do_clip_feedforward", [True, False])
-def test_cap_cond_tokens_and_vqgan_embeds_are_same_distribution(do_clip_feedforward):
+@pytest.mark.parametrize("do_clip_feedforward", [
+    pytest.param(True, id="with_clip_feedforward"),
+    pytest.param(False, id="no_clip_feedforward"),
+])
+@pytest.mark.parametrize("norm_clip_embeddings", [
+    pytest.param(True, id="with_norm_embeddings"),
+    pytest.param(False, id="no_norm_embeddings"),
+])
+def test_cap_cond_tokens_and_vqgan_embeds_are_same_distribution(
+    do_clip_feedforward, norm_clip_embeddings
+):
     """Test that, at initialization, the embeddings for the caps generated with
     gen_conditioning_tokens and the embeddings for the VQGAN tokens have the same mean, same mean
     magnitude, same standard deviation, and same mean standard deviation. If this is true the model
@@ -695,6 +719,7 @@ def test_cap_cond_tokens_and_vqgan_embeds_are_same_distribution(do_clip_feedforw
     cfg.clip_caps = True
     cfg.clip_cap_count = 1
     cfg.do_clip_feedforward = do_clip_feedforward
+    cfg.norm_clip_embeddings = norm_clip_embeddings
     mdl = ImageModel(**cfg.__dict__)
 
     n_samples = 1_000
