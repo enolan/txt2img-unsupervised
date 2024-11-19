@@ -165,7 +165,7 @@ class ImageModel(nn.Module):
                 dtype=self.activations_dtype,
                 param_dtype=self.weights_dtype,
             )
-            self.clip_layernorm = nn.LayerNorm(
+            self.cond_tokens_layernorm = nn.LayerNorm(
                 dtype=self.activations_dtype,
                 param_dtype=jnp.float32,
             )
@@ -343,7 +343,7 @@ class ImageModel(nn.Module):
             ff_out = self.clip_ff_up(ff_out)
             ff_out = self.activation_function(ff_out)
             ff_out = self.clip_ff_down(ff_out)
-            res = self.clip_layernorm(res + ff_out)
+            res = self.cond_tokens_layernorm(res + ff_out)
             assert res.shape == (batch_size, self.prepended_tokens(), self.d_model)
         return res
 
