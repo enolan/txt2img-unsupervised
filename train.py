@@ -865,6 +865,27 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
         to_log["global_step"] = global_step
         wandb.log(to_log)
 
+
+def leading_dims_to_subtrees(tree):
+    """Given a dict pytree, return a new dict pytree with each array split into a dict of arrays
+    indexed by leading dimension.
+    """
+    if not isinstance(tree, dict):
+        raise ValueError(f"Expected dict, got {type(tree)}")
+    out = {}
+    for k, v in tree.items():
+        if isinstance(v, dict):
+            out[k] = leading_dims_to_subtrees(v)
+        elif isinstance(v, jax.Array):
+            if v.ndim < 2:
+                raise ValueError(f"Expected array with at least 2 dims, got {v.ndim}")
+            else:
+                out[k] = {idx: v[idx] for idx in range(v.shape[0])}
+        else:
+            raise ValueError(f"Unknown type: {type(v)} for key {k}")
+    return out
+
+
 def map_to_norms(tree):
     if isinstance(tree, dict):
         return {k: map_to_norms(v) for k, v in tree.items()}
@@ -875,6 +896,7 @@ def map_to_norms(tree):
             return {col: jnp.linalg.norm(tree[col]) for col in range(len(tree))}
     else:
         raise ValueError(f"Unknown type: {type(tree)}")
+
 
 @partial(jax.jit, donate_argnames=["state"])
 def train_step(
@@ -897,7 +919,14 @@ def train_step(
         grads=grads, rng=rng2
     )  # type:ignore[no-untyped-call]
     norm = optax.global_norm(grads)
-    norm_tree = map_to_norms(grads['params'])
+    grads_tree = grads["params"]
+    # Since the transformer layers are a scan, the leading dimension is the layer index. Transform
+    # the grads so we see the parameter norms per-layer.
+    transformed_transformer_layers_grads = leading_dims_to_subtrees(
+        grads_tree["transformer_layers"]
+    )
+    grads_tree["transformer_layers"] = transformed_transformer_layers_grads
+    norm_tree = jax.tree.map(jnp.linalg.norm, grads_tree)
     return new_state, loss, norm, norm_tree
 
 
@@ -1075,7 +1104,11 @@ def prefetch_and_train(current_state, current_step):
     to_log = {
         "train/loss": loss,
         "grad_global_norm": norm,
-    } | ({f"grad_norm/{k}": v for k, v in norm_tree.items()} if current_step % 100 == 0 else {})
+    } | (
+        {f"grad_norm/{k}": v for k, v in norm_tree.items()}
+        if current_step % 100 == 0
+        else {}
+    )
     # The train state, including the optimizer state and the rng, is donated to train_step, so we
     # need to copy any values within it that we want to use after beginning the next step. Note
     # these values are *JAX arrays*, and get copied back to host RAM when needed, after this
