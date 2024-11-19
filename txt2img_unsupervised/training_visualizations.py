@@ -65,7 +65,7 @@ def log_token_loss_visualization(
         max_cos_distances = jnp.zeros((img_cnt, 0), dtype=jnp.float32)
     params = train_state.get_eval_params()
 
-    test_mdl = mdl.clone(dropout=None, image_dropout=None)
+    test_mdl = mdl.clone(dropout=None, image_dropout=None, clip_dropout=None)
 
     losses, entropies = jax.device_get(
         _compute_losses_and_entropies(
@@ -144,7 +144,10 @@ def _compute_attention_weights(
 ):
     """Compute the attention weights for an image"""
     mdl_record = mdl.copy(
-        record_attention_weights=True, dropout=None, image_dropout=None
+        record_attention_weights=True,
+        dropout=None,
+        image_dropout=None,
+        clip_dropout=None,
     )
     params = train_state.get_eval_params()
 

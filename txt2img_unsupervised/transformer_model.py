@@ -40,6 +40,7 @@ class ImageModel(nn.Module):
     ff_dim: int
     dropout: Optional[float]
     image_dropout: Optional[float]
+    clip_dropout: Optional[float]
     n_layers: int
     image_tokens: int
     clip_conditioning: bool
@@ -121,6 +122,14 @@ class ImageModel(nn.Module):
         if self.clip_caps:
             assert self.clip_cap_count is not None, "clip_cap_count must be set"
             assert self.clip_cap_count > 0, "clip_cap_count must be positive"
+
+        if self.clip_dropout is not None:
+            self.clip_dropout_layer = nn.Dropout(
+                rate=self.clip_dropout,
+                deterministic=False,
+            )
+        else:
+            self.clip_dropout_layer = nn.Dropout(rate=0, deterministic=True)
 
         # The initializers for CLIP conditioning are chosen such that the conditioning tokens have
         # the same distribution as the token embeddings, assuming the clip embeddings are uniformly
@@ -380,16 +389,15 @@ class ImageModel(nn.Module):
         # Drop the last token from the images, it's not used to predict anything.
         images = images[:, :-1]
 
-        # Apply dropout to the VQGAN tokens and the positional encodings for them, but not to the
-        # conditioning tokens. We want to a) add a little bit of regularization b) add some noise to
-        # kick training off saddle points and c) encourage the model to learn global structure over
-        # local patterns/texture, and rely more on the conditioning tokens so prompting works
-        # better.
+        # Separate dropout rates for the conditioning tokens and the image tokens. The noise from
+        # dropout is useful for kicking us off saddle points, not just for regularization. Also,
+        # hopefully dropout on the conditioning tokens will prevent exploding gradients from
+        # allocating ~all attention weight to them.
         cond_embeds = self.gen_conditioning_tokens(clip_embeddings, max_cos_distances)
         assert cond_embeds.shape == (batch_size, self.prepended_tokens(), self.d_model)
         cond_pos_embeds = self.positional_encoding(jnp.arange(self.prepended_tokens()))
         assert cond_pos_embeds.shape == (self.prepended_tokens(), self.d_model)
-        cond_embeds = cond_embeds + cond_pos_embeds
+        cond_embeds = self.clip_dropout_layer(cond_embeds + cond_pos_embeds)
 
         img_embeds = self.in_embed(images)
         assert img_embeds.shape == (batch_size, self.image_tokens - 1, self.d_model)
@@ -1323,7 +1331,11 @@ def sample(
     # Flash attention doesn't work with Flax's fast decoding. Something to do with how masks are
     # handled. Would be nice to fix it, but for now we just use the slower attention when sampling.
     mdl_decode = mdl.clone(
-        decode=True, attn_method=AttnMethod.STANDARD, dropout=None, image_dropout=None
+        decode=True,
+        attn_method=AttnMethod.STANDARD,
+        dropout=None,
+        image_dropout=None,
+        clip_dropout=None,
     )
 
     with tqdm(total=mdl.image_tokens * batch_size, unit="token", leave=False) as pbar:
@@ -2112,7 +2124,7 @@ def test_learn_sequential(
     params = optax.contrib.schedule_free_eval_params(opt_state, params)
 
     # Compute test loss
-    test_mdl = mdl.clone(dropout=None, image_dropout=None)
+    test_mdl = mdl.clone(dropout=None, image_dropout=None, clip_dropout=None)
     calc_loss = jax.jit(
         lambda imgs: loss_batch(
             test_mdl,

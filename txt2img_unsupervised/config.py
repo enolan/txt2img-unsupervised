@@ -34,6 +34,7 @@ class ModelConfig:
     do_clip_feedforward: bool = False
     norm_clip_embeddings: bool = False
     image_dropout: Optional[float] = None
+    clip_dropout: Optional[float] = None
 
     @staticmethod
     def from_json_dict(dict: dict[str, Any]) -> "ModelConfig":
@@ -143,6 +144,7 @@ def test_modelconfig_roundtrip_from_json() -> None:
         "ff_dim": 2048,
         "dropout": 0.1,
         "image_dropout": 0.5,
+        "clip_dropout": 0.5,
         "n_layers": 6,
         "image_tokens": 2048,
         "use_biases": true,
