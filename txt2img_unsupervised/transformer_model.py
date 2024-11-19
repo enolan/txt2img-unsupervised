@@ -145,7 +145,7 @@ class ImageModel(nn.Module):
             # variance_scaling scale is in variance and normal stddev is in standard deviation, so
             # we need to square the stddev.
             kernel_init=nn.initializers.variance_scaling(
-                scale=clip_proj_stddev ** 2.0, mode="fan_in", distribution="normal"
+                scale=clip_proj_stddev**2.0, mode="fan_in", distribution="normal"
             )
             if self.norm_clip_embeddings
             else nn.initializers.normal(stddev=clip_proj_stddev),
@@ -697,14 +697,20 @@ def _assert_dicts_equal(d1, d2, name) -> None:
             assert False, f"unknown type {type(d1[k])} for {name}.{k}"
 
 
-@pytest.mark.parametrize("do_clip_feedforward", [
-    pytest.param(True, id="with_clip_feedforward"),
-    pytest.param(False, id="no_clip_feedforward"),
-])
-@pytest.mark.parametrize("norm_clip_embeddings", [
-    pytest.param(True, id="with_norm_embeddings"),
-    pytest.param(False, id="no_norm_embeddings"),
-])
+@pytest.mark.parametrize(
+    "do_clip_feedforward",
+    [
+        pytest.param(True, id="with_clip_feedforward"),
+        pytest.param(False, id="no_clip_feedforward"),
+    ],
+)
+@pytest.mark.parametrize(
+    "norm_clip_embeddings",
+    [
+        pytest.param(True, id="with_norm_embeddings"),
+        pytest.param(False, id="no_norm_embeddings"),
+    ],
+)
 def test_cap_cond_tokens_and_vqgan_embeds_are_same_distribution(
     do_clip_feedforward, norm_clip_embeddings
 ):
