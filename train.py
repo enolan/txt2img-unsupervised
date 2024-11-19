@@ -865,6 +865,16 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
         to_log["global_step"] = global_step
         wandb.log(to_log)
 
+def map_to_norms(tree):
+    if isinstance(tree, dict):
+        return {k: map_to_norms(v) for k, v in tree.items()}
+    elif isinstance(tree, jax.Array):
+        if tree.ndim <= 2:
+            return jnp.linalg.norm(tree)
+        else:
+            return {col: jnp.linalg.norm(tree[col]) for col in range(len(tree))}
+    else:
+        raise ValueError(f"Unknown type: {type(tree)}")
 
 @partial(jax.jit, donate_argnames=["state"])
 def train_step(
@@ -887,7 +897,8 @@ def train_step(
         grads=grads, rng=rng2
     )  # type:ignore[no-untyped-call]
     norm = optax.global_norm(grads)
-    return new_state, loss, norm
+    norm_tree = map_to_norms(grads['params'])
+    return new_state, loss, norm, norm_tree
 
 
 last_checkpoint_time = None
@@ -1053,7 +1064,7 @@ def prefetch_and_train(current_state, current_step):
             (batch_clips.shape[0], 0), dtype=jnp.float32
         )
 
-    train_state, loss, norm = train_step(
+    train_state, loss, norm, norm_tree = train_step(
         current_state,
         batch_imgs,
         batch_clips,
@@ -1064,7 +1075,7 @@ def prefetch_and_train(current_state, current_step):
     to_log = {
         "train/loss": loss,
         "grad_global_norm": norm,
-    }
+    } | ({f"grad_norm/{k}": v for k, v in norm_tree.items()} if current_step % 100 == 0 else {})
     # The train state, including the optimizer state and the rng, is donated to train_step, so we
     # need to copy any values within it that we want to use after beginning the next step. Note
     # these values are *JAX arrays*, and get copied back to host RAM when needed, after this
