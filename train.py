@@ -819,51 +819,29 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
 
             wandb.log(to_log)
     else:
-        # Sample with different top_p values
-        top_ps = [0.2, 0.6, 0.8, 0.9, 0.95]
+        # Sample 100 unconditioned images for a 10x10 grid
+        clip_embeddings = np.zeros((100, 0), dtype=jnp.float32)
 
-        def round_down_to_multiples(x, a, b):
-            # Round something down so it's a multiple of a and b
-            less = min(a, b)
-            more = max(a, b)
-            while True:
-                if x % less != 0:
-                    x -= x % less
-                if x % more != 0:
-                    x -= x % more
-                if x % less == 0 and x % more == 0:
-                    break
-                assert x > 0
-            return x
-
-        imgs_to_sample = min(80, training_cfg.batch_size)
-        imgs_to_sample = round_down_to_multiples(
-            imgs_to_sample, len(top_ps), jax.device_count()
+        imgs = sample.sample_loop(
+            mdl,
+            eval_params,
+            ae_mdl,
+            ae_params,
+            sample_batch_size,
+            clip_embeddings,
+            None,
+            ts.rng,
+            logit_filter_method=transformer_model.LogitFilterMethod.TOP_P,
+            logit_filter_threshold=0.95,
         )
-        img_top_ps = jnp.concatenate(
-            [jnp.repeat(p, imgs_to_sample // len(top_ps)) for p in top_ps]
+        assert len(imgs) == 100
+        grid = sample.make_grid(imgs)
+        wandb.log(
+            {
+                "samples/unconditioned": wandb.Image(grid),
+                "global_step": global_step,
+            }
         )
-        assert len(img_top_ps) % jax.device_count() == 0
-        img_top_ps = jax.device_put(img_top_ps, sharding_1d)
-
-        rngs = jax.device_put(jax.random.split(ts.rng, imgs_to_sample), sharding_2d)
-
-        clip_embeddings = jnp.zeros((imgs_to_sample, 0), dtype=jnp.float32)
-
-        samples = sample_jv(eval_params, clip_embeddings, rngs, img_top_ps)
-
-        decoded = sample.decode_jv(ae_mdl, ae_params, samples)
-        decoded = np.array(decoded)
-
-        decoded_grouped = rearrange(decoded, "(p n) h w c -> p n h w c", p=len(top_ps))
-        to_log = {
-            f"samples/top-p-{p:.02f}": [
-                wandb.Image(PIL.Image.fromarray(np.array(img))) for img in imgs
-            ]
-            for p, imgs in zip(top_ps, decoded_grouped)
-        }
-        to_log["global_step"] = global_step
-        wandb.log(to_log)
 
 
 def leading_dims_to_subtrees(tree):
@@ -1071,7 +1049,10 @@ def prefetch_and_train(current_state, current_step):
         clip_conditioning=mdl.clip_conditioning,
         sharding=examples_sharding,
     )
-    assert batch_clips.shape == (training_cfg.batch_size, 768)
+    if mdl.clip_conditioning:
+        assert batch_clips.shape == (training_cfg.batch_size, 768)
+    else:
+        assert batch_clips.shape == (training_cfg.batch_size, 0)
     if mdl.clip_caps:
         caps_rng, rng = jax.random.split(current_state.rng, 2)
         current_state = current_state.replace(rng=rng)

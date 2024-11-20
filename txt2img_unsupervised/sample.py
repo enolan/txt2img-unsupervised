@@ -201,26 +201,34 @@ def sample_loop(
     """Sample a bunch of images and return PIL images. cap_centers should have shape
     (n, cap_centers, 768) and max_cos_distances should have shape (n, cap_centers) where n is the
     number of images to sample, unless clip caps is off, in which case the cap centers dimension
-    disappears from cap_centers and max_cos_distances should be None."""
+    disappears from cap_centers and max_cos_distances should be None. If clip conditioning is off,
+    cap_centers should have shape (n, 0)."""
 
-    assert mdl.clip_conditioning, "unconditioned model is deprecated"
     assert isinstance(cap_centers, np.ndarray)
-    assert len(cap_centers.shape) == 3
     n_imgs = cap_centers.shape[0]
+
+    if not mdl.clip_conditioning:
+        assert len(cap_centers.shape) == 2
+        assert cap_centers.shape[1] == 0
+        assert max_cos_distances is None
+        max_cos_distances = np.zeros((n_imgs, 0), dtype=jnp.float32)
+    elif mdl.clip_caps:
+        assert len(cap_centers.shape) == 3
+        assert cap_centers.shape[1] == mdl.clip_cap_count
+        assert cap_centers.shape[2] == 768
+        assert isinstance(max_cos_distances, np.ndarray)
+        assert max_cos_distances.shape == (n_imgs, mdl.clip_cap_count)
+    else:
+        # No cap, single CLIP embedding
+        assert len(cap_centers.shape) == 2
+        assert cap_centers.shape[1] == 768
+        assert max_cos_distances is None
+        max_cos_distances = np.zeros((n_imgs, 0), dtype=jnp.float32)
 
     devices = mesh_utils.create_device_mesh((jax.device_count(),))
     mesh = Mesh(devices, axis_names=("dev",))
     sharding = NamedSharding(mesh, PartitionSpec("dev"))
 
-    if mdl.clip_caps:
-        assert isinstance(max_cos_distances, np.ndarray)
-        assert len(cap_centers.shape) == 3
-        assert len(max_cos_distances.shape) == 2
-        assert cap_centers.shape[0] == max_cos_distances.shape[0] == n_imgs
-        assert cap_centers.shape[1] == max_cos_distances.shape[1] == mdl.clip_cap_count
-    else:
-        assert max_cos_distances is None
-        assert cap_centers.shape == (n_imgs, 768)
     assert batch_size % jax.device_count() == 0
     assert (len(cap_centers) % batch_size) % jax.device_count() == 0
 
@@ -240,32 +248,20 @@ def sample_loop(
             rngs_sharded = jax.device_put(rngs_batch, sharding)
             cap_centers_batch = cap_centers[ctr : ctr + batch]
             cap_centers_sharded = jax.device_put(cap_centers_batch, sharding)
-            if mdl.clip_caps:
-                max_cos_distances_batch = max_cos_distances[ctr : ctr + batch]
-                max_cos_distances_sharded = jax.device_put(
-                    max_cos_distances_batch, sharding
-                )
-                codes = sample(
-                    mdl,
-                    params,
-                    cap_centers_sharded,
-                    max_cos_distances_sharded,
-                    rngs_sharded,
-                    logit_filter_method,
-                    logit_filter_threshold,
-                    temperature,
-                )
-            else:
-                codes = sample(
-                    mdl,
-                    params,
-                    cap_centers_sharded,
-                    jnp.zeros((batch, 0), dtype=jnp.float32),
-                    rngs_sharded,
-                    logit_filter_method,
-                    logit_filter_threshold,
-                    temperature,
-                )
+            max_cos_distances_batch = max_cos_distances[ctr : ctr + batch]
+            max_cos_distances_sharded = jax.device_put(
+                max_cos_distances_batch, sharding
+            )
+            codes = sample(
+                mdl,
+                params,
+                cap_centers_sharded,
+                max_cos_distances_sharded,
+                rngs_sharded,
+                logit_filter_method,
+                logit_filter_threshold,
+                temperature,
+            )
             sampled_codes_arrs.append(jax.device_get(codes))
             pbar.update(batch)
             ctr += batch
