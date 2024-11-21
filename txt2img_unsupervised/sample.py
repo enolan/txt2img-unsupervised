@@ -225,12 +225,34 @@ def sample_loop(
         assert max_cos_distances is None
         max_cos_distances = np.zeros((n_imgs, 0), dtype=jnp.float32)
 
-    devices = mesh_utils.create_device_mesh((jax.device_count(),))
-    mesh = Mesh(devices, axis_names=("dev",))
-    sharding = NamedSharding(mesh, PartitionSpec("dev"))
+    params_sharded = None
+    ae_params_sharded = None
+    sharding = None
 
-    assert batch_size % jax.device_count() == 0
-    assert (len(cap_centers) % batch_size) % jax.device_count() == 0
+    def mk_sharding(batch_size):
+        # Create a sharding that uses the maximum number of devices such that batch_size is
+        # divisible by the number of devices
+        nonlocal params_sharded, ae_params_sharded, sharding
+        devs_to_use = max(
+            i for i in range(1, jax.device_count() + 1) if batch_size % i == 0
+        )
+        devices = mesh_utils.create_device_mesh(
+            (devs_to_use,), devices=jax.devices()[:devs_to_use]
+        )
+        mesh = Mesh(devices, axis_names=("dev",))
+        sharding = NamedSharding(mesh, PartitionSpec("dev"))
+        if devs_to_use != jax.device_count():
+            # JAX is weird, we have to replicate the params across the same set of devices we shard
+            # across, even if the latter is a subset of the former.
+            params_sharded = jax.device_put(
+                params, NamedSharding(mesh, PartitionSpec(None))
+            )
+            ae_params_sharded = jax.device_put(
+                ae_params, NamedSharding(mesh, PartitionSpec(None))
+            )
+        else:
+            params_sharded = params
+            ae_params_sharded = ae_params
 
     if force_f32:
         # Even with models that are trained with bf16, float32 gives subjectively substantially
@@ -244,6 +266,7 @@ def sample_loop(
     with tqdm(total=len(cap_centers), desc="sampling", unit="img") as pbar:
         ctr = 0
         for batch in batches:
+            mk_sharding(batch)
             rngs_batch = rngs[ctr : ctr + batch]
             rngs_sharded = jax.device_put(rngs_batch, sharding)
             cap_centers_batch = cap_centers[ctr : ctr + batch]
@@ -254,7 +277,7 @@ def sample_loop(
             )
             codes = sample(
                 mdl,
-                params,
+                params_sharded,
                 cap_centers_sharded,
                 max_cos_distances_sharded,
                 rngs_sharded,
@@ -278,10 +301,11 @@ def sample_loop(
     with tqdm(total=len(cap_centers), desc="decoding", unit="img") as pbar:
         ctr = 0
         for batch in batches:
+            mk_sharding(batch)
             codes_batch = sampled_codes[ctr : ctr + batch]
             codes_sharded = jax.device_put(codes_batch, sharding)
             imgs = ldm_autoencoder.decode_jv(
-                ae_mdl, ae_params, (ae_res, ae_res), codes_sharded
+                ae_mdl, ae_params_sharded, (ae_res, ae_res), codes_sharded
             )
             decoded_imgs.append(jax.device_get(imgs))
             pbar.update(batch)
