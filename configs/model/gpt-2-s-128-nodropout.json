@@ -1,13 +1,13 @@
 {
-  "d_model": 1024,
-  "num_heads": 16,
-  "ff_dim": 4096,
-  "dropout": null,
-  "n_layers": 24,
-  "image_tokens": 1024,
-  "use_biases": true,
-  "activations_dtype": "bfloat16",
   "activation_function": "gelu",
+  "activations_dtype": "bfloat16",
   "clip_conditioning": true,
-  "corrected_cap_projections": true
+  "corrected_cap_projections": true,
+  "d_model": 1024,
+  "dropout": null,
+  "ff_dim": 4096,
+  "image_tokens": 1024,
+  "n_layers": 24,
+  "num_heads": 16,
+  "use_biases": true
 }

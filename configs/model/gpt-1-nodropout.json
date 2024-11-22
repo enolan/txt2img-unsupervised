@@ -1,13 +1,13 @@
 {
-  "d_model": 768,
-  "num_heads": 12,
-  "ff_dim": 3072,
-  "dropout": null,
-  "n_layers": 12,
-  "image_tokens": 256,
-  "use_biases": true,
-  "activations_dtype": "float32",
   "activation_function": "relu",
+  "activations_dtype": "float32",
   "corrected_cap_projections": true,
-  "pre_norm": true
+  "d_model": 768,
+  "dropout": null,
+  "ff_dim": 3072,
+  "image_tokens": 256,
+  "n_layers": 12,
+  "num_heads": 12,
+  "pre_norm": true,
+  "use_biases": true
 }

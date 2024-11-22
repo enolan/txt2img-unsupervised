@@ -1,14 +1,14 @@
 {
-  "d_model": 1280,
-  "num_heads": 20,
-  "ff_dim": 5120,
-  "dropout": null,
-  "n_layers": 36,
-  "image_tokens": 1024,
-  "use_biases": true,
-  "activations_dtype": "bfloat16",
   "activation_function": "gelu",
-  "clip_conditioning": true,
+  "activations_dtype": "bfloat16",
   "clip_caps": false,
-  "corrected_cap_projections": true
+  "clip_conditioning": true,
+  "corrected_cap_projections": true,
+  "d_model": 1280,
+  "dropout": null,
+  "ff_dim": 5120,
+  "image_tokens": 1024,
+  "n_layers": 36,
+  "num_heads": 20,
+  "use_biases": true
 }
