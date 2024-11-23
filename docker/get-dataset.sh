@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # Default path
-default_r2_path="txt2img-unsupervised-dataset/preprocessed/capexamples/128x128-randomcrops-merged-2caps/"
+default_r2_path="txt2img-unsupervised-dataset/preprocessed/128x128-randomcrops/"
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
