@@ -2162,6 +2162,7 @@ def test_learn_sequential(
                 jnp.zeros((sample_batch_size, 0), dtype=jnp.float32),
                 jnp.zeros((sample_batch_size, 0), dtype=jnp.float32),
                 split_rngs[:-1],
+                filter_threshold=0.8,
             )
         )
     sampled_arr = jnp.concatenate(samples, axis=0)
