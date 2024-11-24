@@ -26,3 +26,4 @@ RUN pip install poetry
 
 ADD setup-repo.sh /root/setup-repo.sh
 ADD get-dataset.sh /root/get-dataset.sh
+ADD tmux.conf /root/.tmux.conf
