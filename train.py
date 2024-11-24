@@ -854,34 +854,25 @@ def leading_dims_to_subtrees(tree):
     for k, v in tree.items():
         if isinstance(v, dict):
             out[k] = leading_dims_to_subtrees(v)
-        elif isinstance(v, jax.Array):
+        elif isinstance(v, np.ndarray):
             if v.ndim < 2:
                 raise ValueError(f"Expected array with at least 2 dims, got {v.ndim}")
             else:
-                out[k] = {idx: v[idx] for idx in range(v.shape[0])}
+                out[k] = {f"{idx:03d}": v[idx] for idx in range(v.shape[0])}
         else:
             raise ValueError(f"Unknown type: {type(v)} for key {k}")
     return out
 
 
-def map_to_norms(tree):
-    if isinstance(tree, dict):
-        return {k: map_to_norms(v) for k, v in tree.items()}
-    elif isinstance(tree, jax.Array):
-        if tree.ndim <= 2:
-            return jnp.linalg.norm(tree)
-        else:
-            return {col: jnp.linalg.norm(tree[col]) for col in range(len(tree))}
-    else:
-        raise ValueError(f"Unknown type: {type(tree)}")
-
-
-@partial(jax.jit, donate_argnames=["state"])
+@partial(
+    jax.jit, donate_argnames=["state"], static_argnames=["return_weights_and_grads"]
+)
 def train_step(
     state: TrainState,
     batch_imgs: jax.Array,
     batch_clips: jax.Array,
     batch_max_cos_distances: jax.Array,
+    return_weights_and_grads: bool = False,
 ) -> Tuple[TrainState, jax.Array, jax.Array]:
     """Compute a single optimization step."""
     dropout_rng, rng2 = jax.random.split(state.rng, 2)
@@ -897,15 +888,18 @@ def train_step(
         grads=grads, rng=rng2
     )  # type:ignore[no-untyped-call]
     norm = optax.global_norm(grads)
-    grads_tree = grads["params"]
-    # Since the transformer layers are a scan, the leading dimension is the layer index. Transform
-    # the grads so we see the parameter norms per-layer.
-    transformed_transformer_layers_grads = leading_dims_to_subtrees(
-        grads_tree["transformer_layers"]
-    )
-    grads_tree["transformer_layers"] = transformed_transformer_layers_grads
-    norm_tree = jax.tree.map(jnp.linalg.norm, grads_tree)
-    return new_state, loss, norm, norm_tree
+    if return_weights_and_grads:
+        return (
+            new_state,
+            loss,
+            norm,
+            (
+                state.params["params"],
+                grads["params"],
+            ),
+        )
+    else:
+        return new_state, loss, norm, None
 
 
 last_checkpoint_time = None
@@ -1073,23 +1067,20 @@ def prefetch_and_train(current_state, current_step):
         batch_max_cos_distances = jnp.zeros(
             (batch_clips.shape[0], 0), dtype=jnp.float32
         )
-
-    train_state, loss, norm, norm_tree = train_step(
+    train_state, loss, norm, weights_and_grads = train_step(
         current_state,
         batch_imgs,
         batch_clips,
         batch_max_cos_distances,
+        return_weights_and_grads=global_step % 100 == 0,
     )
     opt_state = train_state.opt_state
 
     to_log = {
         "train/loss": loss,
         "grad_global_norm": norm,
-    } | (
-        {f"grad_norm/{k}": v for k, v in norm_tree.items()}
-        if current_step % 100 == 0
-        else {}
-    )
+    }
+
     # The train state, including the optimizer state and the rng, is donated to train_step, so we
     # need to copy any values within it that we want to use after beginning the next step. Note
     # these values are *JAX arrays*, and get copied back to host RAM when needed, after this
@@ -1111,6 +1102,7 @@ def prefetch_and_train(current_state, current_step):
         batch_clips,
         batch_max_cos_distances,
         to_log,
+        weights_and_grads,
         skipped_last,
     )
 
@@ -1156,6 +1148,7 @@ for epoch in trange(
                     batch_clips,
                     batch_max_cos_distances,
                     train_step_to_log,
+                    weights_and_grads,
                     skipped_last,
                 ) = next_train_step_outputs
                 next_train_step_outputs = None
@@ -1167,6 +1160,7 @@ for epoch in trange(
                     batch_clips,
                     batch_max_cos_distances,
                     train_step_to_log,
+                    weights_and_grads,
                     skipped_last,
                 ) = prefetch_and_train(train_state, global_step)
 
@@ -1227,8 +1221,8 @@ for epoch in trange(
             # we can block on the current step and be sure the GPU will have stuff to do. There's a
             # small but real perf improvement to be had by fetching only train_step_to_log at this
             # point and waiting a bit before fetching extra_to_log.
-            skipped_last, train_step_to_log = jax.device_get(
-                (skipped_last, train_step_to_log)
+            skipped_last, train_step_to_log, weights_and_grads = jax.device_get(
+                (skipped_last, train_step_to_log, weights_and_grads)
             )
 
             if not np.isfinite(train_step_to_log["train/loss"]):
@@ -1240,6 +1234,22 @@ for epoch in trange(
             if train_step_to_log["debug/notfinite_count"] > 50:
                 tqdm.write(f"Too many nonfinite values in gradients, giving up")
                 exit(1)
+            if weights_and_grads is not None:
+                for name, vals_tree in [
+                    ("weights", weights_and_grads[0]),
+                    ("grads", weights_and_grads[1]),
+                ]:
+                    transformed_vals = copy(vals_tree)
+                    transformed_vals["transformer_layers"] = leading_dims_to_subtrees(
+                        vals_tree["transformer_layers"]
+                    )
+                    log_tree = {
+                        f"{name}/{k}": v
+                        for k, v in jax.tree.map(
+                            wandb.Histogram, transformed_vals
+                        ).items()
+                    }
+                    train_step_to_log |= log_tree
             wandb.log(train_step_to_log)
             if extra_to_log is not None:
                 # If we actually got any extra stuff to log, fetch it now and do the logging.
