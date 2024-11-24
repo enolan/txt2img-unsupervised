@@ -179,12 +179,6 @@ class ImageModel(nn.Module):
                 param_dtype=jnp.float32,
             )
 
-        if self.norm_clip_embeddings:
-            self.clip_embeddings_norm = nn.LayerNorm(
-                dtype=self.activations_dtype,
-                param_dtype=jnp.float32,
-            )
-
         self.positional_encoding = nn.Embed(
             num_embeddings=self.seq_len(),
             features=self.d_model,
@@ -299,7 +293,10 @@ class ImageModel(nn.Module):
             res = jnp.zeros((batch_size, 1, self.d_model), dtype=self.activations_dtype)
         else:
             if self.norm_clip_embeddings:
-                clip_embeddings = self.clip_embeddings_norm(clip_embeddings)
+                # Scale CLIP embeddings to have ~unit variance. It ends up being ~0.998 for linear
+                # algebra reasons. It's totally possible to compute a scaling factor that hits
+                # exactly 1, but this is simpler.
+                clip_embeddings = clip_embeddings * jnp.sqrt(768)
             if not self.clip_caps:
                 assert clip_embeddings.shape == (batch_size, 768)
                 assert max_cos_distances.shape == (batch_size, 0)
