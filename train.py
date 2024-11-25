@@ -1246,7 +1246,8 @@ for epoch in trange(
                     log_tree = {
                         f"{name}/{k}": v
                         for k, v in jax.tree.map(
-                            wandb.Histogram, transformed_vals
+                            # NumPy histograms don't know what bf16 is
+                            lambda arr: wandb.Histogram(arr.astype(np.float32)), transformed_vals
                         ).items()
                     }
                     train_step_to_log |= log_tree
