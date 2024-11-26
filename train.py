@@ -132,6 +132,12 @@ parser.add_argument(
 parser.add_argument(
     "--skip-saving", action="store_true", help="Skip saving checkpoints during training"
 )
+parser.add_argument(
+    "--log-weight-and-grad-interval",
+    type=int,
+    default=0,
+    help="Log attention weights and gradients every N steps",
+)
 args, _unknown = parser.parse_known_args()
 
 
@@ -889,6 +895,10 @@ def train_step(
     )  # type:ignore[no-untyped-call]
     norm = optax.global_norm(grads)
     if return_weights_and_grads:
+        # TODO this uses a lot of VRAM and reduces max model size/max batch size. Instead of
+        # returning the gradients from train_step, when we want to log weights and grads we should
+        # copy the train state to host RAM, free everything but the weights on the GPU, then compute
+        # gradients for logging, then copy the train state back to the GPU and resume training.
         return (
             new_state,
             loss,
@@ -1072,7 +1082,8 @@ def prefetch_and_train(current_state, current_step):
         batch_imgs,
         batch_clips,
         batch_max_cos_distances,
-        return_weights_and_grads=global_step % 100 == 0,
+        return_weights_and_grads=args.log_weight_and_grad_interval > 0
+        and global_step % args.log_weight_and_grad_interval == 0,
     )
     opt_state = train_state.opt_state
 
