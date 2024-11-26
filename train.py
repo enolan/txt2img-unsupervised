@@ -102,12 +102,12 @@ parser.add_argument("--schedule-free-beta1", type=float, default=None)
 parser.add_argument("--gradient-accumulation-steps", type=int)
 parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))
 parser.add_argument("--gradient-clipping", type=float, default=None)
-parser.add_argument("--adaptive-gradient-skip", type=lambda x: bool(strtobool(x)))
-parser.add_argument("--adaptive-gradient-skip-history-len", type=int, default=None)
+parser.add_argument("--adaptive-gradient-clip", type=lambda x: bool(strtobool(x)))
+parser.add_argument("--adaptive-gradient-clip-history-len", type=int, default=None)
 parser.add_argument(
-    "--adaptive-gradient-skip-threshold-factor", type=float, default=None
+    "--adaptive-gradient-clip-threshold-factor", type=float, default=None
 )
-parser.add_argument("--adaptive-gradient-skip-quantile", type=float, default=None)
+parser.add_argument("--adaptive-gradient-clip-quantile", type=float, default=None)
 parser.add_argument("--image-dropout", type=float, default=None)
 parser.add_argument("--weight-decay", type=float, default=0.0)
 parser.add_argument("--ae-cfg", type=Path, required=True)
@@ -1086,12 +1086,12 @@ def prefetch_and_train(current_state, current_step):
     # these values are *JAX arrays*, and get copied back to host RAM when needed, after this
     # function returns.
     to_log["debug/notfinite_count"] = opt_state.notfinite_count.copy()
-    if training_cfg.adaptive_gradient_skip:
-        to_log["debug/skipped_updates"] = opt_state.inner_state.skip_count.copy()
-        skipped_last = opt_state.inner_state.skipped_last.copy()
+    if training_cfg.adaptive_gradient_clip:
+        to_log["debug/clipped_updates"] = opt_state.inner_state.clip_count.copy()
+        clipped_last = opt_state.inner_state.clipped_last.copy()
     else:
-        to_log["debug/skipped_updates"] = 0
-        skipped_last = False
+        to_log["debug/clipped_updates"] = 0
+        clipped_last = False
 
     # The example data is used for auxillary loss logging (eval loss, unweighted loss) so we return
     # it, even though it's not used for training outside this function.
@@ -1103,7 +1103,7 @@ def prefetch_and_train(current_state, current_step):
         batch_max_cos_distances,
         to_log,
         weights_and_grads,
-        skipped_last,
+        clipped_last,
     )
 
 
@@ -1149,7 +1149,7 @@ for epoch in trange(
                     batch_max_cos_distances,
                     train_step_to_log,
                     weights_and_grads,
-                    skipped_last,
+                    clipped_last,
                 ) = next_train_step_outputs
                 next_train_step_outputs = None
             else:
@@ -1161,7 +1161,7 @@ for epoch in trange(
                     batch_max_cos_distances,
                     train_step_to_log,
                     weights_and_grads,
-                    skipped_last,
+                    clipped_last,
                 ) = prefetch_and_train(train_state, global_step)
 
             train_step_to_log["global_step"] = global_step
@@ -1221,15 +1221,15 @@ for epoch in trange(
             # we can block on the current step and be sure the GPU will have stuff to do. There's a
             # small but real perf improvement to be had by fetching only train_step_to_log at this
             # point and waiting a bit before fetching extra_to_log.
-            skipped_last, train_step_to_log, weights_and_grads = jax.device_get(
-                (skipped_last, train_step_to_log, weights_and_grads)
+            clipped_last, train_step_to_log, weights_and_grads = jax.device_get(
+                (clipped_last, train_step_to_log, weights_and_grads)
             )
 
             if not np.isfinite(train_step_to_log["train/loss"]):
                 tqdm.write(f"Loss nonfinite 😢 ({train_step_to_log['train/loss']})")
-            if skipped_last:
+            if clipped_last:
                 tqdm.write(
-                    f"Skipped update due to large gradient norm: {train_step_to_log['grad_global_norm']}"
+                    f"Clipped update due to large gradient norm: {train_step_to_log['grad_global_norm']}"
                 )
             if train_step_to_log["debug/notfinite_count"] > 50:
                 tqdm.write(f"Too many nonfinite values in gradients, giving up")

@@ -221,10 +221,10 @@ class TrainingConfig:
     schedule_free_beta1: Optional[float] = None
     weight_decay: float = 0.0
     training_images: int = 0  # How many images to train for (in addition to epochs)
-    adaptive_gradient_skip: bool = False
-    adaptive_gradient_skip_history_len: Optional[int] = None
-    adaptive_gradient_skip_threshold_factor: Optional[float] = None
-    adaptive_gradient_skip_quantile: Optional[float] = None
+    adaptive_gradient_clip: bool = False
+    adaptive_gradient_clip_history_len: Optional[int] = None
+    adaptive_gradient_clip_threshold_factor: Optional[float] = None
+    adaptive_gradient_clip_quantile: Optional[float] = None
 
     @staticmethod
     def from_json_dict(dict: dict[str, Any]) -> "TrainingConfig":
@@ -247,27 +247,27 @@ class TrainingConfig:
 
     def validate(self):
         """Validate the configuration."""
-        if self.adaptive_gradient_skip:
+        if self.adaptive_gradient_clip:
             if (
-                self.adaptive_gradient_skip_history_len is None
-                or self.adaptive_gradient_skip_threshold_factor is None
-                or self.adaptive_gradient_skip_quantile is None
+                self.adaptive_gradient_clip_history_len is None
+                or self.adaptive_gradient_clip_threshold_factor is None
+                or self.adaptive_gradient_clip_quantile is None
             ):
                 raise ValueError(
-                    "adaptive_gradient_skip_history_len, adaptive_gradient_skip_threshold_factor, "
-                    "and adaptive_gradient_skip_quantile must be set when adaptive_gradient_skip "
+                    "adaptive_gradient_clip_history_len, adaptive_gradient_clip_threshold_factor, "
+                    "and adaptive_gradient_clip_quantile must be set when adaptive_gradient_clip "
                     "is enabled"
                 )
         else:
             if (
-                self.adaptive_gradient_skip_history_len is not None
-                or self.adaptive_gradient_skip_threshold_factor is not None
-                or self.adaptive_gradient_skip_quantile is not None
+                self.adaptive_gradient_clip_history_len is not None
+                or self.adaptive_gradient_clip_threshold_factor is not None
+                or self.adaptive_gradient_clip_quantile is not None
             ):
                 raise ValueError(
-                    "adaptive_gradient_skip_history_len, adaptive_gradient_skip_threshold_factor, "
-                    "and adaptive_gradient_skip_quantile should not be set when "
-                    "adaptive_gradient_skip is disabled"
+                    "adaptive_gradient_clip_history_len, adaptive_gradient_clip_threshold_factor, "
+                    "and adaptive_gradient_clip_quantile should not be set when "
+                    "adaptive_gradient_clip is disabled"
                 )
 
         def get_schedule_error_message(schedule, warmup_required, beta1_required):
@@ -344,10 +344,10 @@ _test_json_strs = [
         "training_images": 0,
         "learning_rate_schedule": "triangle",
         "gradient_accumulation_steps": 1,
-        "adaptive_gradient_skip": true,
-        "adaptive_gradient_skip_history_len": 100,
-        "adaptive_gradient_skip_threshold_factor": 1.1,
-        "adaptive_gradient_skip_quantile": 0.95,
+        "adaptive_gradient_clip": true,
+        "adaptive_gradient_clip_history_len": 100,
+        "adaptive_gradient_clip_threshold_factor": 1.1,
+        "adaptive_gradient_clip_quantile": 0.95,
         "weight_decay": 0.1
         }""",
     """{
@@ -359,7 +359,7 @@ _test_json_strs = [
         "warmup_steps": 100,
         "schedule_free_beta1": 0.9,
         "gradient_accumulation_steps": 1,
-        "adaptive_gradient_skip": false,
+        "adaptive_gradient_clip": false,
         "weight_decay": 0.0
         }""",
 ]

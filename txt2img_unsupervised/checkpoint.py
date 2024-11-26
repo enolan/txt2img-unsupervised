@@ -18,7 +18,7 @@ from pathlib import Path
 from tqdm import tqdm
 from typing import Any, Optional, Tuple
 
-from .adaptive_gradient_skip import AdaptiveGradientSkipState, adaptive_gradient_skip
+from .adaptive_gradient_clip import AdaptiveGradientClipState, adaptive_gradient_clip
 from .config import LearningRateSchedule, ModelConfig, TrainingConfig
 from .transformer_model import ImageModel
 from .triangle_schedule import triangle_schedule
@@ -84,12 +84,12 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int):
         clip = optax.identity()
     opt = optax.chain(clip, opt)
 
-    # Apply adaptive gradient skip if needed
-    if training_cfg.adaptive_gradient_skip:
-        opt = adaptive_gradient_skip(
+    # Apply adaptive gradient clip if needed
+    if training_cfg.adaptive_gradient_clip:
+        opt = adaptive_gradient_clip(
             opt,
-            training_cfg.adaptive_gradient_skip_history_len,
-            training_cfg.adaptive_gradient_skip_threshold_factor,
+            training_cfg.adaptive_gradient_clip_history_len,
+            training_cfg.adaptive_gradient_clip_threshold_factor,
         )
 
     # Apply finite check
@@ -191,8 +191,8 @@ class TrainState(train_state.TrainState):
         if isinstance(self.opt_state, optax.ApplyIfFiniteState):
             opt_state = self.opt_state.inner_state
 
-        # adaptive gradient skip
-        if isinstance(opt_state, AdaptiveGradientSkipState):
+        # adaptive gradient clip
+        if isinstance(opt_state, AdaptiveGradientClipState):
             opt_state = opt_state.inner_state
 
         # chain for gradient clipping
@@ -368,9 +368,9 @@ def setup_checkpoint_manager_and_initial_state(
 @pytest.mark.parametrize("schedule_free", [True, False])
 @pytest.mark.parametrize("gradient_accumulation_steps", [1, 2])
 @pytest.mark.parametrize("gradient_clipping", [None, 1.0])
-@pytest.mark.parametrize("adaptive_gradient_skip", [True, False])
+@pytest.mark.parametrize("adaptive_gradient_clip", [True, False])
 def test_get_eval_params(
-    adaptive_gradient_skip,
+    adaptive_gradient_clip,
     gradient_clipping,
     gradient_accumulation_steps,
     schedule_free,
@@ -378,14 +378,14 @@ def test_get_eval_params(
     # Set up a TrainState with either schedule-free or non-schedule-free optimizer
     rng = jax.random.PRNGKey(0)
 
-    if adaptive_gradient_skip:
-        adaptive_gradient_skip_cfg = {
-            "adaptive_gradient_skip": True,
-            "adaptive_gradient_skip_history_len": 100,
-            "adaptive_gradient_skip_threshold_factor": 1.1,
+    if adaptive_gradient_clip:
+        adaptive_gradient_clip_cfg = {
+            "adaptive_gradient_clip": True,
+            "adaptive_gradient_clip_history_len": 100,
+            "adaptive_gradient_clip_threshold_factor": 1.1,
         }
     else:
-        adaptive_gradient_skip_cfg = {}
+        adaptive_gradient_clip_cfg = {}
 
     if schedule_free:
         training_cfg = TrainingConfig(
@@ -397,7 +397,7 @@ def test_get_eval_params(
             epochs=1,
             gradient_clipping=gradient_clipping,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            **adaptive_gradient_skip_cfg,
+            **adaptive_gradient_clip_cfg,
         )
     else:
         training_cfg = TrainingConfig(
@@ -407,7 +407,7 @@ def test_get_eval_params(
             epochs=1,
             gradient_clipping=gradient_clipping,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            **adaptive_gradient_skip_cfg,
+            **adaptive_gradient_clip_cfg,
         )
 
     optimizer = setup_optimizer(training_cfg, batches_total=1000)
