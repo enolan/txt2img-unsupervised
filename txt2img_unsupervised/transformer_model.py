@@ -391,22 +391,43 @@ class ImageModel(nn.Module):
         # hopefully dropout on the conditioning tokens will prevent exploding gradients from
         # allocating ~all attention weight to them.
         cond_embeds = self.gen_conditioning_tokens(clip_embeddings, max_cos_distances)
+        assert (
+            cond_embeds.dtype == self.activations_dtype
+        ), f"cond_embeds dtype: {cond_embeds.dtype}, expected: {self.activations_dtype}"
         assert cond_embeds.shape == (batch_size, self.prepended_tokens(), self.d_model)
         cond_pos_embeds = self.positional_encoding(jnp.arange(self.prepended_tokens()))
+        assert (
+            cond_pos_embeds.dtype == self.activations_dtype
+        ), f"cond_pos_embeds dtype: {cond_pos_embeds.dtype}, expected: {self.activations_dtype}"
         assert cond_pos_embeds.shape == (self.prepended_tokens(), self.d_model)
         cond_embeds = self.clip_dropout_layer(cond_embeds + cond_pos_embeds)
+        assert (
+            cond_embeds.dtype == self.activations_dtype
+        ), f"cond_embeds dtype: {cond_embeds.dtype}, expected: {self.activations_dtype}"
 
         img_embeds = self.in_embed(images)
+        assert (
+            img_embeds.dtype == self.activations_dtype
+        ), f"img_embeds dtype: {img_embeds.dtype}, expected: {self.activations_dtype}"
         assert img_embeds.shape == (batch_size, self.image_tokens - 1, self.d_model)
         img_pos_embeds = self.positional_encoding(
             jnp.arange(self.image_tokens - 1) + self.prepended_tokens()
         )
+        assert (
+            img_pos_embeds.dtype == self.activations_dtype
+        ), f"img_pos_embeds dtype: {img_pos_embeds.dtype}, expected: {self.activations_dtype}"
         assert img_pos_embeds.shape == (self.image_tokens - 1, self.d_model)
         img_embeds = img_embeds + img_pos_embeds
         img_embeds = self.image_dropout_layer(img_embeds)
+        assert (
+            img_embeds.dtype == self.activations_dtype
+        ), f"img_embeds dtype: {img_embeds.dtype}, expected: {self.activations_dtype}"
         assert img_embeds.shape == (batch_size, self.image_tokens - 1, self.d_model)
 
         h = jnp.concatenate([cond_embeds, img_embeds], axis=1)
+        assert (
+            h.dtype == self.activations_dtype
+        ), f"h dtype: {h.dtype}, expected: {self.activations_dtype}"
         assert h.shape == (batch_size, self.seq_len(), self.d_model)
 
         h, _ = self.transformer_layers(h, None)
@@ -1707,6 +1728,9 @@ class TransformerLayer(nn.Module):
         )
         assert len(embeds.shape) == 3, assert_msg
         assert embeds.shape[2] == self.d_model, assert_msg
+        assert (
+            embeds.dtype == self.activations_dtype
+        ), f"input embeds dtype: {embeds.dtype}, expected: {self.activations_dtype}"
         batch_size = embeds.shape[0]
         seq_len = embeds.shape[1]
 
@@ -1736,6 +1760,9 @@ class TransformerLayer(nn.Module):
         embeds = embeds + self.dropout_layer(ff_output)
 
         assert embeds.shape == (batch_size, seq_len, self.d_model)
+        assert (
+            embeds.dtype == self.activations_dtype
+        ), f"output embeds dtype: {embeds.dtype}, expected: {self.activations_dtype}"
         return embeds, None
 
 

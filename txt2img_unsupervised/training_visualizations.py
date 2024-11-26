@@ -232,6 +232,9 @@ def log_attention_maps(
             mask = np.triu(np.ones_like(weights_log), k=1)
             masked_weights_log = np.ma.array(weights_log, mask=mask)
 
+            print(
+                f"weights dtype {weights.dtype}, weights_log dtype {weights_log.dtype}, masked_weights_log dtype {masked_weights_log.dtype}"
+            )
             # ensure vmin < vmedian < vmax. it's possible for one of the endpoints to be the median
             # and the scaling will error out in that case.
             vmin = np.min(masked_weights_log) - eps

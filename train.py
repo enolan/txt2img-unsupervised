@@ -916,7 +916,7 @@ def save_checkpoint_and_log_images(
 
     if not skip_sampling:
         tqdm.write("Sampling")
-        sample_and_log(my_train_state, sample_batch_size, global_step)
+        # sample_and_log(my_train_state, sample_batch_size, global_step)
         tqdm.write("Done sampling")
         visualization_imgs = test_imgs[sfw_indices[:8]]
         visualization_img_names = visualization_imgs["name"]
