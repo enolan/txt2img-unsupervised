@@ -84,17 +84,10 @@ class ModelConfig:
             f"float32 weights, got activations in {self.activations_dtype} and weights in "
             f"{self.weights_dtype}"
         )
-        if self.activations_dtype != self.weights_dtype:
-            if (
-                self.activations_dtype == jnp.float16
-                or self.activations_dtype == jnp.bfloat16
-            ):
-                if self.weights_dtype != jnp.float32:
-                    raise ValueError(dtypes_error)
-            elif self.activations_dtype == jnp.float32:
-                raise ValueError(dtypes_error)
-            else:
-                raise ValueError(f"Unknown activations_dtype {self.activations_dtype}")
+        if self.activations_dtype == jnp.float32 and self.weights_dtype != jnp.float32:
+            raise ValueError(
+                "It doesn't make sense to use float32 activations with float16 or bfloat16 weights"
+            )
 
 
 def invert_dict(d: dict[Any, Any]) -> dict[Any, Any]:
