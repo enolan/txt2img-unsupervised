@@ -4,15 +4,17 @@
   "clip_cap_count": 1,
   "clip_caps": true,
   "clip_conditioning": true,
+  "clip_dropout": null,
   "corrected_cap_projections": true,
-  "d_model": 1920,
-  "dropout": 0.1,
-  "ff_dim": 7680,
+  "d_model": 1664,
+  "do_clip_feedforward": false,
+  "dropout": null,
+  "ff_dim": 6656,
   "image_dropout": 0.1,
   "image_tokens": 1024,
-  "n_layers": 30,
-  "num_heads": 30,
+  "n_layers": 26,
+  "num_heads": 26,
   "pre_norm": true,
   "use_biases": true,
-  "weights_dtype": "bfloat16"
+  "weights_dtype": "float32"
 }
