@@ -36,6 +36,7 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int):
         opt = optax.adamw(
             learning_rate=training_cfg.learning_rate,
             weight_decay=training_cfg.weight_decay,
+            b2=training_cfg.adam_beta2,
         )
     elif training_cfg.learning_rate_schedule == LearningRateSchedule.TRIANGLE:
         opt = optax.adamw(
@@ -44,6 +45,7 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int):
                 batches_total,
             ),
             weight_decay=training_cfg.weight_decay,
+            b2=training_cfg.adam_beta2,
         )
     elif training_cfg.learning_rate_schedule == LearningRateSchedule.WARMUP_PLUS_COSINE:
         opt = optax.adamw(
@@ -55,6 +57,7 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int):
                 end_value=training_cfg.learning_rate * 0.05,
             ),
             weight_decay=training_cfg.weight_decay,
+            b2=training_cfg.adam_beta2,
         )
     elif (
         training_cfg.learning_rate_schedule
@@ -64,6 +67,7 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int):
             learning_rate=training_cfg.learning_rate,
             warmup_steps=training_cfg.warmup_steps,
             b1=training_cfg.schedule_free_beta1,
+            b2=training_cfg.adam_beta2,
             weight_decay=training_cfg.weight_decay,
         )
     else:
@@ -112,6 +116,13 @@ class TrainState(train_state.TrainState):
         )
 
         opt = setup_optimizer(training_cfg, batches_total)
+
+        # Validate Adam beta2. The default is 0.999, which rounds to 1.0 in bfloat16.
+        beta2_in_dtype = jnp.astype(training_cfg.adam_beta2, mdl.weights_dtype)
+        if beta2_in_dtype >= 1.0:
+            raise ValueError(
+                f"Adam beta2 {training_cfg.adam_beta2} is too large for {mdl.weights_dtype}"
+            )
 
         return TrainState.create(
             apply_fn=mdl.apply,

@@ -212,6 +212,7 @@ class TrainingConfig:
     # the other schedules this value must be None
     warmup_steps: Optional[int] = None
     schedule_free_beta1: Optional[float] = None
+    adam_beta2: float = 0.999
     weight_decay: float = 0.0
     training_images: int = 0  # How many images to train for (in addition to epochs)
     adaptive_gradient_clip: bool = False
@@ -341,7 +342,8 @@ _test_json_strs = [
         "adaptive_gradient_clip_history_len": 100,
         "adaptive_gradient_clip_threshold_factor": 1.1,
         "adaptive_gradient_clip_quantile": 0.95,
-        "weight_decay": 0.1
+        "weight_decay": 0.1,
+        "adam_beta2": 0.999
         }""",
     """{
         "learning_rate": 1e-4,
@@ -353,7 +355,8 @@ _test_json_strs = [
         "schedule_free_beta1": 0.9,
         "gradient_accumulation_steps": 1,
         "adaptive_gradient_clip": false,
-        "weight_decay": 0.0
+        "weight_decay": 0.0,
+        "adam_beta2": 0.9
         }""",
 ]
 
