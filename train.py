@@ -893,7 +893,16 @@ def train_step(
     new_state = state.apply_gradients(
         grads=grads, rng=rng2
     )  # type:ignore[no-untyped-call]
-    norm = optax.global_norm(grads)
+    # If we're using adaptive gradient clip, we've already computed the global norm. Reusing it
+    # saves, surprisingly, a substantial amount of memory. IDK why the memory used when adaptive
+    # gradient clip computes the norm isn't freed when it's done, but whatever.
+    if training_cfg.adaptive_gradient_clip:
+        norm = new_state.get_last_norm()
+        assert norm is not None
+    else:
+        assert new_state.get_last_norm() is None
+        norm = optax.global_norm(grads)
+
     if return_weights_and_grads:
         # TODO this uses a lot of VRAM and reduces max model size/max batch size. Instead of
         # returning the gradients from train_step, when we want to log weights and grads we should

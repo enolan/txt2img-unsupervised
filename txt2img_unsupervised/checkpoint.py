@@ -210,6 +210,15 @@ class TrainState(train_state.TrainState):
         # For scheduleful optimizers, return the regular params
         return self.params
 
+    def get_last_norm(self):
+        """If adaptive gradient clip is enabled, return the norm of the last update. Otherwise
+        return None."""
+        if isinstance(self.opt_state, optax.ApplyIfFiniteState):
+            opt_state = self.opt_state.inner_state
+        if isinstance(opt_state, AdaptiveGradientClipState):
+            return opt_state.last_norm
+        return None
+
     def save_checkpoint(
         self, checkpoint_manager: ocp.CheckpointManager, global_step: int
     ) -> None:

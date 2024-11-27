@@ -22,6 +22,8 @@ class AdaptiveGradientClipState(NamedTuple):
     """The state of the inner optimizer."""
     total_steps: int
     """The total number of steps taken."""
+    last_norm: float
+    """The norm of the last update, before clipping."""
     historical_norms: jax.Array
     last_idx: int
 
@@ -64,6 +66,7 @@ def adaptive_gradient_clip(
             last_idx=-1,
             inner_state=inner_optimizer.init(params),
             total_steps=0,
+            last_norm=-1.0,
         )
 
     def update_fn(updates, state, params=None):
@@ -77,6 +80,7 @@ def adaptive_gradient_clip(
             historical_norms=new_norms,
             last_idx=next_idx,
             total_steps=state.total_steps + 1,
+            last_norm=this_norm,
         )
 
         def clip_grads():
