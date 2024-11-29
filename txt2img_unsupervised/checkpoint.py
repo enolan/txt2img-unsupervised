@@ -157,20 +157,16 @@ class TrainState(train_state.TrainState):
         training_cfg = TrainingConfig.from_json_dict(metadata["training_cfg"])
         mdl = ImageModel(**model_cfg.__dict__)
 
-        # Jitting this means we don't actually do any flops, just compute new random params.
-        @jax.jit
-        def mk_templates(rng):
-            template_ts = TrainState.new(rng, mdl, training_cfg, batches_total=0)
-            return (template_ts.params, template_ts.opt_state, template_ts.rng)
-
-        params_template, opt_state_template, rng_template = mk_templates(
-            jax.random.PRNGKey(0)
+        template_ts = TrainState.new(
+            jax.random.PRNGKey(0), mdl, training_cfg, batches_total=0
         )
+
         # Free the memory of the templates as soon as we know the shapes and dtypes
         params_template, opt_state_template, rng_template = map(
             lambda x: jax.tree.map(ocp.utils.to_shape_dtype_struct, x),
-            (params_template, opt_state_template, rng_template),
+            (template_ts.params, template_ts.opt_state, template_ts.rng),
         )
+        del template_ts
 
         restored = checkpoint_manager.restore(
             step,
