@@ -135,7 +135,7 @@ parser.add_argument(
 parser.add_argument(
     "--log-weight-and-grad-interval",
     type=int,
-    default=0,
+    default=100,
     help="Log attention weights and gradients every N steps",
 )
 args, _unknown = parser.parse_known_args()
@@ -850,35 +850,12 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
         )
 
 
-def leading_dims_to_subtrees(tree):
-    """Given a dict pytree, return a new dict pytree with each array split into a dict of arrays
-    indexed by leading dimension.
-    """
-    if not isinstance(tree, dict):
-        raise ValueError(f"Expected dict, got {type(tree)}")
-    out = {}
-    for k, v in tree.items():
-        if isinstance(v, dict):
-            out[k] = leading_dims_to_subtrees(v)
-        elif isinstance(v, np.ndarray):
-            if v.ndim < 2:
-                raise ValueError(f"Expected array with at least 2 dims, got {v.ndim}")
-            else:
-                out[k] = {f"{idx:03d}": v[idx] for idx in range(v.shape[0])}
-        else:
-            raise ValueError(f"Unknown type: {type(v)} for key {k}")
-    return out
-
-
-@partial(
-    jax.jit, donate_argnames=["state"], static_argnames=["return_weights_and_grads"]
-)
+@partial(jax.jit, donate_argnames=["state"])
 def train_step(
     state: TrainState,
     batch_imgs: jax.Array,
     batch_clips: jax.Array,
     batch_max_cos_distances: jax.Array,
-    return_weights_and_grads: bool = False,
 ) -> Tuple[TrainState, jax.Array, jax.Array]:
     """Compute a single optimization step."""
     dropout_rng, rng2 = jax.random.split(state.rng, 2)
@@ -903,22 +880,87 @@ def train_step(
         assert new_state.get_last_norm() is None
         norm = optax.global_norm(grads)
 
-    if return_weights_and_grads:
-        # TODO this uses a lot of VRAM and reduces max model size/max batch size. Instead of
-        # returning the gradients from train_step, when we want to log weights and grads we should
-        # copy the train state to host RAM, free everything but the weights on the GPU, then compute
-        # gradients for logging, then copy the train state back to the GPU and resume training.
-        return (
-            new_state,
-            loss,
-            norm,
-            (
-                state.params["params"],
-                grads["params"],
-            ),
+    return new_state, loss, norm
+
+
+@jax.jit
+def compute_grads(params, rng, batch_imgs, batch_clips, batch_max_cos_distances):
+    """Compute gradients without doing an optimization step. For logging. Doing this separately
+    from train_step saves VRAM."""
+    dropout_rng, rng2 = jax.random.split(rng, 2)
+    _, grads = loss_grad_fn(
+        mdl, params, dropout_rng, batch_imgs, batch_clips, batch_max_cos_distances
+    )
+    return grads["params"]
+
+
+def leading_dims_to_subtrees(tree):
+    """Given a dict pytree, return a new dict pytree with each array split into a dict of arrays
+    indexed by leading dimension.
+    """
+    if not isinstance(tree, dict):
+        raise ValueError(f"Expected dict, got {type(tree)}")
+    out = {}
+    for k, v in tree.items():
+        if isinstance(v, dict):
+            out[k] = leading_dims_to_subtrees(v)
+        elif isinstance(v, np.ndarray):
+            if v.ndim < 2:
+                raise ValueError(f"Expected array with at least 2 dims, got {v.ndim}")
+            else:
+                out[k] = {f"{idx:03d}": v[idx] for idx in range(v.shape[0])}
+        else:
+            raise ValueError(f"Unknown type: {type(v)} for key {k}")
+    return out
+
+
+def log_weights_and_grads(batch_imgs, batch_clips, batch_max_cos_distances):
+    """Log weights and grads to wandb."""
+    # We go out of our way to conserve VRAM by copying the train state to host RAM, freeing
+    # everything except the params from GPU memory, computing the gradients, then copying the train
+    # state back to the GPU and resuming training. Simply returning the gradients from train_step
+    # uses extra VRAM.
+
+    # Copy and free data
+    global train_state
+    # Freeing does no good if work is still in flight, so we block until the prior train step is
+    # complete.
+    jax.tree.map(lambda arr: arr.block_until_ready(), train_state)
+    gpu_params = train_state.params
+    gpu_rng = train_state.rng
+    cpu_train_state = jax.device_get(train_state)
+    del train_state
+    gc.collect()
+    # Everything except params and rng should be freed on GPU now.
+    # Compute gradients
+    gpu_grads = compute_grads(
+        gpu_params, gpu_rng, batch_imgs, batch_clips, batch_max_cos_distances
+    )
+    # Copy gradients to host
+    cpu_grads = jax.device_get(gpu_grads)
+    cpu_params = cpu_train_state.params["params"]
+    del gpu_params, gpu_rng, gpu_grads
+    gc.collect()
+    # Everything should be freed on GPU now. Copy the train state back to the GPU(s).
+    train_state = cpu_train_state.replicate_for_multi_gpu(mesh)
+
+    to_log = {}
+    for name, vals_tree in [
+        ("weights", cpu_params),
+        ("grads", cpu_grads),
+    ]:
+        vals_tree["transformer_layers"] = leading_dims_to_subtrees(
+            vals_tree["transformer_layers"]
         )
-    else:
-        return new_state, loss, norm, None
+        to_log |= {
+            f"{name}/{k}": v
+            for k, v in jax.tree.map(
+                # NumPy histograms don't know what bf16 is
+                lambda arr: wandb.Histogram(arr.astype(np.float32)),
+                vals_tree,
+            ).items()
+        }
+    wandb.log(to_log)
 
 
 last_checkpoint_time = None
@@ -1086,13 +1128,11 @@ def prefetch_and_train(current_state, current_step):
         batch_max_cos_distances = jnp.zeros(
             (batch_clips.shape[0], 0), dtype=jnp.float32
         )
-    train_state, loss, norm, weights_and_grads = train_step(
+    train_state, loss, norm = train_step(
         current_state,
         batch_imgs,
         batch_clips,
         batch_max_cos_distances,
-        return_weights_and_grads=args.log_weight_and_grad_interval > 0
-        and global_step % args.log_weight_and_grad_interval == 0,
     )
     opt_state = train_state.opt_state
 
@@ -1122,7 +1162,6 @@ def prefetch_and_train(current_state, current_step):
         batch_clips,
         batch_max_cos_distances,
         to_log,
-        weights_and_grads,
         clipped_last,
     )
 
@@ -1168,7 +1207,6 @@ for epoch in trange(
                     batch_clips,
                     batch_max_cos_distances,
                     train_step_to_log,
-                    weights_and_grads,
                     clipped_last,
                 ) = next_train_step_outputs
                 next_train_step_outputs = None
@@ -1180,7 +1218,6 @@ for epoch in trange(
                     batch_clips,
                     batch_max_cos_distances,
                     train_step_to_log,
-                    weights_and_grads,
                     clipped_last,
                 ) = prefetch_and_train(train_state, global_step)
 
@@ -1235,14 +1272,19 @@ for epoch in trange(
                 )
                 last_checkpoint_time = datetime.datetime.now()
                 early_checkpoint_requested = False
+            if (
+                args.log_weight_and_grad_interval > 0
+                and (global_step - 1) % args.log_weight_and_grad_interval == 0
+            ):
+                log_weights_and_grads(batch_imgs, batch_clips, batch_max_cos_distances)
             if batch_idx + 1 < actual_batches:
                 next_train_step_outputs = prefetch_and_train(train_state, global_step)
             # At this point we've enqueued all the work for this step and queued the next step, so
             # we can block on the current step and be sure the GPU will have stuff to do. There's a
             # small but real perf improvement to be had by fetching only train_step_to_log at this
             # point and waiting a bit before fetching extra_to_log.
-            clipped_last, train_step_to_log, weights_and_grads = jax.device_get(
-                (clipped_last, train_step_to_log, weights_and_grads)
+            clipped_last, train_step_to_log = jax.device_get(
+                (clipped_last, train_step_to_log)
             )
 
             if not np.isfinite(train_step_to_log["train/loss"]):
@@ -1254,24 +1296,6 @@ for epoch in trange(
             if train_step_to_log["debug/notfinite_count"] > 50:
                 tqdm.write(f"Too many nonfinite values in gradients, giving up")
                 exit(1)
-            if weights_and_grads is not None:
-                for name, vals_tree in [
-                    ("weights", weights_and_grads[0]),
-                    ("grads", weights_and_grads[1]),
-                ]:
-                    transformed_vals = copy(vals_tree)
-                    transformed_vals["transformer_layers"] = leading_dims_to_subtrees(
-                        vals_tree["transformer_layers"]
-                    )
-                    log_tree = {
-                        f"{name}/{k}": v
-                        for k, v in jax.tree.map(
-                            # NumPy histograms don't know what bf16 is
-                            lambda arr: wandb.Histogram(arr.astype(np.float32)),
-                            transformed_vals,
-                        ).items()
-                    }
-                    train_step_to_log |= log_tree
             wandb.log(train_step_to_log)
             if extra_to_log is not None:
                 # If we actually got any extra stuff to log, fetch it now and do the logging.
