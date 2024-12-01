@@ -158,7 +158,7 @@ class TrainState(train_state.TrainState):
         mdl = ImageModel(**model_cfg.__dict__)
 
         template_ts = TrainState.new(
-            jax.random.PRNGKey(0), mdl, training_cfg, batches_total=0
+            jax.random.PRNGKey(0), mdl, training_cfg, batches_total=batches_total
         )
 
         # Free the memory of the templates as soon as we know the shapes and dtypes
