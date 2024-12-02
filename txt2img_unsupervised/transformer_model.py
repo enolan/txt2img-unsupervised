@@ -22,11 +22,8 @@ from tqdm import tqdm, trange
 
 from .cap_sampling import LogitsTable, random_pt_with_cosine_similarity, sample_cap
 from .config import ModelConfig
-from .gen_training_caps import gen_training_examples_from_tree
 from .gpu_check import gpu_is_ampere_or_newer
 from .load_pq_dir import load_pq_to_infinidata
-from .spherical_space_partitioning import CapTree
-from .triangle_schedule import triangle_schedule
 
 
 AttnMethod = Enum("AttnMethod", ["STANDARD", "FLASH_JAX", "FLASH_CPP", "CUDNN"])
