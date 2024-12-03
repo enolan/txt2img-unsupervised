@@ -56,7 +56,10 @@ echo "Starting sync process..."
 last_hash=""
 sync_if_changed() {
     # Create a list of every file along with its mod time, excluding temporary Orbax files
-    current_hash=$(find "$checkpoint_path" -type f -not -path '*.orbax-checkpoint-tmp-*' -printf '%P %T@\n' | sort | sha1sum | awk '{print $1}')
+    if ! current_hash=$(find "$checkpoint_path" -type f -not -path '*.orbax-checkpoint-tmp-*' -printf '%P %T@\n' | sort | sha1sum | awk '{print $1}'); then
+        echo "Warning: Error running find command. Skipping this sync iteration..."
+        return
+    fi
 
     # If there are new files, files have been deleted, or files have been modified, the hash will
     # have changed, so we sync.
