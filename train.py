@@ -416,29 +416,6 @@ loss_grad_fn = jax.value_and_grad(transformer_model.loss_batch, argnums=1)
 loss_fn = jax.jit(partial(transformer_model.loss_batch, mdl))
 
 
-# TODO delete this, unnecessary now
-# Set up for sampling:
-sample_cfg = copy(model_cfg)
-sample_cfg.dropout = None
-sample_mdl = transformer_model.ImageModel(**sample_cfg.__dict__, decode=True)
-sample_params = sample_mdl.init(jax.random.PRNGKey(0), *sample_mdl.dummy_inputs())
-sample_cache = sample_params["cache"]
-del sample_params
-
-sample_jv = jax.jit(
-    jax.vmap(
-        lambda params, clip_embedding, max_cos_distance, rng, top_p: transformer_model.sample(
-            sample_mdl,
-            flax.core.copy(params, {"cache": sample_cache}),
-            clip_embedding,
-            max_cos_distance,
-            rng,
-            top_p,
-        ),
-        in_axes=(None, 0, 0, 0, 0),
-    )
-)
-
 # CLIP embeddings to use for diagnostic sampling
 image_prompts_to_sample = 8
 
