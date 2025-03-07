@@ -1008,36 +1008,49 @@ examples_sharding = NamedSharding(mesh, PartitionSpec("dev"))
 
 eval_loss = None
 
-exit_requested = False
+
+class SignalHandler:
+    """
+    Class to handle signals for clean exit and checkpointing. It's important to checkpoint and exit
+    at well-defined times (not in the middle of a train step), so we use a flag and check for it
+    rather than exiting immediately upon receiving the signal.
+
+    Attributes:
+        exit_requested: Flag indicating whether exit has been requested.
+        early_checkpoint_requested: Flag indicating whether early checkpointing has been requested.
+    """
+
+    def __init__(self):
+        """Initialize signal handler."""
+        self.exit_requested = False
+        self.early_checkpoint_requested = False
+
+        # Register signal handlers
+        signal.signal(signal.SIGTERM, self._exit_early_signal_handler)
+        signal.signal(signal.SIGINT, self._exit_early_signal_handler)
+        signal.signal(signal.SIGUSR1, self._early_checkpoint_signal_handler)
+
+    def _exit_early_signal_handler(self, signum, frame):
+        if self.exit_requested:
+            tqdm.write(
+                "CTRL-C pressed twice, exiting immediately without checkpointing"
+            )
+            exit(1)
+        else:
+            tqdm.write("CTRL-C pressed, doing clean exit after checkpointing")
+            self.exit_requested = True
+
+    def _early_checkpoint_signal_handler(self, signum, frame):
+        # Same deal as exit_early_signal_handler, but we don't exit, just checkpoint.
+        self.early_checkpoint_requested = True
+
+    def reset_checkpoint_flag(self):
+        """Reset the early checkpoint flag after it's been handled."""
+        self.early_checkpoint_requested = False
 
 
-def exit_early_signal_handler(signum, frame):
-    # It's important to checkpoint and exit at well-defined times (not in the middle of a train
-    # step), so we use a flag and check for it rather than exiting immediately upon recieving the
-    # signal.
-    global exit_requested
-    if exit_requested:
-        tqdm.write("CTRL-C pressed twice, exiting immediately without checkpointing")
-        exit(1)
-    else:
-        tqdm.write("CTRL-C pressed, doing clean exit after checkpointing")
-        exit_requested = True
+signal_handler = SignalHandler()
 
-
-signal.signal(signal.SIGTERM, exit_early_signal_handler)
-signal.signal(signal.SIGINT, exit_early_signal_handler)
-
-
-early_checkpoint_requested = False
-
-
-def early_checkpoint_signal_handler(signum, frame):
-    # Same deal as exit_early_signal_handler, but we don't exit, just checkpoint.
-    global early_checkpoint_requested
-    early_checkpoint_requested = True
-
-
-signal.signal(signal.SIGUSR1, early_checkpoint_signal_handler)
 
 cap_logits_table = cap_sampling.LogitsTable(767, 16384)
 
@@ -1217,7 +1230,7 @@ for epoch in trange(
             else:
                 extra_to_log = None
             global_step += 1
-            if exit_requested:
+            if signal_handler.exit_requested:
                 tqdm.write("Saving checkpoint and exiting early")
                 save_checkpoint_and_log_images(
                     train_state,
@@ -1233,7 +1246,7 @@ for epoch in trange(
                 last_checkpoint_time is None
                 or (datetime.datetime.now() - last_checkpoint_time)
                 > datetime.timedelta(minutes=30)
-                or early_checkpoint_requested
+                or signal_handler.early_checkpoint_requested
             ):
                 save_checkpoint_and_log_images(
                     train_state,
@@ -1243,7 +1256,7 @@ for epoch in trange(
                     args.skip_saving,
                 )
                 last_checkpoint_time = datetime.datetime.now()
-                early_checkpoint_requested = False
+                signal_handler.reset_checkpoint_flag()
             if batch_idx + 1 < actual_batches:
                 next_train_step_outputs = prefetch_and_train(train_state, global_step)
             # At this point we've enqueued all the work for this step and queued the next step, so
