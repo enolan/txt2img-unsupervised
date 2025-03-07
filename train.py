@@ -39,7 +39,7 @@ from omegaconf import OmegaConf
 from pathlib import Path
 from sys import exit
 from tqdm import tqdm, trange
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 from txt2img_unsupervised.checkpoint import (
     mk_checkpoint_manager,
@@ -172,11 +172,11 @@ def json_pretty(dict):
 
 
 def init_train_state(
-    resume_checkpoint_path: Path = None,
-    finetune_checkpoint_path: Path = None,
-    model_config_path: Path = None,
-    training_config_path: Path = None,
-    sample_batch_size: int = None,
+    resume_checkpoint_path: Optional[Path] = None,
+    finetune_checkpoint_path: Optional[Path] = None,
+    model_config_path: Optional[Path] = None,
+    training_config_path: Optional[Path] = None,
+    sample_batch_size: Optional[int] = None,
     start_where_finetune_source_left_off: bool = False,
 ):
     """Set up our ModelConfig and TrainingConfig, initialize wandb, and create our initial
