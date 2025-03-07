@@ -150,8 +150,8 @@ def parse_arguments():
 args = parse_arguments()
 
 
-def setup_profiling_server():
-    if args.profiling_server:
+def setup_profiling_server(profiling_server: bool = False):
+    if profiling_server:
         if importlib.util.find_spec("tensorflow") is None:
             print("You gotta install tensorflow for profiling bro")
             exit(1)
@@ -160,7 +160,7 @@ def setup_profiling_server():
         print("JAX profiling server started on port 6969")
 
 
-setup_profiling_server()
+setup_profiling_server(args.profiling_server)
 
 # Turn on JAX compilation cache
 jax.config.update("jax_compilation_cache_dir", "/tmp/t2i-u-jax-cache")
@@ -171,7 +171,14 @@ def json_pretty(dict):
     return json.dumps(dict, indent=2)
 
 
-def init_train_state():
+def init_train_state(
+    resume_checkpoint_path: Path = None,
+    finetune_checkpoint_path: Path = None,
+    model_config_path: Path = None,
+    training_config_path: Path = None,
+    sample_batch_size: int = None,
+    start_where_finetune_source_left_off: bool = False,
+):
     """Set up our ModelConfig and TrainingConfig, initialize wandb, and create our initial
     TrainState."""
     checkpoint_options = ocp.CheckpointManagerOptions(
@@ -181,12 +188,12 @@ def init_train_state():
         enable_async_checkpointing=False,
     )
     wandb_settings = wandb.Settings(code_dir="txt2img_unsupervised")
-    assert ((args.resume is None) != (args.finetune is None)) or (
-        args.resume is None and args.finetune is None
+    assert ((resume_checkpoint_path is None) != (finetune_checkpoint_path is None)) or (
+        resume_checkpoint_path is None and finetune_checkpoint_path is None
     ), "Must specify one of --resume or --finetune or neither, not both"
-    if args.resume is not None:
-        print(f"Resuming from checkpoint {args.resume}...")
-        checkpoint_dir = args.resume.absolute()
+    if resume_checkpoint_path is not None:
+        print(f"Resuming from checkpoint {resume_checkpoint_path}...")
+        checkpoint_dir = resume_checkpoint_path.absolute()
         checkpoint_manager = mk_checkpoint_manager(checkpoint_dir, checkpoint_options)
         # The step recorded in a checkpoint is the number of steps completed, so our starting step
         # index is that number. If the checkpoint we're resuming from completed 0 steps, we start
@@ -220,11 +227,11 @@ def init_train_state():
 
         global_step = 0
         # Load model configuration
-        with open(args.model_config) as f:
+        with open(model_config_path) as f:
             model_cfg = ModelConfig.from_json_dict(json.load(f))
         config.merge_attrs(model_cfg, args)
         # Load training configuration
-        with open(args.training_config) as f:
+        with open(training_config_path) as f:
             training_cfg = TrainingConfig.from_json_dict(json.load(f))
         config.merge_attrs(training_cfg, args)
 
@@ -238,12 +245,12 @@ def init_train_state():
         print(f"Model config post-wandb: {json_pretty(model_cfg.to_json_dict())}")
         print(f"Training config post-wandb: {json_pretty(training_cfg.to_json_dict())}")
 
-        if args.finetune is not None:
-            finetune_src_checkpoint_dir = args.finetune.absolute()
+        if finetune_checkpoint_path is not None:
+            finetune_src_checkpoint_dir = finetune_checkpoint_path.absolute()
             finetune_src_checkpoint_manager = mk_checkpoint_manager(
                 finetune_src_checkpoint_dir
             )
-            if args.start_where_finetune_source_left_off:
+            if start_where_finetune_source_left_off:
                 # data_offset is the offset (in batches) we use into the training data, equal to the
                 # number of examples the source run trained on divided by our batch size, rounded
                 # up. We track this number so we don't repeat any training data the source run saw
@@ -282,10 +289,10 @@ def init_train_state():
             extra_metadata=extra_metadata,
         )
 
-        if args.finetune is not None:
+        if finetune_checkpoint_path is not None:
             train_state = train_state.replace(params=None)
             gc.collect()
-            print(f"Loading params from {args.finetune} for finetuning...")
+            print(f"Loading params from {finetune_checkpoint_path} for finetuning...")
 
             finetune_src_ts, finetune_src_mdl = TrainState.load_from_checkpoint(
                 finetune_src_checkpoint_manager,
@@ -308,10 +315,8 @@ def init_train_state():
 
         mdl = transformer_model.ImageModel(**model_cfg.__dict__)
 
-    if args.sample_batch_size is None:
+    if sample_batch_size is None:
         sample_batch_size = training_cfg.batch_size
-    else:
-        sample_batch_size = args.sample_batch_size
 
     print(mdl.tabulate(jax.random.PRNGKey(0), *mdl.dummy_inputs()))
 
@@ -340,7 +345,14 @@ def init_train_state():
     train_state,
     mdl,
     data_offset,
-) = init_train_state()
+) = init_train_state(
+    resume_checkpoint_path=args.resume,
+    finetune_checkpoint_path=args.finetune,
+    model_config_path=args.model_config,
+    training_config_path=args.training_config,
+    sample_batch_size=args.sample_batch_size,
+    start_where_finetune_source_left_off=args.start_where_finetune_source_left_off,
+)
 
 
 def load_dataset(dir: Path) -> Tuple[Dataset, Dataset]:
@@ -612,10 +624,16 @@ def mk_txt_prompt_conditions(text_prompt_clips, grid_size):
         return clip_embeddings, None
 
 
-ae_cfg = OmegaConf.load(args.ae_cfg)["model"]["params"]
-ae_mdl = LDMAutoencoder(ae_cfg)
-# don't keep these on the GPU when we're not using them
-ae_params_torch = torch.load(args.ae_ckpt, map_location="cpu")
+def load_autoencoder(ae_cfg_path: Path, ae_ckpt_path: Path):
+    """Load the autoencoder model and parameters."""
+    ae_cfg = OmegaConf.load(ae_cfg_path)["model"]["params"]
+    ae_mdl = LDMAutoencoder(ae_cfg)
+    # don't keep these on the GPU when we're not using them
+    ae_params_torch = torch.load(ae_ckpt_path, map_location="cpu")
+    return ae_cfg, ae_mdl, ae_params_torch
+
+
+ae_cfg, ae_mdl, ae_params_torch = load_autoencoder(args.ae_cfg, args.ae_ckpt)
 
 
 def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> None:
@@ -911,7 +929,11 @@ last_checkpoint_time = None
 
 
 def save_checkpoint_and_log_images(
-    my_train_state, sample_batch_size, global_step, skip_sampling, skip_saving
+    my_train_state,
+    sample_batch_size: int,
+    global_step: int,
+    skip_sampling: bool,
+    skip_saving: bool,
 ) -> None:
     if not skip_saving:
         my_train_state.save_checkpoint(checkpoint_manager, global_step)
@@ -1048,7 +1070,9 @@ def gen_caps(rng, batch_clips, n_caps):
 # In order to ensure the GPU doesn't wait on CPU stuff, we ensure that there's always at least one
 # batch in flight. So at the beginning of each inner loop we enqueue the next step before doing
 # anything that would wait for the current step to finish.
-def prefetch_and_train(current_state, current_step):
+def prefetch_and_train(
+    current_state, current_step, log_weight_and_grad_interval: int = 0
+):
     """Prefetch next batch and enqueue next train step."""
 
     batch_imgs, batch_clips = get_batch(
@@ -1090,8 +1114,8 @@ def prefetch_and_train(current_state, current_step):
         batch_imgs,
         batch_clips,
         batch_max_cos_distances,
-        return_weights_and_grads=args.log_weight_and_grad_interval > 0
-        and global_step % args.log_weight_and_grad_interval == 0,
+        return_weights_and_grads=log_weight_and_grad_interval > 0
+        and global_step % log_weight_and_grad_interval == 0,
     )
     opt_state = train_state.opt_state
 
@@ -1181,7 +1205,9 @@ for epoch in trange(
                     train_step_to_log,
                     weights_and_grads,
                     clipped_last,
-                ) = prefetch_and_train(train_state, global_step)
+                ) = prefetch_and_train(
+                    train_state, global_step, args.log_weight_and_grad_interval
+                )
 
             train_step_to_log["global_step"] = global_step
             if global_step % 20 == 0:
@@ -1235,7 +1261,9 @@ for epoch in trange(
                 last_checkpoint_time = datetime.datetime.now()
                 signal_handler.reset_checkpoint_flag()
             if batch_idx + 1 < actual_batches:
-                next_train_step_outputs = prefetch_and_train(train_state, global_step)
+                next_train_step_outputs = prefetch_and_train(
+                    train_state, global_step, args.log_weight_and_grad_interval
+                )
             # At this point we've enqueued all the work for this step and queued the next step, so
             # we can block on the current step and be sure the GPU will have stuff to do. There's a
             # small but real perf improvement to be had by fetching only train_step_to_log at this
