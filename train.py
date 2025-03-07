@@ -68,9 +68,6 @@ import txt2img_unsupervised.sample as sample
 import txt2img_unsupervised.transformer_model as transformer_model
 
 
-parser = argparse.ArgumentParser()
-
-
 def argparse_from_dict(d: dict[str, Any]) -> Callable[[str], Any]:
     """Create an argparse argument type from a dictionary."""
 
@@ -83,62 +80,74 @@ def argparse_from_dict(d: dict[str, Any]) -> Callable[[str], Any]:
     return f
 
 
-parser.add_argument("--pq-dir", type=Path, required=True)
-parser.add_argument("--model-config", type=Path, required=True)
-parser.add_argument("--training-config", type=Path, required=True)
-parser.add_argument("--batch-size", type=int)
-parser.add_argument("--sample-batch-size", type=int, default=None)
-parser.add_argument(
-    "--profiling-server", action="store_true", help="Enable JAX profiling server"
-)
-parser.add_argument("--epochs", type=int)
-parser.add_argument("--training-images", type=int)
-parser.add_argument("--learning-rate", type=float, default=1e-4)
-parser.add_argument(
-    "--learning-rate-schedule", type=argparse_from_dict(str_to_learning_rate_schedule)
-)
-parser.add_argument("--warmup-steps", type=int, default=None)
-parser.add_argument("--schedule-free-beta1", type=float, default=None)
-parser.add_argument("--gradient-accumulation-steps", type=int)
-parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))
-parser.add_argument("--gradient-clipping", type=float, default=None)
-parser.add_argument("--adaptive-gradient-clip", type=lambda x: bool(strtobool(x)))
-parser.add_argument("--adaptive-gradient-clip-history-len", type=int, default=None)
-parser.add_argument(
-    "--adaptive-gradient-clip-threshold-factor", type=float, default=None
-)
-parser.add_argument("--adaptive-gradient-clip-quantile", type=float, default=None)
-parser.add_argument("--image-dropout", type=float, default=None)
-parser.add_argument("--weight-decay", type=float, default=0.0)
-parser.add_argument("--ae-cfg", type=Path, required=True)
-parser.add_argument("--ae-ckpt", type=Path, required=True)
-parser.add_argument("--activations-dtype", type=argparse_from_dict(str_to_dtype))
-parser.add_argument("--weights-dtype", type=argparse_from_dict(str_to_dtype))
-parser.add_argument("--activation-function", type=argparse_from_dict(str_to_activation))
-parser.add_argument("--clip-conditioning", type=lambda x: bool(strtobool(x)))
-parser.add_argument("--clip-caps", type=lambda x: bool(strtobool(x)))
-parser.add_argument("--clip-cap-count", type=int)
-parser.add_argument("--resume", type=Path)
-parser.add_argument("--finetune", type=Path)
-parser.add_argument(
-    "--start-where-finetune-source-left-off",
-    type=lambda x: bool(strtobool(x)),
-    help="start the training data from where the finetune source run left off",
-    default=False,
-)
-parser.add_argument(
-    "--skip-sampling", action="store_true", help="Skip sampling during training"
-)
-parser.add_argument(
-    "--skip-saving", action="store_true", help="Skip saving checkpoints during training"
-)
-parser.add_argument(
-    "--log-weight-and-grad-interval",
-    type=int,
-    default=0,
-    help="Log attention weights and gradients every N steps",
-)
-args, _unknown = parser.parse_known_args()
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pq-dir", type=Path, required=True)
+    parser.add_argument("--model-config", type=Path, required=True)
+    parser.add_argument("--training-config", type=Path, required=True)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--sample-batch-size", type=int, default=None)
+    parser.add_argument(
+        "--profiling-server", action="store_true", help="Enable JAX profiling server"
+    )
+    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--training-images", type=int)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--learning-rate-schedule",
+        type=argparse_from_dict(str_to_learning_rate_schedule),
+    )
+    parser.add_argument("--warmup-steps", type=int, default=None)
+    parser.add_argument("--schedule-free-beta1", type=float, default=None)
+    parser.add_argument("--gradient-accumulation-steps", type=int)
+    parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))
+    parser.add_argument("--gradient-clipping", type=float, default=None)
+    parser.add_argument("--adaptive-gradient-clip", type=lambda x: bool(strtobool(x)))
+    parser.add_argument("--adaptive-gradient-clip-history-len", type=int, default=None)
+    parser.add_argument(
+        "--adaptive-gradient-clip-threshold-factor", type=float, default=None
+    )
+    parser.add_argument("--adaptive-gradient-clip-quantile", type=float, default=None)
+    parser.add_argument("--image-dropout", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--ae-cfg", type=Path, required=True)
+    parser.add_argument("--ae-ckpt", type=Path, required=True)
+    parser.add_argument("--activations-dtype", type=argparse_from_dict(str_to_dtype))
+    parser.add_argument("--weights-dtype", type=argparse_from_dict(str_to_dtype))
+    parser.add_argument(
+        "--activation-function", type=argparse_from_dict(str_to_activation)
+    )
+    parser.add_argument("--clip-conditioning", type=lambda x: bool(strtobool(x)))
+    parser.add_argument("--clip-caps", type=lambda x: bool(strtobool(x)))
+    parser.add_argument("--clip-cap-count", type=int)
+    parser.add_argument("--resume", type=Path)
+    parser.add_argument("--finetune", type=Path)
+    parser.add_argument(
+        "--start-where-finetune-source-left-off",
+        type=lambda x: bool(strtobool(x)),
+        help="start the training data from where the finetune source run left off",
+        default=False,
+    )
+    parser.add_argument(
+        "--skip-sampling", action="store_true", help="Skip sampling during training"
+    )
+    parser.add_argument(
+        "--skip-saving",
+        action="store_true",
+        help="Skip saving checkpoints during training",
+    )
+    parser.add_argument(
+        "--log-weight-and-grad-interval",
+        type=int,
+        default=0,
+        help="Log attention weights and gradients every N steps",
+    )
+    args, _unknown = parser.parse_known_args()
+    return args
+
+
+args = parse_arguments()
 
 
 def setup_profiling_server():
