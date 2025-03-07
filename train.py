@@ -502,7 +502,7 @@ def mk_image_prompt_conditions(image_prompt_clips, grid_size):
     # Use a larger and a smaller cap. The smaller cap should generate images that are very
     # similar to the image prompt, the larger one should generate images that are semantically
     # similar but not necessarily visually similar.
-    if model_cfg.clip_caps:
+    if mdl.clip_caps:
         max_cos_distance_choices = jnp.array([0.75, 0.4], dtype=jnp.float32)
 
         samples_count = (
@@ -512,7 +512,7 @@ def mk_image_prompt_conditions(image_prompt_clips, grid_size):
         # With more than one cap slot, we fill in the unused ones with caps that cover the entire
         # space.
         cap_centers_fill, cap_max_cos_distances_fill = sample.mk_filler_caps(
-            model_cfg, samples_count, 1, jax.random.PRNGKey(20240214)
+            mdl, samples_count, 1, jax.random.PRNGKey(20240214)
         )
         cap_centers_fill = rearrange(
             cap_centers_fill,
@@ -549,14 +549,14 @@ def mk_image_prompt_conditions(image_prompt_clips, grid_size):
             len(image_prompt_clips),
             len(max_cos_distance_choices),
             grid_size,
-            model_cfg.clip_cap_count,
+            mdl.clip_cap_count,
             768,
         )
         assert cap_max_cos_distances.shape == (
             len(image_prompt_clips),
             len(max_cos_distance_choices),
             grid_size,
-            model_cfg.clip_cap_count,
+            mdl.clip_cap_count,
         )
         assert np.prod(cap_centers.shape[:3]) == samples_count
         return cap_centers, cap_max_cos_distances, max_cos_distance_choices
@@ -575,9 +575,9 @@ def mk_txt_prompt_conditions(text_prompt_clips, grid_size):
     """Make conditioning data for the text prompts."""
     assert text_prompt_clips.shape[1] == 768
     samples_count = len(text_prompt_clips) * grid_size
-    if model_cfg.clip_caps:
+    if mdl.clip_caps:
         cap_centers_fill, cap_max_cos_distances_fill = sample.mk_filler_caps(
-            model_cfg, samples_count, 1, jax.random.PRNGKey(20240214)
+            mdl, samples_count, 1, jax.random.PRNGKey(20240214)
         )
         cap_centers_fill = rearrange(
             cap_centers_fill,
@@ -607,13 +607,13 @@ def mk_txt_prompt_conditions(text_prompt_clips, grid_size):
         assert cap_centers.shape == (
             len(text_prompt_clips),
             grid_size,
-            model_cfg.clip_cap_count,
+            mdl.clip_cap_count,
             768,
         )
         assert cap_max_cos_distances.shape == (
             len(text_prompt_clips),
             grid_size,
-            model_cfg.clip_cap_count,
+            mdl.clip_cap_count,
         )
         return cap_centers, cap_max_cos_distances
     else:
@@ -642,14 +642,14 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
     ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
     eval_params = ts.get_eval_params()
 
-    if model_cfg.clip_conditioning:
+    if mdl.clip_conditioning:
         # Create a grid of samples for each set of conditions.
         grid_size = 9
 
         image_prompt_names = visualization_dset["name"]
         text_prompt_texts = text_prompt_clips["name"]
 
-        if model_cfg.clip_caps:
+        if mdl.clip_caps:
             (
                 img_cap_centers,
                 img_max_cos_distances,
@@ -774,7 +774,6 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
 
             imgs_list = sample.sample_loop(
                 mdl,
-                model_cfg,
                 eval_params,
                 ae_mdl,
                 ae_params,

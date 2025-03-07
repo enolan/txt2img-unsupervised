@@ -424,20 +424,20 @@ def test_sample_loop_batch_equivalence():
         ), "Too many substantially different samples"
 
 
-def mk_filler_caps(model_cfg, n_cap_sets, n_used_caps, rng):
+def mk_filler_caps(model, n_cap_sets, n_used_caps, rng):
     """Make caps with max cosine distance 2 and random centers to fill in all but n_used_caps cap
     slots. These caps *should* have no effect on the output, since they don't restrict the space of
     valid embeddings at all. Filler caps are necessary for unconditioned sampling on cap models and
     for prompting models with >1 cap slot with fewer than the full number of caps.
     """
-    assert model_cfg.clip_caps
-    assert n_used_caps <= model_cfg.clip_cap_count
+    assert model.clip_caps
+    assert n_used_caps <= model.clip_cap_count
     centers = jax.random.normal(
-        rng, (n_cap_sets, model_cfg.clip_cap_count - n_used_caps, 768)
+        rng, (n_cap_sets, model.clip_cap_count - n_used_caps, 768)
     )
     centers = centers / jnp.linalg.norm(centers, axis=-1, keepdims=True)
     max_cos_distances = np.full(
-        (n_cap_sets, model_cfg.clip_cap_count - n_used_caps), 2, dtype=jnp.float32
+        (n_cap_sets, model.clip_cap_count - n_used_caps), 2, dtype=jnp.float32
     )
     return np.asarray(centers), max_cos_distances
 
