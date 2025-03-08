@@ -147,9 +147,6 @@ def parse_arguments():
     return args
 
 
-args = parse_arguments()
-
-
 def setup_profiling_server(profiling_server: bool = False):
     if profiling_server:
         if importlib.util.find_spec("tensorflow") is None:
@@ -158,12 +155,6 @@ def setup_profiling_server(profiling_server: bool = False):
 
         jax.profiler.start_server(6969)
         print("JAX profiling server started on port 6969")
-
-
-setup_profiling_server(args.profiling_server)
-
-# Turn on JAX compilation cache
-jax.config.update("jax_compilation_cache_dir", "/tmp/t2i-u-jax-cache")
 
 
 def json_pretty(dict):
@@ -336,25 +327,6 @@ def init_train_state(
     )
 
 
-(
-    global_step,
-    model_cfg,
-    training_cfg,
-    sample_batch_size,
-    checkpoint_manager,
-    train_state,
-    mdl,
-    data_offset,
-) = init_train_state(
-    resume_checkpoint_path=args.resume,
-    finetune_checkpoint_path=args.finetune,
-    model_config_path=args.model_config,
-    training_config_path=args.training_config,
-    sample_batch_size=args.sample_batch_size,
-    start_where_finetune_source_left_off=args.start_where_finetune_source_left_off,
-)
-
-
 def load_dataset(dir: Path) -> Tuple[Dataset, Dataset]:
     dset_all = load_pq_dir(dir)
     dset_split = dset_all.train_test_split(test_size=0.01, seed=19900515)
@@ -365,11 +337,6 @@ def load_dataset(dir: Path) -> Tuple[Dataset, Dataset]:
         {"train_set_size": len(train_imgs), "test_set_size": len(test_imgs)}
     )
     return train_imgs, test_imgs
-
-
-train_imgs, test_imgs = load_dataset(args.pq_dir)
-# Make the RNG partitionable across devices
-jax.config.update("jax_threefry_partitionable", True)
 
 
 def calculate_steps(train_set_size, training_cfg, train_state):
@@ -400,35 +367,16 @@ def calculate_steps(train_set_size, training_cfg, train_state):
     return batches_total, epochs_total, batches_per_epoch, extra_batches, train_state
 
 
-(
-    batches_total,
-    epochs_total,
-    batches_per_epoch,
-    extra_batches,
-    train_state,
-) = calculate_steps(train_imgs.shape[0], training_cfg, train_state)
-
-
-def setup_sharding():
+def setup_sharding(batch_size):
     print(
-        f"Sharding batches of {training_cfg.batch_size} across {jax.device_count()} devices, {training_cfg.batch_size / jax.device_count()} per device"
+        f"Sharding batches of {batch_size} across {jax.device_count()} devices, {batch_size / jax.device_count()} per device"
     )
-    assert training_cfg.batch_size % jax.device_count() == 0
+    assert batch_size % jax.device_count() == 0
     # NamedSharding is overkill for the simple batch parallelism we do, but it's necessary to get
     # orbax to save checkpoints correctly.
     devices = mesh_utils.create_device_mesh((jax.device_count(),))
     mesh = Mesh(devices, axis_names=("dev",))
     return mesh
-
-
-mesh = setup_sharding()
-train_state = train_state.replicate_for_multi_gpu(mesh)
-
-loss_fn = jax.jit(partial(transformer_model.loss_batch, mdl))
-
-
-# CLIP embeddings to use for diagnostic sampling
-image_prompts_to_sample = 8
 
 
 def get_clip_mdl():
@@ -438,9 +386,6 @@ def get_clip_mdl():
     clip_mdl = transformers.FlaxCLIPModel.from_pretrained(clip_mdl_name)
     clip_processor = transformers.AutoProcessor.from_pretrained(clip_mdl_name)
     return clip_mdl, clip_processor
-
-
-clip_mdl, clip_processor = get_clip_mdl()
 
 
 def find_sfw_indices(clip_mdl, clip_processor, dset, n: int):
@@ -460,7 +405,7 @@ def find_sfw_indices(clip_mdl, clip_processor, dset, n: int):
     return jax.device_get(ok_indices[:n])
 
 
-def get_clip_text_embeddings_to_sample(n: int) -> jax.Array:
+def get_clip_text_embeddings_to_sample(n: int, clip_mdl, clip_processor) -> jax.Array:
     """Generate some text embeddings to test the model with."""
     prompts = [
         "A woman’s face",
@@ -483,16 +428,7 @@ def get_clip_text_embeddings_to_sample(n: int) -> jax.Array:
     }
 
 
-sfw_indices = find_sfw_indices(
-    clip_mdl, clip_processor, test_imgs[:2048], image_prompts_to_sample
-)
-visualization_dset = test_imgs.select(sfw_indices[:8])
-print(
-    f"Using {[visualization_dset['name'][i] for i in range(8)]} for visualization & sampling"
-)
-text_prompt_clips = get_clip_text_embeddings_to_sample(8)
-
-del clip_mdl, clip_processor
+# These initializations moved to if __name__ == "__main__"
 
 
 def mk_image_prompt_conditions(image_prompt_clips, grid_size):
@@ -630,9 +566,6 @@ def load_autoencoder(ae_cfg_path: Path, ae_ckpt_path: Path):
     # don't keep these on the GPU when we're not using them
     ae_params_torch = torch.load(ae_ckpt_path, map_location="cpu")
     return ae_cfg, ae_mdl, ae_params_torch
-
-
-ae_cfg, ae_mdl, ae_params_torch = load_autoencoder(args.ae_cfg, args.ae_ckpt)
 
 
 def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> None:
@@ -1384,9 +1317,73 @@ def gen_caps(rng, batch_clips, n_caps, model):
     return cap_centers, cap_max_cos_distances
 
 
-examples_sharding = NamedSharding(mesh, PartitionSpec("dev"))
-
 if __name__ == "__main__":
+    # Parse arguments
+    args = parse_arguments()
+
+    # Set up JAX configuration
+    setup_profiling_server(args.profiling_server)
+    jax.config.update("jax_compilation_cache_dir", "/tmp/t2i-u-jax-cache")
+    jax.config.update("jax_threefry_partitionable", True)
+
+    # Initialize model and state
+    (
+        global_step,
+        model_cfg,
+        training_cfg,
+        sample_batch_size,
+        checkpoint_manager,
+        train_state,
+        mdl,
+        data_offset,
+    ) = init_train_state(
+        resume_checkpoint_path=args.resume,
+        finetune_checkpoint_path=args.finetune,
+        model_config_path=args.model_config,
+        training_config_path=args.training_config,
+        sample_batch_size=args.sample_batch_size,
+        start_where_finetune_source_left_off=args.start_where_finetune_source_left_off,
+    )
+
+    # Load dataset
+    train_imgs, test_imgs = load_dataset(args.pq_dir)
+
+    # Calculate training steps
+    (
+        batches_total,
+        epochs_total,
+        batches_per_epoch,
+        extra_batches,
+        train_state,
+    ) = calculate_steps(train_imgs.shape[0], training_cfg, train_state)
+
+    # Set up sharding
+    mesh = setup_sharding(training_cfg.batch_size)
+    train_state = train_state.replicate_for_multi_gpu(mesh)
+    examples_sharding = NamedSharding(mesh, PartitionSpec("dev"))
+
+    # Define loss function
+    loss_fn = jax.jit(partial(transformer_model.loss_batch, mdl))
+
+    # Load CLIP model and prepare visualization dataset
+    image_prompts_to_sample = 8
+    clip_mdl, clip_processor = get_clip_mdl()
+
+    sfw_indices = find_sfw_indices(
+        clip_mdl, clip_processor, test_imgs[:2048], image_prompts_to_sample
+    )
+    visualization_dset = test_imgs.select(sfw_indices[:8])
+    print(
+        f"Using {[visualization_dset['name'][i] for i in range(8)]} for visualization & sampling"
+    )
+    text_prompt_clips = get_clip_text_embeddings_to_sample(8, clip_mdl, clip_processor)
+
+    del clip_mdl, clip_processor
+
+    # Load autoencoder
+    ae_cfg, ae_mdl, ae_params_torch = load_autoencoder(args.ae_cfg, args.ae_ckpt)
+
+    # Run training loop
     global_step, train_state = train_loop(
         global_step,
         train_state,
