@@ -428,9 +428,6 @@ def get_clip_text_embeddings_to_sample(n: int, clip_mdl, clip_processor) -> jax.
     }
 
 
-# These initializations moved to if __name__ == "__main__"
-
-
 def mk_image_prompt_conditions(image_prompt_clips, grid_size):
     """Make conditioning data for the image prompts."""
     assert image_prompt_clips.shape[1] == 768
@@ -1318,15 +1315,14 @@ def gen_caps(rng, batch_clips, n_caps, model):
 
 
 if __name__ == "__main__":
-    # Parse arguments
     args = parse_arguments()
 
-    # Set up JAX configuration
     setup_profiling_server(args.profiling_server)
+    # Enable caching of JIT-compiled functions
     jax.config.update("jax_compilation_cache_dir", "/tmp/t2i-u-jax-cache")
+    # Make the RNG partitionable across devices
     jax.config.update("jax_threefry_partitionable", True)
 
-    # Initialize model and state
     (
         global_step,
         model_cfg,
@@ -1345,10 +1341,8 @@ if __name__ == "__main__":
         start_where_finetune_source_left_off=args.start_where_finetune_source_left_off,
     )
 
-    # Load dataset
     train_imgs, test_imgs = load_dataset(args.pq_dir)
 
-    # Calculate training steps
     (
         batches_total,
         epochs_total,
@@ -1357,15 +1351,12 @@ if __name__ == "__main__":
         train_state,
     ) = calculate_steps(train_imgs.shape[0], training_cfg, train_state)
 
-    # Set up sharding
     mesh = setup_sharding(training_cfg.batch_size)
     train_state = train_state.replicate_for_multi_gpu(mesh)
     examples_sharding = NamedSharding(mesh, PartitionSpec("dev"))
 
-    # Define loss function
     loss_fn = jax.jit(partial(transformer_model.loss_batch, mdl))
 
-    # Load CLIP model and prepare visualization dataset
     image_prompts_to_sample = 8
     clip_mdl, clip_processor = get_clip_mdl()
 
