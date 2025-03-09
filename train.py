@@ -58,6 +58,7 @@ from txt2img_unsupervised.config import (
 from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
 from txt2img_unsupervised.load_pq_dir import load_pq_dir
 from txt2img_unsupervised.train_data_loading import get_batch
+from txt2img_unsupervised.training_infra import plan_steps
 from txt2img_unsupervised.training_visualizations import (
     log_attention_maps,
     log_token_loss_visualization,
@@ -337,34 +338,6 @@ def load_dataset(dir: Path) -> Tuple[Dataset, Dataset]:
         {"train_set_size": len(train_imgs), "test_set_size": len(test_imgs)}
     )
     return train_imgs, test_imgs
-
-
-def calculate_steps(train_set_size, training_cfg, train_state):
-    """Calculate the number of steps and epochs to do."""
-
-    batches_for_image_count = training_cfg.training_images // training_cfg.batch_size
-    batches_per_epoch = train_set_size // training_cfg.batch_size
-    image_count_epochs = batches_for_image_count // batches_per_epoch
-    extra_batches = batches_for_image_count % batches_per_epoch
-    epochs_total = (
-        image_count_epochs + training_cfg.epochs + (1 if extra_batches > 0 else 0)
-    )
-    batches_total = (
-        training_cfg.epochs + image_count_epochs
-    ) * batches_per_epoch + extra_batches
-    assert epochs_total > 0, "Can't train for 0 steps"
-
-    print(
-        f"Training for {batches_total * training_cfg.batch_size} images in {batches_total} steps over {image_count_epochs + training_cfg.epochs} full epochs plus {extra_batches} extra batches"
-    )
-    # Reconfigure optimizer now that we know the total number of batches
-    # TODO this is a super dubious thing to be doing. We should ideally always set the optimizer
-    # state and the optimizer itself at the same time. It's fine so long as the shape of the
-    # optimizer state doesn't depend on batches_total, but we should really get all the info needed
-    # to set up the optimizer before we set up the optimizer.
-    opt = setup_optimizer(training_cfg, batches_total)
-    train_state = train_state.replace(tx=opt)
-    return batches_total, epochs_total, batches_per_epoch, extra_batches, train_state
 
 
 def setup_sharding(batch_size):
@@ -931,10 +904,10 @@ def train_loop(
     mdl,
     model_cfg,
     training_cfg,
-    batches_total,
-    epochs_total,
-    batches_per_epoch,
-    extra_batches,
+    total_steps,
+    total_epochs,
+    steps_per_epoch,
+    steps_in_partial_epoch,
     sample_batch_size,
     checkpoint_manager,
     data_offset,
@@ -942,12 +915,12 @@ def train_loop(
     examples_sharding,
 ):
     """Run the training loop across epochs."""
-    assert global_step < batches_total, "training run is over my dude"
+    assert global_step < total_steps, "training run is over my dude"
 
-    start_epoch = global_step // batches_per_epoch
+    start_epoch = global_step // steps_per_epoch
     if data_offset > 0:
         print(f"Using data offset for finetuning: {data_offset} batches")
-    start_step = global_step % batches_per_epoch
+    start_step = global_step % steps_per_epoch
     tqdm.write(f"Starting at epoch {start_epoch}, step {start_step}")
 
     eval_loss = None
@@ -1039,19 +1012,21 @@ def train_loop(
 
     for epoch in trange(
         start_epoch,
-        epochs_total,
+        total_epochs,
         initial=start_epoch,
-        total=epochs_total,
+        total=total_epochs,
         desc="epochs",
     ):
         # If we're doing a partial epoch, set the number of batches to do
-        if epoch == epochs_total - 1:
+        if epoch == total_epochs - 1:
             # The number of batches for the epoch, assuming we're not resuming
             batches_for_this_epoch = (
-                extra_batches if extra_batches > 0 else batches_per_epoch
+                steps_in_partial_epoch
+                if steps_in_partial_epoch is not None
+                else steps_per_epoch
             )
         else:
-            batches_for_this_epoch = batches_per_epoch
+            batches_for_this_epoch = steps_per_epoch
 
         this_start_step = start_step if epoch == start_epoch else 0
         actual_batches = batches_for_this_epoch - this_start_step
@@ -1344,12 +1319,30 @@ if __name__ == "__main__":
     train_imgs, test_imgs = load_dataset(args.pq_dir)
 
     (
-        batches_total,
-        epochs_total,
-        batches_per_epoch,
-        extra_batches,
-        train_state,
-    ) = calculate_steps(train_imgs.shape[0], training_cfg, train_state)
+        steps_per_epoch,
+        total_steps,
+        complete_epochs,
+        total_epochs,
+        steps_in_partial_epoch,
+    ) = plan_steps(
+        train_set_size=train_imgs.shape[0],
+        batch_size=training_cfg.batch_size,
+        epochs=training_cfg.epochs,
+        examples=training_cfg.training_images,
+        steps=0,  # We don't use the steps parameter directly
+    )
+
+    print(
+        f"Training for {total_steps * training_cfg.batch_size} images in {total_steps} steps over {complete_epochs} full epochs plus {steps_in_partial_epoch if steps_in_partial_epoch is not None else 0} extra batches"
+    )
+
+    # Reconfigure optimizer now that we know the total number of batches
+    # TODO this is a super dubious thing to be doing. We should ideally always set the optimizer
+    # state and the optimizer itself at the same time. It's fine so long as the shape of the
+    # optimizer state doesn't depend on total_steps, but we should really get all the info needed
+    # to set up the optimizer before we set up the optimizer.
+    opt = setup_optimizer(training_cfg, total_steps)
+    train_state = train_state.replace(tx=opt)
 
     mesh = setup_sharding(training_cfg.batch_size)
     train_state = train_state.replicate_for_multi_gpu(mesh)
@@ -1383,10 +1376,10 @@ if __name__ == "__main__":
         mdl,
         model_cfg,
         training_cfg,
-        batches_total,
-        epochs_total,
-        batches_per_epoch,
-        extra_batches,
+        total_steps,
+        total_epochs,
+        steps_per_epoch,
+        steps_in_partial_epoch,
         sample_batch_size,
         checkpoint_manager,
         data_offset,
