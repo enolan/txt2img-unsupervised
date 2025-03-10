@@ -27,7 +27,7 @@ from pathlib import Path
 from PIL.PngImagePlugin import PngInfo
 from random import randint
 from tqdm import tqdm, trange
-from typing import List, Tuple
+from typing import List, Tuple, Union
 
 from . import ldm_autoencoder
 from .checkpoint import get_imagemodel_from_checkpoint, load_params
@@ -448,8 +448,8 @@ def mk_png_metadata(
     logit_filter_threshold: float,
     temperature: float,
     force_f32: bool,
-    cond_imgs: List[Tuple[str, float]],
-    cond_txts: List[Tuple[str, float]],
+    cond_imgs: List[Tuple[str, Union[float, None]]],
+    cond_txts: List[Tuple[str, Union[float, None]]],
     checkpoint: str,
     checkpoint_step: int,
 ) -> PngInfo:
@@ -653,14 +653,18 @@ def main():
 
     args.out_dir.mkdir(exist_ok=True, parents=True)
 
+    fmt_cond = lambda d: (
+        d["cond"],
+        float(d["max_cos_distance"]) if d["max_cos_distance"] is not None else None,
+    )
     metadata = mk_png_metadata(
         seed,
         logit_filter_method,
         args.logit_filter_threshold,
         args.temperature,
         args.force_fp32,
-        [(d["cond"], float(d["max_cos_distance"])) for d in cond_img_inputs],
-        [(d["cond"], float(d["max_cos_distance"])) for d in cond_txt_inputs],
+        [fmt_cond(d) for d in cond_img_inputs],
+        [fmt_cond(d) for d in cond_txt_inputs],
         args.transformer_checkpoint_dir.name,
         checkpoint_step,
     )
