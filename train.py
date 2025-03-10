@@ -164,25 +164,32 @@ def json_pretty(dict):
 
 
 def init_train_state(
+    model_cfg: ModelConfig,
+    training_cfg: TrainingConfig,
+    total_steps: int,
     resume_checkpoint_path: Optional[Path] = None,
     finetune_checkpoint_path: Optional[Path] = None,
-    model_config_path: Optional[Path] = None,
-    training_config_path: Optional[Path] = None,
     sample_batch_size: Optional[int] = None,
     start_where_finetune_source_left_off: bool = False,
 ):
-    """Set up our ModelConfig and TrainingConfig, initialize wandb, and create our initial
-    TrainState."""
+    """Set up our initial TrainState using the provided configs.
+
+    Args:
+        model_cfg: The model configuration
+        training_cfg: The training configuration
+        total_steps: Total number of training steps
+        resume_checkpoint_path: Path to checkpoint to resume from, if any
+        finetune_checkpoint_path: Path to checkpoint to finetune from, if any
+        sample_batch_size: Batch size for sampling, if different from training
+        start_where_finetune_source_left_off: Whether to start training from where the finetune source left off
+    """
     checkpoint_options = ocp.CheckpointManagerOptions(
         max_to_keep=3,
         keep_time_interval=datetime.timedelta(hours=6),
         # Async checkpointing can hide out of disk errors, so we disable it.
         enable_async_checkpointing=False,
     )
-    wandb_settings = wandb.Settings(code_dir="txt2img_unsupervised")
-    assert ((resume_checkpoint_path is None) != (finetune_checkpoint_path is None)) or (
-        resume_checkpoint_path is None and finetune_checkpoint_path is None
-    ), "Must specify one of --resume or --finetune or neither, not both"
+
     if resume_checkpoint_path is not None:
         print(f"Resuming from checkpoint {resume_checkpoint_path}...")
         checkpoint_dir = resume_checkpoint_path.absolute()
@@ -192,50 +199,17 @@ def init_train_state(
         # at step 0, if it completed 5 steps, that means it did 0-4 inclusive, so we start at step
         # 5.
         global_step = checkpoint_manager.latest_step()
-        metadata = checkpoint_manager.metadata()
-        model_cfg = ModelConfig.from_json_dict(metadata["model_cfg"])
-        training_cfg = TrainingConfig.from_json_dict(metadata["training_cfg"])
-        run_id = metadata["run_id"]
-        data_offset = metadata.get("data_offset", 0)
-        print(f"Resuming run {run_id}")
-        print(
-            "ALL TRAINING AND MODEL PARAMETERS PASSED ON THE COMMAND LINE WILL BE IGNORED."
-        )
-        print(f"ModelConfig {json_pretty(model_cfg.to_json_dict())}")
-        print(f"TrainingConfig {json_pretty(training_cfg.to_json_dict())}")
-        wandb.init(id=run_id, resume="must", settings=wandb_settings)
+        data_offset = checkpoint_manager.metadata().get("data_offset", 0)
 
         train_state, mdl = TrainState.load_from_checkpoint(
             checkpoint_manager,
             global_step,
-            # we don't know the total number of batches until calculate_steps
-            training_cfg.warmup_steps + 1
-            if training_cfg.warmup_steps is not None
-            else 1,
+            total_steps,
         )
     else:
-        print("Starting new run...")
-        wandb.init(settings=wandb_settings)
-
         global_step = 0
-        # Load model configuration
-        with open(model_config_path) as f:
-            model_cfg = ModelConfig.from_json_dict(json.load(f))
-        config.merge_attrs(model_cfg, args)
-        # Load training configuration
-        with open(training_config_path) as f:
-            training_cfg = TrainingConfig.from_json_dict(json.load(f))
-        config.merge_attrs(training_cfg, args)
-
-        # Send config to wandb
-        wandb.config.update(model_cfg.to_json_dict())
-        wandb.config.update(training_cfg.to_json_dict())
-
-        # Read potentially sweep-controlled parameters from wandb
-        model_cfg = ModelConfig.from_json_dict(wandb.config.as_dict())
-        training_cfg = TrainingConfig.from_json_dict(wandb.config.as_dict())
-        print(f"Model config post-wandb: {json_pretty(model_cfg.to_json_dict())}")
-        print(f"Training config post-wandb: {json_pretty(training_cfg.to_json_dict())}")
+        data_offset = 0
+        extra_metadata = None
 
         if finetune_checkpoint_path is not None:
             finetune_src_checkpoint_dir = finetune_checkpoint_path.absolute()
@@ -254,17 +228,13 @@ def init_train_state(
                     ]
                 )
                 data_offset = ceil(data_offset_examples / training_cfg.batch_size)
-            else:
-                data_offset = 0
+
             extra_metadata = (
                 "finetune_src_config",
                 finetune_src_checkpoint_manager.metadata(),
             )
-        else:
-            data_offset = 0
-            extra_metadata = None
-        # Set up checkpoint manager and initial state
 
+        # Set up checkpoint manager and initial state
         checkpoint_dir = Path(f"checkpoints/{wandb.run.id}").absolute()
         checkpoint_manager, train_state = setup_checkpoint_manager_and_initial_state(
             checkpoint_options,
@@ -273,10 +243,7 @@ def init_train_state(
             model_cfg,
             training_cfg,
             jax.random.PRNGKey(1337),
-            # we don't know the total number of batches until calculate_steps
-            training_cfg.warmup_steps + 1
-            if training_cfg.warmup_steps is not None
-            else 1,
+            total_steps,
             data_offset=data_offset,
             extra_metadata=extra_metadata,
         )
@@ -289,7 +256,7 @@ def init_train_state(
             finetune_src_ts, finetune_src_mdl = TrainState.load_from_checkpoint(
                 finetune_src_checkpoint_manager,
                 finetune_src_checkpoint_manager.latest_step(),
-                1,
+                total_steps,
             )
             finetune_src_params = finetune_src_ts.get_eval_params()
             del finetune_src_ts
@@ -312,14 +279,8 @@ def init_train_state(
 
     print(mdl.tabulate(jax.random.PRNGKey(0), *mdl.dummy_inputs()))
 
-    wandb.define_metric("*", step_metric="global_step")
-    wandb.define_metric("test/loss", summary="last")
-    wandb.define_metric("train/loss", summary="last")
-
     return (
         global_step,
-        model_cfg,
-        training_cfg,
         sample_batch_size,
         checkpoint_manager,
         train_state,
@@ -1298,23 +1259,59 @@ if __name__ == "__main__":
     # Make the RNG partitionable across devices
     jax.config.update("jax_threefry_partitionable", True)
 
-    (
-        global_step,
-        model_cfg,
-        training_cfg,
-        sample_batch_size,
-        checkpoint_manager,
-        train_state,
-        mdl,
-        data_offset,
-    ) = init_train_state(
-        resume_checkpoint_path=args.resume,
-        finetune_checkpoint_path=args.finetune,
-        model_config_path=args.model_config,
-        training_config_path=args.training_config,
-        sample_batch_size=args.sample_batch_size,
-        start_where_finetune_source_left_off=args.start_where_finetune_source_left_off,
-    )
+    wandb_settings = wandb.Settings(code_dir="txt2img_unsupervised")
+
+    # Load and set up configs
+    if args.resume is not None:
+        # Resuming from checkpoint - load configs from checkpoint
+        print(f"Resuming from checkpoint {args.resume}...")
+        checkpoint_dir = args.resume.absolute()
+        checkpoint_options = ocp.CheckpointManagerOptions(
+            max_to_keep=3,
+            keep_time_interval=datetime.timedelta(hours=6),
+            enable_async_checkpointing=False,
+        )
+        checkpoint_manager = mk_checkpoint_manager(checkpoint_dir, checkpoint_options)
+        metadata = checkpoint_manager.metadata()
+        model_cfg = ModelConfig.from_json_dict(metadata["model_cfg"])
+        training_cfg = TrainingConfig.from_json_dict(metadata["training_cfg"])
+        run_id = metadata["run_id"]
+
+        print(f"Resuming run {run_id}")
+        print(
+            "ALL TRAINING AND MODEL PARAMETERS PASSED ON THE COMMAND LINE WILL BE IGNORED."
+        )
+        print(f"ModelConfig {json_pretty(model_cfg.to_json_dict())}")
+        print(f"TrainingConfig {json_pretty(training_cfg.to_json_dict())}")
+
+        wandb.init(id=run_id, resume="must", settings=wandb_settings)
+    else:
+        print("Starting new run...")
+
+        wandb.init(settings=wandb_settings)
+
+        with open(args.model_config) as f:
+            model_cfg = ModelConfig.from_json_dict(json.load(f))
+        config.merge_attrs(model_cfg, args)
+
+        with open(args.training_config) as f:
+            training_cfg = TrainingConfig.from_json_dict(json.load(f))
+        config.merge_attrs(training_cfg, args)
+
+        # Send config to wandb
+        wandb.config.update(model_cfg.to_json_dict())
+        wandb.config.update(training_cfg.to_json_dict())
+
+        # Read potentially sweep-controlled parameters from wandb
+        model_cfg = ModelConfig.from_json_dict(wandb.config.as_dict())
+        training_cfg = TrainingConfig.from_json_dict(wandb.config.as_dict())
+        print(f"Model config post-wandb: {json_pretty(model_cfg.to_json_dict())}")
+        print(f"Training config post-wandb: {json_pretty(training_cfg.to_json_dict())}")
+
+    # Set up wandb metrics
+    wandb.define_metric("*", step_metric="global_step")
+    wandb.define_metric("test/loss", summary="last")
+    wandb.define_metric("train/loss", summary="last")
 
     train_imgs, test_imgs = load_dataset(args.pq_dir)
 
@@ -1336,13 +1333,22 @@ if __name__ == "__main__":
         f"Training for {total_steps * training_cfg.batch_size} images in {total_steps} steps over {complete_epochs} full epochs plus {steps_in_partial_epoch if steps_in_partial_epoch is not None else 0} extra batches"
     )
 
-    # Reconfigure optimizer now that we know the total number of batches
-    # TODO this is a super dubious thing to be doing. We should ideally always set the optimizer
-    # state and the optimizer itself at the same time. It's fine so long as the shape of the
-    # optimizer state doesn't depend on total_steps, but we should really get all the info needed
-    # to set up the optimizer before we set up the optimizer.
-    opt = setup_optimizer(training_cfg, total_steps)
-    train_state = train_state.replace(tx=opt)
+    (
+        global_step,
+        sample_batch_size,
+        checkpoint_manager,
+        train_state,
+        mdl,
+        data_offset,
+    ) = init_train_state(
+        model_cfg=model_cfg,
+        training_cfg=training_cfg,
+        total_steps=total_steps,
+        resume_checkpoint_path=args.resume,
+        finetune_checkpoint_path=args.finetune,
+        sample_batch_size=args.sample_batch_size,
+        start_where_finetune_source_left_off=args.start_where_finetune_source_left_off,
+    )
 
     mesh = setup_sharding(training_cfg.batch_size)
     train_state = train_state.replicate_for_multi_gpu(mesh)
