@@ -20,7 +20,11 @@
 - Use pytest for testing with descriptive test names (test_function_does_x)
 - Use custom pytest markers for tests with special requirements
 - When the code is doing something that isn't obvious, add comments to explain it.
-- Never write comments that are just repeating what the code does.
+- NEVER write comments that are just repeating what the code does. If a comment wouldn't give the
+  reader any information that reading the code wouldn't already provide, then it's not needed.
+- Prefer functional code with minimal state. Small, independent functions that have a clear purpose
+  are easier to understand and test.
+- When state is necessary, use classes to manage it. Use dataclasses where they make sense.
 
 ## JAX-specific reminders
 - Pay attention to the special requirements for traced JAX functions:
