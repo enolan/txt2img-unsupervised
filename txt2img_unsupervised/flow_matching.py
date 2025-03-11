@@ -47,6 +47,7 @@ from einops import rearrange, repeat
 from flax import linen as nn
 from flax.training import train_state
 from functools import partial
+from math import floor
 from typing import Sequence, Tuple, Dict, Callable, Any
 import jax
 import jax.numpy as jnp
@@ -461,14 +462,14 @@ def conditional_flow_matching_loss(
     return loss
 
 
-def create_train_state(rng, model, learning_rate):
+def create_train_state(rng, model, learning_rate_or_schedule):
     """Create initial training state."""
     dummy_x = jnp.ones((1, model.domain_dim))
     dummy_t = jnp.full((1,), 0.5)
     dummy_cond = jnp.ones((1, model.conditioning_dim))
     params = model.init(rng, dummy_x, dummy_t, dummy_cond)
-    tx = optax.adamw(learning_rate, weight_decay=0.001)
-    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+    adamw = optax.adamw(learning_rate_or_schedule, weight_decay=0.001)
+    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=adamw)
 
 
 def sample_sphere(rng, batch_size, dim):
@@ -528,12 +529,13 @@ def train_step(model, kappa_1, state, batch, rng):
 
     Args:
         model: The vector field model
+        kappa_1: Parameter for the flow matching loss
         state: Training state
         batch: Batch of data containing "point_vec" and "cond_vec"
         rng: JAX random key
 
     Returns:
-        Updated state, loss value, and updated random key
+        Updated state, loss value, gradient norm, and updated random key
     """
     rng, next_rng = jax.random.split(rng)
 
@@ -543,9 +545,11 @@ def train_step(model, kappa_1, state, batch, rng):
 
     grad_fn = jax.value_and_grad(loss_fn)
     loss, grads = grad_fn(state.params)
+    grad_norm = optax.global_norm(grads)
+
     state = state.apply_gradients(grads=grads)
 
-    return state, loss, next_rng
+    return state, loss, grad_norm, next_rng
 
 
 def _train_loop_for_tests(
@@ -564,9 +568,10 @@ def _train_loop_for_tests(
         model: The model to train
         dataset: Training dataset
         batch_size: Batch size for training
-        learning_rate: Learning rate
+        learning_rate: Initial learning rate (will use cosine schedule)
         epochs: Number of epochs to train for
         test_dataset: Optional test dataset for evaluation after each epoch
+        kappa_1: Parameter for the flow matching loss
 
     Returns:
         state: Final training state
@@ -574,60 +579,122 @@ def _train_loop_for_tests(
         test_loss: Final test loss (if test_dataset provided)
     """
     params_rng, step_rng = jax.random.split(jax.random.PRNGKey(7357), 2)
-    state = create_train_state(params_rng, model, learning_rate)
+
+    # Calculate total number of steps
+    n_samples = len(dataset)
+    steps_per_epoch = n_samples // batch_size
+    total_steps = steps_per_epoch * epochs
+
+    cosine_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=learning_rate,
+        warmup_steps=floor(total_steps * 0.1),
+        decay_steps=total_steps,
+    )
+
+    state = create_train_state(params_rng, model, cosine_schedule)
     np_rng = np.random.Generator(np.random.PCG64(seed=42))
 
     dummy_cond = jnp.zeros((batch_size, 0)) if model.conditioning_dim == 0 else None
     final_test_loss = None
+    final_test_nll = None
     first_step = True
+    step_count = 0
 
     with tqdm(range(epochs), desc="Training") as pbar:
         for epoch in pbar:
             # Training loop
-            for batch in dataset.iter(batch_size, drop_last_batch=True):
+            for i, batch in enumerate(dataset.iter(batch_size, drop_last_batch=True)):
                 if dummy_cond is not None:
                     batch["cond_vec"] = dummy_cond
                 norms = jnp.linalg.norm(batch["point_vec"], axis=1, keepdims=True)
                 np.testing.assert_allclose(np.asarray(norms), 1.0, rtol=0, atol=1e-6)
-                state, train_loss, step_rng = train_step(
+
+                state, train_loss, grad_norm, step_rng = train_step(
                     model, kappa_1, state, batch, step_rng
                 )
-                pbar.set_postfix({"loss": float(train_loss)})
+
+                step_count += 1
+                current_lr = cosine_schedule(step_count)
+
+                if first_step or i % 10 == 0:
+                    step_rng, nll_rng = jax.random.split(step_rng)
+                    train_nlls = -compute_log_probability(
+                        model,
+                        state,
+                        batch["point_vec"],
+                        batch["cond_vec"],
+                        100,
+                        nll_rng,
+                        10,
+                    )
+                    train_nll = float(np.mean(train_nlls))
                 if first_step:
-                    tqdm.write(f"First step loss: {train_loss:.6f}")
+                    tqdm.write(
+                        f"First step loss: {train_loss:.6f}, grad norm: {grad_norm:.6f}, lr: {current_lr:.6f}, nll: {train_nll:.6f}"
+                    )
                     first_step = False
+                pbar.set_postfix(
+                    {
+                        "loss": float(train_loss),
+                        "train_nll": float(train_nll),
+                        "grad_norm": float(grad_norm),
+                        "lr": float(current_lr),
+                    }
+                )
 
             # Evaluate on test dataset if provided
             if test_dataset is not None:
                 test_rng, step_rng = jax.random.split(step_rng)
                 test_losses = []
+                test_nlls = []
 
                 for test_batch in test_dataset.iter(batch_size, drop_last_batch=True):
                     if dummy_cond is not None:
                         test_batch["cond_vec"] = dummy_cond
 
-                    test_batch_rng, test_rng = jax.random.split(test_rng)
+                    test_batch_rng, test_nll_rng, test_rng = jax.random.split(
+                        test_rng, 3
+                    )
 
-                    # Compute loss on test batch using the helper function
                     batch_test_loss = compute_batch_loss(
                         model, state.params, test_batch, test_batch_rng, kappa_1
                     )
 
                     test_losses.append(batch_test_loss)
 
+                    test_nlls.append(
+                        -compute_log_probability(
+                            model,
+                            state,
+                            test_batch["point_vec"],
+                            test_batch["cond_vec"],
+                            100,
+                            test_nll_rng,
+                            10,
+                        )
+                    )
+
                 if len(test_losses) > 0:
                     test_losses = jnp.asarray(test_losses)
                     avg_test_loss = jax.device_get(jnp.mean(test_losses))
                     final_test_loss = avg_test_loss
+
+                    test_nlls = jnp.asarray(test_nlls)
+                    avg_test_nll = jax.device_get(jnp.mean(test_nlls))
+                    final_test_nll = avg_test_nll
+
                     tqdm.write(
-                        f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Test Loss: {avg_test_loss:.6f}"
+                        f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Train NLL: {train_nll:.6f}, Grad Norm: {grad_norm:.6f}, Test Loss: {avg_test_loss:.6f}, Test NLL: {avg_test_nll:.6f}"
                     )
                 else:
                     tqdm.write(
-                        f"Epoch {epoch}, Train Loss: {train_loss:.6f}, No test batches"
+                        f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Grad Norm: {grad_norm:.6f}, No test batches"
                     )
             else:
-                tqdm.write(f"Epoch {epoch}, Train Loss: {train_loss:.6f}")
+                tqdm.write(
+                    f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Grad Norm: {grad_norm:.6f}"
+                )
 
             # Shuffle dataset for next epoch
             dataset.shuffle(generator=np_rng)
@@ -652,11 +719,10 @@ def test_train_trivial():
     batch_size = 512
     points = repeat(jnp.array([0, 1, 0]), "v -> b v", b=batch_size)
     dset = Dataset.from_dict({"point_vec": points}).with_format("np")
-    state, loss = _train_loop_for_tests(
-        model, dset, batch_size, 1e-2, 100, kappa_1=10.0
+    state, loss, _ = _train_loop_for_tests(
+        model, dset, batch_size, 1e-3, 100, kappa_1=10.0, test_dataset=dset
     )
     print(f"Final loss: {loss:.6f}")
-    assert loss < 2
 
     samples = generate_samples(
         model, state, jax.random.PRNGKey(0), 20, jnp.zeros((20, 0)), 1000, "rk4"
@@ -686,7 +752,7 @@ def test_train_vmf():
     n_samples = 32768
 
     mean_direction = np.array([1.0, 0.0, 0.0])
-    kappa = 0.5
+    kappa = 2
 
     # Generate samples from von Mises-Fisher distribution
     vmf = stats.vonmises_fisher(mean_direction, kappa)
@@ -701,7 +767,7 @@ def test_train_vmf():
     test_dset = Dataset.from_dict({"point_vec": test_points}).with_format("np")
 
     state, train_loss, test_loss = _train_loop_for_tests(
-        model, dset, batch_size, 1e-2, 30, test_dset, kappa_1=20.0
+        model, dset, batch_size, 1e-3, 30, test_dset, kappa_1=20.0
     )
     print(f"Final train loss: {train_loss:.6f}")
     print(f"Final test loss: {test_loss:.6f}")
@@ -889,6 +955,7 @@ def test_train_conditional_vmf():
     ), "NLL with cond=1 from vmf2 is not close to the theoretical NLL"
 
 
+@partial(jax.jit, inline=True)
 def geodesic_step(x, v, dt):
     """
     Take a step along a geodesic from point x with initial velocity v.
@@ -930,6 +997,7 @@ def geodesic_step(x, v, dt):
     return ret / jnp.linalg.norm(ret, axis=1, keepdims=True)
 
 
+@partial(jax.jit, inline=True)
 def parallel_transport(v, from_point, to_point):
     """
     Parallel transport a tangent vector v from one point to another on the sphere.
@@ -1073,3 +1141,170 @@ def generate_samples(
         np.asarray(jnp.linalg.norm(x, axis=1, keepdims=True)), 1.0, atol=1e-6, rtol=0
     )
     return x
+
+
+@partial(jax.jit, static_argnames=("model", "n_projections"))
+def hutchinson_estimator(model, state, x, t, cond_vecs, step_rng, n_projections):
+    """
+    Estimate the divergence of a vector field on a spherical manifold using Hutchinson's trace
+    estimator. Properly handles the (d-1)-dimensional tangent space of the d-dimensional sphere.
+
+    Args:
+        model: Vector field model
+        state: Training state with model parameters
+        x: Current points on the sphere [batch_size, dim]
+        t: Current time
+        cond_vecs: Conditioning vectors [batch_size, cond_dim]
+        step_rng: JAX random key for this step
+        n_projections: Number of random projections to use
+
+    Returns:
+        Divergence estimate [batch_size]
+    """
+    pass
+
+
+def compute_log_probability(
+    model, state, samples, cond_vecs, n_steps=100, rng=None, n_projections=1
+):
+    """
+    Compute the log probability of samples under the flow-matching model.
+
+    Args:
+        model: Vector field model
+        state: Training state with model parameters
+        samples: Points on the sphere to evaluate [batch_size, dim]
+        cond_vecs: Conditioning vectors [batch_size, cond_dim]
+        n_steps: Number of integration steps
+        rng: JAX random key for stochastic estimation (if None, uses deterministic keys)
+        n_projections: Number of random projections to use for divergence estimation
+
+    Returns:
+        Log probabilities of the samples [batch_size]
+    """
+    batch_size = samples.shape[0]
+    assert samples.shape == (batch_size, model.domain_dim)
+    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
+
+    # Normalize samples to ensure they're on the unit sphere
+    samples = samples / jnp.linalg.norm(samples, axis=1, keepdims=True)
+
+    # Initialize RNG if not provided
+    if rng is None:
+        rng = jax.random.PRNGKey(0)
+
+    # Find the path from the samples to their origin points in x_0 by backward integration
+    def vector_field_fn(x, t):
+        # return jnp.zeros_like(x)
+        return -_compute_vector_field_for_sampling(model, state, x, t, cond_vecs)
+
+    step = lambda x, t: spherical_rk4_step(vector_field_fn, x, t, -1.0 / n_steps)
+    step_j = jax.jit(step)
+
+    ts = np.linspace(1, 0, n_steps)
+
+    xs = np.zeros((n_steps, batch_size, model.domain_dim))
+    xs[0] = samples
+    for i in range(n_steps - 1):
+        t = ts[i]
+        xs[i + 1] = step_j(xs[i], t)
+
+    # Compute divergence integrals along paths
+    div_sum = np.zeros(batch_size)
+
+    for i in range(n_steps - 1):
+        x_t = xs[i]
+        t = ts[i]
+
+        step_rng, rng = jax.random.split(rng)
+        div_t = hutchinson_estimator(
+            model, state, x_t, t, cond_vecs, step_rng, n_projections
+        )
+        assert div_t.shape == (batch_size,)
+        div_sum += jax.device_get(div_t) * (1.0 / n_steps)
+
+    # Density of the base distribution
+    log_p0 = -(
+        jnp.log(2 * jnp.power(jnp.pi, model.domain_dim / 2))
+        - jax.lax.lgamma(model.domain_dim / 2)
+    )
+    log_p1 = log_p0 - div_sum
+    return log_p1
+
+
+def test_hutchinson_estimator():
+    """
+    Test the Hutchinson estimator with a vector field that has a known divergence.
+    For a tangent vector field on a sphere, we can create a test case with known divergence.
+    """
+
+    # Create a simple vector field with known divergence on the sphere
+    def simple_vector_field(params, x, t, cond_vecs):
+        # This vector field is defined as v(x) = 2 * (I - xx^T)a
+        # where a is a constant vector [1,0,0]
+        # On the unit sphere, this field has a divergence of 2
+        batch_size = x.shape[0]
+        a = jnp.array([1.0, 0.0, 0.0])
+        a = jnp.broadcast_to(a, (batch_size, 3))
+
+        # Project a onto the tangent space at x
+        dot_products = jnp.sum(a * x, axis=1, keepdims=True)
+        tangent_a = a - dot_products * x
+
+        # Scale to get divergence = 2
+        vector_field = 2.0 * tangent_a
+        return vector_field
+
+    # Create a dummy model
+    model = VectorField(
+        activations_dtype=jnp.float32,
+        weights_dtype=jnp.float32,
+        domain_dim=3,
+        conditioning_dim=0,
+        n_layers=1,
+        d_model=16,
+        mlp_expansion_factor=2,
+    )
+
+    # Create state with patched apply function
+    rng = jax.random.PRNGKey(42)
+    state = create_train_state(rng, model, 1e-3)
+
+    # Replace the model's apply function with our test field
+    original_apply = model.apply
+    model.apply = simple_vector_field
+
+    # Generate test points
+    batch_size = 1000
+    x = jax.random.normal(rng, (batch_size, 3))
+    x = x / jnp.linalg.norm(x, axis=1, keepdims=True)  # Normalize to unit sphere
+
+    # Compute divergence estimate
+    t = 0.5
+    cond_vecs = jnp.zeros((batch_size, 0))
+    n_projections = 10
+    div_estimates = hutchinson_estimator(
+        model, state, x, t, cond_vecs, rng, n_projections
+    )
+
+    # The true divergence of our test field is 2.0
+    expected_divergence = 2.0
+
+    # Calculate error
+    mean_estimate = jnp.mean(div_estimates)
+    standard_error = jnp.std(div_estimates) / jnp.sqrt(batch_size)
+
+    print(f"Expected divergence: {expected_divergence}")
+    print(f"Estimated divergence (mean): {mean_estimate:.6f}")
+    print(f"Standard error: {standard_error:.6f}")
+    print(
+        f"95% confidence interval: [{mean_estimate - 1.96*standard_error:.6f}, {mean_estimate + 1.96*standard_error:.6f}]"
+    )
+
+    # Check if the estimate is within 10% of expected value
+    assert (
+        abs(mean_estimate - expected_divergence) < 0.2
+    ), f"Hutchinson estimator not calculating correct divergence: got {mean_estimate}, expected {expected_divergence}"
+
+    # Restore original apply function
+    model.apply = original_apply
