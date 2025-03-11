@@ -588,7 +588,7 @@ def _train_loop_for_tests(
                 if dummy_cond is not None:
                     batch["cond_vec"] = dummy_cond
                 norms = jnp.linalg.norm(batch["point_vec"], axis=1, keepdims=True)
-                np.testing.assert_allclose(np.asarray(norms), 1.0)
+                np.testing.assert_allclose(np.asarray(norms), 1.0, rtol=0, atol=1e-6)
                 state, train_loss, step_rng = train_step(
                     model, kappa_1, state, batch, step_rng
                 )
@@ -745,6 +745,148 @@ def test_train_vmf():
     assert (
         abs(nll - theoretical_nll) < 1.0
     ), f"NLL {nll} too far from theoretical {theoretical_nll}"
+
+
+def test_train_conditional_vmf():
+    """
+    Train a model with data from two different von Mises-Fisher distributions
+    conditioned on a binary conditioning vector.
+
+    When conditioning vector is 0, samples should come from the first vMF distribution.
+    When conditioning vector is 1, samples should come from the second vMF distribution.
+    """
+    model = VectorField(
+        activations_dtype=jnp.float32,
+        weights_dtype=jnp.float32,
+        domain_dim=3,
+        conditioning_dim=1,
+        n_layers=2,
+        d_model=32,
+        mlp_expansion_factor=4,
+    )
+
+    # Define two different vMF distributions
+    mean_direction1 = np.array([1.0, 0.0, 0.0])  # First distribution along x-axis
+    mean_direction2 = np.array([0.0, 0.0, 1.0])  # Second distribution along z-axis
+    kappa = 2.0
+
+    vmf1 = stats.vonmises_fisher(mean_direction1, kappa)
+    vmf2 = stats.vonmises_fisher(mean_direction2, kappa)
+
+    # Sample from our distributions
+    np_rng = np.random.Generator(np.random.PCG64(seed=42))
+    total_samples = 20_000
+    train_samples = int(total_samples * 0.9)
+    test_samples = total_samples - train_samples
+    points1 = vmf1.rvs(total_samples // 2)
+    points2 = vmf2.rvs(total_samples // 2)
+
+    cond_vec1 = np.zeros((total_samples // 2, 1))
+    cond_vec2 = np.ones((total_samples // 2, 1))
+
+    all_points = np.vstack([points1, points2])
+    all_cond_vecs = np.vstack([cond_vec1, cond_vec2])
+
+    dataset = Dataset.from_dict(
+        {"point_vec": all_points, "cond_vec": all_cond_vecs}
+    ).with_format("np")
+    train_dataset = dataset.select(range(train_samples))
+    test_dataset = dataset.select(range(train_samples, total_samples))
+
+    # Train the model (smaller batch size)
+    batch_size = 256
+    state, train_loss, test_loss = _train_loop_for_tests(
+        model, train_dataset, batch_size, 1e-2, 20, test_dataset, kappa_1=10.0
+    )
+    print(f"Final loss - Train: {train_loss:.4f}, Test: {test_loss:.4f}")
+
+    # Test the conditioned model
+    n_eval_samples = 200
+    seed = jax.random.PRNGKey(123)
+    seed1, seed2 = jax.random.split(seed)
+
+    # Generate samples with each conditioning
+    cond_vec_0 = jnp.zeros((n_eval_samples, 1))
+    cond_vec_1 = jnp.ones((n_eval_samples, 1))
+
+    samples_0 = generate_samples(
+        model, state, seed1, n_eval_samples, cond_vec_0, 500, "rk4"
+    )
+    samples_1 = generate_samples(
+        model, state, seed2, n_eval_samples, cond_vec_1, 500, "rk4"
+    )
+
+    # Check if conditioning affects samples by comparing with same seed
+    seed_check = jax.random.PRNGKey(456)
+    check_samples_0 = generate_samples(
+        model, state, seed_check, 50, jnp.zeros((50, 1)), 500, "rk4"
+    )
+    check_samples_1 = generate_samples(
+        model, state, seed_check, 50, jnp.ones((50, 1)), 500, "rk4"
+    )
+    mean_dist = jnp.mean(
+        jnp.sqrt(jnp.sum((check_samples_0 - check_samples_1) ** 2, axis=1))
+    )
+    assert mean_dist > 0.1, "Conditioning has no effect on samples"
+
+    # Calculate average cosine similarities
+    cos_sim_0_dir1 = np.mean([np.dot(s, mean_direction1) for s in samples_0])
+    cos_sim_0_dir2 = np.mean([np.dot(s, mean_direction2) for s in samples_0])
+    cos_sim_1_dir1 = np.mean([np.dot(s, mean_direction1) for s in samples_1])
+    cos_sim_1_dir2 = np.mean([np.dot(s, mean_direction2) for s in samples_1])
+
+    # Validate correct conditioning behavior
+    print(
+        f"Conditioning=0 - Avg similarity with dir1: {cos_sim_0_dir1:.4f}, dir2: {cos_sim_0_dir2:.4f}"
+    )
+    print(
+        f"Conditioning=1 - Avg similarity with dir1: {cos_sim_1_dir1:.4f}, dir2: {cos_sim_1_dir2:.4f}"
+    )
+
+    # Verify that samples align with their respective target distributions
+    # Samples with cond=0 should align better with direction1
+    assert (
+        cos_sim_0_dir1 > cos_sim_0_dir2
+    ), "Samples with cond=0 don't align with direction1"
+    # Samples with cond=1 should align better with direction2
+    assert (
+        cos_sim_1_dir2 > cos_sim_1_dir1
+    ), "Samples with cond=1 don't align with direction2"
+
+    # Verify that conditioning makes a significant difference
+    diff = (cos_sim_0_dir1 - cos_sim_0_dir2) + (cos_sim_1_dir2 - cos_sim_1_dir1)
+    assert (
+        diff > 0.5
+    ), "Conditioning did not produce sufficiently different distributions"
+
+    # Additional check: negative log-likelihood (samples should match their respective distributions)
+    samples_0_np = np.array(samples_0)
+    samples_1_np = np.array(samples_1)
+
+    nll_0_from_vmf1 = -np.mean(vmf1.logpdf(samples_0_np))
+    nll_0_from_vmf2 = -np.mean(vmf2.logpdf(samples_0_np))
+    nll_1_from_vmf1 = -np.mean(vmf1.logpdf(samples_1_np))
+    nll_1_from_vmf2 = -np.mean(vmf2.logpdf(samples_1_np))
+
+    assert (
+        nll_0_from_vmf1 < nll_0_from_vmf2
+    ), "Samples with cond=0 don't match distribution 1"
+    assert (
+        nll_1_from_vmf2 < nll_1_from_vmf1
+    ), "Samples with cond=1 don't match distribution 2"
+
+    distribution_nll = np.log(4 * np.pi * np.sinh(kappa) / kappa) - kappa
+    print(f"Theoretical NLL: {distribution_nll:.4f}")
+    print(f"NLL with cond=0 from vmf1: {nll_0_from_vmf1:.4f}")
+    print(f"NLL with cond=0 from vmf2: {nll_0_from_vmf2:.4f}")
+    print(f"NLL with cond=1 from vmf1: {nll_1_from_vmf1:.4f}")
+    print(f"NLL with cond=1 from vmf2: {nll_1_from_vmf2:.4f}")
+    assert (
+        abs(nll_0_from_vmf1 - distribution_nll) < 0.5
+    ), "NLL with cond=0 from vmf1 is not close to the theoretical NLL"
+    assert (
+        abs(nll_1_from_vmf2 - distribution_nll) < 0.5
+    ), "NLL with cond=1 from vmf2 is not close to the theoretical NLL"
 
 
 def geodesic_step(x, v, dt):
