@@ -50,6 +50,7 @@ from functools import partial
 from math import floor
 from typing import Sequence, Tuple, Dict, Callable, Any
 import jax
+import jax.lax
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -1225,6 +1226,70 @@ def exact_divergence(model, state, x, t, cond_vecs, step_rng=None, n_projections
     return jax.vmap(divergence_single)(x, cond_vecs)
 
 
+@partial(jax.jit, static_argnames=("model", "n_steps", "n_projections"))
+def _reverse_path_and_compute_divergence(
+    model, model_state, samples, cond_vecs, n_steps, rng, n_projections=1
+):
+    """
+    Compute the reverse path and integrate the divergence.
+
+    Args:
+        model: Vector field model
+        model_state: Training state with model parameters
+        samples: Points on the sphere to evaluate [batch_size, dim]
+        cond_vecs: Conditioning vectors [batch_size, cond_dim]
+        n_steps: Number of integration steps
+        rng: JAX random key for stochastic estimation
+        n_projections: Number of random projections to use for divergence estimation
+
+    Returns:
+        div_sum: Integrated divergence along the path [batch_size]
+    """
+    batch_size = samples.shape[0]
+    assert samples.shape == (batch_size, model.domain_dim)
+    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
+
+    ts = jnp.linspace(1.0, 0.0, n_steps)
+
+    # Initialize state for fori_loop
+    # We'll track the current position and the accumulated divergence
+    x_t = samples
+    div_sum = jnp.zeros(batch_size)
+
+    # Loop going backwards in time while accumulating the divergence
+    def body_fun(i, loop_state):
+        x_t, div_sum, rng = loop_state
+        t = ts[i]
+
+        # Compute divergence at current point
+        step_rng, rng = jax.random.split(rng)
+        div_t = exact_divergence(
+            model, model_state, x_t, t, cond_vecs, step_rng, n_projections
+        )
+        div_sum = div_sum + div_t * (1.0 / n_steps)
+
+        # Take a step backward along the path
+        next_x = spherical_rk4_step_with_model(
+            model,
+            model_state,
+            x_t,
+            t,
+            -1.0 / n_steps,
+            cond_vecs,
+            negate_vector_field=True,
+        )
+
+        return next_x, div_sum, rng
+
+    # Run the loop
+    init_state = (x_t, div_sum, rng)
+    final_x, final_div_sum, final_rng = jax.lax.fori_loop(
+        0, n_steps - 1, body_fun, init_state
+    )
+
+    return jax.device_get(final_div_sum)
+
+
 def compute_log_probability(
     model, state, samples, cond_vecs, n_steps=100, rng=None, n_projections=1
 ):
@@ -1247,41 +1312,15 @@ def compute_log_probability(
     assert samples.shape == (batch_size, model.domain_dim)
     assert cond_vecs.shape == (batch_size, model.conditioning_dim)
 
+    if rng is None:
+        rng = jax.random.PRNGKey(0)
     # Normalize samples to ensure they're on the unit sphere
     samples = samples / jnp.linalg.norm(samples, axis=1, keepdims=True)
 
-    # Initialize RNG if not provided
-    if rng is None:
-        rng = jax.random.PRNGKey(0)
-
-    # Find the path from the samples to their origin points in x_0 by backward integration
-    def vector_field_fn(x, t):
-        # return jnp.zeros_like(x)
-        return -_compute_vector_field_for_sampling(model, state, x, t, cond_vecs)
-
-    ts = np.linspace(1, 0, n_steps)
-
-    xs = np.zeros((n_steps, batch_size, model.domain_dim))
-    xs[0] = samples
-    for i in range(n_steps - 1):
-        t = ts[i]
-        xs[i + 1] = spherical_rk4_step_with_model(
-            model, state, xs[i], t, -1.0 / n_steps, cond_vecs, negate_vector_field=True
-        )
-
-    # Compute divergence integrals along paths
-    div_sum = np.zeros(batch_size)
-
-    for i in range(n_steps - 1):
-        x_t = xs[i]
-        t = ts[i]
-
-        step_rng, rng = jax.random.split(rng)
-        div_t = exact_divergence(
-            model, state, x_t, t, cond_vecs, step_rng, n_projections
-        )
-        assert div_t.shape == (batch_size,)
-        div_sum += jax.device_get(div_t) * (1.0 / n_steps)
+    # Compute the reverse path and integrate divergence in a single loop
+    div_sum = _reverse_path_and_compute_divergence(
+        model, state, samples, cond_vecs, n_steps, rng, n_projections
+    )
 
     # Density of the base distribution
     log_p0 = -(
