@@ -53,6 +53,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 from scipy import stats
 from tqdm import tqdm
 
@@ -717,10 +718,10 @@ def test_train_trivial():
         mlp_expansion_factor=4,
     )
     batch_size = 512
-    points = repeat(jnp.array([0, 1, 0]), "v -> b v", b=batch_size)
+    points = repeat(jnp.array([1, 0, 0]), "v -> b v", b=batch_size * 10)
     dset = Dataset.from_dict({"point_vec": points}).with_format("np")
     state, loss, _ = _train_loop_for_tests(
-        model, dset, batch_size, 1e-3, 100, kappa_1=10.0, test_dataset=dset
+        model, dset, batch_size, 1e-3, 10, kappa_1=10.0, test_dataset=dset
     )
     print(f"Final loss: {loss:.6f}")
 
@@ -728,7 +729,7 @@ def test_train_trivial():
         model, state, jax.random.PRNGKey(0), 20, jnp.zeros((20, 0)), 1000, "rk4"
     )
     for sample in samples:
-        cos_sim = jnp.dot(sample, jnp.array([0, 1, 0]))
+        cos_sim = jnp.dot(sample, points[0])
         print(
             f"Sample: [{sample[0]:9.6f}, {sample[1]:9.6f}, {sample[2]:9.6f}]  Cosine similarity: {cos_sim:9.6f}"
         )
@@ -893,6 +894,7 @@ def test_train_conditional_vmf():
     mean_dist = jnp.mean(
         jnp.sqrt(jnp.sum((check_samples_0 - check_samples_1) ** 2, axis=1))
     )
+
     assert mean_dist > 0.1, "Conditioning has no effect on samples"
 
     # Calculate average cosine similarities
@@ -1076,6 +1078,20 @@ def spherical_rk4_step(f, x, t, dt):
 
 
 @partial(jax.jit, static_argnames=("model",))
+def spherical_rk4_step_with_model(
+    model, state, x, t, dt, cond_vecs, negate_vector_field=False
+):
+    vector_field_multiplier = jax.lax.cond(
+        negate_vector_field, lambda: -1.0, lambda: 1.0
+    )
+    vector_field_fn = (
+        lambda x, t: vector_field_multiplier
+        * _compute_vector_field_for_sampling(model, state, x, t, cond_vecs)
+    )
+    return spherical_rk4_step(vector_field_fn, x, t, dt)
+
+
+@partial(jax.jit, static_argnames=("model",))
 def _compute_vector_field_for_sampling(model, state, x, t, cond_vecs):
     return model.apply(state.params, x, jnp.full((x.shape[0],), t), cond_vecs)
 
@@ -1129,11 +1145,11 @@ def generate_samples(
             x = geodesic_step(x, v2, dt)
     elif method == "rk4":
         # 4th order Runge-Kutta method
-        step = lambda x, t: spherical_rk4_step(vector_field_fn, x, t, dt)
-        step_j = jax.jit(step)
         for i in range(n_steps):
             t = i * dt
-            x = step_j(x, t)
+            x = spherical_rk4_step_with_model(
+                model, state, x, t, dt, cond_vecs, negate_vector_field=False
+            )
     else:
         raise ValueError(f"Unknown ODE solver method: {method}")
 
@@ -1162,6 +1178,51 @@ def hutchinson_estimator(model, state, x, t, cond_vecs, step_rng, n_projections)
         Divergence estimate [batch_size]
     """
     pass
+
+
+@partial(jax.jit, static_argnames=("model",))
+def exact_divergence(model, state, x, t, cond_vecs, step_rng=None, n_projections=None):
+    """
+    Compute the exact divergence of a vector field on a spherical manifold.
+    Has the same interface as hutchinson_estimator for easy substitution.
+
+    Args:
+        model: Vector field model
+        state: Training state with model parameters
+        x: Current points on the sphere [batch_size, dim]
+        t: Current time (scalar)
+        cond_vecs: Conditioning vectors [batch_size, cond_dim]
+        step_rng: JAX random key (unused, but kept for interface compatibility)
+        n_projections: Number of random projections (unused, but kept for interface compatibility)
+
+    Returns:
+        Exact divergence [batch_size]
+    """
+    batch_size, dim = x.shape
+    assert dim == model.domain_dim
+    assert isinstance(t, float) or (isinstance(t, jnp.ndarray) and t.shape == ())
+    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
+
+    # Helper to compute divergence for a single instance.
+    def divergence_single(x_i, cond):
+        # Define a function f: R^(dim) -> R^(dim) that wraps model.apply.
+        # We add a batch dimension of 1 to x, t, and cond.
+        def f(x_single):
+            # x_single has shape [dim], so we reshape to [1, dim]
+            # t is a scalar; we wrap it as [t] to form a batch of one.
+            # cond has shape [cond_dim] and we reshape it to [1, cond_dim].
+            return model.apply(
+                state.params, x_single[None, :], jnp.array([t]), cond[None, :]
+            )[0]
+
+        # Compute the Jacobian (of shape [dim, dim]) with respect to x_i.
+        jac = jax.jacfwd(f)(x_i)
+        # The intrinsic divergence on the sphere is given by the trace of the projected Jacobian:
+        #   divergence = trace(Df) - x^T (Df) x
+        return jnp.trace(jac) - jnp.dot(x_i, jac @ x_i)
+
+    # Vectorize the divergence computation over the batch dimension.
+    return jax.vmap(divergence_single)(x, cond_vecs)
 
 
 def compute_log_probability(
@@ -1198,16 +1259,15 @@ def compute_log_probability(
         # return jnp.zeros_like(x)
         return -_compute_vector_field_for_sampling(model, state, x, t, cond_vecs)
 
-    step = lambda x, t: spherical_rk4_step(vector_field_fn, x, t, -1.0 / n_steps)
-    step_j = jax.jit(step)
-
     ts = np.linspace(1, 0, n_steps)
 
     xs = np.zeros((n_steps, batch_size, model.domain_dim))
     xs[0] = samples
     for i in range(n_steps - 1):
         t = ts[i]
-        xs[i + 1] = step_j(xs[i], t)
+        xs[i + 1] = spherical_rk4_step_with_model(
+            model, state, xs[i], t, -1.0 / n_steps, cond_vecs, negate_vector_field=True
+        )
 
     # Compute divergence integrals along paths
     div_sum = np.zeros(batch_size)
@@ -1217,7 +1277,7 @@ def compute_log_probability(
         t = ts[i]
 
         step_rng, rng = jax.random.split(rng)
-        div_t = hutchinson_estimator(
+        div_t = exact_divergence(
             model, state, x_t, t, cond_vecs, step_rng, n_projections
         )
         assert div_t.shape == (batch_size,)
@@ -1232,28 +1292,34 @@ def compute_log_probability(
     return log_p1
 
 
-def test_hutchinson_estimator():
+@pytest.mark.parametrize(
+    "divergence_fn,n_projections,field",
+    [
+        (hutchinson_estimator, 10, "zero_divergence"),
+        (hutchinson_estimator, 10, "variable_divergence"),
+        (exact_divergence, None, "zero_divergence"),
+        (exact_divergence, None, "variable_divergence"),
+    ],
+)
+def test_divergence_estimate(divergence_fn, n_projections, field):
     """
-    Test the Hutchinson estimator with a vector field that has a known divergence.
-    For a tangent vector field on a sphere, we can create a test case with known divergence.
+    Test divergence estimators with vector fields that have known divergences.
+
+    Args:
+        divergence_fn: Function to compute divergence, either hutchinson_estimator or exact_divergence
+        n_projections: Number of random projections to use (only for hutchinson_estimator)
     """
 
     # Create a simple vector field with known divergence on the sphere
     def simple_vector_field(params, x, t, cond_vecs):
-        # This vector field is defined as v(x) = 2 * (I - xx^T)a
-        # where a is a constant vector [1,0,0]
-        # On the unit sphere, this field has a divergence of 2
-        batch_size = x.shape[0]
-        a = jnp.array([1.0, 0.0, 0.0])
-        a = jnp.broadcast_to(a, (batch_size, 3))
-
-        # Project a onto the tangent space at x
-        dot_products = jnp.sum(a * x, axis=1, keepdims=True)
-        tangent_a = a - dot_products * x
-
-        # Scale to get divergence = 2
-        vector_field = 2.0 * tangent_a
-        return vector_field
+        if field == "zero_divergence":
+            # Always 0
+            return jax.vmap(lambda x_i: jnp.array([-x_i[1], x_i[0], 0]))(x)
+        elif field == "variable_divergence":
+            # -2 * x[2]
+            return jax.vmap(lambda x_i: jnp.array([0, 0, 1]) - x_i * x_i[2])(x)
+        else:
+            raise ValueError(f"Unknown field: {field}")
 
     # Create a dummy model
     model = VectorField(
@@ -1277,34 +1343,38 @@ def test_hutchinson_estimator():
     # Generate test points
     batch_size = 1000
     x = jax.random.normal(rng, (batch_size, 3))
-    x = x / jnp.linalg.norm(x, axis=1, keepdims=True)  # Normalize to unit sphere
+    x = x / jnp.linalg.norm(x, axis=1, keepdims=True)
+
+    if field == "zero_divergence":
+        expected_divergence = jnp.full((batch_size,), 0.0)
+    elif field == "variable_divergence":
+        expected_divergence = jax.vmap(lambda x_i: -2 * x_i[2])(x)
+    else:
+        raise ValueError(f"Unknown field: {field}")
 
     # Compute divergence estimate
     t = 0.5
     cond_vecs = jnp.zeros((batch_size, 0))
-    n_projections = 10
-    div_estimates = hutchinson_estimator(
-        model, state, x, t, cond_vecs, rng, n_projections
-    )
 
-    # The true divergence of our test field is 2.0
-    expected_divergence = 2.0
+    # Call the appropriate divergence function
+    div_estimates = divergence_fn(model, state, x, t, cond_vecs, rng, n_projections)
 
     # Calculate error
-    mean_estimate = jnp.mean(div_estimates)
-    standard_error = jnp.std(div_estimates) / jnp.sqrt(batch_size)
+    error = jnp.abs(div_estimates - expected_divergence)
+    mean_error = jnp.mean(error)
 
-    print(f"Expected divergence: {expected_divergence}")
-    print(f"Estimated divergence (mean): {mean_estimate:.6f}")
-    print(f"Standard error: {standard_error:.6f}")
-    print(
-        f"95% confidence interval: [{mean_estimate - 1.96*standard_error:.6f}, {mean_estimate + 1.96*standard_error:.6f}]"
-    )
+    print(f"Mean error: {mean_error}")
 
-    # Check if the estimate is within 10% of expected value
-    assert (
-        abs(mean_estimate - expected_divergence) < 0.2
-    ), f"Hutchinson estimator not calculating correct divergence: got {mean_estimate}, expected {expected_divergence}"
+    # For exact method, we expect essentially no error
+    if divergence_fn == exact_divergence:
+        np.testing.assert_allclose(
+            div_estimates, expected_divergence, rtol=1e-5, atol=1e-5
+        )
+    else:
+        # Check if the estimate is within 10% of expected value
+        assert (
+            abs(mean_error) < 0.2
+        ), f"Hutchinson estimator not calculating correct divergence: got {mean_error}, expected {expected_divergence}"
 
     # Restore original apply function
     model.apply = original_apply
