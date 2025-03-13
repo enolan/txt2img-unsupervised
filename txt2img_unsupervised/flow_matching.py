@@ -175,7 +175,7 @@ class VectorField(nn.Module):
             nn.remat(MLPBlock),
             variable_axes={"params": 0},
             variable_broadcast=False,
-            split_rngs={"params": True, "dropout": True},
+            split_rngs={"params": True},
             length=self.n_layers,
         )(
             bottleneck_dim=self.d_model,
@@ -189,7 +189,7 @@ class VectorField(nn.Module):
 
         self.final_norm = nn.LayerNorm(
             dtype=self.activations_dtype,
-            param_dtype=self.weights_dtype,
+            param_dtype=jnp.float32,
         )
 
         self.out_proj = nn.Dense(
