@@ -346,7 +346,7 @@ def spherical_ot_field(x, x1, t, kappa_1):
             # Field is 0 if x is very close to x1
             lambda: jnp.zeros_like(x),
             # If points are opposite/almost opposite, pick an orthogonal vector
-            lambda: generate_orthogonal_vector(x) * kappa_t,
+            lambda: get_consistent_tangent_direction(x) * kappa_t,
         )
 
     def handle_general_case():
@@ -367,27 +367,58 @@ def spherical_ot_field(x, x1, t, kappa_1):
     )
 
 
-def generate_orthogonal_vector(v):
-    """Generate a unit vector orthogonal to v."""
-    assert len(v.shape) == 1
-    assert v.shape[0] > 0
+def get_consistent_tangent_direction(x):
+    """
+    Generate a unit vector in the tangent space of x, ensuring that nearby points get similar
+    tangent directions, creating smooth paths.
 
-    # Find the component with smallest absolute value
-    idx = jnp.argmin(jnp.abs(v))
+    Args:
+        x: Point on the sphere [dim]
 
-    # Create a basis vector in that direction
-    e = jnp.zeros_like(v).at[idx].set(1.0)
+    Returns:
+        Unit vector in the tangent space of x
+    """
+    dim = x.shape[0]
 
-    # Make it orthogonal to v
-    orthogonal = e - jnp.dot(e, v) * v
+    # Instead of picking the "best" basis vector which could lead to discontinuities,
+    # we use a fixed reference direction approach:
 
-    # Normalize and return
-    return orthogonal / jnp.linalg.norm(orthogonal)
+    # Define two fixed orthogonal reference vectors that will be used for all points
+    # These are fixed in the global space (not dependent on x) to ensure consistency
+    ref1 = jnp.zeros(dim).at[0].set(1.0)
+    ref2 = jnp.zeros(dim).at[1].set(1.0)
+
+    # Project the first reference to the tangent space of x
+    ref1_tan = ref1 - jnp.dot(ref1, x) * x
+    ref1_norm = jnp.linalg.norm(ref1_tan)
+
+    # For second reference (fallback option)
+    ref2_tan = ref2 - jnp.dot(ref2, x) * x
+    ref2_norm = jnp.linalg.norm(ref2_tan)
+
+    # Final fallback: permute coordinates
+    permuted_x = jnp.roll(x, 1)
+    fallback_tan = permuted_x - jnp.dot(permuted_x, x) * x
+    # Since x and its rolled version cannot be parallel for dim >= 2,
+    # this is safe to normalize
+    fallback_norm = jnp.linalg.norm(fallback_tan)
+
+    # Use the first direction with a sufficiently large tangent norm.
+    ref1_fallback = jax.lax.cond(
+        ref2_norm > 1e-8,
+        lambda: ref2_tan / ref2_norm,
+        lambda: fallback_tan / fallback_norm,
+    )
+    return jax.lax.cond(
+        ref1_norm > 1e-8, lambda: ref1_tan / ref1_norm, lambda: ref1_fallback
+    )
 
 
 def compute_psi_t_spherical(x0, x1, t):
     """
     Compute the flow map for the spherical OT field.
+    In the general case this is just a spherical linear interpolation, but we're careful with the
+    antipodal case.
 
     Args:
         x0: Starting point on the sphere [dim]
@@ -401,15 +432,34 @@ def compute_psi_t_spherical(x0, x1, t):
     assert x0.shape == x1.shape
     assert t.shape == ()
 
-    # Compute the angle between the points
     cos_angle = jnp.clip(jnp.dot(x0, x1), -1.0, 1.0)
     angle = jnp.arccos(cos_angle)
 
     def handle_close_or_opposite():
         return jax.lax.cond(
             angle < 1e-8,
-            lambda: x0,
-            lambda: generate_orthogonal_vector(x0),
+            lambda: x0,  # If points are very close, just return x0
+            lambda: handle_antipodal(),
+        )
+
+    def handle_antipodal():
+        tangent_dir = get_consistent_tangent_direction(x0)
+
+        # Create a point that's 90 degrees away from x0 in the tangent direction
+        # This is a point on the great circle connecting x0 and -x0 via the tangent direction
+        midpoint = tangent_dir
+
+        # For antipodal points, we want to go halfway around the sphere in the consistent direction
+        # If t <= 0.5, we interpolate from x0 to midpoint
+        # If t > 0.5, we interpolate from midpoint to x1 (which is approximately -x0)
+        return jax.lax.cond(
+            t <= 0.5,
+            lambda: slerp(
+                x0, midpoint, 2.0 * t
+            ),  # Scale t to [0, 1] for the first half
+            lambda: slerp(
+                midpoint, x1, 2.0 * (t - 0.5)
+            ),  # Scale t to [0, 1] for the second half
         )
 
     return jax.lax.cond(
@@ -719,21 +769,33 @@ def test_train_trivial():
         mlp_expansion_factor=4,
     )
     batch_size = 512
-    points = repeat(jnp.array([1, 0, 0]), "v -> b v", b=batch_size * 10)
+    points = repeat(jnp.array([1, 0, 0]), "v -> b v", b=batch_size * 11)
     dset = Dataset.from_dict({"point_vec": points}).with_format("np")
-    state, loss, _ = _train_loop_for_tests(
-        model, dset, batch_size, 1e-3, 10, kappa_1=10.0, test_dataset=dset
+    train_dset = dset.select(range(batch_size * 10))
+    test_dset = dset.select(range(batch_size * 10, batch_size * 11))
+    state, loss, test_loss = _train_loop_for_tests(
+        model, train_dset, batch_size, 1e-3, 20, kappa_1=10.0, test_dataset=test_dset
     )
     print(f"Final loss: {loss:.6f}")
-
+    print(f"Final test loss: {test_loss:.6f}")
     samples = generate_samples(
         model, state, jax.random.PRNGKey(0), 20, jnp.zeros((20, 0)), 1000, "rk4"
     )
-    for sample in samples:
-        cos_sim = jnp.dot(sample, points[0])
+    cos_sims = samples @ points[0]
+
+    for sample, cos_sim in zip(samples, cos_sims):
         print(
             f"Sample: [{sample[0]:9.6f}, {sample[1]:9.6f}, {sample[2]:9.6f}]  Cosine similarity: {cos_sim:9.6f}"
         )
+
+    assert cos_sims.shape == (20,)
+    # It's very hard for the network to learn the vector field near the antipode of our target
+    # point. That region of the sphere is very sparsely covered by paths. So any samples that start
+    # there get stuck. Hopefully this isn't an issue with nontrivial distributions.
+    high_sims = cos_sims > 0.99
+    assert high_sims.mean() > 0.90
+    low_sims = cos_sims < -0.85
+    assert low_sims.mean() < 0.10
 
 
 def test_train_vmf():
