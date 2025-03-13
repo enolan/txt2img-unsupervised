@@ -129,21 +129,16 @@ class VectorField(nn.Module):
     weights_dtype: jnp.dtype
 
     def setup(self) -> None:
-        # Default initialization for internal layers
-        default_kernel_init = nn.initializers.variance_scaling(
-            scale=1.0, mode="fan_in", distribution="normal"
-        )
-
-        # Initializers for our 3 conditioning inputs are specially scaled so their sum has mean 0
-        # variance 1. Each component of the sum should have mean 0 and variance 1/3.
+        # Initializers for our 3 inputs are specially scaled so their sum has mean 0 variance 1.
+        # Each component of the sum should have mean 0 and variance either 1/3 or 1/2, depending on
+        # if we have conditioning vectors or not
+        input_variance_scale = 1.0 / (3.0 if self.conditioning_dim > 0 else 2.0)
         self.domain_in_proj = nn.Dense(
             features=self.d_model,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
             kernel_init=nn.initializers.variance_scaling(
-                # The variance of a uniformly distributed unit vector is approximeatly 1/d, so we
-                # multiply to cancel
-                scale=self.domain_dim / 3.0,
+                scale=input_variance_scale,
                 mode="fan_in",
                 distribution="normal",
             ),
@@ -156,7 +151,7 @@ class VectorField(nn.Module):
                 param_dtype=self.weights_dtype,
                 kernel_init=nn.initializers.variance_scaling(
                     # We assume the input is unit normal
-                    scale=1.0 / 3.0,
+                    scale=input_variance_scale,
                     mode="fan_in",
                     distribution="normal",
                 ),
@@ -169,12 +164,11 @@ class VectorField(nn.Module):
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
             kernel_init=nn.initializers.variance_scaling(
-                # The variance of U[0, 1] is 1/12, so me multiply by 12 and divide by 3 to get 4.
-                scale=4.0,
+                # The variance of U[0, 1] is 1/12, so me multiply by 12 before scaling
+                scale=12.0 * input_variance_scale,
                 mode="fan_in",
                 distribution="normal",
             ),
-            bias_init=nn.initializers.constant(-0.5),  # Center the uniform [0,1] input
         )
 
         self.mlp_blocks = nn.scan(
@@ -188,7 +182,9 @@ class VectorField(nn.Module):
             expansion_factor=self.mlp_expansion_factor,
             activations_dtype=self.activations_dtype,
             weights_dtype=self.weights_dtype,
-            kernel_init=default_kernel_init,
+            kernel_init=nn.initializers.variance_scaling(
+                scale=1.0, mode="fan_in", distribution="normal"
+            ),
         )
 
         self.final_norm = nn.LayerNorm(
@@ -200,7 +196,9 @@ class VectorField(nn.Module):
             features=self.domain_dim,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
-            kernel_init=default_kernel_init,
+            kernel_init=nn.initializers.variance_scaling(
+                scale=1.0, mode="fan_in", distribution="normal"
+            ),
         )
 
     def __call__(self, x, t, cond_vec):
@@ -219,7 +217,7 @@ class VectorField(nn.Module):
         # important so the layer interprets the times as being batched and not just a vector for a
         # single input
         t = rearrange(t, "b -> b 1")
-        t_in = self.time_in_proj(t)
+        t_in = self.time_in_proj(t - 0.5)  # Center the uniform [0,1] input
         assert x_in.shape == (batch_size, self.d_model)
         assert cond_in.shape == (batch_size, self.d_model)
         assert t_in.shape == (batch_size, self.d_model)
