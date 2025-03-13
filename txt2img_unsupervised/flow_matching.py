@@ -1479,3 +1479,174 @@ def test_divergence_estimate(divergence_fn, n_projections, field):
 
     # Restore original apply function
     model.apply = original_apply
+
+
+def test_vector_field_evaluation():
+    """
+    Test that initializes a VectorField, generates random points on the sphere, evaluates the vector
+    field at those points/times, and prints information about the magnitudes and directions of the
+    vector field values.
+    """
+    rng = jax.random.PRNGKey(48)
+
+    model = VectorField(
+        activations_dtype=jnp.float32,
+        weights_dtype=jnp.float32,
+        domain_dim=3,
+        conditioning_dim=0,
+        n_layers=2,
+        d_model=64,
+        mlp_expansion_factor=4,
+    )
+
+    state = create_train_state(rng, model, 1e-3)
+
+    # Generate points & times
+    n_samples = 30
+    key1, key2 = jax.random.split(rng)
+    points = sample_sphere(key1, n_samples, model.domain_dim)
+    times = jax.random.uniform(key2, (n_samples,))
+
+    cond_vecs = jnp.zeros((n_samples, model.conditioning_dim))
+
+    vector_field_values = model.apply(state.params, points, times, cond_vecs)
+
+    dot_products = jnp.sum(points * vector_field_values, axis=1)
+    magnitudes = jnp.linalg.norm(vector_field_values, axis=1)
+
+    # Use stereographic projection to represent tangent vectors in (d-1) dimensions so we can easily
+    # compare directions
+    def stereographic_projection(point, vector):
+        """
+        Project a tangent vector from an n-dimensional sphere to (n-1) dimensions
+        using stereographic projection from a reference point.
+
+        Args:
+            point: Point on the n-dimensional sphere [dim]
+            vector: Tangent vector at that point [dim]
+
+        Returns:
+            (dim-1) coordinates representing the tangent vector
+        """
+        dim = point.shape[0]
+
+        # Choose a reference point (north pole)
+        north_pole = jnp.zeros(dim).at[dim - 1].set(1.0)
+
+        # Check if point is near the north pole
+        is_near_pole = jnp.abs(jnp.dot(point, north_pole) - 1.0) < 1e-6
+
+        # If near north pole, use south pole as reference instead
+        reference_pole = jnp.where(
+            is_near_pole, -north_pole, north_pole  # Use south pole  # Use north pole
+        )
+
+        # Determine which coordinate to use for projection
+        proj_index = dim - 1
+
+        # Compute the denominator for projection (depends on which pole we're using)
+        pole_sign = jnp.where(is_near_pole, -1.0, 1.0)
+        denominator = 1.0 - pole_sign * point[proj_index]
+
+        # Ensure vector is tangent to the sphere (orthogonal to point)
+        vector_tangent = vector - jnp.dot(vector, point) * point
+
+        # The differential of stereographic projection
+        # For a tangent vector v at point p, the formula is:
+        # dp_*(v) = (v[:d-1] * (1 - p[d-1]) + v[d-1] * p[:d-1]) / (1 - p[d-1])^2
+        # When using south pole, we adjust the formula accordingly
+
+        scaling = 1.0 / denominator
+
+        # Compute the differential based on which pole we're using
+        def project_from_south_pole():
+            # When projecting from south pole
+            proj_vector = jnp.zeros(dim - 1)
+            for i in range(dim - 1):
+                proj_vector = proj_vector.at[i].set(
+                    (
+                        vector_tangent[i] * (1.0 + point[proj_index])
+                        - vector_tangent[proj_index] * point[i]
+                    )
+                    * scaling
+                    * scaling
+                )
+            return proj_vector
+
+        def project_from_north_pole():
+            # When projecting from north pole
+            proj_vector = jnp.zeros(dim - 1)
+            for i in range(dim - 1):
+                proj_vector = proj_vector.at[i].set(
+                    (
+                        vector_tangent[i] * (1.0 - point[proj_index])
+                        + vector_tangent[proj_index] * point[i]
+                    )
+                    * scaling
+                    * scaling
+                )
+            return proj_vector
+
+        proj_vector = jax.lax.cond(
+            is_near_pole, project_from_south_pole, project_from_north_pole
+        )
+
+        return proj_vector
+
+    # Apply to all points and vectors
+    projected_vectors = jax.vmap(stereographic_projection)(points, vector_field_values)
+
+    projected_magnitudes = jnp.linalg.norm(projected_vectors, axis=1)
+    nonzero_mask = projected_magnitudes > 1e-8
+    projected_directions = jnp.zeros_like(projected_vectors)
+    if jnp.any(nonzero_mask):
+        projected_directions = projected_directions.at[nonzero_mask].set(
+            projected_vectors[nonzero_mask] / projected_magnitudes[nonzero_mask, None]
+        )
+
+    # Print results
+    print("\nVector Field Evaluation Test Results:")
+    print("=====================================")
+    print(
+        f"Model: {model.n_layers} layers, {model.d_model} width, {model.mlp_expansion_factor}x expansion"
+    )
+    print(f"Number of samples: {n_samples}")
+    print(f"Dimension of sphere: {model.domain_dim}")
+    print(f"Projection dimension: {model.domain_dim - 1}")
+    print(f"Average magnitude: {jnp.mean(magnitudes):.6f}")
+    print(f"Min magnitude: {jnp.min(magnitudes):.6f}")
+    print(f"Max magnitude: {jnp.max(magnitudes):.6f}")
+    print(
+        f"Average absolute dot product with point (should be ~0): {jnp.mean(jnp.abs(dot_products)):.6f}"
+    )
+
+    # Sort all data by x coordinate (first component of the point)
+    sort_indices = jnp.argsort(points[:, 0])
+    sorted_points = points[sort_indices]
+    sorted_times = times[sort_indices]
+    sorted_magnitudes = magnitudes[sort_indices]
+    sorted_projected_directions = projected_directions[sort_indices]
+
+    # Print details for all samples in a compact, aligned format
+    print(f"\nDetails for all {n_samples} samples (sorted by x coordinate):")
+    for i in range(n_samples):
+        point_str = ", ".join(
+            [f"{sorted_points[i, j]:7.4f}" for j in range(model.domain_dim)]
+        )
+        dir_str = ", ".join(
+            [
+                f"{sorted_projected_directions[i, j]:7.4f}"
+                for j in range(model.domain_dim - 1)
+            ]
+        )
+        print(
+            f"Sample {i+1:2d}: t={sorted_times[i]:.4f} x=[{point_str}] "
+            f"Magnitude={sorted_magnitudes[i]:6.4f} Direction{model.domain_dim-1}D=[{dir_str}]"
+        )
+
+    # Verify that vector field values are tangent to the sphere
+    np.testing.assert_allclose(dot_products, 0.0, atol=1e-6)
+
+    # Verify that the model produces consistent outputs for the same inputs
+    vector_field_values_2 = model.apply(state.params, points, times, cond_vecs)
+    np.testing.assert_allclose(vector_field_values, vector_field_values_2)
