@@ -1885,7 +1885,7 @@ def test_vector_field_evaluation():
 class CapConditionedVectorField(VectorField):
     """
     Model of a vector field that learns a distribution on the unit sphere and can sample conditional
-    on the sample being within an arbitrary spherical cap. Thin wrapper around VectorField.
+    on the sample being within an arbitrary spherical cap.
     """
 
     def __post_init__(self):
@@ -1897,6 +1897,43 @@ class CapConditionedVectorField(VectorField):
         self.conditioning_dim = correct_conditioning_dim
         super().__post_init__()
 
+    def process_cap_inputs(self, cap_centers, cap_d_maxes):
+        """
+        Process the cap centers and max distances to have appropriate statistics.
+        This helper method is used for testing the distribution of values.
+
+        Args:
+            cap_centers: Unit vectors defining cap centers [batch_size, domain_dim]
+            cap_d_maxes: Maximum cosine distances [batch_size]
+
+        Returns:
+            Dictionary with:
+            - cap_centers_transformed: Transformed cap centers [batch_size, domain_dim]
+            - cap_d_maxes_transformed: Transformed max distances [batch_size]
+            - cap_info: Combined conditioning vector for the base model [batch_size, conditioning_dim]
+        """
+        batch_size = cap_centers.shape[0]
+        assert cap_centers.shape == (batch_size, self.domain_dim)
+        assert cap_d_maxes.shape == (batch_size,)
+
+        # Norm the input to have mean 0 variance 1
+        # Unit vector components have std 1/sqrt(d), mean 0
+        cap_centers_transformed = cap_centers * jnp.sqrt(self.domain_dim)
+        # U[0, 2] has variance 1/3, mean 1
+        cap_d_maxes_transformed = (cap_d_maxes - 1) * np.sqrt(3)
+
+        # Convert the spherical cap info into a vector we can pass
+        cap_info = jnp.concatenate(
+            [cap_centers_transformed, cap_d_maxes_transformed[:, None]], axis=1
+        )
+        assert cap_info.shape == (batch_size, self.conditioning_dim)
+
+        return {
+            "cap_centers_transformed": cap_centers_transformed,
+            "cap_d_maxes_transformed": cap_d_maxes_transformed,
+            "cap_info": cap_info,
+        }
+
     def __call__(self, x, t, cap_centers, cap_d_maxes):
         assert len(x.shape) == 2
         batch_size = x.shape[0]
@@ -1905,16 +1942,8 @@ class CapConditionedVectorField(VectorField):
         assert cap_centers.shape == (batch_size, self.domain_dim)
         assert cap_d_maxes.shape == (batch_size,)
 
-        # Norm the input to have mean 0 variance 1
-        # Unit vector components have std 1/sqrt(d), mean 0
-        cap_centers = cap_centers * jnp.sqrt(self.domain_dim)
-        # U[0, 2] has variance 1/3, mean 1
-        cap_d_maxes = (cap_d_maxes - 1) * np.sqrt(3)
-
-        # Convert the spherical cap info into a vector we can pass
-        cap_info = jnp.concatenate([cap_centers, cap_d_maxes[:, None]], axis=1)
-        assert cap_info.shape == (batch_size, self.conditioning_dim)
-        return super().__call__(x, t, cap_info)
+        processed = self.process_cap_inputs(cap_centers, cap_d_maxes)
+        return super().__call__(x, t, processed["cap_info"])
 
     def forward_with_random_caps(self, x, t, logits_table):
         """
@@ -1941,6 +1970,89 @@ class CapConditionedVectorField(VectorField):
         assert cap_centers.shape == (batch_size, self.domain_dim)
         assert cap_d_maxes.shape == (batch_size,)
         return self.__call__(x, t, cap_centers, cap_d_maxes)
+
+
+def test_cap_conditioned_vector_field_normalization():
+    """
+    Test that CapConditionedVectorField properly normalizes the inputs passed to the superclass.
+    This verifies that the cap centers and max distances are properly transformed to have the
+    statistical properties expected by the base VectorField class.
+
+    The test checks:
+    1. That cap centers are scaled to have variance 1 per dimension
+    2. That cap distances are transformed to have mean 0 and variance 1
+    3. That the combined conditioning vector has appropriate statistics
+    """
+    rng = jax.random.PRNGKey(42)
+
+    # Test with different dimensions like in the VectorField test
+    domain_dims = [3, 5, 8]
+
+    for domain_dim in domain_dims:
+        # Create the model
+        model = CapConditionedVectorField(
+            activations_dtype=jnp.float32,
+            weights_dtype=jnp.float32,
+            domain_dim=domain_dim,
+            n_layers=1,
+            d_model=2048,
+            mlp_expansion_factor=1,
+            conditioning_dim=None,  # Should be automatically set to domain_dim + 1
+        )
+
+        params_rng, sample_rng = jax.random.split(rng)
+        state = create_train_state(params_rng, model, 1e-3)
+
+        # Generate test inputs
+        n_samples = 10_000
+        keys = jax.random.split(sample_rng, 3)
+
+        cap_centers = sample_sphere(keys[0], n_samples, domain_dim)
+        cap_d_maxes = jax.random.uniform(
+            keys[1], shape=(n_samples,), minval=0.0, maxval=2.0
+        )
+
+        # Get the processed conditioning data using the model's helper method
+        processed = model.apply(
+            state.params, cap_centers, cap_d_maxes, method=model.process_cap_inputs
+        )
+
+        cap_centers_transformed = processed["cap_centers_transformed"]
+        cap_d_maxes_transformed = processed["cap_d_maxes_transformed"]
+        cap_info = processed["cap_info"]
+
+        assert cap_centers_transformed.shape == (n_samples, domain_dim)
+        assert cap_d_maxes_transformed.shape == (n_samples,)
+        assert cap_info.shape == (n_samples, model.conditioning_dim)
+
+        # Check statistics of transformed values
+        cap_centers_mean = jnp.mean(cap_centers_transformed, axis=0)
+        cap_centers_var = jnp.var(cap_centers_transformed, axis=0)
+        cap_d_maxes_mean = jnp.mean(cap_d_maxes_transformed)
+        cap_d_maxes_var = jnp.var(cap_d_maxes_transformed)
+
+        print(
+            f"\nTesting CapConditionedVectorField normalization with domain_dim={domain_dim}"
+        )
+        print(f"Cap centers - Mean: {jnp.mean(cap_centers_mean):.6f}, Expected: ~0.0")
+        print(
+            f"Cap centers - Variance: {jnp.mean(cap_centers_var):.6f}, Expected: ~1.0"
+        )
+        print(f"Cap distances - Mean: {cap_d_maxes_mean:.6f}, Expected: ~0.0")
+        print(f"Cap distances - Variance: {cap_d_maxes_var:.6f}, Expected: ~1.0")
+
+        assert jnp.all(
+            jnp.abs(cap_centers_mean) < 0.05
+        ), f"Cap center mean should be close to 0, got {cap_centers_mean}"
+        assert jnp.all(
+            jnp.abs(cap_centers_var - 1.0) < 0.05
+        ), f"Cap center variance should be close to 1, got {cap_centers_var}"
+        assert (
+            jnp.abs(cap_d_maxes_mean) < 0.05
+        ), f"Cap distances mean should be close to 0, got {cap_d_maxes_mean}"
+        assert (
+            jnp.abs(cap_d_maxes_var - 1.0) < 0.05
+        ), f"Cap distances variance should be close to 1, got {cap_d_maxes_var}"
 
 
 def test_train_cap_conditioned_model():
