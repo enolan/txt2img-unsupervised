@@ -132,15 +132,13 @@ class VectorField(nn.Module):
         # Initializers for our 3 inputs are specially scaled so their sum has mean 0 variance 1.
         # Each component of the sum should have mean 0 and variance either 1/3 or 1/2, depending on
         # if we have conditioning vectors or not
-        input_variance_scale = 1.0 / (3.0 if self.conditioning_dim > 0 else 2.0)
+        input_variance_scale = 1.0 / 3.0 if self.conditioning_dim > 0 else 1.0 / 2.0
         self.domain_in_proj = nn.Dense(
             features=self.d_model,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
-            kernel_init=nn.initializers.variance_scaling(
-                scale=input_variance_scale,
-                mode="fan_in",
-                distribution="normal",
+            kernel_init=nn.initializers.normal(
+                stddev=jnp.sqrt(self.domain_dim * input_variance_scale)
             ),
         )
 
@@ -150,7 +148,7 @@ class VectorField(nn.Module):
                 dtype=self.activations_dtype,
                 param_dtype=self.weights_dtype,
                 kernel_init=nn.initializers.variance_scaling(
-                    # We assume the input is unit normal
+                    # We assume the input components are unit normal
                     scale=input_variance_scale,
                     mode="fan_in",
                     distribution="normal",
