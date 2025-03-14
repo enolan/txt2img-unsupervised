@@ -1140,21 +1140,15 @@ def spherical_rk4_step(f, x, t, dt):
     return geodesic_step(x, combined_direction, dt)
 
 
-@partial(jax.jit, static_argnames=("model",))
-def spherical_rk4_step_with_model(
-    model, state, x, t, dt, cond_vecs, negate_vector_field=False
-):
-    vector_field_multiplier = jax.lax.cond(
-        negate_vector_field, lambda: -1.0, lambda: 1.0
-    )
-    vector_field_fn = (
-        lambda x, t: vector_field_multiplier
-        * _compute_vector_field_for_sampling(model, state, x, t, cond_vecs)
+@partial(jax.jit, static_argnames=("model",), inline=True)
+def spherical_rk4_step_with_model(model, state, x, t, dt, cond_vecs):
+    vector_field_fn = lambda x, t: _compute_vector_field_for_sampling(
+        model, state, x, t, cond_vecs
     )
     return spherical_rk4_step(vector_field_fn, x, t, dt)
 
 
-@partial(jax.jit, static_argnames=("model",))
+@partial(jax.jit, static_argnames=("model",), inline=True)
 def _compute_vector_field_for_sampling(model, state, x, t, cond_vecs):
     return model.apply(state.params, x, jnp.full((x.shape[0],), t), cond_vecs)
 
@@ -1210,9 +1204,7 @@ def generate_samples(
         # 4th order Runge-Kutta method
         for i in range(n_steps):
             t = i * dt
-            x = spherical_rk4_step_with_model(
-                model, state, x, t, dt, cond_vecs, negate_vector_field=False
-            )
+            x = spherical_rk4_step_with_model(model, state, x, t, dt, cond_vecs)
     else:
         raise ValueError(f"Unknown ODE solver method: {method}")
 
@@ -1338,7 +1330,6 @@ def _reverse_path_and_compute_divergence(
             t,
             -1.0 / n_steps,
             cond_vecs,
-            negate_vector_field=True,
         )
 
         return next_x, div_sum, rng
@@ -1346,10 +1337,10 @@ def _reverse_path_and_compute_divergence(
     # Run the loop
     init_state = (x_t, div_sum, rng)
     final_x, final_div_sum, final_rng = jax.lax.fori_loop(
-        0, n_steps - 1, body_fun, init_state
+        0, n_steps, body_fun, init_state
     )
 
-    return jax.device_get(final_div_sum)
+    return final_div_sum
 
 
 def compute_log_probability(
@@ -1379,7 +1370,6 @@ def compute_log_probability(
     # Normalize samples to ensure they're on the unit sphere
     samples = samples / jnp.linalg.norm(samples, axis=1, keepdims=True)
 
-    # Compute the reverse path and integrate divergence in a single loop
     div_sum = _reverse_path_and_compute_divergence(
         model, state, samples, cond_vecs, n_steps, rng, n_projections
     )
