@@ -138,14 +138,13 @@ class VectorField(nn.Module):
         # Each component of the sum should have mean 0 and variance either 1/3 or 1/2, depending on
         # if we have conditioning vectors or not
         input_variance_scale = 1.0 / 3.0 if self.conditioning_dim > 0 else 1.0 / 2.0
+
         self.domain_in_proj = nn.Dense(
             features=self.d_model,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
             use_bias=False,
-            kernel_init=nn.initializers.normal(
-                stddev=jnp.sqrt(self.domain_dim * input_variance_scale)
-            ),
+            kernel_init=nn.initializers.normal(stddev=jnp.sqrt(input_variance_scale)),
         )
 
         if self.conditioning_dim > 0:
@@ -164,16 +163,15 @@ class VectorField(nn.Module):
         else:
             self.conditioning_in_proj = None
 
+        # Time projection. We subtract 0.5 in process_inputs to get mean 0, and the variance of
+        # U[-0.5, 0.5] is 1/12, so we multiply by 12
         self.time_in_proj = nn.Dense(
             features=self.d_model,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
             use_bias=False,
-            kernel_init=nn.initializers.variance_scaling(
-                # The variance of U[0, 1] is 1/12, so me multiply by 12 before scaling
-                scale=12.0 * input_variance_scale,
-                mode="fan_in",
-                distribution="normal",
+            kernel_init=nn.initializers.normal(
+                stddev=jnp.sqrt(12 * input_variance_scale)
             ),
         )
 
@@ -214,7 +212,23 @@ class VectorField(nn.Module):
             ),
         )
 
-    def __call__(self, x, t, cond_vec):
+    def process_inputs(self, x, t, cond_vec):
+        """
+        Process the inputs to the model, returning the individual components and combined input.
+        This helper method is used for testing the distribution of values.
+
+        Args:
+            x: Input unit vectors [batch_size, domain_dim]
+            t: Time parameters in [0, 1] [batch_size]
+            cond_vec: Conditioning vectors [batch_size, conditioning_dim]
+
+        Returns:
+            Dictionary with individual projection outputs and combined input:
+            - domain_proj: Output of domain_in_proj [batch_size, d_model]
+            - cond_proj: Output of conditioning_in_proj [batch_size, d_model]
+            - time_proj: Output of time_in_proj [batch_size, d_model]
+            - mlp_input: Combined input to the MLP [batch_size, d_model]
+        """
         batch_size = x.shape[0]
         assert x.shape == (batch_size, self.domain_dim)
         assert t.shape == (batch_size,)
@@ -229,14 +243,31 @@ class VectorField(nn.Module):
         )
         # important so the layer interprets the times as being batched and not just a vector for a
         # single input
-        t = rearrange(t, "b -> b 1")
-        t_in = self.time_in_proj(t - 0.5)  # Center the uniform [0,1] input
+        t_reshaped = rearrange(t, "b -> b 1")
+        t_in = self.time_in_proj(t_reshaped - 0.5)  # Center the uniform [0,1] input
         assert x_in.shape == (batch_size, self.d_model)
         assert cond_in.shape == (batch_size, self.d_model)
         assert t_in.shape == (batch_size, self.d_model)
 
         mlp_in = x_in + cond_in + t_in + self.mlp_in_bias
         assert mlp_in.shape == (batch_size, self.d_model)
+
+        return {
+            "domain_proj": x_in,
+            "cond_proj": cond_in,
+            "time_proj": t_in,
+            "mlp_input": mlp_in,
+        }
+
+    def __call__(self, x, t, cond_vec):
+        batch_size = x.shape[0]
+        assert x.shape == (batch_size, self.domain_dim)
+        assert t.shape == (batch_size,)
+        assert cond_vec.shape == (batch_size, self.conditioning_dim)
+
+        # Process inputs so we can give them to the MLP
+        inputs = self.process_inputs(x, t, cond_vec)
+        mlp_in = inputs["mlp_input"]
 
         # Run them through our MLP and normalize the output
         mlp_out, _ = self.mlp_blocks(mlp_in, None)
@@ -254,6 +285,124 @@ class VectorField(nn.Module):
         assert tangent_outputs.shape == (batch_size, self.domain_dim)
 
         return tangent_outputs
+
+
+def test_vector_field_projections_normalization():
+    """
+    Test that the outputs of domain_in_proj, conditioning_proj, and time_in_proj in the VectorField
+    model have the distributions they're supposed to (mean 0, variance 1/2 or 1/3 depending on if
+    conditioning_dim is > 0), and that the sum (input to MLP) has mean 0 and variance 1.
+
+    Assumptions:
+    * x is composed of uniformly distributed unit vectors in domain_dim dimensions
+    * t is uniformly distributed between 0 and 1
+    * cond_vec's components each have mean 0 variance 1
+
+    """
+    rng = jax.random.PRNGKey(42)
+
+    # Test both with and without conditioning
+    domain_dims = [3, 10]
+    conditioning_cases = [0, 4]  # 0 for no conditioning, positive for conditioning
+
+    for domain_dim in domain_dims:
+        for conditioning_dim in conditioning_cases:
+            model = VectorField(
+                activations_dtype=jnp.float32,
+                weights_dtype=jnp.float32,
+                domain_dim=domain_dim,
+                conditioning_dim=conditioning_dim,
+                n_layers=1,
+                d_model=2048,  # Bigger mlp_in vectors reduce the variance of our estimates
+                mlp_expansion_factor=1,
+            )
+
+            params_rng, sample_rng = jax.random.split(rng)
+            state = create_train_state(params_rng, model, 1e-3)
+
+            # Generate test inputs
+            n_samples = 10_000
+            keys = jax.random.split(sample_rng, 3)
+
+            x = sample_sphere(keys[0], n_samples, domain_dim)
+
+            t = jax.random.uniform(keys[1], (n_samples,))
+
+            if conditioning_dim > 0:
+                cond_vec = jax.random.normal(keys[2], (n_samples, conditioning_dim))
+            else:
+                cond_vec = jnp.zeros((n_samples, 0))
+
+            inputs = model.apply(
+                state.params, x, t, cond_vec, method=model.process_inputs
+            )
+
+            expected_proj_variance = 1.0 / 3.0 if conditioning_dim > 0 else 1.0 / 2.0
+
+            # Compute statistics for each projection, and their sum
+            domain_proj = inputs["domain_proj"]
+            domain_mean = jnp.mean(domain_proj)
+            domain_variance = jnp.mean(jnp.var(domain_proj, axis=1))
+
+            time_proj = inputs["time_proj"]
+            time_mean = jnp.mean(time_proj)
+            time_variance = jnp.mean(jnp.var(time_proj, axis=1))
+
+            if conditioning_dim > 0:
+                cond_proj = inputs["cond_proj"]
+                cond_mean = jnp.mean(cond_proj)
+                cond_variance = jnp.mean(jnp.var(cond_proj, axis=1))
+
+            mlp_input = inputs["mlp_input"]
+            mlp_input_mean = jnp.mean(mlp_input)
+            mlp_input_variance = jnp.mean(jnp.var(mlp_input, axis=1))
+
+            # Print statistics
+            print(
+                f"\nTesting with domain_dim={domain_dim}, conditioning_dim={conditioning_dim}"
+            )
+            print(f"Expected component variance: {expected_proj_variance:.6f}")
+            print(
+                f"Domain projection - Mean: {domain_mean:.6f}, Variance: {domain_variance:.6f}"
+            )
+            print(
+                f"Time projection - Mean: {time_mean:.6f}, Variance: {time_variance:.6f}"
+            )
+            if conditioning_dim > 0:
+                print(
+                    f"Conditioning projection - Mean: {cond_mean:.6f}, Variance: {cond_variance:.6f}"
+                )
+            print(
+                f"MLP input - Mean: {mlp_input_mean:.6f}, Variance: {mlp_input_variance:.6f}"
+            )
+
+            # Check if means are close to 0
+            mean_tol = 0.02
+            assert (
+                abs(domain_mean) < mean_tol
+            ), f"Domain projection mean should be close to 0, got {domain_mean}"
+            assert (
+                abs(domain_variance - expected_proj_variance) < 0.02
+            ), f"Domain projection variance should be close to {expected_proj_variance}, got {domain_variance}"
+            assert (
+                abs(time_mean) < mean_tol
+            ), f"Time projection mean should be close to 0, got {time_mean}"
+            assert (
+                abs(time_variance - expected_proj_variance) < 0.02
+            ), f"Time projection variance should be close to {expected_proj_variance}, got {time_variance}"
+            if conditioning_dim > 0:
+                assert (
+                    abs(cond_mean) < mean_tol
+                ), f"Conditioning projection mean should be close to 0, got {cond_mean}"
+                assert (
+                    abs(cond_variance - expected_proj_variance) < 0.02
+                ), f"Conditioning projection variance should be close to {expected_proj_variance}, got {cond_variance}"
+            assert (
+                abs(mlp_input_mean) < mean_tol
+            ), f"MLP input mean should be close to 0, got {mlp_input_mean}"
+            assert (
+                abs(mlp_input_variance - 1) < 0.02
+            ), f"MLP input variance should be close to 1, got {mlp_input_variance}"
 
 
 def test_optimal_transport_field_direction():
