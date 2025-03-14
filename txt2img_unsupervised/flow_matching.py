@@ -60,7 +60,6 @@ from scipy import stats
 from tqdm import tqdm
 from tqdm.contrib import tenumerate
 
-# TODO use sample_d_sphere from this module
 from .cap_sampling import LogitsTable, sample_cap, sample_from_cap
 
 
