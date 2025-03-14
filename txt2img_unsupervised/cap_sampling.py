@@ -109,13 +109,15 @@ class LogitsTable:
         self.table = jnp.array(slice_logits)
 
     def tree_flatten(self):
-        return (self.d, self.table), self.buckets
+        # For some reason you can't just return the array as the first element of the returned
+        # tuple, you have to return a tuple there.
+        return ((self.table,), (self.d, self.buckets))
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         out = cls.__new__(cls)
-        out.d, out.table = children
-        out.buckets = aux_data
+        out.table = children[0]
+        out.d, out.buckets = aux_data
         return out
 
     def _height_to_idx(self, h):
