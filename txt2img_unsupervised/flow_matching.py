@@ -659,6 +659,7 @@ def _train_loop_for_tests(
     first_step = True
     step_count = 0
 
+    print("Train! Loop! Go!")
     with tqdm(range(epochs), desc="Training") as pbar:
         for epoch in pbar:
             # Training loop
@@ -751,14 +752,14 @@ def _train_loop_for_tests(
                     )
             else:
                 tqdm.write(
-                    f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Grad Norm: {grad_norm:.6f}"
+                    f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Grad Norm: {grad_norm:.6f}, No test batches"
                 )
 
             # Shuffle dataset for next epoch
             dataset.shuffle(generator=np_rng)
 
     if test_dataset is not None:
-        return state, train_loss, final_test_loss
+        return state, train_loss, final_test_loss, final_test_nll
     else:
         return state, train_loss
 
@@ -779,11 +780,12 @@ def test_train_trivial():
     dset = Dataset.from_dict({"point_vec": points}).with_format("np")
     train_dset = dset.select(range(batch_size * 10))
     test_dset = dset.select(range(batch_size * 10, batch_size * 11))
-    state, loss, test_loss = _train_loop_for_tests(
+    state, loss, test_loss, test_nll = _train_loop_for_tests(
         model, train_dset, batch_size, 1e-3, 20, kappa_1=10.0, test_dataset=test_dset
     )
     print(f"Final loss: {loss:.6f}")
     print(f"Final test loss: {test_loss:.6f}")
+    print(f"Final test nll: {test_nll:.6f}")
     samples = generate_samples(
         model, state, jax.random.PRNGKey(0), 20, jnp.zeros((20, 0)), 1000, "rk4"
     )
@@ -800,6 +802,14 @@ def test_train_trivial():
     # there get stuck. Hopefully this isn't an issue with nontrivial distributions.
     high_sims = cos_sims > 0.99
     assert high_sims.mean() >= 0.95
+    assert test_nll < -10.0
+
+
+def _vmf_differential_entropy(kappa):
+    "Calculate the differential entropy of a von Mises-Fisher distribution. Used for tests."
+    sinh_k = np.sinh(kappa)
+    coth_k = np.cosh(kappa) / sinh_k
+    return np.log(4 * np.pi * sinh_k / kappa) - kappa * coth_k + 1
 
 
 def test_train_vmf():
@@ -833,11 +843,18 @@ def test_train_vmf():
     print(f"Test mean log density: {vmf.logpdf(test_points).mean():.6f}")
     test_dset = Dataset.from_dict({"point_vec": test_points}).with_format("np")
 
-    state, train_loss, test_loss = _train_loop_for_tests(
+    # Compute the differential entropy of the vMF distribution
+    differential_entropy = _vmf_differential_entropy(kappa)
+    print(f"vMF distribution entropy: {differential_entropy:.6f}")
+
+    state, train_loss, test_loss, test_nll = _train_loop_for_tests(
         model, dset, batch_size, 1e-3, 30, test_dset, kappa_1=5.0
     )
     print(f"Final train loss: {train_loss:.6f}")
     print(f"Final test loss: {test_loss:.6f}")
+    print(f"Final test nll: {test_nll:.6f}")
+
+    assert test_nll < differential_entropy + 0.5
 
     n_test_samples = 1_000
     samples = generate_samples(
@@ -853,9 +870,9 @@ def test_train_vmf():
     # Calculate negative log-likelihood of samples under the VMF distribution
     samples_np = np.array(samples)
     log_probs = vmf.logpdf(samples_np)
-    nll = -np.mean(log_probs)
+    sample_nll = -np.mean(log_probs)
 
-    print(f"Negative log-likelihood: {nll:.6f}")
+    print(f"Sample NLL: {sample_nll:.6f}")
 
     # Print some sample points and their log probabilities
     print("\nSample points and their log probabilities:")
@@ -868,18 +885,10 @@ def test_train_vmf():
             f"Log prob: {log_prob:9.6f}  Cosine similarity: {cos_sim:9.6f}"
         )
 
-    # Assert that the NLL is reasonable (should be close to the theoretical value)
-    # For VMF(mu, kappa) in 3D, the theoretical NLL is approximately:
-    # log(4*pi*sinh(kappa)/kappa) - kappa
-    sinh_k = np.sinh(kappa)
-    coth_k = np.cosh(kappa) / sinh_k
-    differential_entropy = np.log(4 * np.pi * sinh_k / kappa) - kappa * coth_k + 1
-    print(f"vMF distribution entropy: {differential_entropy:.6f}")
-
     # Allow some tolerance due to sampling variability
     assert (
-        abs(nll - differential_entropy) < 1.0
-    ), f"NLL {nll} too far from differential entropy {differential_entropy}"
+        abs(sample_nll - differential_entropy) < 1.0
+    ), f"Sample NLL {sample_nll} too far from differential entropy {differential_entropy}"
 
 
 def test_train_conditional_vmf():
@@ -928,12 +937,13 @@ def test_train_conditional_vmf():
     train_dataset = dataset.select(range(train_samples))
     test_dataset = dataset.select(range(train_samples, total_samples))
 
-    # Train the model (smaller batch size)
     batch_size = 256
-    state, train_loss, test_loss = _train_loop_for_tests(
-        model, train_dataset, batch_size, 1e-2, 20, test_dataset, kappa_1=10.0
+    state, train_loss, test_loss, test_nll = _train_loop_for_tests(
+        model, train_dataset, batch_size, 1e-2, 20, test_dataset, kappa_1=5.0
     )
-    print(f"Final loss - Train: {train_loss:.4f}, Test: {test_loss:.4f}")
+    print(
+        f"Final loss - Train: {train_loss:.4f}, Test: {test_loss:.4f}, Test NLL: {test_nll:.4f}"
+    )
 
     # Test the conditioned model
     n_eval_samples = 200
@@ -952,10 +962,10 @@ def test_train_conditional_vmf():
     )
 
     # Calculate average cosine similarities
-    cos_sim_0_dir1 = np.mean([np.dot(s, mean_direction1) for s in samples_0])
-    cos_sim_0_dir2 = np.mean([np.dot(s, mean_direction2) for s in samples_0])
-    cos_sim_1_dir1 = np.mean([np.dot(s, mean_direction1) for s in samples_1])
-    cos_sim_1_dir2 = np.mean([np.dot(s, mean_direction2) for s in samples_1])
+    cos_sim_0_dir1 = np.mean(samples_0 @ mean_direction1)
+    cos_sim_0_dir2 = np.mean(samples_0 @ mean_direction2)
+    cos_sim_1_dir1 = np.mean(samples_1 @ mean_direction1)
+    cos_sim_1_dir2 = np.mean(samples_1 @ mean_direction2)
 
     # Validate correct conditioning behavior
     print(
@@ -965,15 +975,14 @@ def test_train_conditional_vmf():
         f"Conditioning=1 - Avg similarity with dir1: {cos_sim_1_dir1:.4f}, dir2: {cos_sim_1_dir2:.4f}"
     )
 
-    # Verify that samples align with their respective target distributions
-    # Samples with cond=0 should align better with direction1
+    # Samples should align more closely with their respective directions that the other directions
     assert (
         cos_sim_0_dir1 > cos_sim_0_dir2
-    ), "Samples with cond=0 don't align with direction1"
+    ), "Samples with cond=0 don't align more closely with direction1 than direction2"
     # Samples with cond=1 should align better with direction2
     assert (
         cos_sim_1_dir2 > cos_sim_1_dir1
-    ), "Samples with cond=1 don't align with direction2"
+    ), "Samples with cond=1 don't align more closely with direction2 than direction1"
 
     # Verify that conditioning makes a significant difference
     diff = (cos_sim_0_dir1 - cos_sim_0_dir2) + (cos_sim_1_dir2 - cos_sim_1_dir1)
@@ -997,7 +1006,7 @@ def test_train_conditional_vmf():
         nll_1_from_vmf2 < nll_1_from_vmf1
     ), "Samples with cond=1 don't match distribution 2"
 
-    distribution_nll = np.log(4 * np.pi * np.sinh(kappa) / kappa) - kappa
+    distribution_nll = _vmf_differential_entropy(kappa)
     print(f"Theoretical NLL: {distribution_nll:.4f}")
     print(f"NLL with cond=0 from vmf1: {nll_0_from_vmf1:.4f}")
     print(f"NLL with cond=0 from vmf2: {nll_0_from_vmf2:.4f}")
@@ -1387,8 +1396,18 @@ def compute_log_probability(
 @pytest.mark.parametrize(
     "divergence_fn,n_projections,field",
     [
-        pytest.param(hutchinson_estimator, 10, "zero_divergence", marks=pytest.mark.xfail(reason="Hutchinson estimator not implemented yet")),
-        pytest.param(hutchinson_estimator, 10, "variable_divergence", marks=pytest.mark.xfail(reason="Hutchinson estimator not implemented yet")),
+        pytest.param(
+            hutchinson_estimator,
+            10,
+            "zero_divergence",
+            marks=pytest.mark.xfail(reason="Hutchinson estimator not implemented yet"),
+        ),
+        pytest.param(
+            hutchinson_estimator,
+            10,
+            "variable_divergence",
+            marks=pytest.mark.xfail(reason="Hutchinson estimator not implemented yet"),
+        ),
         (exact_divergence, None, "zero_divergence"),
         (exact_divergence, None, "variable_divergence"),
     ],
