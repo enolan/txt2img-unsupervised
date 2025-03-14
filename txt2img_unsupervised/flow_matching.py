@@ -137,6 +137,7 @@ class VectorField(nn.Module):
             features=self.d_model,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
+            use_bias=False,
             kernel_init=nn.initializers.normal(
                 stddev=jnp.sqrt(self.domain_dim * input_variance_scale)
             ),
@@ -147,6 +148,7 @@ class VectorField(nn.Module):
                 features=self.d_model,
                 dtype=self.activations_dtype,
                 param_dtype=self.weights_dtype,
+                use_bias=False,
                 kernel_init=nn.initializers.variance_scaling(
                     # We assume the input components are unit normal
                     scale=input_variance_scale,
@@ -161,12 +163,20 @@ class VectorField(nn.Module):
             features=self.d_model,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
+            use_bias=False,
             kernel_init=nn.initializers.variance_scaling(
                 # The variance of U[0, 1] is 1/12, so me multiply by 12 before scaling
                 scale=12.0 * input_variance_scale,
                 mode="fan_in",
                 distribution="normal",
             ),
+        )
+
+        # Rather than having a bias on each of the input linear layers, which then just get summed,
+        # we have them share a single one. Reduces parameter count very slightly and speeds up
+        # inference and gradients. May or may not actually matter tbh.
+        self.mlp_in_bias = self.param(
+            "shared_bias", nn.initializers.zeros, (self.d_model,), self.weights_dtype
         )
 
         self.mlp_blocks = nn.scan(
@@ -220,7 +230,7 @@ class VectorField(nn.Module):
         assert cond_in.shape == (batch_size, self.d_model)
         assert t_in.shape == (batch_size, self.d_model)
 
-        mlp_in = x_in + cond_in + t_in
+        mlp_in = x_in + cond_in + t_in + self.mlp_in_bias
         assert mlp_in.shape == (batch_size, self.d_model)
 
         # Run them through our MLP and normalize the output
