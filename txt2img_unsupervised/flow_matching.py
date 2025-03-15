@@ -133,9 +133,11 @@ class VectorField(nn.Module):
     weights_dtype: jnp.dtype
 
     def setup(self) -> None:
-        # Initializers for our 3 inputs are specially scaled so their sum has mean 0 variance 1.
-        # Each component of the sum should have mean 0 and variance either 1/3 or 1/2, depending on
-        # if we have conditioning vectors or not
+        # The 3 inputs are transformed into d_model vectors and summed before being passed into the
+        # MLP. We want the sum to have mean 0 variance 1, so each component of the input must have
+        # mean 0 and variance 1/3 or 1/2 depending on whether there's a conditioning vector or not.
+        # We achieve this by carefully initializng these linear layers and by scaling in
+        # time_encoding and process_inputs.
         input_variance_scale = 1.0 / 3.0 if self.conditioning_dim > 0 else 1.0 / 2.0
 
         self.domain_in_proj = nn.Dense(
@@ -162,15 +164,19 @@ class VectorField(nn.Module):
         else:
             self.conditioning_in_proj = None
 
-        # Time projection. We subtract 0.5 in process_inputs to get mean 0, and the variance of
-        # U[-0.5, 0.5] is 1/12, so we multiply by 12
+        # Time projection. time_encoding produces unit normal outputs. We could just add the output
+        # of time_encoding to the output of the other two projections, but this way the network
+        # can learn to control the inputs to the mlp, instead of being forced to work around
+        # sinusoidal features it can't control.
         self.time_in_proj = nn.Dense(
             features=self.d_model,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
             use_bias=False,
-            kernel_init=nn.initializers.normal(
-                stddev=jnp.sqrt(12 * input_variance_scale)
+            kernel_init=nn.initializers.variance_scaling(
+                scale=input_variance_scale,
+                mode="fan_in",
+                distribution="normal",
             ),
         )
 
@@ -211,6 +217,38 @@ class VectorField(nn.Module):
             ),
         )
 
+    def time_encoding(self, t):
+        "Create a sinusoidal encoding for the time parameter."
+        if self.d_model % 2 != 0:
+            raise ValueError("Dimension d must be even")
+
+        # Equal number of sine and cosine components
+        half_d = self.d_model // 2
+
+        # Generate logarithmically spaced frequencies
+        min_freq = 1.0
+        max_freq = 1000.0
+        freqs = jnp.exp(jnp.linspace(jnp.log(min_freq), jnp.log(max_freq), half_d))
+
+        sin_components = jnp.sin(2 * jnp.pi * freqs * t)
+        cos_components = jnp.cos(2 * jnp.pi * freqs * t)
+
+        # Compute the means of the sine and cosine components
+        # This might be faster with an explicit lookup table, but maybe it'll get constant folded
+        # who knows.
+        sin_means = -(jnp.cos(2 * jnp.pi * freqs) - 1.0) / (2 * jnp.pi * freqs)
+        cos_means = jnp.sin(2 * jnp.pi * freqs) / (2 * jnp.pi * freqs)
+
+        sin_components = sin_components - sin_means
+        cos_components = cos_components - cos_means
+
+        encoding = jnp.concatenate([sin_components, cos_components])
+        # Try and normalize to variance 1. The standard deviation of a sine over [0, 1] is
+        # 1 / sqrt(2), but the scaling above makes this a little off.
+        encoding = encoding * jnp.sqrt(2)
+        assert encoding.shape == (self.d_model,)
+        return encoding
+
     def process_inputs(self, x, t, cond_vec):
         """
         Process the inputs to the model, returning the individual components and combined input.
@@ -240,10 +278,9 @@ class VectorField(nn.Module):
             if self.conditioning_dim > 0
             else jnp.zeros((batch_size, self.d_model))
         )
-        # important so the layer interprets the times as being batched and not just a vector for a
-        # single input
-        t_reshaped = rearrange(t, "b -> b 1")
-        t_in = self.time_in_proj(t_reshaped - 0.5)  # Center the uniform [0,1] input
+
+        t_in = jax.vmap(self.time_encoding)(t)
+        t_in = self.time_in_proj(t_in)
         assert x_in.shape == (batch_size, self.d_model)
         assert cond_in.shape == (batch_size, self.d_model)
         assert t_in.shape == (batch_size, self.d_model)
@@ -284,6 +321,67 @@ class VectorField(nn.Module):
         assert tangent_outputs.shape == (batch_size, self.domain_dim)
 
         return tangent_outputs
+
+
+def test_vector_field_time_encoding_statistics():
+    """
+    Test that the time encoding function produces vectors with appropriate statistical properties
+    when given uniformly distributed time values between 0 and 1.
+
+    The test checks:
+    1. That the mean of each component is close to 0
+    2. That the standard deviation of each component is close to 1
+    """
+    rng = jax.random.PRNGKey(42)
+
+    # Test with different model widths
+    d_model_values = [4, 16, 64, 256, 1024]
+
+    for d_model in d_model_values:
+        # Create a minimal VectorField model just to test the time_encoding. Parameters other than
+        # d_model are irrelevant for this test.
+        model = VectorField(
+            activations_dtype=jnp.float32,
+            weights_dtype=jnp.float32,
+            domain_dim=3,
+            conditioning_dim=0,
+            n_layers=1,
+            d_model=d_model,
+            mlp_expansion_factor=1,
+            mlp_dropout_rate=None,
+            input_dropout_rate=None,
+        )
+
+        params = model.init(rng, jnp.ones((1, 3)), jnp.ones((1,)), jnp.ones((1, 0)))
+
+        n_samples = 10_000
+        times = jax.random.uniform(rng, (n_samples,))
+
+        compute_encoding = lambda t: model.apply(params, t, method=model.time_encoding)
+        encoded_times = jax.vmap(compute_encoding)(times)
+
+        assert encoded_times.shape == (n_samples, d_model)
+
+        # Check statistics
+        means = jnp.mean(encoded_times, axis=0)
+        stds = jnp.std(encoded_times, axis=0)
+
+        expected_mean = 0.0
+        expected_std = 1.0
+
+        np.testing.assert_allclose(means, expected_mean, atol=0.05)
+        np.testing.assert_allclose(stds, expected_std, atol=0.1)
+
+        # Check overall vector statistics
+        overall_mean = jnp.mean(encoded_times)
+        overall_std = jnp.std(encoded_times)
+
+        np.testing.assert_allclose(overall_mean, expected_mean, atol=0.01)
+        np.testing.assert_allclose(overall_std, expected_std, atol=0.01)
+
+        print(f"Time encoding test passed for d_model={d_model}")
+        print(f"  Mean: {overall_mean:.6f} (expected {expected_mean:.6f})")
+        print(f"  Std: {overall_std:.6f} (expected {expected_std:.6f})")
 
 
 def test_vector_field_projections_normalization():
