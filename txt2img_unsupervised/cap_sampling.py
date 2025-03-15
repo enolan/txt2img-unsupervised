@@ -157,8 +157,8 @@ class LogitsTable:
             rand = jax.random.uniform(rng, shape=())
             idx_high = jnp.searchsorted(cum_probs, rand, side="right")
 
-            # Do interpolation unless we're at the first entry, since we can't interpolate using an
-            # entry that isn't in the table.
+            # Do interpolation unless we're at the first entry or last entry, since we can't
+            # interpolate using an entry that isn't in the table.
             def do_interp():
                 idx_low = idx_high - 1
                 cumprob_low = cum_probs[idx_low]
@@ -167,10 +167,15 @@ class LogitsTable:
                 return self._idx_to_height(idx_low) + interp_frac * (
                     self._idx_to_height(idx_high) - self._idx_to_height(idx_low)
                 )
-
+            def handle_edge_case():
+                return jax.lax.cond(
+                    idx_high == 0,
+                    lambda: -1.0,
+                    lambda: 1.0,
+                )
             sampled_height = jax.lax.cond(
-                idx_high == 0,
-                lambda: -1.0,
+                jnp.logical_or(idx_high == 0, idx_high == self.buckets),
+                handle_edge_case,
                 do_interp,
             )
         # We've sampled a height in [-1, d_max - 1]. Convert to a cosine distance.
