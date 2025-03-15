@@ -167,12 +167,14 @@ class LogitsTable:
                 return self._idx_to_height(idx_low) + interp_frac * (
                     self._idx_to_height(idx_high) - self._idx_to_height(idx_low)
                 )
+
             def handle_edge_case():
                 return jax.lax.cond(
                     idx_high == 0,
                     lambda: -1.0,
                     lambda: 1.0,
                 )
+
             sampled_height = jax.lax.cond(
                 jnp.logical_or(idx_high == 0, idx_high == self.buckets),
                 handle_edge_case,
