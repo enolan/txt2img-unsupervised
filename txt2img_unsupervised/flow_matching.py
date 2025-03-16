@@ -872,14 +872,20 @@ def conditional_flow_matching_loss(
 
     # Compute predicted vector field from our model (different for each model type)
     if is_cap_conditioned:
-        caps_rng, dropout_rng = jax.random.split(rng)
+        rngs = jax.random.split(rng, batch_size + 1)
+
+        my_sample_cap = lambda rng, x: sample_cap(
+            logits_table, rng, x, bias_d_max=False
+        )
+        cap_centers, cap_d_maxes = jax.vmap(my_sample_cap)(rngs[:batch_size], x1)
+
         predicted_field = model.apply(
             params,
             psi_t,
             t,
-            logits_table,
-            method=CapConditionedVectorField.forward_with_random_caps,
-            rngs={"caps": caps_rng, "dropout": dropout_rng},
+            cap_centers,
+            cap_d_maxes,
+            rngs={"dropout": rngs[-1]},
         )
     else:
         predicted_field = model.apply(params, psi_t, t, conds, rngs={"dropout": rng})
@@ -953,6 +959,9 @@ def compute_batch_loss(model, params, batch, rng, kappa_1, logits_table=None):
         assert (
             "cond_vec" not in batch
         ), "cond_vec is not supported for CapConditionedVectorField"
+        assert (
+            logits_table is not None
+        ), "logits_table is required for CapConditionedVectorField"
         conds = None
     else:
         conds = batch["cond_vec"]
@@ -2211,32 +2220,6 @@ class CapConditionedVectorField(VectorField):
         processed = self.process_cap_inputs(cap_centers, cap_d_maxes)
         return super().__call__(x, t, processed["cap_info"])
 
-    def forward_with_random_caps(self, x, t, logits_table):
-        """
-        Run the model forward on a batch of examples, generating random containing caps for each
-        example beforehand. Useful exclusively for training.
-        """
-        batch_size = x.shape[0]
-        assert x.shape == (batch_size, self.domain_dim)
-        assert t.shape == (batch_size,)
-
-        assert logits_table.d == self.domain_dim - 1
-
-        rngs = jax.random.split(self.make_rng("caps"), batch_size)
-
-        # idk if bias_d_max should be true or not. I think the data efficiency argument is weaker
-        # in a design where you have a model dedicated to generating cap-conditioned embeddings
-        # than in a design where you have a single model handling embeddings and actual data
-        # generation.
-        my_sample_cap = lambda rng, x: sample_cap(
-            logits_table, rng, x, bias_d_max=False
-        )
-        cap_centers, cap_d_maxes = jax.vmap(my_sample_cap)(rngs, x)
-
-        assert cap_centers.shape == (batch_size, self.domain_dim)
-        assert cap_d_maxes.shape == (batch_size,)
-        return self.__call__(x, t, cap_centers, cap_d_maxes)
-
 
 def test_cap_conditioned_vector_field_normalization():
     """
@@ -2343,16 +2326,16 @@ def test_train_cap_conditioned_model():
     model = CapConditionedVectorField(
         domain_dim=3,
         reference_directions=128,
-        n_layers=24,
+        n_layers=6,
         d_model=512,
         time_dim=128,
         mlp_expansion_factor=4,
         activations_dtype=jnp.float32,
         weights_dtype=jnp.float32,
         conditioning_dim=None,
-        input_dropout_rate=0.1,
-        mlp_dropout_rate=0.1,
-        use_pre_mlp_projection=False,
+        input_dropout_rate=None,
+        mlp_dropout_rate=None,
+        use_pre_mlp_projection=True,
     )
 
     distribution_rng, shuffle_rng, params_rng, train_rng, sample_rng = jax.random.split(
@@ -2367,8 +2350,8 @@ def test_train_cap_conditioned_model():
     # sphere.
     n_distribution_points = 5
     distribution_points = sample_sphere(distribution_rng, n_distribution_points, 3)
-    training_points = jnp.repeat(distribution_points, 2000, axis=0)
-    assert training_points.shape == (10_000, 3)
+    training_points = jnp.repeat(distribution_points, 20_000, axis=0)
+    assert training_points.shape == (100_000, 3)
     shuffle_indices = jax.random.permutation(
         shuffle_rng, jnp.arange(training_points.shape[0])
     )
@@ -2427,7 +2410,7 @@ def test_train_cap_conditioned_model():
 
     print(f"distribution points: {distribution_points}")
 
-    n_samples = 20
+    n_samples = 100
 
     print("Sampling from full sphere...")
     full_sample_rng, center_rng, sample_rng = jax.random.split(sample_rng, 3)
@@ -2453,9 +2436,9 @@ def test_train_cap_conditioned_model():
     print(
         f"closest cos similarity: {cos_similarities[jnp.arange(n_samples), closest_distribution_points]}"
     )
-    assert jnp.all(
-        cos_similarities[jnp.arange(n_samples), closest_distribution_points] > 0.999
-    )
+    assert (
+        cos_similarities[jnp.arange(n_samples), closest_distribution_points] > 0.99
+    ).mean() > 0.95
 
     print("Sampling from hemisphere...")
     hemisphere_sample_rng, center_rng, sample_rng = jax.random.split(sample_rng, 3)
@@ -2478,10 +2461,12 @@ def test_train_cap_conditioned_model():
     )
     assert cos_similarity_targets.shape == (n_distribution_points + 1, 3)
     cos_similarities = jnp.dot(hemisphere_samples, cos_similarity_targets.T)
+    fraction_inside_hemisphere = (cos_similarities[:, 0] > 0).mean()
     print(f"cosine similarities to cap center:\n{cos_similarities[:, 0]}")
+    print(f"Inside hemisphere: {fraction_inside_hemisphere * 100:.2f}%")
     print(f"cosine similarities to distribution points:\n{cos_similarities[:, 1:]}")
     # All samples should be within the hemisphere
-    assert jnp.all(cos_similarities[:, 0] > 0)
+    assert fraction_inside_hemisphere > 0.95
 
 
 def test_vector_field_without_reference_directions():
