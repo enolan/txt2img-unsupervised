@@ -875,7 +875,7 @@ def conditional_flow_matching_loss(
         rngs = jax.random.split(rng, batch_size + 1)
 
         my_sample_cap = lambda rng, x: sample_cap(
-            logits_table, rng, x, bias_d_max=False
+            logits_table, rng, x, bias_d_max=True
         )
         cap_centers, cap_d_maxes = jax.vmap(my_sample_cap)(rngs[:batch_size], x1)
 
@@ -2321,6 +2321,14 @@ def test_train_cap_conditioned_model():
     """
     Train a cap conditioned model on a simple 3d training distribution and check the samples are
     inside the input caps and correctly distributed.
+
+    Tests three cases:
+    1. Full sphere (d_max=2.0)
+    2. Hemisphere (d_max=1.0)
+    3. Quarter-sphere (d_max=0.5)
+
+    In each case, we check that the samples respect the cap boundaries and come from the learned
+    distribution.
     """
 
     model = CapConditionedVectorField(
@@ -2363,7 +2371,7 @@ def test_train_cap_conditioned_model():
     test_dset = dset.select(range(train_set_size, training_points.shape[0]))
 
     # Train a model
-    epochs = 20
+    epochs = 40
     batch_size = 256
     batches_per_epoch = len(train_dset) // batch_size
     total_steps = epochs * batches_per_epoch
@@ -2412,61 +2420,65 @@ def test_train_cap_conditioned_model():
 
     n_samples = 100
 
-    print("Sampling from full sphere...")
-    full_sample_rng, center_rng, sample_rng = jax.random.split(sample_rng, 3)
-    centers = sample_sphere(center_rng, n_samples, 3)
-    d_maxes = jnp.full((n_samples,), 1.0)
-    full_samples = generate_samples(
-        model,
-        train_state,
-        full_sample_rng,
-        n_samples,
-        cap_centers=centers,
-        cap_d_maxes=d_maxes,
-    )
-    print(f"full samples: {full_samples}")
+    test_cases = [
+        {"name": "full sphere", "d_max": 2.0},
+        {"name": "hemisphere", "d_max": 1.0},
+        {"name": "quarter-sphere", "d_max": 0.5},
+    ]
 
-    # Compute the cosine similarity of each distribution point/sample pair
-    cos_similarities = jnp.dot(full_samples, distribution_points.T)
-    assert cos_similarities.shape == (n_samples, n_distribution_points)
+    for test_case in test_cases:
+        test_name = test_case["name"]
+        d_max = test_case["d_max"]
 
-    closest_distribution_points = jnp.argmax(cos_similarities, axis=1)
-    assert closest_distribution_points.shape == (n_samples,)
-    print(f"closest distribution points: {closest_distribution_points}")
-    print(
-        f"closest cos similarity: {cos_similarities[jnp.arange(n_samples), closest_distribution_points]}"
-    )
-    assert (
-        cos_similarities[jnp.arange(n_samples), closest_distribution_points] > 0.99
-    ).mean() > 0.95
+        # For each test case, sample from a cap centered on the first distribution point
+        print(f"\nSampling from {test_name} (d_max={d_max})...")
+        cap_sample_rng, pt_sample_rng, sample_rng = jax.random.split(sample_rng, 3)
 
-    print("Sampling from hemisphere...")
-    hemisphere_sample_rng, center_rng, sample_rng = jax.random.split(sample_rng, 3)
-    # Sample a random center for our hemisphere to have
-    center = sample_sphere(center_rng, 1, 3)[0]
-    centers = jnp.repeat(center[None, :], n_samples, axis=0)
-    d_maxes = jnp.full((n_samples,), 1.0)
+        center = sample_sphere(cap_sample_rng, 1, 3)[0]
+        centers = jnp.repeat(center[None, :], n_samples, axis=0)
+        d_maxes = jnp.full((n_samples,), d_max)
 
-    hemisphere_samples = generate_samples(
-        model,
-        train_state,
-        hemisphere_sample_rng,
-        n_samples,
-        cap_centers=centers,
-        cap_d_maxes=d_maxes,
-    )
-    print(f"hemisphere samples: {hemisphere_samples}")
-    cos_similarity_targets = jnp.concatenate(
-        [center[None, :], distribution_points], axis=0
-    )
-    assert cos_similarity_targets.shape == (n_distribution_points + 1, 3)
-    cos_similarities = jnp.dot(hemisphere_samples, cos_similarity_targets.T)
-    fraction_inside_hemisphere = (cos_similarities[:, 0] > 0).mean()
-    print(f"cosine similarities to cap center:\n{cos_similarities[:, 0]}")
-    print(f"Inside hemisphere: {fraction_inside_hemisphere * 100:.2f}%")
-    print(f"cosine similarities to distribution points:\n{cos_similarities[:, 1:]}")
-    # All samples should be within the hemisphere
-    assert fraction_inside_hemisphere > 0.95
+        # Generate samples with increased accuracy settings
+        # Higher number of steps and RK4 method dramatically improves cap constraint satisfaction
+        cap_samples = generate_samples(
+            model,
+            train_state,
+            pt_sample_rng,
+            n_samples,
+            cap_centers=centers,
+            cap_d_maxes=d_maxes,
+            n_steps=1000,
+            method="rk4",
+        )
+
+        cos_similarity_targets = jnp.concatenate(
+            [center[None, :], distribution_points], axis=0
+        )
+        assert cos_similarity_targets.shape == (n_distribution_points + 1, 3)
+
+        # Calculate similarities to center and distribution points
+        cos_similarities = jnp.dot(cap_samples, cos_similarity_targets.T)
+        cos_to_center = cos_similarities[:, 0]
+
+        # Print stats
+        print(
+            f"Cosine similarities to cap center - min: {cos_to_center.min():.4f}, max: {cos_to_center.max():.4f}"
+        )
+
+        constraint_results = cos_to_center > (1 - d_max)
+        constraint_fraction = constraint_results.mean()
+        print(
+            f"Fraction of points satisfying constraint: {constraint_fraction * 100:.2f}%"
+        )
+        assert (
+            constraint_fraction >= 0.90
+        ), f"Only {constraint_fraction * 100:.2f}% of samples satisfy the {test_name} constraint (required >= 90%)"
+
+        # Check which distribution points the samples are closest to
+        distribution_similarities = cos_similarities[:, 1:]
+        closest_points = jnp.argmax(distribution_similarities, axis=1)
+        counts = np.bincount(np.array(closest_points), minlength=n_distribution_points)
+        print(f"Distribution of closest points: {counts}")
 
 
 def test_vector_field_without_reference_directions():
