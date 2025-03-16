@@ -54,6 +54,7 @@ def create_rotating_animation(
         model_config = {
             "domain_dim": 3,  # Only support 3D for sphere rotation
             "conditioning_dim": 0,
+            "time_dim": 16,
             "n_layers": 2,
             "d_model": 32,
             "mlp_expansion_factor": 4,

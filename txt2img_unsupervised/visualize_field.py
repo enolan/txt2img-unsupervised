@@ -132,6 +132,7 @@ def visualize_vector_field(
         model_config = {
             "domain_dim": 3,
             "conditioning_dim": 0,
+            "time_dim": 16,
             "n_layers": 2,
             "d_model": 32,
             "mlp_expansion_factor": 4,
@@ -329,6 +330,7 @@ if __name__ == "__main__":
     model_config = {
         "domain_dim": args.domain_dim,
         "conditioning_dim": args.conditioning_dim,
+        "time_dim": args.time_dim,
         "n_layers": args.n_layers,
         "d_model": args.d_model,
         "mlp_expansion_factor": args.expansion_factor,

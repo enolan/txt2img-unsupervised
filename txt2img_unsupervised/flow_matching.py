@@ -127,8 +127,15 @@ class VectorField(nn.Module):
 
     # Dimension of the sphere and the vector field
     domain_dim: int
+    # If reference_directions is not None, encode the input unit vectors as a set of cosine
+    # similarities with n randomly selected reference directions. Note that in order for this
+    # encoding to capture all the information reference_directions must be at least domain_dim. If
+    # it is None, pass it through unmodified.
+    reference_directions: Optional[int]
     # Dimension of the conditioning vector. Can be zero for unconditioned models.
     conditioning_dim: int
+    # Dimension of the time encoding. Must be even.
+    time_dim: int
     # Number of MLP blocks
     n_layers: int
     # Width of the MLP
@@ -143,59 +150,39 @@ class VectorField(nn.Module):
     activations_dtype: jnp.dtype
     weights_dtype: jnp.dtype
 
+    @property
+    def input_feature_dim(self) -> int:
+        return (
+            self.reference_directions
+            if self.reference_directions is not None
+            else self.domain_dim
+        )
+
+    @property
+    def total_input_dim(self) -> int:
+        return self.input_feature_dim + self.conditioning_dim + self.time_dim
+
     def setup(self) -> None:
-        # The 3 inputs are transformed into d_model vectors and summed before being passed into the
-        # MLP. We want the sum to have mean 0 variance 1, so each component of the input must have
-        # mean 0 and variance 1/3 or 1/2 depending on whether there's a conditioning vector or not.
-        # We achieve this by carefully initializng these linear layers and by scaling in
-        # time_encoding and process_inputs.
-        input_variance_scale = 1.0 / 3.0 if self.conditioning_dim > 0 else 1.0 / 2.0
-
-        self.domain_in_proj = nn.Dense(
-            features=self.d_model,
-            dtype=self.activations_dtype,
-            param_dtype=self.weights_dtype,
-            use_bias=False,
-            kernel_init=nn.initializers.normal(stddev=jnp.sqrt(input_variance_scale)),
-        )
-
-        if self.conditioning_dim > 0:
-            self.conditioning_in_proj = nn.Dense(
-                features=self.d_model,
-                dtype=self.activations_dtype,
-                param_dtype=self.weights_dtype,
-                use_bias=False,
-                kernel_init=nn.initializers.variance_scaling(
-                    # We assume the input components are unit normal
-                    scale=input_variance_scale,
-                    mode="fan_in",
-                    distribution="normal",
-                ),
+        if self.total_input_dim > self.d_model:
+            raise ValueError(
+                f"input_feature_dim + conditioning_dim + time_dim ({self.total_input_dim}) "
+                f"exceeds d_model ({self.d_model}). Reduce one or more of them or increase d_model."
             )
-        else:
-            self.conditioning_in_proj = None
+        if self.time_dim % 2 != 0:
+            raise ValueError("Time dimension must be even")
 
-        # Time projection. time_encoding produces unit normal outputs. We could just add the output
-        # of time_encoding to the output of the other two projections, but this way the network
-        # can learn to control the inputs to the mlp, instead of being forced to work around
-        # sinusoidal features it can't control.
-        self.time_in_proj = nn.Dense(
-            features=self.d_model,
-            dtype=self.activations_dtype,
-            param_dtype=self.weights_dtype,
-            use_bias=False,
-            kernel_init=nn.initializers.variance_scaling(
-                scale=input_variance_scale,
-                mode="fan_in",
-                distribution="normal",
-            ),
-        )
+        # Learned bias to add to the concatenated input
+        def init_bias(rng, shape, dtype):
+            # Zero bias for the components of the input that will actually be set to something,
+            # unit normal for the rest to avoid weight tying.
+            used_bias = jnp.zeros((self.total_input_dim,), dtype=dtype)
+            unused_bias = jax.random.normal(
+                rng, (self.d_model - self.total_input_dim,), dtype=dtype
+            )
+            return jnp.concatenate([used_bias, unused_bias], axis=0)
 
-        # Rather than having a bias on each of the input linear layers, which then just get summed,
-        # we have them share a single one. Reduces parameter count very slightly and speeds up
-        # inference and gradients. May or may not actually matter tbh.
         self.mlp_in_bias = self.param(
-            "shared_bias", nn.initializers.zeros, (self.d_model,), self.weights_dtype
+            "mlp_in_bias", init_bias, (self.d_model,), self.weights_dtype
         )
 
         if self.input_dropout_rate is not None:
@@ -236,13 +223,16 @@ class VectorField(nn.Module):
             ),
         )
 
-    def time_encoding(self, t):
-        "Create a sinusoidal encoding for the time parameter."
-        if self.d_model % 2 != 0:
-            raise ValueError("Dimension d must be even")
+        # Used to encode the input unit vectors as a vector of dot products
+        if self.reference_directions is not None:
+            self.reference_vectors = sample_sphere(
+                jax.random.PRNGKey(20250315), self.reference_directions, self.domain_dim
+            )
 
+    def time_encoding(self, t):
+        "Create a sinusoidal encoding for the time parameter with configurable dimension."
         # Equal number of sine and cosine components
-        half_d = self.d_model // 2
+        half_d = self.time_dim // 2
 
         # Generate logarithmically spaced frequencies
         min_freq = 1.0
@@ -265,7 +255,7 @@ class VectorField(nn.Module):
         # Try and normalize to variance 1. The standard deviation of a sine over [0, 1] is
         # 1 / sqrt(2), but the scaling above makes this a little off.
         encoding = encoding * jnp.sqrt(2)
-        assert encoding.shape == (self.d_model,)
+        assert encoding.shape == (self.time_dim,)
         return encoding
 
     def process_inputs(self, x, t, cond_vec):
@@ -279,10 +269,10 @@ class VectorField(nn.Module):
             cond_vec: Conditioning vectors [batch_size, conditioning_dim]
 
         Returns:
-            Dictionary with individual projection outputs and combined input:
-            - domain_proj: Output of domain_in_proj [batch_size, d_model]
-            - cond_proj: Output of conditioning_in_proj [batch_size, d_model]
-            - time_proj: Output of time_in_proj [batch_size, d_model]
+            Dictionary with individual components and combined input:
+            - input_features: Input features (either dot products or scaled input vectors) [batch_size, input_feature_dim]
+            - time_encoding: Time encoding [batch_size, time_dim]
+            - cond_vec: Conditioning vectors [batch_size, conditioning_dim]
             - mlp_input: Combined input to the MLP [batch_size, d_model]
         """
         batch_size = x.shape[0]
@@ -290,21 +280,32 @@ class VectorField(nn.Module):
         assert t.shape == (batch_size,)
         assert cond_vec.shape == (batch_size, self.conditioning_dim)
 
-        # Convert inputs to the dimension of our MLP
-        x_in = self.domain_in_proj(x)
-        cond_in = (
-            self.conditioning_in_proj(cond_vec)
-            if self.conditioning_dim > 0
-            else jnp.zeros((batch_size, self.d_model))
+        if self.reference_directions is not None:
+            # Encode the input unit vectors as a vector of dot products
+            input_features = (x @ self.reference_vectors.T) * jnp.sqrt(self.domain_dim)
+            assert input_features.shape == (batch_size, self.reference_directions)
+        else:
+            # Use the raw input vectors, scaled to have unit variance
+            input_features = x * jnp.sqrt(self.domain_dim)
+            assert input_features.shape == (batch_size, self.domain_dim)
+
+        time_encoding = jax.vmap(self.time_encoding)(t)
+        assert time_encoding.shape == (batch_size, self.time_dim)
+
+        concatenated = jnp.concatenate(
+            [input_features, time_encoding, cond_vec], axis=1
         )
+        assert concatenated.shape == (batch_size, self.total_input_dim)
 
-        t_in = jax.vmap(self.time_encoding)(t)
-        t_in = self.time_in_proj(t_in)
-        assert x_in.shape == (batch_size, self.d_model)
-        assert cond_in.shape == (batch_size, self.d_model)
-        assert t_in.shape == (batch_size, self.d_model)
+        if self.total_input_dim < self.d_model:
+            padding = jnp.zeros((batch_size, self.d_model - self.total_input_dim))
+            mlp_in = jnp.concatenate([concatenated, padding], axis=1)
+        else:
+            mlp_in = concatenated
 
-        mlp_in = x_in + cond_in + t_in + self.mlp_in_bias
+        mlp_in = mlp_in + self.mlp_in_bias
+        assert mlp_in.shape == (batch_size, self.d_model)
+
         mlp_in = (
             self.input_dropout(mlp_in)
             if self.input_dropout_rate is not None
@@ -313,9 +314,9 @@ class VectorField(nn.Module):
         assert mlp_in.shape == (batch_size, self.d_model)
 
         return {
-            "domain_proj": x_in,
-            "cond_proj": cond_in,
-            "time_proj": t_in,
+            "input_features": input_features,
+            "time_encoding": time_encoding,
+            "cond_vec": cond_vec,
             "mlp_input": mlp_in,
         }
 
@@ -359,9 +360,9 @@ def test_vector_field_time_encoding_statistics():
     rng = jax.random.PRNGKey(42)
 
     # Test with different model widths
-    d_model_values = [4, 16, 64, 256, 1024]
+    time_dims = [4, 16, 64]
 
-    for d_model in d_model_values:
+    for time_dim in time_dims:
         # Create a minimal VectorField model just to test the time_encoding. Parameters other than
         # d_model are irrelevant for this test.
         model = VectorField(
@@ -369,8 +370,10 @@ def test_vector_field_time_encoding_statistics():
             weights_dtype=jnp.float32,
             domain_dim=3,
             conditioning_dim=0,
+            time_dim=time_dim,
+            reference_directions=16,
             n_layers=1,
-            d_model=d_model,
+            d_model=256,
             mlp_expansion_factor=1,
             mlp_dropout_rate=None,
             input_dropout_rate=None,
@@ -384,7 +387,7 @@ def test_vector_field_time_encoding_statistics():
         compute_encoding = lambda t: model.apply(params, t, method=model.time_encoding)
         encoded_times = jax.vmap(compute_encoding)(times)
 
-        assert encoded_times.shape == (n_samples, d_model)
+        assert encoded_times.shape == (n_samples, time_dim)
 
         # Check statistics
         means = jnp.mean(encoded_times, axis=0)
@@ -403,28 +406,30 @@ def test_vector_field_time_encoding_statistics():
         np.testing.assert_allclose(overall_mean, expected_mean, atol=0.01)
         np.testing.assert_allclose(overall_std, expected_std, atol=0.01)
 
-        print(f"Time encoding test passed for d_model={d_model}")
+        print(f"Time encoding test passed for time_dim={time_dim}")
         print(f"  Mean: {overall_mean:.6f} (expected {expected_mean:.6f})")
         print(f"  Std: {overall_std:.6f} (expected {expected_std:.6f})")
 
 
 def test_vector_field_projections_normalization():
     """
-    Test that the outputs of domain_in_proj, conditioning_proj, and time_in_proj in the VectorField
-    model have the distributions they're supposed to (mean 0, variance 1/2 or 1/3 depending on if
-    conditioning_dim is > 0), and that the sum (input to MLP) has mean 0 and variance 1.
+    Test that the inputs to the MLP in the VectorField model have the expected distributions.
+
+    Specifically, check that each component has mean 0 and variance 1 and that the combined
+    input also has mean 0 and variance 1.
 
     Assumptions:
     * x is composed of uniformly distributed unit vectors in domain_dim dimensions
     * t is uniformly distributed between 0 and 1
     * cond_vec's components each have mean 0 variance 1
-
     """
     rng = jax.random.PRNGKey(42)
 
     # Test both with and without conditioning
+    # TODO parameterize
     domain_dims = [3, 10]
     conditioning_cases = [0, 4]  # 0 for no conditioning, positive for conditioning
+    time_dim = 16
 
     for domain_dim in domain_dims:
         for conditioning_dim in conditioning_cases:
@@ -433,6 +438,8 @@ def test_vector_field_projections_normalization():
                 weights_dtype=jnp.float32,
                 domain_dim=domain_dim,
                 conditioning_dim=conditioning_dim,
+                time_dim=time_dim,
+                reference_directions=16,
                 n_layers=1,
                 d_model=2048,  # Bigger mlp_in vectors reduce the variance of our estimates
                 mlp_expansion_factor=1,
@@ -460,72 +467,88 @@ def test_vector_field_projections_normalization():
                 state.params, x, t, cond_vec, method=model.process_inputs
             )
 
-            expected_proj_variance = 1.0 / 3.0 if conditioning_dim > 0 else 1.0 / 2.0
+            input_features = inputs["input_features"]
+            input_features_mean = jnp.mean(input_features)
+            input_features_variance = jnp.mean(jnp.var(input_features, axis=0))
 
-            # Compute statistics for each projection, and their sum
-            domain_proj = inputs["domain_proj"]
-            domain_mean = jnp.mean(domain_proj)
-            domain_variance = jnp.mean(jnp.var(domain_proj, axis=1))
-
-            time_proj = inputs["time_proj"]
-            time_mean = jnp.mean(time_proj)
-            time_variance = jnp.mean(jnp.var(time_proj, axis=1))
+            time_encoding = inputs["time_encoding"]
+            time_encoding_mean = jnp.mean(time_encoding)
+            time_encoding_variance = jnp.mean(jnp.var(time_encoding, axis=0))
 
             if conditioning_dim > 0:
-                cond_proj = inputs["cond_proj"]
-                cond_mean = jnp.mean(cond_proj)
-                cond_variance = jnp.mean(jnp.var(cond_proj, axis=1))
+                cond_vec_data = inputs["cond_vec"]
+                cond_vec_mean = jnp.mean(cond_vec_data)
+                cond_vec_variance = jnp.mean(jnp.var(cond_vec_data, axis=0))
 
             mlp_input = inputs["mlp_input"]
-            mlp_input_mean = jnp.mean(mlp_input)
-            mlp_input_variance = jnp.mean(jnp.var(mlp_input, axis=1))
+            # The padding components of mlp_input are constant, so they have 0 variance. So we test
+            # the statistics of the unpadded part separately from the whole thing.
+            unpadded_mlp_input = mlp_input[:, : model.total_input_dim]
+            unpadded_mlp_input_mean = jnp.mean(unpadded_mlp_input)
+            unpadded_mlp_input_variance = jnp.mean(jnp.var(unpadded_mlp_input, axis=0))
 
+            padded_mlp_input_mean = jnp.mean(mlp_input)
+            # note axis: calculating variances inside examples, not features across examples
+            padded_mlp_input_variance = jnp.mean(jnp.var(mlp_input, axis=1))
             # Print statistics
             print(
-                f"\nTesting with domain_dim={domain_dim}, conditioning_dim={conditioning_dim}"
+                f"\nTesting with domain_dim={domain_dim}, conditioning_dim={conditioning_dim}, time_dim={time_dim}"
             )
-            print(f"Expected component variance: {expected_proj_variance:.6f}")
+            # print(
+            #    f"scaled_x - Mean: {scaled_x_mean:.6f}, Variance: {scaled_x_variance:.6f}"
+            # )
             print(
-                f"Domain projection - Mean: {domain_mean:.6f}, Variance: {domain_variance:.6f}"
+                f"dot_products - Mean: {input_features_mean:.6f}, Variance: {input_features_variance:.6f}"
             )
             print(
-                f"Time projection - Mean: {time_mean:.6f}, Variance: {time_variance:.6f}"
+                f"time_encoding - Mean: {time_encoding_mean:.6f}, Variance: {time_encoding_variance:.6f}"
             )
             if conditioning_dim > 0:
                 print(
-                    f"Conditioning projection - Mean: {cond_mean:.6f}, Variance: {cond_variance:.6f}"
+                    f"cond_vec - Mean: {cond_vec_mean:.6f}, Variance: {cond_vec_variance:.6f}"
                 )
             print(
-                f"MLP input - Mean: {mlp_input_mean:.6f}, Variance: {mlp_input_variance:.6f}"
+                f"Unpadded MLP input - Mean: {unpadded_mlp_input_mean:.6f}, Variance: {unpadded_mlp_input_variance:.6f}"
+            )
+            print(
+                f"Padded MLP input - Mean: {padded_mlp_input_mean:.6f}, Variance: {padded_mlp_input_variance:.6f}"
             )
 
             # Check if means are close to 0
             mean_tol = 0.02
             assert (
-                abs(domain_mean) < mean_tol
-            ), f"Domain projection mean should be close to 0, got {domain_mean}"
+                abs(input_features_mean) < mean_tol
+            ), f"input_features mean should be close to 0, got {input_features_mean}"
             assert (
-                abs(domain_variance - expected_proj_variance) < 0.02
-            ), f"Domain projection variance should be close to {expected_proj_variance}, got {domain_variance}"
+                abs(input_features_variance - 1.0) < 0.05
+            ), f"input_features variance should be close to 1.0, got {input_features_variance}"
             assert (
-                abs(time_mean) < mean_tol
-            ), f"Time projection mean should be close to 0, got {time_mean}"
+                abs(time_encoding_mean) < mean_tol
+            ), f"time_encoding mean should be close to 0, got {time_encoding_mean}"
             assert (
-                abs(time_variance - expected_proj_variance) < 0.02
-            ), f"Time projection variance should be close to {expected_proj_variance}, got {time_variance}"
+                abs(time_encoding_variance - 1.0) < 0.05
+            ), f"time_encoding variance should be close to 1.0, got {time_encoding_variance}"
+
             if conditioning_dim > 0:
                 assert (
-                    abs(cond_mean) < mean_tol
-                ), f"Conditioning projection mean should be close to 0, got {cond_mean}"
+                    abs(cond_vec_mean) < mean_tol
+                ), f"cond_vec mean should be close to 0, got {cond_vec_mean}"
                 assert (
-                    abs(cond_variance - expected_proj_variance) < 0.02
-                ), f"Conditioning projection variance should be close to {expected_proj_variance}, got {cond_variance}"
+                    abs(cond_vec_variance - 1.0) < 0.05
+                ), f"cond_vec variance should be close to 1.0, got {cond_vec_variance}"
+
             assert (
-                abs(mlp_input_mean) < mean_tol
-            ), f"MLP input mean should be close to 0, got {mlp_input_mean}"
+                abs(unpadded_mlp_input_mean) < mean_tol
+            ), f"Unpadded MLP input mean should be close to 0, got {unpadded_mlp_input_mean}"
             assert (
-                abs(mlp_input_variance - 1) < 0.02
-            ), f"MLP input variance should be close to 1, got {mlp_input_variance}"
+                abs(unpadded_mlp_input_variance - 1.0) < 0.05
+            ), f"Unpadded MLP input variance should be close to 1.0, got {unpadded_mlp_input_variance}"
+            assert (
+                abs(padded_mlp_input_mean) < 0.05
+            ), f"Padded MLP input mean should be close to 0, got {padded_mlp_input_mean}"
+            assert (
+                abs(padded_mlp_input_variance - 1.0) < 0.05
+            ), f"Padded MLP input variance should be close to 1.0, got {padded_mlp_input_variance}"
 
 
 def test_optimal_transport_field_direction():
@@ -1099,19 +1122,22 @@ def test_train_trivial():
         weights_dtype=jnp.float32,
         domain_dim=3,
         conditioning_dim=0,
-        n_layers=2,
-        d_model=16,
+        n_layers=3,
+        d_model=32,
         mlp_expansion_factor=4,
+        reference_directions=16,
+        time_dim=16,
         input_dropout_rate=None,
         mlp_dropout_rate=None,
     )
+
     batch_size = 512
     points = repeat(jnp.array([1, 0, 0]), "v -> b v", b=batch_size * 11)
     dset = Dataset.from_dict({"point_vec": points}).with_format("np")
     train_dset = dset.select(range(batch_size * 10))
     test_dset = dset.select(range(batch_size * 10, batch_size * 11))
     state, loss, test_loss, test_nll = _train_loop_for_tests(
-        model, train_dset, batch_size, 1e-2, 50, kappa_1=10.0, test_dataset=test_dset
+        model, train_dset, batch_size, 1e-1, 50, kappa_1=10.0, test_dataset=test_dset
     )
     print(f"Final loss: {loss:.6f}")
     print(f"Final test loss: {test_loss:.6f}")
@@ -1156,6 +1182,8 @@ def test_train_vmf():
         activations_dtype=jnp.float32,
         weights_dtype=jnp.float32,
         domain_dim=3,
+        reference_directions=32,
+        time_dim=32,
         conditioning_dim=0,
         n_layers=3,
         d_model=128,
@@ -1242,8 +1270,10 @@ def test_train_conditional_vmf():
         weights_dtype=jnp.float32,
         domain_dim=3,
         conditioning_dim=1,
+        time_dim=24,
+        reference_directions=24,
         n_layers=2,
-        d_model=32,
+        d_model=64,
         mlp_expansion_factor=4,
         input_dropout_rate=None,
         mlp_dropout_rate=None,
@@ -1279,8 +1309,8 @@ def test_train_conditional_vmf():
 
     batch_size = 256
     state, train_loss, test_loss, test_nll = _train_loop_for_tests(
-        model, train_dataset, batch_size, 1e-2, 20, test_dataset, kappa_1=5.0
-    )
+        model, train_dataset, batch_size, 1e-3, 20, test_dataset, kappa_1=5.0
+    )  # 1e-2 8.55,
     print(
         f"Final loss - Train: {train_loss:.4f}, Test: {test_loss:.4f}, Test NLL: {test_nll:.4f}"
     )
@@ -1831,8 +1861,10 @@ def test_divergence_estimate(divergence_fn, n_projections, field):
         weights_dtype=jnp.float32,
         domain_dim=3,
         conditioning_dim=0,
+        reference_directions=1,
         n_layers=1,
         d_model=16,
+        time_dim=2,
         mlp_expansion_factor=2,
         input_dropout_rate=None,
         mlp_dropout_rate=None,
@@ -1899,13 +1931,14 @@ def test_vector_field_evaluation():
         weights_dtype=jnp.float32,
         domain_dim=3,
         conditioning_dim=0,
+        time_dim=32,
+        reference_directions=16,
         n_layers=2,
         d_model=64,
         mlp_expansion_factor=4,
         input_dropout_rate=None,
         mlp_dropout_rate=None,
     )
-
     state = create_train_state(rng, model, 1e-3)
 
     # Generate points & times
@@ -2065,7 +2098,12 @@ class CapConditionedVectorField(VectorField):
     conditioning_dim: Optional[int]  # Pass None, will be overwritten.
 
     def __post_init__(self):
-        correct_conditioning_dim = self.domain_dim + 1
+        cap_center_dim = (
+            self.domain_dim
+            if self.reference_directions is None
+            else self.reference_directions
+        )
+        correct_conditioning_dim = cap_center_dim + 1
         assert (
             self.conditioning_dim is None
             or self.conditioning_dim == correct_conditioning_dim
@@ -2084,7 +2122,7 @@ class CapConditionedVectorField(VectorField):
 
         Returns:
             Dictionary with:
-            - cap_centers_transformed: Transformed cap centers [batch_size, domain_dim]
+            - cap_centers_transformed: Transformed cap centers [batch_size, domain_dim or reference_directions if it's not None]
             - cap_d_maxes_transformed: Transformed max distances [batch_size]
             - cap_info: Combined conditioning vector for the base model [batch_size, conditioning_dim]
         """
@@ -2093,8 +2131,13 @@ class CapConditionedVectorField(VectorField):
         assert cap_d_maxes.shape == (batch_size,)
 
         # Norm the input to have mean 0 variance 1
-        # Unit vector components have std 1/sqrt(d), mean 0
-        cap_centers_transformed = cap_centers * jnp.sqrt(self.domain_dim)
+        # Both unit vectors and cosine similarities have mean 0 standard deviation 1/sqrt(d)
+        if self.reference_directions is not None:
+            cap_centers_transformed = (
+                cap_centers @ self.reference_vectors.T
+            ) * jnp.sqrt(self.domain_dim)
+        else:
+            cap_centers_transformed = cap_centers * jnp.sqrt(self.domain_dim)
         # U[0, 2] has variance 1/3, mean 1
         cap_d_maxes_transformed = (cap_d_maxes - 1) * np.sqrt(3)
 
@@ -2163,74 +2206,84 @@ def test_cap_conditioned_vector_field_normalization():
 
     # Test with different dimensions like in the VectorField test
     domain_dims = [3, 5, 8]
+    reference_directions_options = [8, 16]
+    time_dim = 16
 
     for domain_dim in domain_dims:
-        # Create the model
-        model = CapConditionedVectorField(
-            activations_dtype=jnp.float32,
-            weights_dtype=jnp.float32,
-            domain_dim=domain_dim,
-            n_layers=1,
-            d_model=2048,
-            mlp_expansion_factor=1,
-            conditioning_dim=None,  # Should be automatically set to domain_dim + 1
-            input_dropout_rate=None,
-            mlp_dropout_rate=None,
-        )
+        for reference_directions in reference_directions_options:
+            # Create the model
+            model = CapConditionedVectorField(
+                activations_dtype=jnp.float32,
+                weights_dtype=jnp.float32,
+                domain_dim=domain_dim,
+                reference_directions=reference_directions,
+                n_layers=1,
+                d_model=128,
+                time_dim=time_dim,
+                mlp_expansion_factor=1,
+                conditioning_dim=None,
+                input_dropout_rate=None,
+                mlp_dropout_rate=None,
+            )
 
-        params_rng, sample_rng = jax.random.split(rng)
-        state = create_train_state(params_rng, model, 1e-3)
+            params_rng, sample_rng = jax.random.split(rng)
+            state = create_train_state(params_rng, model, 1e-3)
 
-        # Generate test inputs
-        n_samples = 10_000
-        keys = jax.random.split(sample_rng, 3)
+            # Generate test inputs
+            n_samples = 10_000
+            keys = jax.random.split(sample_rng, 3)
 
-        cap_centers = sample_sphere(keys[0], n_samples, domain_dim)
-        cap_d_maxes = jax.random.uniform(
-            keys[1], shape=(n_samples,), minval=0.0, maxval=2.0
-        )
+            cap_centers = sample_sphere(keys[0], n_samples, domain_dim)
+            cap_d_maxes = jax.random.uniform(
+                keys[1], shape=(n_samples,), minval=0.0, maxval=2.0
+            )
 
-        # Get the processed conditioning data using the model's helper method
-        processed = model.apply(
-            state.params, cap_centers, cap_d_maxes, method=model.process_cap_inputs
-        )
+            # Get the processed conditioning data using the model's helper method
+            processed = model.apply(
+                state.params, cap_centers, cap_d_maxes, method=model.process_cap_inputs
+            )
 
-        cap_centers_transformed = processed["cap_centers_transformed"]
-        cap_d_maxes_transformed = processed["cap_d_maxes_transformed"]
-        cap_info = processed["cap_info"]
+            cap_centers_transformed = processed["cap_centers_transformed"]
+            cap_d_maxes_transformed = processed["cap_d_maxes_transformed"]
+            cap_info = processed["cap_info"]
 
-        assert cap_centers_transformed.shape == (n_samples, domain_dim)
-        assert cap_d_maxes_transformed.shape == (n_samples,)
-        assert cap_info.shape == (n_samples, model.conditioning_dim)
+            assert cap_centers_transformed.shape == (
+                n_samples,
+                model.reference_directions,
+            )
+            assert cap_d_maxes_transformed.shape == (n_samples,)
+            assert cap_info.shape == (n_samples, model.conditioning_dim)
 
-        # Check statistics of transformed values
-        cap_centers_mean = jnp.mean(cap_centers_transformed, axis=0)
-        cap_centers_var = jnp.var(cap_centers_transformed, axis=0)
-        cap_d_maxes_mean = jnp.mean(cap_d_maxes_transformed)
-        cap_d_maxes_var = jnp.var(cap_d_maxes_transformed)
+            # Check statistics of transformed values
+            cap_centers_mean = jnp.mean(cap_centers_transformed, axis=0)
+            cap_centers_var = jnp.var(cap_centers_transformed, axis=0)
+            cap_d_maxes_mean = jnp.mean(cap_d_maxes_transformed)
+            cap_d_maxes_var = jnp.var(cap_d_maxes_transformed)
 
-        print(
-            f"\nTesting CapConditionedVectorField normalization with domain_dim={domain_dim}"
-        )
-        print(f"Cap centers - Mean: {jnp.mean(cap_centers_mean):.6f}, Expected: ~0.0")
-        print(
-            f"Cap centers - Variance: {jnp.mean(cap_centers_var):.6f}, Expected: ~1.0"
-        )
-        print(f"Cap distances - Mean: {cap_d_maxes_mean:.6f}, Expected: ~0.0")
-        print(f"Cap distances - Variance: {cap_d_maxes_var:.6f}, Expected: ~1.0")
+            print(
+                f"\nTesting CapConditionedVectorField normalization with domain_dim={domain_dim}"
+            )
+            print(
+                f"Cap centers - Mean: {jnp.mean(cap_centers_mean):.6f}, Expected: ~0.0"
+            )
+            print(
+                f"Cap centers - Variance: {jnp.mean(cap_centers_var):.6f}, Expected: ~1.0"
+            )
+            print(f"Cap distances - Mean: {cap_d_maxes_mean:.6f}, Expected: ~0.0")
+            print(f"Cap distances - Variance: {cap_d_maxes_var:.6f}, Expected: ~1.0")
 
-        assert jnp.all(
-            jnp.abs(cap_centers_mean) < 0.05
-        ), f"Cap center mean should be close to 0, got {cap_centers_mean}"
-        assert jnp.all(
-            jnp.abs(cap_centers_var - 1.0) < 0.05
-        ), f"Cap center variance should be close to 1, got {cap_centers_var}"
-        assert (
-            jnp.abs(cap_d_maxes_mean) < 0.05
-        ), f"Cap distances mean should be close to 0, got {cap_d_maxes_mean}"
-        assert (
-            jnp.abs(cap_d_maxes_var - 1.0) < 0.05
-        ), f"Cap distances variance should be close to 1, got {cap_d_maxes_var}"
+            assert jnp.all(
+                jnp.abs(cap_centers_mean) < 0.05
+            ), f"Cap center mean should be close to 0, got {cap_centers_mean}"
+            assert jnp.all(
+                jnp.abs(cap_centers_var - 1.0) < 0.05
+            ), f"Cap center variance should be close to 1, got {cap_centers_var}"
+            assert (
+                jnp.abs(cap_d_maxes_mean) < 0.05
+            ), f"Cap distances mean should be close to 0, got {cap_d_maxes_mean}"
+            assert (
+                jnp.abs(cap_d_maxes_var - 1.0) < 0.05
+            ), f"Cap distances variance should be close to 1, got {cap_d_maxes_var}"
 
 
 def test_train_cap_conditioned_model():
@@ -2241,8 +2294,10 @@ def test_train_cap_conditioned_model():
 
     model = CapConditionedVectorField(
         domain_dim=3,
-        n_layers=4,
-        d_model=256,
+        reference_directions=128,
+        n_layers=24,
+        d_model=512,
+        time_dim=128,
         mlp_expansion_factor=4,
         activations_dtype=jnp.float32,
         weights_dtype=jnp.float32,
@@ -2378,3 +2433,55 @@ def test_train_cap_conditioned_model():
     print(f"cosine similarities to distribution points:\n{cos_similarities[:, 1:]}")
     # All samples should be within the hemisphere
     assert jnp.all(cos_similarities[:, 0] > 0)
+
+
+def test_vector_field_without_reference_directions():
+    """Test that the VectorField works correctly when reference_directions is None."""
+    domain_dim = 3
+    batch_size = 4
+    time_dim = 16
+    conditioning_dim = 8
+
+    # Create a model with reference_directions=None
+    model = VectorField(
+        domain_dim=domain_dim,
+        reference_directions=None,  # No reference directions
+        conditioning_dim=conditioning_dim,
+        time_dim=time_dim,
+        n_layers=2,
+        d_model=64,
+        mlp_expansion_factor=2,
+        mlp_dropout_rate=None,
+        input_dropout_rate=None,
+        activations_dtype=jnp.float32,
+        weights_dtype=jnp.float32,
+    )
+
+    # Initialize the model
+    rng = jax.random.PRNGKey(0)
+    params = model.init(
+        rng,
+        jnp.ones((batch_size, domain_dim)),
+        jnp.ones((batch_size,)),
+        jnp.ones((batch_size, conditioning_dim)),
+    )
+
+    # Generate some test inputs
+    x = sample_sphere(jax.random.PRNGKey(1), batch_size, domain_dim)
+    t = jnp.linspace(0, 1, batch_size)
+    cond_vec = jnp.ones((batch_size, conditioning_dim))
+
+    # Process the inputs
+    inputs = model.apply(params, x, t, cond_vec, method=model.process_inputs)
+
+    # Check that the input features have the correct shape (should be domain_dim)
+    input_features = inputs["input_features"]
+    assert input_features.shape == (batch_size, domain_dim)
+
+    # Check that the model output has the correct shape
+    output = model.apply(params, x, t, cond_vec)
+    assert output.shape == (batch_size, domain_dim)
+
+    # Verify that the output vectors are tangent to the sphere
+    dot_products = jnp.sum(output * x, axis=1)
+    np.testing.assert_allclose(dot_products, 0.0, atol=1e-6)
