@@ -49,7 +49,7 @@ from flax import linen as nn
 from flax.training import train_state
 from functools import partial
 from math import floor
-from typing import Sequence, Tuple, Dict, Callable, Any
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 import jax
 import jax.lax
 import jax.numpy as jnp
@@ -70,6 +70,7 @@ class MLPBlock(nn.Module):
 
     bottleneck_dim: int
     expansion_factor: int
+    dropout_rate: Optional[float]
 
     activations_dtype: jnp.dtype
     weights_dtype: jnp.dtype
@@ -98,12 +99,18 @@ class MLPBlock(nn.Module):
             param_dtype=self.weights_dtype,
             kernel_init=self.kernel_init,
         )
+        if self.dropout_rate is not None:
+            self.dropout = nn.Dropout(rate=self.dropout_rate, deterministic=False)
+        else:
+            self.dropout = None
 
     def __call__(self, x, _):
         "Run the layer forward. Unused extra parameter and return value are for scan."
         assert len(x.shape) == 2
         assert x.shape[1] == self.bottleneck_dim
         x_normed = self.norm(x)
+        if self.dropout is not None:
+            x_normed = self.dropout(x_normed)
         gate = self.gate_proj(x_normed)
         value = self.value_proj(x_normed)
         gated = jax.nn.silu(gate) * value
@@ -128,6 +135,10 @@ class VectorField(nn.Module):
     d_model: int
     # MLP expansion factor
     mlp_expansion_factor: int
+    # Dropout rate for the MLP
+    mlp_dropout_rate: Optional[float]
+    # Dropout rate for the input
+    input_dropout_rate: Optional[float]
 
     activations_dtype: jnp.dtype
     weights_dtype: jnp.dtype
@@ -187,11 +198,18 @@ class VectorField(nn.Module):
             "shared_bias", nn.initializers.zeros, (self.d_model,), self.weights_dtype
         )
 
+        if self.input_dropout_rate is not None:
+            self.input_dropout = nn.Dropout(
+                rate=self.input_dropout_rate, deterministic=False
+            )
+        else:
+            self.input_dropout = None
+
         self.mlp_blocks = nn.scan(
             nn.remat(MLPBlock),
             variable_axes={"params": 0},
             variable_broadcast=False,
-            split_rngs={"params": True},
+            split_rngs={"params": True, "dropout": True},
             length=self.n_layers,
         )(
             bottleneck_dim=self.d_model,
@@ -201,6 +219,7 @@ class VectorField(nn.Module):
             kernel_init=nn.initializers.variance_scaling(
                 scale=1.0, mode="fan_in", distribution="normal"
             ),
+            dropout_rate=self.mlp_dropout_rate,
         )
 
         self.final_norm = nn.LayerNorm(
@@ -286,6 +305,11 @@ class VectorField(nn.Module):
         assert t_in.shape == (batch_size, self.d_model)
 
         mlp_in = x_in + cond_in + t_in + self.mlp_in_bias
+        mlp_in = (
+            self.input_dropout(mlp_in)
+            if self.input_dropout_rate is not None
+            else mlp_in
+        )
         assert mlp_in.shape == (batch_size, self.d_model)
 
         return {
@@ -412,6 +436,8 @@ def test_vector_field_projections_normalization():
                 n_layers=1,
                 d_model=2048,  # Bigger mlp_in vectors reduce the variance of our estimates
                 mlp_expansion_factor=1,
+                input_dropout_rate=None,
+                mlp_dropout_rate=None,
             )
 
             params_rng, sample_rng = jax.random.split(rng)
@@ -727,7 +753,7 @@ def compute_psi_t_spherical(x0, x1, t):
 
 
 def conditional_flow_matching_loss(
-    model, params, x0, x1, t, conds=None, kappa_1=10.0, logits_table=None, caps_rng=None
+    model, params, x0, x1, t, conds=None, kappa_1=10.0, logits_table=None, rng=None
 ):
     """
     Compute the Conditional Flow Matching loss from eq. 9 in the paper, modified for the spherical
@@ -760,15 +786,15 @@ def conditional_flow_matching_loss(
         assert (
             logits_table is not None
         ), "LogitsTable is required for CapConditionedVectorField"
-        assert (
-            caps_rng is not None
-        ), "caps_rng is required for CapConditionedVectorField"
+        assert rng is not None, "rng is required for CapConditionedVectorField"
         assert (
             conds is None
         ), "extra conditioning is not supported for CapConditionedVectorField"
     else:
         assert conds is not None, "conds is required for regular VectorField"
         assert conds.shape == (batch_size, model.conditioning_dim)
+        if model.input_dropout_rate is not None or model.mlp_dropout_rate is not None:
+            assert rng is not None, "rng is required for VectorField with dropout"
 
     psi_t = jax.vmap(compute_psi_t_spherical)(x0, x1, t)
     assert psi_t.shape == x0.shape
@@ -781,16 +807,17 @@ def conditional_flow_matching_loss(
 
     # Compute predicted vector field from our model (different for each model type)
     if is_cap_conditioned:
+        caps_rng, dropout_rng = jax.random.split(rng)
         predicted_field = model.apply(
             params,
             psi_t,
             t,
             logits_table,
             method=CapConditionedVectorField.forward_with_random_caps,
-            rngs={"caps": caps_rng},
+            rngs={"caps": caps_rng, "dropout": dropout_rng},
         )
     else:
-        predicted_field = model.apply(params, psi_t, t, conds)
+        predicted_field = model.apply(params, psi_t, t, conds, rngs={"dropout": rng})
 
     assert predicted_field.shape == x0.shape
 
@@ -851,7 +878,7 @@ def compute_batch_loss(model, params, batch, rng, kappa_1, logits_table=None):
     batch_size = x1_batch.shape[0]
     assert x1_batch.shape == (batch_size, model.domain_dim)
 
-    rng, noise_rng, time_rng, caps_rng = jax.random.split(rng, 4)
+    rng, noise_rng, time_rng = jax.random.split(rng, 3)
     x0_batch = sample_sphere(noise_rng, batch_size, model.domain_dim)
     t = jax.random.uniform(time_rng, (batch_size,))
 
@@ -875,7 +902,7 @@ def compute_batch_loss(model, params, batch, rng, kappa_1, logits_table=None):
         conds=conds,
         kappa_1=kappa_1,
         logits_table=logits_table,
-        caps_rng=caps_rng,
+        rng=rng,
     )
 
 
@@ -1075,6 +1102,8 @@ def test_train_trivial():
         n_layers=2,
         d_model=16,
         mlp_expansion_factor=4,
+        input_dropout_rate=None,
+        mlp_dropout_rate=None,
     )
     batch_size = 512
     points = repeat(jnp.array([1, 0, 0]), "v -> b v", b=batch_size * 11)
@@ -1082,13 +1111,19 @@ def test_train_trivial():
     train_dset = dset.select(range(batch_size * 10))
     test_dset = dset.select(range(batch_size * 10, batch_size * 11))
     state, loss, test_loss, test_nll = _train_loop_for_tests(
-        model, train_dset, batch_size, 1e-3, 20, kappa_1=10.0, test_dataset=test_dset
+        model, train_dset, batch_size, 1e-2, 50, kappa_1=10.0, test_dataset=test_dset
     )
     print(f"Final loss: {loss:.6f}")
     print(f"Final test loss: {test_loss:.6f}")
     print(f"Final test nll: {test_nll:.6f}")
     samples = generate_samples(
-        model, state, jax.random.PRNGKey(0), 20, jnp.zeros((20, 0)), 1000, "rk4"
+        model,
+        state,
+        jax.random.PRNGKey(0),
+        20,
+        cond_vecs=jnp.zeros((20, 0)),
+        n_steps=1000,
+        method="rk4",
     )
     cos_sims = samples @ points[0]
 
@@ -1125,6 +1160,8 @@ def test_train_vmf():
         n_layers=3,
         d_model=128,
         mlp_expansion_factor=4,
+        input_dropout_rate=None,
+        mlp_dropout_rate=None,
     )
 
     batch_size = 512
@@ -1163,9 +1200,9 @@ def test_train_vmf():
         state,
         jax.random.PRNGKey(42),
         n_test_samples,
-        jnp.zeros((n_test_samples, 0)),
-        1000,
-        "rk4",
+        cond_vecs=jnp.zeros((n_test_samples, 0)),
+        n_steps=1000,
+        method="rk4",
     )
 
     # Calculate negative log-likelihood of samples under the VMF distribution
@@ -1208,6 +1245,8 @@ def test_train_conditional_vmf():
         n_layers=2,
         d_model=32,
         mlp_expansion_factor=4,
+        input_dropout_rate=None,
+        mlp_dropout_rate=None,
     )
 
     # Define two different vMF distributions
@@ -1256,10 +1295,22 @@ def test_train_conditional_vmf():
     cond_vec_1 = jnp.ones((n_eval_samples, 1))
 
     samples_0 = generate_samples(
-        model, state, seed1, n_eval_samples, cond_vec_0, 500, "rk4"
+        model,
+        state,
+        seed1,
+        n_eval_samples,
+        cond_vecs=cond_vec_0,
+        n_steps=500,
+        method="rk4",
     )
     samples_1 = generate_samples(
-        model, state, seed2, n_eval_samples, cond_vec_1, 500, "rk4"
+        model,
+        state,
+        seed2,
+        n_eval_samples,
+        cond_vecs=cond_vec_1,
+        n_steps=500,
+        method="rk4",
     )
 
     # Calculate average cosine similarities
@@ -1407,7 +1458,7 @@ def parallel_transport(v, from_point, to_point):
     return result - dot_with_to * to_point
 
 
-def spherical_rk4_step(f, x, t, dt):
+def spherical_rk4_step(f, x, t, dt, rng=None):
     """
     Runge-Kutta 4th order step adapted for spherical manifold with correct parallel transport.
 
@@ -1422,18 +1473,18 @@ def spherical_rk4_step(f, x, t, dt):
     """
     # Each result from f is in the tangent space of f's input point, when we combine them we need to
     # parallel transport them all into the tangent space of x.
-    k1 = f(x, t)
+    k1 = f(x, t, rng)
 
     x2 = geodesic_step(x, k1, dt / 2)
-    k2 = f(x2, t + dt / 2)
+    k2 = f(x2, t + dt / 2, rng)
     k2_at_x = parallel_transport(k2, x2, x)
 
     x3 = geodesic_step(x, k2, dt / 2)
-    k3 = f(x3, t + dt / 2)
+    k3 = f(x3, t + dt / 2, rng)
     k3_at_x = parallel_transport(k3, x3, x)
 
     x4 = geodesic_step(x, k3, dt)
-    k4 = f(x4, t + dt)
+    k4 = f(x4, t + dt, rng)
     k4_at_x = parallel_transport(k4, x4, x)
 
     combined_direction = (k1 + 2 * k2_at_x + 2 * k3_at_x + k4_at_x) / 6
@@ -1443,25 +1494,37 @@ def spherical_rk4_step(f, x, t, dt):
 
 @partial(jax.jit, static_argnames=("model",), inline=True)
 def spherical_rk4_step_with_model(
-    model, state, x, t, dt, cond_vecs=None, cap_centers=None, cap_d_maxes=None
+    model, state, x, t, dt, cond_vecs=None, cap_centers=None, cap_d_maxes=None, rng=None
 ):
-    vector_field_fn = lambda x, t: _compute_vector_field_for_sampling(
-        model, state, x, t, cond_vecs, cap_centers, cap_d_maxes
+    vector_field_fn = lambda x, t, rng: _compute_vector_field_for_sampling(
+        model, state, x, t, cond_vecs, cap_centers, cap_d_maxes, rng
     )
-    return spherical_rk4_step(vector_field_fn, x, t, dt)
+    return spherical_rk4_step(vector_field_fn, x, t, dt, rng)
 
 
 @partial(jax.jit, static_argnames=("model",), inline=True)
 def _compute_vector_field_for_sampling(
-    model, state, x, t, cond_vecs=None, cap_centers=None, cap_d_maxes=None
+    model, state, x, t, cond_vecs=None, cap_centers=None, cap_d_maxes=None, rng=None
 ):
+    rngs_dict = {"dropout": rng} if rng is not None else {}
     if isinstance(model, CapConditionedVectorField):
         assert cond_vecs is None
         return model.apply(
-            state.params, x, jnp.full((x.shape[0],), t), cap_centers, cap_d_maxes
+            state.params,
+            x,
+            jnp.full((x.shape[0],), t),
+            cap_centers,
+            cap_d_maxes,
+            rngs=rngs_dict,
         )
     else:
-        return model.apply(state.params, x, jnp.full((x.shape[0],), t), cond_vecs)
+        return model.apply(
+            state.params,
+            x,
+            jnp.full((x.shape[0],), t),
+            cond_vecs,
+            rngs=rngs_dict,
+        )
 
 
 def generate_samples(
@@ -1501,11 +1564,12 @@ def generate_samples(
         assert cap_centers is None
         assert cap_d_maxes is None
 
+    x0_rng, *dropout_rngs = jax.random.split(rng, num=n_steps + 1)
     # Sample initial points uniformly from the sphere
-    x0 = sample_sphere(rng, batch_size, model.domain_dim)
+    x0 = sample_sphere(x0_rng, batch_size, model.domain_dim)
 
-    vector_field_fn = lambda x, t: _compute_vector_field_for_sampling(
-        model, state, x, t, cond_vecs, cap_centers, cap_d_maxes
+    vector_field_fn = lambda x, t, rng: _compute_vector_field_for_sampling(
+        model, state, x, t, cond_vecs, cap_centers, cap_d_maxes, rng
     )
 
     # Solve ODE
@@ -1516,25 +1580,33 @@ def generate_samples(
         # Forward Euler method
         for i in range(n_steps):
             t = i * dt
-            v = vector_field_fn(x, t)
+            v = vector_field_fn(x, t, dropout_rngs[i])
             x = geodesic_step(x, v, dt)
     elif method == "midpoint":
         # Midpoint method
         for i in range(n_steps):
             t = i * dt
             # First half-step
-            v1 = vector_field_fn(x, t)
+            v1 = vector_field_fn(x, t, dropout_rngs[i])
             x_mid = geodesic_step(x, v1, dt / 2)
 
             # Second half-step using midpoint derivative
-            v2 = vector_field_fn(x_mid, t + 0.5 * dt)
+            v2 = vector_field_fn(x_mid, t + 0.5 * dt, dropout_rngs[i])
             x = geodesic_step(x, v2, dt)
     elif method == "rk4":
         # 4th order Runge-Kutta method
         for i in range(n_steps):
             t = i * dt
             x = spherical_rk4_step_with_model(
-                model, state, x, t, dt, cond_vecs, cap_centers, cap_d_maxes
+                model,
+                state,
+                x,
+                t,
+                dt,
+                cond_vecs,
+                cap_centers,
+                cap_d_maxes,
+                dropout_rngs[i],
             )
     else:
         raise ValueError(f"Unknown ODE solver method: {method}")
@@ -1762,6 +1834,8 @@ def test_divergence_estimate(divergence_fn, n_projections, field):
         n_layers=1,
         d_model=16,
         mlp_expansion_factor=2,
+        input_dropout_rate=None,
+        mlp_dropout_rate=None,
     )
 
     # Create state with patched apply function
@@ -1828,6 +1902,8 @@ def test_vector_field_evaluation():
         n_layers=2,
         d_model=64,
         mlp_expansion_factor=4,
+        input_dropout_rate=None,
+        mlp_dropout_rate=None,
     )
 
     state = create_train_state(rng, model, 1e-3)
@@ -1986,6 +2062,8 @@ class CapConditionedVectorField(VectorField):
     on the sample being within an arbitrary spherical cap.
     """
 
+    conditioning_dim: Optional[int]  # Pass None, will be overwritten.
+
     def __post_init__(self):
         correct_conditioning_dim = self.domain_dim + 1
         assert (
@@ -2096,6 +2174,8 @@ def test_cap_conditioned_vector_field_normalization():
             d_model=2048,
             mlp_expansion_factor=1,
             conditioning_dim=None,  # Should be automatically set to domain_dim + 1
+            input_dropout_rate=None,
+            mlp_dropout_rate=None,
         )
 
         params_rng, sample_rng = jax.random.split(rng)
@@ -2167,6 +2247,8 @@ def test_train_cap_conditioned_model():
         activations_dtype=jnp.float32,
         weights_dtype=jnp.float32,
         conditioning_dim=None,
+        input_dropout_rate=0.1,
+        mlp_dropout_rate=0.1,
     )
 
     distribution_rng, shuffle_rng, params_rng, train_rng, sample_rng = jax.random.split(
