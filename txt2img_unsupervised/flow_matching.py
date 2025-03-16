@@ -123,6 +123,26 @@ class VectorField(nn.Module):
     """
     Model of a vector field conditioned on a time t in [0, 1] and a arbitrary-dimensional vector.
     The vector field is over unit vectors in the domain.
+
+    The inputs are processed as follows:
+    * If reference_directions is not None, encode the input unit vectors as a set of cosine
+      similarities with n randomly selected reference directions. Note that in order for this
+      to capture all the information reference_directions must be at least domain_dim. If
+      it is None, pass it through unmodified.
+    * Encode the time parameter with a sinusoidal encoding of time_dim components.
+    * Pass the conditioning vector through unmodified. It should have mean 0 and variance 1.
+    * Concatenate the above into a single vector.
+    * If use_pre_mlp_projection is true, multiply the concatenated vector by a learnable matrix to
+      create a d_model-dimensional vector.
+    * If use_pre_mlp_projection is false:
+      * The following must sum to less than or equal to d_model:
+        * reference_directions if it is not None, otherwise domain_dim
+        * time_dim
+        * conditioning_dim
+      * If they're less, pad the vector with zeros.
+    * Add a learnable bias to the vector.
+    * Apply dropout to the vector if input_dropout_rate is not None.
+    * Feed that to the MLP.
     """
 
     # Dimension of the sphere and the vector field
@@ -136,6 +156,8 @@ class VectorField(nn.Module):
     conditioning_dim: int
     # Dimension of the time encoding. Must be even.
     time_dim: int
+    # If true, multiply the inputs by a learnable matrix
+    use_pre_mlp_projection: bool
     # Number of MLP blocks
     n_layers: int
     # Width of the MLP
@@ -163,7 +185,7 @@ class VectorField(nn.Module):
         return self.input_feature_dim + self.conditioning_dim + self.time_dim
 
     def setup(self) -> None:
-        if self.total_input_dim > self.d_model:
+        if not self.use_pre_mlp_projection and self.total_input_dim > self.d_model:
             raise ValueError(
                 f"input_feature_dim + conditioning_dim + time_dim ({self.total_input_dim}) "
                 f"exceeds d_model ({self.d_model}). Reduce one or more of them or increase d_model."
@@ -171,15 +193,30 @@ class VectorField(nn.Module):
         if self.time_dim % 2 != 0:
             raise ValueError("Time dimension must be even")
 
-        # Learned bias to add to the concatenated input
+        if self.use_pre_mlp_projection:
+            self.pre_mlp_proj = nn.Dense(
+                features=self.d_model,
+                dtype=self.activations_dtype,
+                param_dtype=self.weights_dtype,
+                kernel_init=nn.initializers.variance_scaling(
+                    scale=1.0, mode="fan_in", distribution="normal"
+                ),
+                use_bias=False,
+            )
+
+        # Learned bias to add to the MLP input
         def init_bias(rng, shape, dtype):
             # Zero bias for the components of the input that will actually be set to something,
             # unit normal for the rest to avoid weight tying.
-            used_bias = jnp.zeros((self.total_input_dim,), dtype=dtype)
-            unused_bias = jax.random.normal(
-                rng, (self.d_model - self.total_input_dim,), dtype=dtype
-            )
-            return jnp.concatenate([used_bias, unused_bias], axis=0)
+            if self.use_pre_mlp_projection:
+                # When using projection, all components will be set
+                return jnp.zeros(shape, dtype=dtype)
+            else:
+                used_bias = jnp.zeros((self.total_input_dim,), dtype=dtype)
+                unused_bias = jax.random.normal(
+                    rng, (self.d_model - self.total_input_dim,), dtype=dtype
+                )
+                return jnp.concatenate([used_bias, unused_bias], axis=0)
 
         self.mlp_in_bias = self.param(
             "mlp_in_bias", init_bias, (self.d_model,), self.weights_dtype
@@ -297,11 +334,14 @@ class VectorField(nn.Module):
         )
         assert concatenated.shape == (batch_size, self.total_input_dim)
 
-        if self.total_input_dim < self.d_model:
-            padding = jnp.zeros((batch_size, self.d_model - self.total_input_dim))
-            mlp_in = jnp.concatenate([concatenated, padding], axis=1)
+        if self.use_pre_mlp_projection:
+            mlp_in = self.pre_mlp_proj(concatenated)
         else:
-            mlp_in = concatenated
+            if self.total_input_dim < self.d_model:
+                padding = jnp.zeros((batch_size, self.d_model - self.total_input_dim))
+                mlp_in = jnp.concatenate([concatenated, padding], axis=1)
+            else:
+                mlp_in = concatenated
 
         mlp_in = mlp_in + self.mlp_in_bias
         assert mlp_in.shape == (batch_size, self.d_model)
@@ -377,6 +417,7 @@ def test_vector_field_time_encoding_statistics():
             mlp_expansion_factor=1,
             mlp_dropout_rate=None,
             input_dropout_rate=None,
+            use_pre_mlp_projection=False,
         )
 
         params = model.init(rng, jnp.ones((1, 3)), jnp.ones((1,)), jnp.ones((1, 0)))
@@ -440,6 +481,7 @@ def test_vector_field_projections_normalization():
                 conditioning_dim=conditioning_dim,
                 time_dim=time_dim,
                 reference_directions=16,
+                use_pre_mlp_projection=False,
                 n_layers=1,
                 d_model=2048,  # Bigger mlp_in vectors reduce the variance of our estimates
                 mlp_expansion_factor=1,
@@ -1127,6 +1169,7 @@ def test_train_trivial():
         mlp_expansion_factor=4,
         reference_directions=16,
         time_dim=16,
+        use_pre_mlp_projection=False,
         input_dropout_rate=None,
         mlp_dropout_rate=None,
     )
@@ -1188,6 +1231,7 @@ def test_train_vmf():
         n_layers=3,
         d_model=128,
         mlp_expansion_factor=4,
+        use_pre_mlp_projection=False,
         input_dropout_rate=None,
         mlp_dropout_rate=None,
     )
@@ -1275,6 +1319,7 @@ def test_train_conditional_vmf():
         n_layers=2,
         d_model=64,
         mlp_expansion_factor=4,
+        use_pre_mlp_projection=False,
         input_dropout_rate=None,
         mlp_dropout_rate=None,
     )
@@ -1866,6 +1911,7 @@ def test_divergence_estimate(divergence_fn, n_projections, field):
         d_model=16,
         time_dim=2,
         mlp_expansion_factor=2,
+        use_pre_mlp_projection=False,
         input_dropout_rate=None,
         mlp_dropout_rate=None,
     )
@@ -1936,6 +1982,7 @@ def test_vector_field_evaluation():
         n_layers=2,
         d_model=64,
         mlp_expansion_factor=4,
+        use_pre_mlp_projection=False,
         input_dropout_rate=None,
         mlp_dropout_rate=None,
     )
@@ -2224,6 +2271,7 @@ def test_cap_conditioned_vector_field_normalization():
                 conditioning_dim=None,
                 input_dropout_rate=None,
                 mlp_dropout_rate=None,
+                use_pre_mlp_projection=False,
             )
 
             params_rng, sample_rng = jax.random.split(rng)
@@ -2304,6 +2352,7 @@ def test_train_cap_conditioned_model():
         conditioning_dim=None,
         input_dropout_rate=0.1,
         mlp_dropout_rate=0.1,
+        use_pre_mlp_projection=False,
     )
 
     distribution_rng, shuffle_rng, params_rng, train_rng, sample_rng = jax.random.split(
@@ -2448,6 +2497,7 @@ def test_vector_field_without_reference_directions():
         reference_directions=None,  # No reference directions
         conditioning_dim=conditioning_dim,
         time_dim=time_dim,
+        use_pre_mlp_projection=False,
         n_layers=2,
         d_model=64,
         mlp_expansion_factor=2,
