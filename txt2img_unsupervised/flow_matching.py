@@ -452,7 +452,9 @@ def test_vector_field_time_encoding_statistics():
         print(f"  Std: {overall_std:.6f} (expected {expected_std:.6f})")
 
 
-def test_vector_field_projections_normalization():
+@pytest.mark.parametrize("domain_dim", [3, 10])
+@pytest.mark.parametrize("conditioning_dim", [0, 4])
+def test_vector_field_projections_normalization(domain_dim, conditioning_dim):
     """
     Test that the inputs to the MLP in the VectorField model have the expected distributions.
 
@@ -465,132 +467,123 @@ def test_vector_field_projections_normalization():
     * cond_vec's components each have mean 0 variance 1
     """
     rng = jax.random.PRNGKey(42)
-
-    # Test both with and without conditioning
-    # TODO parameterize
-    domain_dims = [3, 10]
-    conditioning_cases = [0, 4]  # 0 for no conditioning, positive for conditioning
     time_dim = 16
 
-    for domain_dim in domain_dims:
-        for conditioning_dim in conditioning_cases:
-            model = VectorField(
-                activations_dtype=jnp.float32,
-                weights_dtype=jnp.float32,
-                domain_dim=domain_dim,
-                conditioning_dim=conditioning_dim,
-                time_dim=time_dim,
-                reference_directions=16,
-                use_pre_mlp_projection=False,
-                n_layers=1,
-                d_model=2048,  # Bigger mlp_in vectors reduce the variance of our estimates
-                mlp_expansion_factor=1,
-                input_dropout_rate=None,
-                mlp_dropout_rate=None,
-            )
+    model = VectorField(
+        activations_dtype=jnp.float32,
+        weights_dtype=jnp.float32,
+        domain_dim=domain_dim,
+        conditioning_dim=conditioning_dim,
+        time_dim=time_dim,
+        reference_directions=16,
+        use_pre_mlp_projection=False,
+        n_layers=1,
+        d_model=2048,  # Bigger mlp_in vectors reduce the variance of our estimates
+        mlp_expansion_factor=1,
+        input_dropout_rate=None,
+        mlp_dropout_rate=None,
+    )
 
-            params_rng, sample_rng = jax.random.split(rng)
-            state = create_train_state(params_rng, model, 1e-3)
+    params_rng, sample_rng = jax.random.split(rng)
+    state = create_train_state(params_rng, model, 1e-3)
 
-            # Generate test inputs
-            n_samples = 10_000
-            keys = jax.random.split(sample_rng, 3)
+    # Generate test inputs
+    n_samples = 10_000
+    keys = jax.random.split(sample_rng, 3)
 
-            x = sample_sphere(keys[0], n_samples, domain_dim)
+    x = sample_sphere(keys[0], n_samples, domain_dim)
 
-            t = jax.random.uniform(keys[1], (n_samples,))
+    t = jax.random.uniform(keys[1], (n_samples,))
 
-            if conditioning_dim > 0:
-                cond_vec = jax.random.normal(keys[2], (n_samples, conditioning_dim))
-            else:
-                cond_vec = jnp.zeros((n_samples, 0))
+    if conditioning_dim > 0:
+        cond_vec = jax.random.normal(keys[2], (n_samples, conditioning_dim))
+    else:
+        cond_vec = jnp.zeros((n_samples, 0))
 
-            inputs = model.apply(
-                state.params, x, t, cond_vec, method=model.process_inputs
-            )
+    inputs = model.apply(state.params, x, t, cond_vec, method=model.process_inputs)
 
-            input_features = inputs["input_features"]
-            input_features_mean = jnp.mean(input_features)
-            input_features_variance = jnp.mean(jnp.var(input_features, axis=0))
+    input_features = inputs["input_features"]
+    input_features_mean = jnp.mean(input_features)
+    input_features_variance = jnp.mean(jnp.var(input_features, axis=0))
 
-            time_encoding = inputs["time_encoding"]
-            time_encoding_mean = jnp.mean(time_encoding)
-            time_encoding_variance = jnp.mean(jnp.var(time_encoding, axis=0))
+    time_encoding = inputs["time_encoding"]
+    time_encoding_mean = jnp.mean(time_encoding)
+    time_encoding_variance = jnp.mean(jnp.var(time_encoding, axis=0))
 
-            if conditioning_dim > 0:
-                cond_vec_data = inputs["cond_vec"]
-                cond_vec_mean = jnp.mean(cond_vec_data)
-                cond_vec_variance = jnp.mean(jnp.var(cond_vec_data, axis=0))
+    if conditioning_dim > 0:
+        cond_vec_data = inputs["cond_vec"]
+        cond_vec_mean = jnp.mean(cond_vec_data)
+        cond_vec_variance = jnp.mean(jnp.var(cond_vec_data, axis=0))
 
-            mlp_input = inputs["mlp_input"]
-            # The padding components of mlp_input are constant, so they have 0 variance. So we test
-            # the statistics of the unpadded part separately from the whole thing.
-            unpadded_mlp_input = mlp_input[:, : model.total_input_dim]
-            unpadded_mlp_input_mean = jnp.mean(unpadded_mlp_input)
-            unpadded_mlp_input_variance = jnp.mean(jnp.var(unpadded_mlp_input, axis=0))
+    mlp_input = inputs["mlp_input"]
+    # The padding components of mlp_input are constant, so they have 0 variance. So we test
+    # the statistics of the unpadded part separately from the whole thing.
+    unpadded_mlp_input = mlp_input[:, : model.total_input_dim]
+    unpadded_mlp_input_mean = jnp.mean(unpadded_mlp_input)
+    unpadded_mlp_input_variance = jnp.mean(jnp.var(unpadded_mlp_input, axis=0))
 
-            padded_mlp_input_mean = jnp.mean(mlp_input)
-            # note axis: calculating variances inside examples, not features across examples
-            padded_mlp_input_variance = jnp.mean(jnp.var(mlp_input, axis=1))
-            # Print statistics
-            print(
-                f"\nTesting with domain_dim={domain_dim}, conditioning_dim={conditioning_dim}, time_dim={time_dim}"
-            )
-            # print(
-            #    f"scaled_x - Mean: {scaled_x_mean:.6f}, Variance: {scaled_x_variance:.6f}"
-            # )
-            print(
-                f"dot_products - Mean: {input_features_mean:.6f}, Variance: {input_features_variance:.6f}"
-            )
-            print(
-                f"time_encoding - Mean: {time_encoding_mean:.6f}, Variance: {time_encoding_variance:.6f}"
-            )
-            if conditioning_dim > 0:
-                print(
-                    f"cond_vec - Mean: {cond_vec_mean:.6f}, Variance: {cond_vec_variance:.6f}"
-                )
-            print(
-                f"Unpadded MLP input - Mean: {unpadded_mlp_input_mean:.6f}, Variance: {unpadded_mlp_input_variance:.6f}"
-            )
-            print(
-                f"Padded MLP input - Mean: {padded_mlp_input_mean:.6f}, Variance: {padded_mlp_input_variance:.6f}"
-            )
+    padded_mlp_input_mean = jnp.mean(mlp_input)
+    # note axis: calculating variances inside examples, not features across examples
+    padded_mlp_input_variance = jnp.mean(jnp.var(mlp_input, axis=1))
+    # Print statistics
+    print(
+        f"\nTesting with domain_dim={domain_dim}, conditioning_dim={conditioning_dim}, time_dim={time_dim}"
+    )
+    # print(
+    #    f"scaled_x - Mean: {scaled_x_mean:.6f}, Variance: {scaled_x_variance:.6f}"
+    # )
+    print(
+        f"dot_products - Mean: {input_features_mean:.6f}, Variance: {input_features_variance:.6f}"
+    )
+    print(
+        f"time_encoding - Mean: {time_encoding_mean:.6f}, Variance: {time_encoding_variance:.6f}"
+    )
+    if conditioning_dim > 0:
+        print(
+            f"cond_vec - Mean: {cond_vec_mean:.6f}, Variance: {cond_vec_variance:.6f}"
+        )
+    print(
+        f"Unpadded MLP input - Mean: {unpadded_mlp_input_mean:.6f}, Variance: {unpadded_mlp_input_variance:.6f}"
+    )
+    print(
+        f"Padded MLP input - Mean: {padded_mlp_input_mean:.6f}, Variance: {padded_mlp_input_variance:.6f}"
+    )
 
-            # Check if means are close to 0
-            mean_tol = 0.02
-            assert (
-                abs(input_features_mean) < mean_tol
-            ), f"input_features mean should be close to 0, got {input_features_mean}"
-            assert (
-                abs(input_features_variance - 1.0) < 0.05
-            ), f"input_features variance should be close to 1.0, got {input_features_variance}"
-            assert (
-                abs(time_encoding_mean) < mean_tol
-            ), f"time_encoding mean should be close to 0, got {time_encoding_mean}"
-            assert (
-                abs(time_encoding_variance - 1.0) < 0.05
-            ), f"time_encoding variance should be close to 1.0, got {time_encoding_variance}"
+    # Check if means are close to 0
+    mean_tol = 0.02
+    assert (
+        abs(input_features_mean) < mean_tol
+    ), f"input_features mean should be close to 0, got {input_features_mean}"
+    assert (
+        abs(input_features_variance - 1.0) < 0.05
+    ), f"input_features variance should be close to 1.0, got {input_features_variance}"
+    assert (
+        abs(time_encoding_mean) < mean_tol
+    ), f"time_encoding mean should be close to 0, got {time_encoding_mean}"
+    assert (
+        abs(time_encoding_variance - 1.0) < 0.05
+    ), f"time_encoding variance should be close to 1.0, got {time_encoding_variance}"
 
-            if conditioning_dim > 0:
-                assert (
-                    abs(cond_vec_mean) < mean_tol
-                ), f"cond_vec mean should be close to 0, got {cond_vec_mean}"
-                assert (
-                    abs(cond_vec_variance - 1.0) < 0.05
-                ), f"cond_vec variance should be close to 1.0, got {cond_vec_variance}"
+    if conditioning_dim > 0:
+        assert (
+            abs(cond_vec_mean) < mean_tol
+        ), f"cond_vec mean should be close to 0, got {cond_vec_mean}"
+        assert (
+            abs(cond_vec_variance - 1.0) < 0.05
+        ), f"cond_vec variance should be close to 1.0, got {cond_vec_variance}"
 
-            assert (
-                abs(unpadded_mlp_input_mean) < mean_tol
-            ), f"Unpadded MLP input mean should be close to 0, got {unpadded_mlp_input_mean}"
-            assert (
-                abs(unpadded_mlp_input_variance - 1.0) < 0.05
-            ), f"Unpadded MLP input variance should be close to 1.0, got {unpadded_mlp_input_variance}"
-            assert (
-                abs(padded_mlp_input_mean) < 0.05
-            ), f"Padded MLP input mean should be close to 0, got {padded_mlp_input_mean}"
-            assert (
-                abs(padded_mlp_input_variance - 1.0) < 0.05
-            ), f"Padded MLP input variance should be close to 1.0, got {padded_mlp_input_variance}"
+    assert (
+        abs(unpadded_mlp_input_mean) < mean_tol
+    ), f"Unpadded MLP input mean should be close to 0, got {unpadded_mlp_input_mean}"
+    assert (
+        abs(unpadded_mlp_input_variance - 1.0) < 0.05
+    ), f"Unpadded MLP input variance should be close to 1.0, got {unpadded_mlp_input_variance}"
+    assert (
+        abs(padded_mlp_input_mean) < 0.05
+    ), f"Padded MLP input mean should be close to 0, got {padded_mlp_input_mean}"
+    assert (
+        abs(padded_mlp_input_variance - 1.0) < 0.05
+    ), f"Padded MLP input variance should be close to 1.0, got {padded_mlp_input_variance}"
 
 
 def test_optimal_transport_field_direction():
@@ -874,9 +867,7 @@ def conditional_flow_matching_loss(
     if is_cap_conditioned:
         rngs = jax.random.split(rng, batch_size + 1)
 
-        my_sample_cap = lambda rng, x: sample_cap(
-            logits_table, rng, x, bias_d_max=True
-        )
+        my_sample_cap = lambda rng, x: sample_cap(logits_table, rng, x, bias_d_max=True)
         cap_centers, cap_d_maxes = jax.vmap(my_sample_cap)(rngs[:batch_size], x1)
 
         predicted_field = model.apply(
@@ -2199,7 +2190,9 @@ class CapConditionedVectorField(VectorField):
         return super().__call__(x, t, processed["cap_info"])
 
 
-def test_cap_conditioned_vector_field_normalization():
+@pytest.mark.parametrize("domain_dim", [3, 5, 8])
+@pytest.mark.parametrize("reference_directions", [8, 16])
+def test_cap_conditioned_vector_field_normalization(domain_dim, reference_directions):
     """
     Test that CapConditionedVectorField properly normalizes the inputs passed to the superclass.
     This verifies that the cap centers and max distances are properly transformed to have the
@@ -2211,88 +2204,78 @@ def test_cap_conditioned_vector_field_normalization():
     3. That the combined conditioning vector has appropriate statistics
     """
     rng = jax.random.PRNGKey(42)
-
-    # Test with different dimensions like in the VectorField test
-    domain_dims = [3, 5, 8]
-    reference_directions_options = [8, 16]
     time_dim = 16
 
-    for domain_dim in domain_dims:
-        for reference_directions in reference_directions_options:
-            # Create the model
-            model = CapConditionedVectorField(
-                activations_dtype=jnp.float32,
-                weights_dtype=jnp.float32,
-                domain_dim=domain_dim,
-                reference_directions=reference_directions,
-                n_layers=1,
-                d_model=128,
-                time_dim=time_dim,
-                mlp_expansion_factor=1,
-                conditioning_dim=None,
-                input_dropout_rate=None,
-                mlp_dropout_rate=None,
-                use_pre_mlp_projection=False,
-            )
+    # Create the model
+    model = CapConditionedVectorField(
+        activations_dtype=jnp.float32,
+        weights_dtype=jnp.float32,
+        domain_dim=domain_dim,
+        reference_directions=reference_directions,
+        n_layers=1,
+        d_model=128,
+        time_dim=time_dim,
+        mlp_expansion_factor=1,
+        conditioning_dim=None,
+        input_dropout_rate=None,
+        mlp_dropout_rate=None,
+        use_pre_mlp_projection=False,
+    )
 
-            params_rng, sample_rng = jax.random.split(rng)
-            state = create_train_state(params_rng, model, 1e-3)
+    params_rng, sample_rng = jax.random.split(rng)
+    state = create_train_state(params_rng, model, 1e-3)
 
-            # Generate test inputs
-            n_samples = 10_000
-            keys = jax.random.split(sample_rng, 3)
+    # Generate test inputs
+    n_samples = 10_000
+    keys = jax.random.split(sample_rng, 3)
 
-            cap_centers = sample_sphere(keys[0], n_samples, domain_dim)
-            cap_d_maxes = jax.random.uniform(
-                keys[1], shape=(n_samples,), minval=0.0, maxval=2.0
-            )
+    cap_centers = sample_sphere(keys[0], n_samples, domain_dim)
+    cap_d_maxes = jax.random.uniform(
+        keys[1], shape=(n_samples,), minval=0.0, maxval=2.0
+    )
 
-            # Get the processed conditioning data using the model's helper method
-            processed = model.apply(
-                state.params, cap_centers, cap_d_maxes, method=model.process_cap_inputs
-            )
+    # Get the processed conditioning data using the model's helper method
+    processed = model.apply(
+        state.params, cap_centers, cap_d_maxes, method=model.process_cap_inputs
+    )
 
-            cap_centers_transformed = processed["cap_centers_transformed"]
-            cap_d_maxes_transformed = processed["cap_d_maxes_transformed"]
-            cap_info = processed["cap_info"]
+    cap_centers_transformed = processed["cap_centers_transformed"]
+    cap_d_maxes_transformed = processed["cap_d_maxes_transformed"]
+    cap_info = processed["cap_info"]
 
-            assert cap_centers_transformed.shape == (
-                n_samples,
-                model.reference_directions,
-            )
-            assert cap_d_maxes_transformed.shape == (n_samples,)
-            assert cap_info.shape == (n_samples, model.conditioning_dim)
+    assert cap_centers_transformed.shape == (
+        n_samples,
+        model.reference_directions,
+    )
+    assert cap_d_maxes_transformed.shape == (n_samples,)
+    assert cap_info.shape == (n_samples, model.conditioning_dim)
 
-            # Check statistics of transformed values
-            cap_centers_mean = jnp.mean(cap_centers_transformed, axis=0)
-            cap_centers_var = jnp.var(cap_centers_transformed, axis=0)
-            cap_d_maxes_mean = jnp.mean(cap_d_maxes_transformed)
-            cap_d_maxes_var = jnp.var(cap_d_maxes_transformed)
+    # Check statistics of transformed values
+    cap_centers_mean = jnp.mean(cap_centers_transformed, axis=0)
+    cap_centers_var = jnp.var(cap_centers_transformed, axis=0)
+    cap_d_maxes_mean = jnp.mean(cap_d_maxes_transformed)
+    cap_d_maxes_var = jnp.var(cap_d_maxes_transformed)
 
-            print(
-                f"\nTesting CapConditionedVectorField normalization with domain_dim={domain_dim}"
-            )
-            print(
-                f"Cap centers - Mean: {jnp.mean(cap_centers_mean):.6f}, Expected: ~0.0"
-            )
-            print(
-                f"Cap centers - Variance: {jnp.mean(cap_centers_var):.6f}, Expected: ~1.0"
-            )
-            print(f"Cap distances - Mean: {cap_d_maxes_mean:.6f}, Expected: ~0.0")
-            print(f"Cap distances - Variance: {cap_d_maxes_var:.6f}, Expected: ~1.0")
+    print(
+        f"\nTesting CapConditionedVectorField normalization with domain_dim={domain_dim}, reference_directions={reference_directions}"
+    )
+    print(f"Cap centers - Mean: {jnp.mean(cap_centers_mean):.6f}, Expected: ~0.0")
+    print(f"Cap centers - Variance: {jnp.mean(cap_centers_var):.6f}, Expected: ~1.0")
+    print(f"Cap distances - Mean: {cap_d_maxes_mean:.6f}, Expected: ~0.0")
+    print(f"Cap distances - Variance: {cap_d_maxes_var:.6f}, Expected: ~1.0")
 
-            assert jnp.all(
-                jnp.abs(cap_centers_mean) < 0.05
-            ), f"Cap center mean should be close to 0, got {cap_centers_mean}"
-            assert jnp.all(
-                jnp.abs(cap_centers_var - 1.0) < 0.05
-            ), f"Cap center variance should be close to 1, got {cap_centers_var}"
-            assert (
-                jnp.abs(cap_d_maxes_mean) < 0.05
-            ), f"Cap distances mean should be close to 0, got {cap_d_maxes_mean}"
-            assert (
-                jnp.abs(cap_d_maxes_var - 1.0) < 0.05
-            ), f"Cap distances variance should be close to 1, got {cap_d_maxes_var}"
+    assert jnp.all(
+        jnp.abs(cap_centers_mean) < 0.05
+    ), f"Cap center mean should be close to 0, got {cap_centers_mean}"
+    assert jnp.all(
+        jnp.abs(cap_centers_var - 1.0) < 0.05
+    ), f"Cap center variance should be close to 1, got {cap_centers_var}"
+    assert (
+        jnp.abs(cap_d_maxes_mean) < 0.05
+    ), f"Cap distances mean should be close to 0, got {cap_d_maxes_mean}"
+    assert (
+        jnp.abs(cap_d_maxes_var - 1.0) < 0.05
+    ), f"Cap distances variance should be close to 1, got {cap_d_maxes_var}"
 
 
 def test_train_cap_conditioned_model():
