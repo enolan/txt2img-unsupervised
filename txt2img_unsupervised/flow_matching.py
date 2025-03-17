@@ -388,7 +388,8 @@ class VectorField(nn.Module):
         return tangent_outputs
 
 
-def test_vector_field_time_encoding_statistics():
+@pytest.mark.parametrize("time_dim", [4, 16, 64])
+def test_vector_field_time_encoding_statistics(time_dim):
     """
     Test that the time encoding function produces vectors with appropriate statistical properties
     when given uniformly distributed time values between 0 and 1.
@@ -399,57 +400,53 @@ def test_vector_field_time_encoding_statistics():
     """
     rng = jax.random.PRNGKey(42)
 
-    # Test with different model widths
-    time_dims = [4, 16, 64]
+    # Create a minimal VectorField model just to test the time_encoding. Parameters other than
+    # d_model are irrelevant for this test.
+    model = VectorField(
+        activations_dtype=jnp.float32,
+        weights_dtype=jnp.float32,
+        domain_dim=3,
+        conditioning_dim=0,
+        time_dim=time_dim,
+        reference_directions=16,
+        n_layers=1,
+        d_model=256,
+        mlp_expansion_factor=1,
+        mlp_dropout_rate=None,
+        input_dropout_rate=None,
+        use_pre_mlp_projection=False,
+    )
 
-    for time_dim in time_dims:
-        # Create a minimal VectorField model just to test the time_encoding. Parameters other than
-        # d_model are irrelevant for this test.
-        model = VectorField(
-            activations_dtype=jnp.float32,
-            weights_dtype=jnp.float32,
-            domain_dim=3,
-            conditioning_dim=0,
-            time_dim=time_dim,
-            reference_directions=16,
-            n_layers=1,
-            d_model=256,
-            mlp_expansion_factor=1,
-            mlp_dropout_rate=None,
-            input_dropout_rate=None,
-            use_pre_mlp_projection=False,
-        )
+    params = model.init(rng, jnp.ones((1, 3)), jnp.ones((1,)), jnp.ones((1, 0)))
 
-        params = model.init(rng, jnp.ones((1, 3)), jnp.ones((1,)), jnp.ones((1, 0)))
+    n_samples = 10_000
+    times = jax.random.uniform(rng, (n_samples,))
 
-        n_samples = 10_000
-        times = jax.random.uniform(rng, (n_samples,))
+    compute_encoding = lambda t: model.apply(params, t, method=model.time_encoding)
+    encoded_times = jax.vmap(compute_encoding)(times)
 
-        compute_encoding = lambda t: model.apply(params, t, method=model.time_encoding)
-        encoded_times = jax.vmap(compute_encoding)(times)
+    assert encoded_times.shape == (n_samples, time_dim)
 
-        assert encoded_times.shape == (n_samples, time_dim)
+    # Check statistics
+    means = jnp.mean(encoded_times, axis=0)
+    stds = jnp.std(encoded_times, axis=0)
 
-        # Check statistics
-        means = jnp.mean(encoded_times, axis=0)
-        stds = jnp.std(encoded_times, axis=0)
+    expected_mean = 0.0
+    expected_std = 1.0
 
-        expected_mean = 0.0
-        expected_std = 1.0
+    np.testing.assert_allclose(means, expected_mean, atol=0.05)
+    np.testing.assert_allclose(stds, expected_std, atol=0.1)
 
-        np.testing.assert_allclose(means, expected_mean, atol=0.05)
-        np.testing.assert_allclose(stds, expected_std, atol=0.1)
+    # Check overall vector statistics
+    overall_mean = jnp.mean(encoded_times)
+    overall_std = jnp.std(encoded_times)
 
-        # Check overall vector statistics
-        overall_mean = jnp.mean(encoded_times)
-        overall_std = jnp.std(encoded_times)
+    np.testing.assert_allclose(overall_mean, expected_mean, atol=0.01)
+    np.testing.assert_allclose(overall_std, expected_std, atol=0.01)
 
-        np.testing.assert_allclose(overall_mean, expected_mean, atol=0.01)
-        np.testing.assert_allclose(overall_std, expected_std, atol=0.01)
-
-        print(f"Time encoding test passed for time_dim={time_dim}")
-        print(f"  Mean: {overall_mean:.6f} (expected {expected_mean:.6f})")
-        print(f"  Std: {overall_std:.6f} (expected {expected_std:.6f})")
+    print(f"Time encoding test passed for time_dim={time_dim}")
+    print(f"  Mean: {overall_mean:.6f} (expected {expected_mean:.6f})")
+    print(f"  Std: {overall_std:.6f} (expected {expected_std:.6f})")
 
 
 @pytest.mark.parametrize("domain_dim", [3, 10])
@@ -586,7 +583,8 @@ def test_vector_field_projections_normalization(domain_dim, conditioning_dim):
     ), f"Padded MLP input variance should be close to 1.0, got {padded_mlp_input_variance}"
 
 
-def test_optimal_transport_field_direction():
+@pytest.mark.parametrize("dim", [3, 16])
+def test_optimal_transport_field_direction(dim):
     """
     Test that optimal_transport_field produces vectors that are aligned with
     the direct path from x to x1 after tangent space projection.
@@ -595,7 +593,6 @@ def test_optimal_transport_field_direction():
     rng = jax.random.PRNGKey(0)
 
     # Test parameters
-    dim = 3
     n_samples = 100
     kappa_1 = 100.0
 
@@ -1181,12 +1178,16 @@ _baseline_model = VectorField(
 )
 
 
-def test_train_trivial():
+@pytest.mark.parametrize("domain_dim", [3, 16])
+def test_train_trivial(domain_dim):
     "Train a model with a single example"
-    model = _baseline_model
+    model = replace(_baseline_model, domain_dim=domain_dim)
 
     batch_size = 256
-    points = repeat(jnp.array([1, 0, 0]), "v -> b v", b=batch_size * 100)
+    # Create a unit vector in the first dimension
+    first_dim_vec = jnp.zeros(domain_dim)
+    first_dim_vec = first_dim_vec.at[0].set(1.0)
+    points = repeat(first_dim_vec, "v -> b v", b=batch_size * 100)
     dset = Dataset.from_dict({"point_vec": points}).with_format("np")
     state, loss = _train_loop_for_tests(model, dset, batch_size, 1e-3, 2, kappa_1=10.0)
     print(f"Final loss: {loss:.6f}")
@@ -1201,10 +1202,13 @@ def test_train_trivial():
     )
     cos_sims = samples @ points[0]
 
-    for sample, cos_sim in zip(samples, cos_sims):
-        print(
-            f"Sample: [{sample[0]:9.6f}, {sample[1]:9.6f}, {sample[2]:9.6f}]  Cosine similarity: {cos_sim:9.6f}"
-        )
+    print(f"Sample cosine similarities for domain_dim={domain_dim}:")
+    for i, (sample, cos_sim) in enumerate(zip(samples, cos_sims)):
+        if domain_dim == 3 or i < 3:  # Print all for 3D, just first 3 for 16D
+            sample_str = ", ".join([f"{x:9.6f}" for x in sample[: min(3, domain_dim)]])
+            if domain_dim > 3:
+                sample_str += ", ..."
+            print(f"Sample: [{sample_str}]  Cosine similarity: {cos_sim:9.6f}")
 
     assert cos_sims.shape == (20,)
     # It's very hard for the network to learn the vector field near the antipode of our target
@@ -1221,16 +1225,81 @@ def _vmf_differential_entropy(kappa):
     return np.log(4 * np.pi * sinh_k / kappa) - kappa * coth_k + 1
 
 
-def test_train_vmf():
+def vmf_scale_kappa(kappa_src, dim_src, dim_target):
+    """
+    Scale the von Mises-Fisher concentration parameter from a source dimension to a target
+    dimension. The resulting kappa value, when used to specify a vMF distribution in dim_target
+    dimensions, will have the same mean similarity to the distribution's mean direction as a
+    distribution with the source kappa in dim_src dimensions.
+    """
+    if dim_src == dim_target:
+        return kappa_src
+
+    n_samples = 16_384
+    eps = 0.01
+    max_iters = 100
+
+    np_rng = np.random.Generator(np.random.PCG64(seed=20250317))
+
+    def get_mean_similarity(kappa, north):
+        # There are non-stochastic methods of doing this but they have numerical issues and give bad
+        # results. This is slower, but reliable.
+        vmf_distribution = stats.vonmises_fisher(north, kappa)
+        samples = vmf_distribution.rvs(n_samples, random_state=np_rng)
+        return (samples @ north).mean()
+
+    src_north = np.zeros(dim_src)
+    src_north[0] = 1.0
+    src_mean_similarity = get_mean_similarity(kappa_src, src_north)
+    print(f"src mean similarity: {src_mean_similarity:.6f}")
+
+    target_north = np.zeros(dim_target)
+    target_north[0] = 1.0
+
+    low = kappa_src if dim_src < dim_target else kappa_src * (dim_src / dim_target)
+    incr = 200
+    while get_mean_similarity(low, target_north) > src_mean_similarity:
+        print(f"find lower bound: {low:.6f}")
+        low -= incr
+        incr *= 2
+    high = kappa_src if dim_src > dim_target else kappa_src * (dim_target / dim_src)
+    incr = 200
+    while get_mean_similarity(high, target_north) < src_mean_similarity:
+        print(f"find upper bound: {high:.6f}")
+        high += incr
+        incr *= 2
+
+    for i in range(max_iters):
+        test_kappa = (low + high) / 2.0
+        test_mean_similarity = get_mean_similarity(test_kappa, target_north)
+        error = test_mean_similarity - src_mean_similarity
+        print(
+            f"Iteration {i}, low: {low:.6f}, high: {high:.6f}, test kappa: {test_kappa:.6f}, similarity: {test_mean_similarity:.6f}, error: {error:.6f}"
+        )
+        if jnp.abs(error) < eps:
+            return test_kappa
+        if test_mean_similarity > src_mean_similarity:
+            high = test_kappa
+        else:
+            low = test_kappa
+    raise ValueError(
+        f"Failed to find kappa for dim_src={dim_src} and dim_target={dim_target}, final error: {error:.6f}"
+    )
+
+
+@pytest.mark.parametrize("domain_dim", [3, 16])
+def test_train_vmf(domain_dim):
     """
     Train a model with data from a von Mises-Fisher distribution and evaluate the samples.
     """
-    model = replace(_baseline_model, n_layers=2)
+    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2)
 
     batch_size = 512
     n_samples = 32768
 
-    mean_direction = np.array([1.0, 0.0, 0.0])
+    # Create a mean direction that points along the first dimension
+    mean_direction = np.zeros(domain_dim)
+    mean_direction[0] = 1.0
     kappa = 2
 
     # Generate samples from von Mises-Fisher distribution
@@ -1281,8 +1350,15 @@ def test_train_vmf():
         sample = samples[i]
         log_prob = log_probs[i]
         cos_sim = np.dot(sample, mean_direction)
+
+        if domain_dim == 3:
+            sample_str = f"[{sample[0]:9.6f}, {sample[1]:9.6f}, {sample[2]:9.6f}]"
+        else:
+            # For higher dimensions, just show first few components
+            sample_str = f"[{sample[0]:9.6f}, {sample[1]:9.6f}, {sample[2]:9.6f}, ...]"
+
         print(
-            f"Sample: [{sample[0]:9.6f}, {sample[1]:9.6f}, {sample[2]:9.6f}]  "
+            f"Sample: {sample_str}  "
             f"Log prob: {log_prob:9.6f}  Cosine similarity: {cos_sim:9.6f}"
         )
 
@@ -1292,7 +1368,8 @@ def test_train_vmf():
     ), f"Sample NLL {sample_nll} too far from differential entropy {differential_entropy}"
 
 
-def test_train_conditional_vmf():
+@pytest.mark.parametrize("domain_dim", [3, 16])
+def test_train_conditional_vmf(domain_dim):
     """
     Train a model with data from two different von Mises-Fisher distributions
     conditioned on a binary conditioning vector.
@@ -1300,19 +1377,24 @@ def test_train_conditional_vmf():
     When conditioning vector is 0, samples should come from the first vMF distribution.
     When conditioning vector is 1, samples should come from the second vMF distribution.
     """
-    model = replace(_baseline_model, conditioning_dim=1, n_layers=2)
+    model = replace(
+        _baseline_model, domain_dim=domain_dim, conditioning_dim=1, n_layers=2
+    )
 
     # Define two different vMF distributions
-    mean_direction1 = np.array([1.0, 0.0, 0.0])  # First distribution along x-axis
-    mean_direction2 = np.array([0.0, 0.0, 1.0])  # Second distribution along z-axis
-    kappa = 2.0
+    mean_direction1 = np.zeros(domain_dim)
+    mean_direction1[0] = 1.0
+    mean_direction2 = np.zeros(domain_dim)
+    mean_direction2[1] = 1.0
 
-    vmf1 = stats.vonmises_fisher(mean_direction1, kappa)
-    vmf2 = stats.vonmises_fisher(mean_direction2, kappa)
+    vmf_kappa = 2.0 if domain_dim == 3 else 5.0
+
+    vmf1 = stats.vonmises_fisher(mean_direction1, vmf_kappa)
+    vmf2 = stats.vonmises_fisher(mean_direction2, vmf_kappa)
 
     # Sample from our distributions
     np_rng = np.random.Generator(np.random.PCG64(seed=42))
-    total_samples = 30_000
+    total_samples = 60_000
     points1 = vmf1.rvs(total_samples // 2)
     points2 = vmf2.rvs(total_samples // 2)
 
@@ -1332,7 +1414,13 @@ def test_train_conditional_vmf():
 
     batch_size = 256
     state, train_loss, test_loss, test_nll = _train_loop_for_tests(
-        model, train_dataset, batch_size, 1e-3, 8, test_dataset, kappa_1=5.0
+        model,
+        train_dataset,
+        batch_size,
+        1e-3,
+        4 if domain_dim == 3 else 8,
+        test_dataset,
+        kappa_1=5.0,
     )
     print(
         f"Final loss - Train: {train_loss:.4f}, Test: {test_loss:.4f}, Test NLL: {test_nll:.4f}"
@@ -1411,7 +1499,7 @@ def test_train_conditional_vmf():
         nll_1_from_vmf2 < nll_1_from_vmf1
     ), "Samples with cond=1 don't match distribution 2"
 
-    distribution_nll = _vmf_differential_entropy(kappa)
+    distribution_nll = vmf1.entropy()
     print(f"Theoretical NLL: {distribution_nll:.4f}")
     print(f"NLL with cond=0 from vmf1: {nll_0_from_vmf1:.4f}")
     print(f"NLL with cond=0 from vmf2: {nll_0_from_vmf2:.4f}")
@@ -2278,7 +2366,8 @@ def test_cap_conditioned_vector_field_normalization(domain_dim, reference_direct
     ), f"Cap distances variance should be close to 1, got {cap_d_maxes_var}"
 
 
-def test_train_cap_conditioned_model():
+@pytest.mark.parametrize("domain_dim,kappa_1,epochs", [(3, 5.0, 25), (16, 5.0, 50)])
+def test_train_cap_conditioned_model(domain_dim, kappa_1, epochs):
     """
     Train a cap conditioned model on a simple 3d training distribution and check the samples are
     inside the input caps and correctly distributed.
@@ -2293,7 +2382,7 @@ def test_train_cap_conditioned_model():
     """
 
     model = CapConditionedVectorField(
-        domain_dim=3,
+        domain_dim=domain_dim,
         reference_directions=128,
         n_layers=6,
         d_model=512,
@@ -2313,14 +2402,18 @@ def test_train_cap_conditioned_model():
 
     logits_table = LogitsTable(d=model.domain_dim - 1, n=8192)
 
-    kappa_1 = 5.0
-
     # Generate a training set from a discrete uniform distribution of 5 fixed random points on the
     # sphere.
-    n_distribution_points = 5
-    distribution_points = sample_sphere(distribution_rng, n_distribution_points, 3)
-    training_points = jnp.repeat(distribution_points, 20_000, axis=0)
-    assert training_points.shape == (100_000, 3)
+    n_distribution_points = 20
+    distribution_points = sample_sphere(
+        distribution_rng, n_distribution_points, domain_dim
+    )
+    dset_size = 200_000
+    assert dset_size % n_distribution_points == 0
+    training_points = jnp.repeat(
+        distribution_points, dset_size // n_distribution_points, axis=0
+    )
+    assert training_points.shape == (dset_size, domain_dim)
     shuffle_indices = jax.random.permutation(
         shuffle_rng, jnp.arange(training_points.shape[0])
     )
@@ -2332,7 +2425,6 @@ def test_train_cap_conditioned_model():
     test_dset = dset.select(range(train_set_size, training_points.shape[0]))
 
     # Train a model
-    epochs = 14
     batch_size = 256
     batches_per_epoch = len(train_dset) // batch_size
     total_steps = epochs * batches_per_epoch
@@ -2384,7 +2476,9 @@ def test_train_cap_conditioned_model():
     test_cases = [
         {"name": "full sphere", "d_max": 2.0},
         {"name": "hemisphere", "d_max": 1.0},
-        {"name": "quarter-sphere", "d_max": 0.5},
+        # cap area, holding d_max fixed, shrinks as dimension increases. 0.82 is approximately 1/4
+        # of a 15-sphere.
+        {"name": "quarter-sphere", "d_max": 0.5 if domain_dim == 3 else 0.82},
     ]
 
     for test_case in test_cases:
@@ -2395,7 +2489,7 @@ def test_train_cap_conditioned_model():
         print(f"\nSampling from {test_name} (d_max={d_max})...")
         cap_sample_rng, pt_sample_rng, sample_rng = jax.random.split(sample_rng, 3)
 
-        center = sample_sphere(cap_sample_rng, 1, 3)[0]
+        center = sample_sphere(cap_sample_rng, 1, domain_dim)[0]
         centers = jnp.repeat(center[None, :], n_samples, axis=0)
         d_maxes = jnp.full((n_samples,), d_max)
 
@@ -2415,7 +2509,7 @@ def test_train_cap_conditioned_model():
         cos_similarity_targets = jnp.concatenate(
             [center[None, :], distribution_points], axis=0
         )
-        assert cos_similarity_targets.shape == (n_distribution_points + 1, 3)
+        assert cos_similarity_targets.shape == (n_distribution_points + 1, domain_dim)
 
         # Calculate similarities to center and distribution points
         cos_similarities = jnp.dot(cap_samples, cos_similarity_targets.T)
