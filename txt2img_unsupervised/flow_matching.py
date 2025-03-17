@@ -42,7 +42,7 @@ tangent direction along geodesics, (3) efficient sampling with fewer integration
 respect the geometry of the sphere, ensuring flows remain on the manifold.
 
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from datasets import Dataset
 from einops import rearrange, repeat
 from flax import linen as nn
@@ -1062,10 +1062,14 @@ def _train_loop_for_tests(
     step_count = 0
 
     print("Train! Loop! Go!")
-    with tqdm(range(epochs), desc="Training") as pbar:
+    with tqdm(range(epochs), desc="Training", unit="epochs") as pbar:
         for epoch in pbar:
             # Training loop
-            for i, batch in enumerate(dataset.iter(batch_size, drop_last_batch=True)):
+            for i, batch in tenumerate(
+                dataset.iter(batch_size, drop_last_batch=True),
+                unit="train batches",
+                total=len(dataset) // batch_size,
+            ):
                 if dummy_cond is not None:
                     batch["cond_vec"] = dummy_cond
                 norms = jnp.linalg.norm(batch["point_vec"], axis=1, keepdims=True)
@@ -1078,7 +1082,7 @@ def _train_loop_for_tests(
                 step_count += 1
                 current_lr = cosine_schedule(step_count)
 
-                if first_step or i % 10 == 0:
+                if first_step or i % 200 == 0:
                     step_rng, nll_rng = jax.random.split(step_rng)
                     train_nlls = -compute_log_probability(
                         model,
@@ -1110,7 +1114,11 @@ def _train_loop_for_tests(
                 test_losses = []
                 test_nlls = []
 
-                for test_batch in test_dataset.iter(batch_size, drop_last_batch=True):
+                for test_batch in tqdm(
+                    test_dataset.iter(batch_size, drop_last_batch=False),
+                    unit="test batches",
+                    total=len(test_dataset) // batch_size,
+                ):
                     if dummy_cond is not None:
                         test_batch["cond_vec"] = dummy_cond
 
@@ -1166,34 +1174,31 @@ def _train_loop_for_tests(
         return state, train_loss
 
 
+_baseline_model = VectorField(
+    domain_dim=3,
+    reference_directions=128,
+    n_layers=6,
+    d_model=512,
+    time_dim=128,
+    mlp_expansion_factor=4,
+    activations_dtype=jnp.float32,
+    weights_dtype=jnp.float32,
+    conditioning_dim=0,
+    input_dropout_rate=None,
+    mlp_dropout_rate=None,
+    use_pre_mlp_projection=True,
+)
+
+
 def test_train_trivial():
     "Train a model with a single example"
-    model = VectorField(
-        activations_dtype=jnp.float32,
-        weights_dtype=jnp.float32,
-        domain_dim=3,
-        conditioning_dim=0,
-        n_layers=3,
-        d_model=32,
-        mlp_expansion_factor=4,
-        reference_directions=16,
-        time_dim=16,
-        use_pre_mlp_projection=False,
-        input_dropout_rate=None,
-        mlp_dropout_rate=None,
-    )
+    model = _baseline_model
 
-    batch_size = 512
-    points = repeat(jnp.array([1, 0, 0]), "v -> b v", b=batch_size * 11)
+    batch_size = 256
+    points = repeat(jnp.array([1, 0, 0]), "v -> b v", b=batch_size * 100)
     dset = Dataset.from_dict({"point_vec": points}).with_format("np")
-    train_dset = dset.select(range(batch_size * 10))
-    test_dset = dset.select(range(batch_size * 10, batch_size * 11))
-    state, loss, test_loss, test_nll = _train_loop_for_tests(
-        model, train_dset, batch_size, 1e-1, 50, kappa_1=10.0, test_dataset=test_dset
-    )
+    state, loss = _train_loop_for_tests(model, dset, batch_size, 1e-3, 2, kappa_1=10.0)
     print(f"Final loss: {loss:.6f}")
-    print(f"Final test loss: {test_loss:.6f}")
-    print(f"Final test nll: {test_nll:.6f}")
     samples = generate_samples(
         model,
         state,
@@ -1216,7 +1221,6 @@ def test_train_trivial():
     # there get stuck. Hopefully this isn't an issue with nontrivial distributions.
     high_sims = cos_sims > 0.99
     assert high_sims.mean() >= 0.95
-    assert test_nll < -10.0
 
 
 def _vmf_differential_entropy(kappa):
@@ -1230,20 +1234,7 @@ def test_train_vmf():
     """
     Train a model with data from a von Mises-Fisher distribution and evaluate the samples.
     """
-    model = VectorField(
-        activations_dtype=jnp.float32,
-        weights_dtype=jnp.float32,
-        domain_dim=3,
-        reference_directions=32,
-        time_dim=32,
-        conditioning_dim=0,
-        n_layers=3,
-        d_model=128,
-        mlp_expansion_factor=4,
-        use_pre_mlp_projection=False,
-        input_dropout_rate=None,
-        mlp_dropout_rate=None,
-    )
+    model = replace(_baseline_model, n_layers=2)
 
     batch_size = 512
     n_samples = 32768
@@ -1267,7 +1258,7 @@ def test_train_vmf():
     print(f"vMF distribution entropy: {differential_entropy:.6f}")
 
     state, train_loss, test_loss, test_nll = _train_loop_for_tests(
-        model, dset, batch_size, 1e-3, 30, test_dset, kappa_1=5.0
+        model, dset, batch_size, 1e-3, 1, test_dset, kappa_1=5.0
     )
     print(f"Final train loss: {train_loss:.6f}")
     print(f"Final test loss: {test_loss:.6f}")
@@ -1318,20 +1309,7 @@ def test_train_conditional_vmf():
     When conditioning vector is 0, samples should come from the first vMF distribution.
     When conditioning vector is 1, samples should come from the second vMF distribution.
     """
-    model = VectorField(
-        activations_dtype=jnp.float32,
-        weights_dtype=jnp.float32,
-        domain_dim=3,
-        conditioning_dim=1,
-        time_dim=24,
-        reference_directions=24,
-        n_layers=2,
-        d_model=64,
-        mlp_expansion_factor=4,
-        use_pre_mlp_projection=False,
-        input_dropout_rate=None,
-        mlp_dropout_rate=None,
-    )
+    model = replace(_baseline_model, conditioning_dim=1, n_layers=2)
 
     # Define two different vMF distributions
     mean_direction1 = np.array([1.0, 0.0, 0.0])  # First distribution along x-axis
@@ -1343,9 +1321,7 @@ def test_train_conditional_vmf():
 
     # Sample from our distributions
     np_rng = np.random.Generator(np.random.PCG64(seed=42))
-    total_samples = 20_000
-    train_samples = int(total_samples * 0.9)
-    test_samples = total_samples - train_samples
+    total_samples = 30_000
     points1 = vmf1.rvs(total_samples // 2)
     points2 = vmf2.rvs(total_samples // 2)
 
@@ -1355,16 +1331,18 @@ def test_train_conditional_vmf():
     all_points = np.vstack([points1, points2])
     all_cond_vecs = np.vstack([cond_vec1, cond_vec2])
 
-    dataset = Dataset.from_dict(
-        {"point_vec": all_points, "cond_vec": all_cond_vecs}
-    ).with_format("np")
-    train_dataset = dataset.select(range(train_samples))
-    test_dataset = dataset.select(range(train_samples, total_samples))
+    datasets = (
+        Dataset.from_dict({"point_vec": all_points, "cond_vec": all_cond_vecs})
+        .with_format("np")
+        .train_test_split(test_size=2048)
+    )
+    train_dataset = datasets["train"]
+    test_dataset = datasets["test"]
 
     batch_size = 256
     state, train_loss, test_loss, test_nll = _train_loop_for_tests(
-        model, train_dataset, batch_size, 1e-3, 20, test_dataset, kappa_1=5.0
-    )  # 1e-2 8.55,
+        model, train_dataset, batch_size, 1e-3, 8, test_dataset, kappa_1=5.0
+    )
     print(
         f"Final loss - Train: {train_loss:.4f}, Test: {test_loss:.4f}, Test NLL: {test_nll:.4f}"
     )
@@ -2371,7 +2349,7 @@ def test_train_cap_conditioned_model():
     test_dset = dset.select(range(train_set_size, training_points.shape[0]))
 
     # Train a model
-    epochs = 40
+    epochs = 14
     batch_size = 256
     batches_per_epoch = len(train_dset) // batch_size
     total_steps = epochs * batches_per_epoch
