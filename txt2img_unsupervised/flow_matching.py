@@ -132,15 +132,15 @@ class VectorField(nn.Module):
     * Encode the time parameter with a sinusoidal encoding of time_dim components.
     * Pass the conditioning vector through unmodified. It should have mean 0 and variance 1.
     * Concatenate the above into a single vector.
-    * If use_pre_mlp_projection is true, multiply the concatenated vector by a learnable matrix to
-      create a d_model-dimensional vector.
+    * If use_pre_mlp_projection is true, apply a linear layer to the concatenated vector to create a
+      d_model-dimensional vector.
     * If use_pre_mlp_projection is false:
       * The following must sum to less than or equal to d_model:
         * reference_directions if it is not None, otherwise domain_dim
         * time_dim
         * conditioning_dim
       * If they're less, pad the vector with zeros.
-    * Add a learnable bias to the vector.
+    * If use_pre_mlp_projection is false, add a learnable bias to the vector.
     * Apply dropout to the vector if input_dropout_rate is not None.
     * Feed that to the MLP.
     """
@@ -201,26 +201,24 @@ class VectorField(nn.Module):
                 kernel_init=nn.initializers.variance_scaling(
                     scale=1.0, mode="fan_in", distribution="normal"
                 ),
-                use_bias=False,
+                use_bias=True,
             )
 
-        # Learned bias to add to the MLP input
-        def init_bias(rng, shape, dtype):
-            # Zero bias for the components of the input that will actually be set to something,
-            # unit normal for the rest to avoid weight tying.
-            if self.use_pre_mlp_projection:
-                # When using projection, all components will be set
-                return jnp.zeros(shape, dtype=dtype)
-            else:
+        if not self.use_pre_mlp_projection:
+            # Set up a bias on the MLP inputs. If we're using pre-mlp-projection, this would be
+            # redundant so we don't do it.
+            def init_bias(rng, shape, dtype):
+                # Zero bias for the components of the input that will actually be set to something,
+                # unit normal for the rest to avoid weight tying.
                 used_bias = jnp.zeros((self.total_input_dim,), dtype=dtype)
                 unused_bias = jax.random.normal(
                     rng, (self.d_model - self.total_input_dim,), dtype=dtype
                 )
                 return jnp.concatenate([used_bias, unused_bias], axis=0)
 
-        self.mlp_in_bias = self.param(
-            "mlp_in_bias", init_bias, (self.d_model,), self.weights_dtype
-        )
+            self.mlp_in_bias = self.param(
+                "mlp_in_bias", init_bias, (self.d_model,), self.weights_dtype
+            )
 
         if self.input_dropout_rate is not None:
             self.input_dropout = nn.Dropout(
@@ -343,7 +341,8 @@ class VectorField(nn.Module):
             else:
                 mlp_in = concatenated
 
-        mlp_in = mlp_in + self.mlp_in_bias
+        if not self.use_pre_mlp_projection:
+            mlp_in = mlp_in + self.mlp_in_bias
         assert mlp_in.shape == (batch_size, self.d_model)
 
         mlp_in = (
@@ -1417,7 +1416,7 @@ def test_train_conditional_vmf(domain_dim):
         model,
         train_dataset,
         batch_size,
-        1e-3,
+        1e-4 if domain_dim == 3 else 1e-3,
         4 if domain_dim == 3 else 8,
         test_dataset,
         kappa_1=5.0,
@@ -2366,7 +2365,7 @@ def test_cap_conditioned_vector_field_normalization(domain_dim, reference_direct
     ), f"Cap distances variance should be close to 1, got {cap_d_maxes_var}"
 
 
-@pytest.mark.parametrize("domain_dim,kappa_1,epochs", [(3, 5.0, 25), (16, 5.0, 50)])
+@pytest.mark.parametrize("domain_dim,kappa_1,epochs", [(3, 5.0, 25), (16, 5.0, 60)])
 def test_train_cap_conditioned_model(domain_dim, kappa_1, epochs):
     """
     Train a cap conditioned model on a simple 3d training distribution and check the samples are
