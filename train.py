@@ -7,22 +7,16 @@ import os
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
 
 import argparse
-import datasets
 import datetime
-import flax.core
 import gc
 import importlib.util
 import jax
 import jax.numpy as jnp
-import jax.tree_util as jtu
 import json
-import matplotlib.colors as mcolors
-import matplotlib.pyplot as plt
 import numpy as np
 import optax  # type:ignore[import]
 import optax.contrib
 import orbax.checkpoint as ocp
-import PIL.Image
 import signal
 import torch
 import transformers
@@ -30,7 +24,7 @@ import wandb
 from copy import copy
 from datasets import Dataset
 from distutils.util import strtobool
-from einops import rearrange, reduce, repeat
+from einops import rearrange, repeat
 from functools import partial
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -44,7 +38,6 @@ from typing import Any, Callable, Optional, Tuple
 from txt2img_unsupervised.checkpoint import (
     mk_checkpoint_manager,
     setup_checkpoint_manager_and_initial_state,
-    setup_optimizer,
     TrainState,
 )
 from txt2img_unsupervised.config import (
@@ -863,14 +856,12 @@ def train_loop(
     train_imgs,
     test_imgs,
     mdl,
-    model_cfg,
     training_cfg,
     total_steps,
     total_epochs,
     steps_per_epoch,
     steps_in_partial_epoch,
     sample_batch_size,
-    checkpoint_manager,
     data_offset,
     args,
     examples_sharding,
@@ -1380,14 +1371,12 @@ if __name__ == "__main__":
         train_imgs,
         test_imgs,
         mdl,
-        model_cfg,
         training_cfg,
         total_steps,
         total_epochs,
         steps_per_epoch,
         steps_in_partial_epoch,
         sample_batch_size,
-        checkpoint_manager,
         data_offset,
         args,
         examples_sharding,
