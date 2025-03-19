@@ -26,6 +26,8 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
   * `txt2img_unsupervised/visualize_field.py`. Visualize the field of a flow matching model.
   * `txt2img_unsupervised/rotating_field_animation.py`. Make an animation of the field of a flow
     matching model where the sphere rotates so you can see the field from different angles.
+  * `txt2img_unsupervised/coordinate_check.py`. Check the muP implementation in the flow matching
+    model is correct by visualizing the activation scale at different model widths.
 * Modules
   * `txt2img_unsupervised/flow_matching.py`. Spherical flow matching model. Includes baseline and
     cap conditioned models.

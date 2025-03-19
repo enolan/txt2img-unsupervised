@@ -74,7 +74,7 @@ class MLPBlock(nn.Module):
 
     activations_dtype: jnp.dtype
     weights_dtype: jnp.dtype
-    kernel_init: Callable[..., jnp.ndarray]
+    param_variance: float
 
     def setup(self) -> None:
         self.norm = nn.LayerNorm(
@@ -85,19 +85,21 @@ class MLPBlock(nn.Module):
             features=self.expansion_factor * self.bottleneck_dim,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
-            kernel_init=self.kernel_init,
+            kernel_init=nn.initializers.normal(stddev=jnp.sqrt(self.param_variance)),
         )
         self.value_proj = nn.Dense(
             features=self.expansion_factor * self.bottleneck_dim,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
-            kernel_init=self.kernel_init,
+            kernel_init=nn.initializers.normal(stddev=jnp.sqrt(self.param_variance)),
         )
         self.out_proj = nn.Dense(
             features=self.bottleneck_dim,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
-            kernel_init=self.kernel_init,
+            kernel_init=nn.initializers.normal(
+                stddev=jnp.sqrt(self.param_variance / self.expansion_factor)
+            ),
         )
         if self.dropout_rate is not None:
             self.dropout = nn.Dropout(rate=self.dropout_rate, deterministic=False)
@@ -169,8 +171,13 @@ class VectorField(nn.Module):
     # Dropout rate for the input
     input_dropout_rate: Optional[float]
 
-    activations_dtype: jnp.dtype
-    weights_dtype: jnp.dtype
+    activations_dtype: jnp.dtype = jnp.float32
+    weights_dtype: jnp.dtype = jnp.float32
+
+    d_model_base: int = 512  # Baseline d_model that muP scaling is relative to
+    variance_base: float = 1 / 512  # baseline variance used when d_model = d_model_base
+    alpha_input: float = 1.0  # scaling factor for inputs
+    alpha_output: float = 1.0  # scaling factor for outputs
 
     @property
     def input_feature_dim(self) -> int:
@@ -184,7 +191,18 @@ class VectorField(nn.Module):
     def total_input_dim(self) -> int:
         return self.input_feature_dim + self.conditioning_dim + self.time_dim
 
+    @property
+    def d_model_scale_factor(self) -> float:
+        "m_d in muP."
+        return self.d_model / self.d_model_base
+
+    def scale_lr(self, lr: float) -> float:
+        "Scaled learning rate for hidden layers."
+        return lr / self.d_model_scale_factor
+
     def setup(self) -> None:
+        hidden_init_variance = self.variance_base / self.d_model_scale_factor
+
         if not self.use_pre_mlp_projection and self.total_input_dim > self.d_model:
             raise ValueError(
                 f"input_feature_dim + conditioning_dim + time_dim ({self.total_input_dim}) "
@@ -229,7 +247,7 @@ class VectorField(nn.Module):
 
         self.mlp_blocks = nn.scan(
             nn.remat(MLPBlock),
-            variable_axes={"params": 0},
+            variable_axes={"params": 0, "intermediates": 0},
             variable_broadcast=False,
             split_rngs={"params": True, "dropout": True},
             length=self.n_layers,
@@ -238,9 +256,7 @@ class VectorField(nn.Module):
             expansion_factor=self.mlp_expansion_factor,
             activations_dtype=self.activations_dtype,
             weights_dtype=self.weights_dtype,
-            kernel_init=nn.initializers.variance_scaling(
-                scale=1.0, mode="fan_in", distribution="normal"
-            ),
+            param_variance=hidden_init_variance,
             dropout_rate=self.mlp_dropout_rate,
         )
 
@@ -253,9 +269,7 @@ class VectorField(nn.Module):
             features=self.domain_dim,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
-            kernel_init=nn.initializers.variance_scaling(
-                scale=1.0, mode="fan_in", distribution="normal"
-            ),
+            kernel_init=nn.initializers.normal(stddev=jnp.sqrt(hidden_init_variance)),
         )
 
         # Used to encode the input unit vectors as a vector of dot products
@@ -350,6 +364,7 @@ class VectorField(nn.Module):
             if self.input_dropout_rate is not None
             else mlp_in
         )
+        mlp_in = mlp_in * self.alpha_input
         assert mlp_in.shape == (batch_size, self.d_model)
 
         return {
@@ -383,6 +398,7 @@ class VectorField(nn.Module):
         dot_products = jnp.sum(points_out * x, axis=1, keepdims=True)
         tangent_outputs = points_out - dot_products * x
         assert tangent_outputs.shape == (batch_size, self.domain_dim)
+        tangent_outputs = tangent_outputs * self.alpha_output
 
         return tangent_outputs
 
@@ -807,7 +823,16 @@ def compute_psi_t_spherical(x0, x1, t):
 
 
 def conditional_flow_matching_loss(
-    model, params, x0, x1, t, conds=None, kappa_1=10.0, logits_table=None, rng=None
+    model,
+    params,
+    x0,
+    x1,
+    t,
+    conds=None,
+    kappa_1=10.0,
+    logits_table=None,
+    rng=None,
+    capture_intermediates=False,
 ):
     """
     Compute the Conditional Flow Matching loss from eq. 9 in the paper, modified for the spherical
@@ -866,22 +891,37 @@ def conditional_flow_matching_loss(
         my_sample_cap = lambda rng, x: sample_cap(logits_table, rng, x, bias_d_max=True)
         cap_centers, cap_d_maxes = jax.vmap(my_sample_cap)(rngs[:batch_size], x1)
 
-        predicted_field = model.apply(
+        apply_res = model.apply(
             params,
             psi_t,
             t,
             cap_centers,
             cap_d_maxes,
             rngs={"dropout": rngs[-1]},
+            capture_intermediates=capture_intermediates,
         )
     else:
-        predicted_field = model.apply(params, psi_t, t, conds, rngs={"dropout": rng})
+        apply_res = model.apply(
+            params,
+            psi_t,
+            t,
+            conds,
+            rngs={"dropout": rng},
+            capture_intermediates=capture_intermediates,
+        )
 
+    if capture_intermediates:
+        predicted_field, intermediates = apply_res
+    else:
+        predicted_field = apply_res
     assert predicted_field.shape == x0.shape
 
     loss = jnp.mean(jnp.sum((predicted_field - target_field) ** 2, axis=1))
 
-    return loss
+    if capture_intermediates:
+        return loss, intermediates
+    else:
+        return loss
 
 
 def create_train_state(rng, model, learning_rate_or_schedule):
@@ -916,8 +956,12 @@ def sample_sphere(rng, batch_size, dim):
     return normal_samples / jnp.linalg.norm(normal_samples, axis=1, keepdims=True)
 
 
-@partial(jax.jit, inline=True, static_argnames=("model", "kappa_1"))
-def compute_batch_loss(model, params, batch, rng, kappa_1, logits_table=None):
+@partial(
+    jax.jit, inline=True, static_argnames=("model", "kappa_1", "capture_intermediates")
+)
+def compute_batch_loss(
+    model, params, batch, rng, kappa_1, logits_table=None, capture_intermediates=False
+):
     """
     Compute the loss for a batch of data.
 
@@ -964,6 +1008,7 @@ def compute_batch_loss(model, params, batch, rng, kappa_1, logits_table=None):
         kappa_1=kappa_1,
         logits_table=logits_table,
         rng=rng,
+        capture_intermediates=capture_intermediates,
     )
 
 
