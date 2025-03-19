@@ -12,6 +12,7 @@ import math
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
+from contextlib import nullcontext
 
 from .cap_sampling import LogitsTable
 from .flow_matching import CapConditionedVectorField
@@ -63,10 +64,14 @@ def process_intermediates(intermediates):
 
 @partial(
     jax.jit,
-    static_argnames=["mdl", "opt", "kappa_1"],
-    donate_argnames=["params", "opt_state", "rng"],
+    static_argnames=["mdl", "kappa_1"],
+    donate_argnames=["rng"],
 )
-def train_step(logits_tbl, mdl, opt, kappa_1, params, opt_state, rng, pts):
+def compute_gradients(logits_tbl, mdl, kappa_1, params, rng, pts):
+    """
+    Compute gradients. This is split from apply_updates so we can do this on GPU and
+    apply_updates on CPU.
+    """
     rng, next_rng = jax.random.split(rng)
 
     loss_fn = lambda params: flow_matching.compute_batch_loss(
@@ -84,9 +89,47 @@ def train_step(logits_tbl, mdl, opt, kappa_1, params, opt_state, rng, pts):
         lambda x: jnp.mean(jnp.abs(x)),
         process_intermediates(intermediates["intermediates"]),
     )
-    updates, opt_state = opt.update(grad, opt_state, params)
-    params = optax.apply_updates(params, updates)
-    return loss, processed_intermediates, params, opt_state, next_rng
+
+    return loss, processed_intermediates, grad, next_rng
+
+
+@partial(
+    jax.jit,
+    static_argnames=["opt"],
+    donate_argnames=["opt_state", "params"],
+)
+def grad_update(opt, grad, opt_state, params):
+    """Do a gradient descent step given gradients."""
+    updates, new_opt_state = opt.update(grad, opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+    return new_params, new_opt_state
+
+
+str_devices = lambda x: jax.tree.map(lambda y: y.device, x)
+
+
+def train_step(
+    logits_tbl, mdl, opt, kappa_1, params, opt_state, rng, pts, use_cpu_offload=False
+):
+    """Complete training step, optionally with CPU-GPU split."""
+    gpu_params = (
+        jax.device_put(params, device=jax.devices("gpu")[0])
+        if use_cpu_offload
+        else params
+    )
+    loss, processed_intermediates, grad, next_rng = compute_gradients(
+        logits_tbl, mdl, kappa_1, gpu_params, rng, pts
+    )
+
+    if use_cpu_offload:
+        processed_intermediates = jax.device_put(
+            processed_intermediates, jax.devices("cpu")[0]
+        )
+        grad = jax.device_put(grad, jax.devices("cpu")[0])
+        loss = jax.device_put(loss, jax.devices("cpu")[0])
+
+    new_params, new_opt_state = grad_update(opt, grad, opt_state, params)
+    return loss, processed_intermediates, new_params, new_opt_state, next_rng
 
 
 @partial(jax.jit, static_argnames=["model"])
@@ -119,6 +162,13 @@ def main():
     parser.add_argument("--kappa-1", type=float, required=False, default=5.0)
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--n-seeds", type=int, required=False, default=5)
+    parser.add_argument(
+        "--cpu-offload-threshold",
+        type=int,
+        required=False,
+        default=2048,
+        help="d_model threshold above which optimizer state and weight updates are offloaded to CPU",
+    )
 
     args = parser.parse_args()
 
@@ -150,6 +200,10 @@ def main():
     for d_model_idx, d_model in enumerate(tqdm(d_model_values)):
         tqdm.write(f"\nTraining with d_model = {d_model}")
 
+        use_cpu_offload = d_model > args.cpu_offload_threshold
+        if use_cpu_offload:
+            tqdm.write(f"Using CPU offloading for d_model={d_model}")
+
         d_model_key = d_model_keys[d_model_idx]
         seed_keys = jax.random.split(d_model_key, args.n_seeds)
 
@@ -179,11 +233,17 @@ def main():
 
             init_key, train_key = jax.random.split(seed_keys[seed_idx])
 
-            tqdm.write("Initializing parameters")
-            params = init_model_params(model, init_key)
+            device_ctx = (
+                jax.default_device(jax.devices("cpu")[0])
+                if use_cpu_offload
+                else nullcontext()
+            )
+            with device_ctx:
+                tqdm.write("Initializing parameters")
+                params = init_model_params(model, init_key)
 
-            tqdm.write("Initializing optimizer state")
-            opt_state = init_opt_state(params)
+                tqdm.write(f"Initializing optimizer state")
+                opt_state = init_opt_state(params)
 
             tqdm.write("Training")
             rng = train_key
@@ -198,9 +258,11 @@ def main():
                     opt_state,
                     rng,
                     batch["vec"],
+                    use_cpu_offload,
                 )
                 activations_this_seed.append(processed_intermediates)
                 tqdm.write(f"Loss: {loss}")
+                gc.collect()
 
             all_seed_activations.append(activations_this_seed)
             del processed_intermediates, params, opt_state, rng
