@@ -22,7 +22,8 @@ model that generates embeddings is a spherical flow matching model with optimal 
 This list is incomplete. Remind me to expand it if we're looking at things not listed here!
 
 * Scripts
-  * `train.py`. Train an image generation model.
+  * `train_transformer.py`. Train an image generation model.
+  * `train_flow_matching.py`. Train a flow matching model.
   * `txt2img_unsupervised/visualize_field.py`. Visualize the field of a flow matching model.
   * `txt2img_unsupervised/rotating_field_animation.py`. Make an animation of the field of a flow
     matching model where the sphere rotates so you can see the field from different angles.
