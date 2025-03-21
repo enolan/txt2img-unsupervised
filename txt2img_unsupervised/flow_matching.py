@@ -196,6 +196,34 @@ class VectorField(nn.Module):
         "m_d in muP."
         return self.d_model / self.d_model_base
 
+    @property
+    def partition_map(self):
+        """
+        A map of parameter names to learning rate groups, used with optax.transforms.partition to
+        implement muP properly. Parameters will be in either the "fixed_lr" or "scaled_lr" group.
+        """
+        dense_layer_partition_map = {"bias": "fixed_lr", "kernel": "scaled_lr"}
+
+        params_map = {
+            "final_norm": "fixed_lr",
+            "out_proj": dense_layer_partition_map,
+            "mlp_blocks": {
+                "norm": "fixed_lr",
+                "gate_proj": dense_layer_partition_map,
+                "value_proj": dense_layer_partition_map,
+                "out_proj": dense_layer_partition_map,
+            },
+        }
+        if self.use_pre_mlp_projection:
+            # pre_mlp_proj should have its learning rate scaled by 1/m_d because it feeds into the
+            # MLP and gradients go backwards but its initialization should be determined by
+            # total_input_dim because activations go forwards. I think.
+            params_map["pre_mlp_proj"] = dense_layer_partition_map
+        else:
+            params_map["mlp_in_bias"] = "fixed_lr"
+
+        return {"params": params_map}
+
     def scale_lr(self, lr: float) -> float:
         "Scaled learning rate for hidden layers."
         return lr / self.d_model_scale_factor
