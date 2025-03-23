@@ -2,162 +2,85 @@
 
 import os
 
-# neccessary to use more of the GPU's memory. Default is 0.75. It's supposed to be able to
+# necessary to use more of the GPU's memory. Default is 0.75. It's supposed to be able to
 # dynamically allocate more, but there are fragmentation issues since we allocate ginormous arrays.
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
 
 import argparse
 import datetime
 import gc
-import importlib.util
 import jax
 import jax.numpy as jnp
-import json
 import numpy as np
 import optax  # type:ignore[import]
-import optax.contrib
 import orbax.checkpoint as ocp
-import signal
 import torch
 import transformers
 import wandb
 from copy import copy
-from datasets import Dataset
 from distutils.util import strtobool
 from einops import rearrange, repeat
 from functools import partial
-from jax.experimental import mesh_utils
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from math import ceil
+from jax.sharding import NamedSharding, PartitionSpec
 from omegaconf import OmegaConf
 from pathlib import Path
-from sys import exit
 from tqdm import tqdm, trange
-from typing import Any, Callable, Optional, Tuple
+from typing import Optional, Tuple
 
-from txt2img_unsupervised.checkpoint import (
-    mk_checkpoint_manager,
-    setup_checkpoint_manager_and_initial_state,
-    TrainState,
-)
+from txt2img_unsupervised.checkpoint import TransformerTrainState
 from txt2img_unsupervised.config import (
     LearningRateSchedule,
-    ModelConfig,
+    TransformerModelConfig,
     TrainingConfig,
-    str_to_activation,
-    str_to_dtype,
-    str_to_learning_rate_schedule,
 )
 from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
-from txt2img_unsupervised.load_pq_dir import load_pq_dir
 from txt2img_unsupervised.train_data_loading import get_batch
-from txt2img_unsupervised.training_infra import plan_steps
+from txt2img_unsupervised.training_infra import (
+    init_common_train_state,
+    init_wandb_training,
+    leading_dims_to_subtrees,
+    load_dataset,
+    plan_steps,
+    save_checkpoint,
+    setup_common_arguments,
+    setup_jax_for_training,
+    setup_profiling_server,
+    setup_sharding,
+    SignalHandler,
+)
 from txt2img_unsupervised.training_visualizations import (
     log_attention_maps,
     log_token_loss_visualization,
 )
 import txt2img_unsupervised.cap_sampling as cap_sampling
-import txt2img_unsupervised.config as config
 import txt2img_unsupervised.sample as sample
 import txt2img_unsupervised.transformer_model as transformer_model
-
-
-def argparse_from_dict(d: dict[str, Any]) -> Callable[[str], Any]:
-    """Create an argparse argument type from a dictionary."""
-
-    def f(x: str) -> Any:
-        if x in d:
-            return d[x]
-        else:
-            raise argparse.ArgumentTypeError(f"Unknown value {x}")
-
-    return f
 
 
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pq-dir", type=Path, required=True)
-    parser.add_argument("--model-config", type=Path, required=True)
-    parser.add_argument("--training-config", type=Path, required=True)
-    parser.add_argument("--batch-size", type=int)
+    # Add common arguments for all model types
+    parser = setup_common_arguments(parser)
+
+    # Add transformer-specific arguments
     parser.add_argument("--sample-batch-size", type=int, default=None)
-    parser.add_argument(
-        "--profiling-server", action="store_true", help="Enable JAX profiling server"
-    )
-    parser.add_argument("--epochs", type=int)
-    parser.add_argument("--training-images", type=int)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument(
-        "--learning-rate-schedule",
-        type=argparse_from_dict(str_to_learning_rate_schedule),
-    )
-    parser.add_argument("--warmup-steps", type=int, default=None)
-    parser.add_argument("--schedule-free-beta1", type=float, default=None)
-    parser.add_argument("--gradient-accumulation-steps", type=int)
-    parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))
-    parser.add_argument("--gradient-clipping", type=float, default=None)
-    parser.add_argument("--adaptive-gradient-clip", type=lambda x: bool(strtobool(x)))
-    parser.add_argument("--adaptive-gradient-clip-history-len", type=int, default=None)
-    parser.add_argument(
-        "--adaptive-gradient-clip-threshold-factor", type=float, default=None
-    )
-    parser.add_argument("--adaptive-gradient-clip-quantile", type=float, default=None)
-    parser.add_argument("--image-dropout", type=float, default=None)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--ae-cfg", type=Path, required=True)
     parser.add_argument("--ae-ckpt", type=Path, required=True)
-    parser.add_argument("--activations-dtype", type=argparse_from_dict(str_to_dtype))
-    parser.add_argument("--weights-dtype", type=argparse_from_dict(str_to_dtype))
-    parser.add_argument(
-        "--activation-function", type=argparse_from_dict(str_to_activation)
-    )
+    parser.add_argument("--image-dropout", type=float, default=None)
     parser.add_argument("--clip-conditioning", type=lambda x: bool(strtobool(x)))
     parser.add_argument("--clip-caps", type=lambda x: bool(strtobool(x)))
     parser.add_argument("--clip-cap-count", type=int)
-    parser.add_argument("--resume", type=Path)
-    parser.add_argument("--finetune", type=Path)
-    parser.add_argument(
-        "--start-where-finetune-source-left-off",
-        type=lambda x: bool(strtobool(x)),
-        help="start the training data from where the finetune source run left off",
-        default=False,
-    )
     parser.add_argument(
         "--skip-sampling", action="store_true", help="Skip sampling during training"
     )
-    parser.add_argument(
-        "--skip-saving",
-        action="store_true",
-        help="Skip saving checkpoints during training",
-    )
-    parser.add_argument(
-        "--log-weight-and-grad-interval",
-        type=int,
-        default=0,
-        help="Log attention weights and gradients every N steps",
-    )
+
     args, _unknown = parser.parse_known_args()
     return args
 
 
-def setup_profiling_server(profiling_server: bool = False):
-    if profiling_server:
-        if importlib.util.find_spec("tensorflow") is None:
-            print("You gotta install tensorflow for profiling bro")
-            exit(1)
-
-        jax.profiler.start_server(6969)
-        print("JAX profiling server started on port 6969")
-
-
-def json_pretty(dict):
-    """Print a dictionary as pretty JSON."""
-    return json.dumps(dict, indent=2)
-
-
 def init_train_state(
-    model_cfg: ModelConfig,
+    model_cfg: TransformerModelConfig,
     training_cfg: TrainingConfig,
     total_steps: int,
     resume_checkpoint_path: Optional[Path] = None,
@@ -165,7 +88,7 @@ def init_train_state(
     sample_batch_size: Optional[int] = None,
     start_where_finetune_source_left_off: bool = False,
 ):
-    """Set up our initial TrainState using the provided configs.
+    """Set up our initial TransformerTrainState using the provided configs.
 
     Args:
         model_cfg: The model configuration
@@ -176,96 +99,22 @@ def init_train_state(
         sample_batch_size: Batch size for sampling, if different from training
         start_where_finetune_source_left_off: Whether to start training from where the finetune source left off
     """
-    checkpoint_options = ocp.CheckpointManagerOptions(
-        max_to_keep=3,
-        keep_time_interval=datetime.timedelta(hours=6),
-        # Async checkpointing can hide out of disk errors, so we disable it.
-        enable_async_checkpointing=False,
+    (
+        global_step,
+        checkpoint_manager,
+        train_state,
+        mdl,
+        data_offset,
+    ) = init_common_train_state(
+        model_cfg=model_cfg,
+        training_cfg=training_cfg,
+        total_steps=total_steps,
+        train_state_class=TransformerTrainState,
+        resume_checkpoint_path=resume_checkpoint_path,
+        finetune_checkpoint_path=finetune_checkpoint_path,
+        start_where_finetune_source_left_off=start_where_finetune_source_left_off,
+        create_model_fn=transformer_model.ImageModel,
     )
-
-    if resume_checkpoint_path is not None:
-        print(f"Resuming from checkpoint {resume_checkpoint_path}...")
-        checkpoint_dir = resume_checkpoint_path.absolute()
-        checkpoint_manager = mk_checkpoint_manager(checkpoint_dir, checkpoint_options)
-        # The step recorded in a checkpoint is the number of steps completed, so our starting step
-        # index is that number. If the checkpoint we're resuming from completed 0 steps, we start
-        # at step 0, if it completed 5 steps, that means it did 0-4 inclusive, so we start at step
-        # 5.
-        global_step = checkpoint_manager.latest_step()
-        data_offset = checkpoint_manager.metadata().get("data_offset", 0)
-
-        train_state, mdl = TrainState.load_from_checkpoint(
-            checkpoint_manager,
-            global_step,
-            total_steps,
-        )
-    else:
-        global_step = 0
-        data_offset = 0
-        extra_metadata = None
-
-        if finetune_checkpoint_path is not None:
-            finetune_src_checkpoint_dir = finetune_checkpoint_path.absolute()
-            finetune_src_checkpoint_manager = mk_checkpoint_manager(
-                finetune_src_checkpoint_dir
-            )
-            if start_where_finetune_source_left_off:
-                # data_offset is the offset (in batches) we use into the training data, equal to the
-                # number of examples the source run trained on divided by our batch size, rounded
-                # up. We track this number so we don't repeat any training data the source run saw
-                # before we have to.
-                data_offset_examples = (
-                    finetune_src_checkpoint_manager.latest_step()
-                    * finetune_src_checkpoint_manager.metadata()["training_cfg"][
-                        "batch_size"
-                    ]
-                )
-                data_offset = ceil(data_offset_examples / training_cfg.batch_size)
-
-            extra_metadata = (
-                "finetune_src_config",
-                finetune_src_checkpoint_manager.metadata(),
-            )
-
-        # Set up checkpoint manager and initial state
-        checkpoint_dir = Path(f"checkpoints/{wandb.run.id}").absolute()
-        checkpoint_manager, train_state = setup_checkpoint_manager_and_initial_state(
-            checkpoint_options,
-            checkpoint_dir,
-            wandb.run.id,
-            model_cfg,
-            training_cfg,
-            jax.random.PRNGKey(1337),
-            total_steps,
-            data_offset=data_offset,
-            extra_metadata=extra_metadata,
-        )
-
-        if finetune_checkpoint_path is not None:
-            train_state = train_state.replace(params=None)
-            gc.collect()
-            print(f"Loading params from {finetune_checkpoint_path} for finetuning...")
-
-            finetune_src_ts, finetune_src_mdl = TrainState.load_from_checkpoint(
-                finetune_src_checkpoint_manager,
-                finetune_src_checkpoint_manager.latest_step(),
-                total_steps,
-            )
-            finetune_src_params = finetune_src_ts.get_eval_params()
-            del finetune_src_ts
-            gc.collect()
-
-            train_state = train_state.replace(params=finetune_src_params)
-            print(
-                "Finetuning parameters loaded successfully. Overwriting initial checkpoint."
-            )
-            train_state.save_checkpoint(checkpoint_manager, 0)
-            print("Done.")
-            wandb.config.update(
-                {"finetune_src_metadata": finetune_src_checkpoint_manager.metadata()}
-            )
-
-        mdl = transformer_model.ImageModel(**model_cfg.__dict__)
 
     if sample_batch_size is None:
         sample_batch_size = training_cfg.batch_size
@@ -280,30 +129,6 @@ def init_train_state(
         mdl,
         data_offset,
     )
-
-
-def load_dataset(dir: Path) -> Tuple[Dataset, Dataset]:
-    dset_all = load_pq_dir(dir)
-    dset_split = dset_all.train_test_split(test_size=0.01, seed=19900515)
-    train_imgs = dset_split["train"]
-    test_imgs = dset_split["test"]
-    print(f"Train set {train_imgs.shape}, test set {test_imgs.shape}")
-    wandb.config.update(
-        {"train_set_size": len(train_imgs), "test_set_size": len(test_imgs)}
-    )
-    return train_imgs, test_imgs
-
-
-def setup_sharding(batch_size):
-    print(
-        f"Sharding batches of {batch_size} across {jax.device_count()} devices, {batch_size / jax.device_count()} per device"
-    )
-    assert batch_size % jax.device_count() == 0
-    # NamedSharding is overkill for the simple batch parallelism we do, but it's necessary to get
-    # orbax to save checkpoints correctly.
-    devices = mesh_utils.create_device_mesh((jax.device_count(),))
-    mesh = Mesh(devices, axis_names=("dev",))
-    return mesh
 
 
 def get_clip_mdl():
@@ -492,7 +317,9 @@ def load_autoencoder(ae_cfg_path: Path, ae_ckpt_path: Path):
     return ae_cfg, ae_mdl, ae_params_torch
 
 
-def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> None:
+def sample_and_log(
+    ts: TransformerTrainState, sample_batch_size: int, global_step: int
+) -> None:
     """Sample from the model and log to wandb."""
 
     ae_params = LDMAutoencoder.params_from_torch(ae_params_torch, ae_cfg)
@@ -709,36 +536,16 @@ def sample_and_log(ts: TrainState, sample_batch_size: int, global_step: int) -> 
         )
 
 
-def leading_dims_to_subtrees(tree):
-    """Given a dict pytree, return a new dict pytree with each array split into a dict of arrays
-    indexed by leading dimension.
-    """
-    if not isinstance(tree, dict):
-        raise ValueError(f"Expected dict, got {type(tree)}")
-    out = {}
-    for k, v in tree.items():
-        if isinstance(v, dict):
-            out[k] = leading_dims_to_subtrees(v)
-        elif isinstance(v, np.ndarray):
-            if v.ndim < 2:
-                raise ValueError(f"Expected array with at least 2 dims, got {v.ndim}")
-            else:
-                out[k] = {f"{idx:03d}": v[idx] for idx in range(v.shape[0])}
-        else:
-            raise ValueError(f"Unknown type: {type(v)} for key {k}")
-    return out
-
-
 @partial(
     jax.jit, donate_argnames=["state"], static_argnames=["return_weights_and_grads"]
 )
 def train_step(
-    state: TrainState,
+    state: TransformerTrainState,
     batch_imgs: jax.Array,
     batch_clips: jax.Array,
     batch_max_cos_distances: jax.Array,
     return_weights_and_grads: bool = False,
-) -> Tuple[TrainState, jax.Array, jax.Array]:
+) -> Tuple[TransformerTrainState, jax.Array, jax.Array]:
     """Compute a single optimization step."""
     dropout_rng, rng2 = jax.random.split(state.rng, 2)
     loss_grad_fn = jax.value_and_grad(transformer_model.loss_batch, argnums=1)
@@ -791,26 +598,28 @@ def save_checkpoint_and_log_images(
     skip_sampling: bool,
     skip_saving: bool,
 ) -> None:
-    if not skip_saving:
-        my_train_state.save_checkpoint(checkpoint_manager, global_step)
-        tqdm.write("Saved checkpoint")
-    else:
-        tqdm.write("Skipping checkpoint save")
+    save_checkpoint(my_train_state, checkpoint_manager, global_step, skip_saving)
 
     if not skip_sampling:
         tqdm.write("Sampling")
         sample_and_log(my_train_state, sample_batch_size, global_step)
         tqdm.write("Done sampling")
         visualization_img_names = visualization_dset["name"]
-        (
-            visualization_img_encodings,
-            visualization_embeddings,
-        ) = get_batch(
+        fields = ["encoded_img"]
+        if mdl.clip_conditioning:
+            fields.append("clip_embedding")
+
+        visualization_batch = get_batch(
             visualization_dset,
             len(visualization_dset),
             0,
-            clip_conditioning=mdl.clip_conditioning,
+            fields=fields,
             sharding=examples_sharding,
+        )
+
+        visualization_img_encodings = visualization_batch["encoded_img"]
+        visualization_embeddings = visualization_batch.get(
+            "clip_embedding", jnp.zeros((len(visualization_dset), 0))
         )
         if mdl.clip_caps:
             visualization_embeddings, visualization_max_cos_distances = gen_caps(
@@ -888,15 +697,26 @@ def train_loop(
     ):
         """Prefetch next batch and enqueue next train step."""
 
-        batch_imgs, batch_clips = get_batch(
+        fields = ["encoded_img"]
+        if mdl.clip_conditioning:
+            fields.append("clip_embedding")
+
+        batch = get_batch(
             train_imgs,
             training_cfg.batch_size,
             # In order to support --start-where-finetune-source-left-off, we offset where we're
             # reading the data from by the amount of examples seen in the source run (expressed in
             # units of this run's batch size).
             current_step + data_offset,
-            clip_conditioning=mdl.clip_conditioning,
+            fields=fields,
             sharding=examples_sharding,
+        )
+
+        batch_imgs = batch["encoded_img"]
+        batch_clips = (
+            batch["clip_embedding"]
+            if "clip_embedding" in batch
+            else jnp.zeros((training_cfg.batch_size, 0))
         )
         if mdl.clip_conditioning:
             assert batch_clips.shape == (training_cfg.batch_size, 768)
@@ -1150,12 +970,21 @@ def train_loop(
             desc="test batches",
         ):
             dropout_rng, cap_rng, test_rng = jax.random.split(test_rng, 3)
-            batch_imgs, batch_clips = get_batch(
+            fields = ["encoded_img"]
+            if mdl.clip_conditioning:
+                fields.append("clip_embedding")
+
+            batch = get_batch(
                 test_imgs,
                 training_cfg.batch_size,
                 batch_idx,
-                clip_conditioning=mdl.clip_conditioning,
+                fields=fields,
                 sharding=examples_sharding,
+            )
+
+            batch_imgs = batch["encoded_img"]
+            batch_clips = batch.get(
+                "clip_embedding", jnp.zeros((training_cfg.batch_size, 0))
             )
             if mdl.clip_caps:
                 batch_clips, batch_max_cos_distances = gen_caps(
@@ -1185,46 +1014,6 @@ def train_loop(
     return global_step, train_state
 
 
-class SignalHandler:
-    """
-    Class to handle signals for clean exit and checkpointing. It's important to checkpoint and exit
-    at well-defined times (not in the middle of a train step), so we use a flag and check for it
-    rather than exiting immediately upon receiving the signal.
-
-    Attributes:
-        exit_requested: Flag indicating whether exit has been requested.
-        early_checkpoint_requested: Flag indicating whether early checkpointing has been requested.
-    """
-
-    def __init__(self):
-        """Initialize signal handler."""
-        self.exit_requested = False
-        self.early_checkpoint_requested = False
-
-        # Register signal handlers
-        signal.signal(signal.SIGTERM, self._exit_early_signal_handler)
-        signal.signal(signal.SIGINT, self._exit_early_signal_handler)
-        signal.signal(signal.SIGUSR1, self._early_checkpoint_signal_handler)
-
-    def _exit_early_signal_handler(self, signum, frame):
-        if self.exit_requested:
-            tqdm.write(
-                "CTRL-C pressed twice, exiting immediately without checkpointing"
-            )
-            exit(1)
-        else:
-            tqdm.write("CTRL-C pressed, doing clean exit after checkpointing")
-            self.exit_requested = True
-
-    def _early_checkpoint_signal_handler(self, signum, frame):
-        # Same deal as exit_early_signal_handler, but we don't exit, just checkpoint.
-        self.early_checkpoint_requested = True
-
-    def reset_checkpoint_flag(self):
-        """Reset the early checkpoint flag after it's been handled."""
-        self.early_checkpoint_requested = False
-
-
 cap_logits_table = cap_sampling.LogitsTable(767, 16384)
 
 
@@ -1244,65 +1033,14 @@ def gen_caps(rng, batch_clips, n_caps, model):
 if __name__ == "__main__":
     args = parse_arguments()
 
+    setup_jax_for_training()
     setup_profiling_server(args.profiling_server)
-    # Enable caching of JIT-compiled functions
-    jax.config.update("jax_compilation_cache_dir", "/tmp/t2i-u-jax-cache")
-    # Make the RNG partitionable across devices
-    jax.config.update("jax_threefry_partitionable", True)
 
     wandb_settings = wandb.Settings(code_dir="txt2img_unsupervised")
 
-    # Load and set up configs
-    if args.resume is not None:
-        # Resuming from checkpoint - load configs from checkpoint
-        print(f"Resuming from checkpoint {args.resume}...")
-        checkpoint_dir = args.resume.absolute()
-        checkpoint_options = ocp.CheckpointManagerOptions(
-            max_to_keep=3,
-            keep_time_interval=datetime.timedelta(hours=6),
-            enable_async_checkpointing=False,
-        )
-        checkpoint_manager = mk_checkpoint_manager(checkpoint_dir, checkpoint_options)
-        metadata = checkpoint_manager.metadata()
-        model_cfg = ModelConfig.from_json_dict(metadata["model_cfg"])
-        training_cfg = TrainingConfig.from_json_dict(metadata["training_cfg"])
-        run_id = metadata["run_id"]
-
-        print(f"Resuming run {run_id}")
-        print(
-            "ALL TRAINING AND MODEL PARAMETERS PASSED ON THE COMMAND LINE WILL BE IGNORED."
-        )
-        print(f"ModelConfig {json_pretty(model_cfg.to_json_dict())}")
-        print(f"TrainingConfig {json_pretty(training_cfg.to_json_dict())}")
-
-        wandb.init(id=run_id, resume="must", settings=wandb_settings)
-    else:
-        print("Starting new run...")
-
-        wandb.init(settings=wandb_settings)
-
-        with open(args.model_config) as f:
-            model_cfg = ModelConfig.from_json_dict(json.load(f))
-        config.merge_attrs(model_cfg, args)
-
-        with open(args.training_config) as f:
-            training_cfg = TrainingConfig.from_json_dict(json.load(f))
-        config.merge_attrs(training_cfg, args)
-
-        # Send config to wandb
-        wandb.config.update(model_cfg.to_json_dict())
-        wandb.config.update(training_cfg.to_json_dict())
-
-        # Read potentially sweep-controlled parameters from wandb
-        model_cfg = ModelConfig.from_json_dict(wandb.config.as_dict())
-        training_cfg = TrainingConfig.from_json_dict(wandb.config.as_dict())
-        print(f"Model config post-wandb: {json_pretty(model_cfg.to_json_dict())}")
-        print(f"Training config post-wandb: {json_pretty(training_cfg.to_json_dict())}")
-
-    # Set up wandb metrics
-    wandb.define_metric("*", step_metric="global_step")
-    wandb.define_metric("test/loss", summary="last")
-    wandb.define_metric("train/loss", summary="last")
+    model_cfg, training_cfg, _ = init_wandb_training(
+        args.resume, args.model_config, args.training_config, args, wandb_settings
+    )
 
     train_imgs, test_imgs = load_dataset(args.pq_dir)
 
@@ -1361,10 +1099,8 @@ if __name__ == "__main__":
 
     del clip_mdl, clip_processor
 
-    # Load autoencoder
     ae_cfg, ae_mdl, ae_params_torch = load_autoencoder(args.ae_cfg, args.ae_ckpt)
 
-    # Run training loop
     global_step, train_state = train_loop(
         global_step,
         train_state,

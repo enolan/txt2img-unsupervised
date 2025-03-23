@@ -15,7 +15,7 @@ from functools import partial
 from tqdm import tqdm
 from typing import List
 
-from .checkpoint import TrainState
+from .checkpoint import TransformerTrainState
 from .transformer_model import ImageModel
 
 
@@ -43,7 +43,7 @@ def _compute_losses_and_entropies(
 
 
 def log_token_loss_visualization(
-    train_state: TrainState,
+    train_state: TransformerTrainState,
     mdl: ImageModel,
     images: jax.Array,
     image_names: List[str],
@@ -137,7 +137,7 @@ def log_token_loss_visualization(
 @partial(jax.jit, static_argnames=["mdl"])
 def _compute_attention_weights(
     mdl: ImageModel,
-    train_state: TrainState,
+    train_state: TransformerTrainState,
     image: jax.Array,
     clip_embedding: jax.Array,
     max_cos_distance: jax.Array,
@@ -183,7 +183,7 @@ def _compute_attention_weights(
 
 
 def log_attention_maps(
-    train_state: TrainState,
+    train_state: TransformerTrainState,
     mdl: ImageModel,
     image: jax.Array,
     image_name: str,

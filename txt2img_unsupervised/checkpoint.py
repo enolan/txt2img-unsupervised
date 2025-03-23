@@ -11,15 +11,21 @@ import time
 import subprocess
 
 from flax.training import train_state
-from functools import partial
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from pathlib import Path
 from tqdm import tqdm
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Union
 
 from .adaptive_gradient_clip import AdaptiveGradientClipState, adaptive_gradient_clip
-from .config import LearningRateSchedule, ModelConfig, TrainingConfig
+from .config import (
+    BaseModelConfig,
+    FlowMatchingModelConfig,
+    LearningRateSchedule,
+    TrainingConfig,
+    TransformerModelConfig,
+)
+from .flow_matching import CapConditionedVectorField
 from .transformer_model import ImageModel
 from .triangle_schedule import triangle_schedule
 
@@ -75,20 +81,17 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int):
             f"Unknown learning rate schedule {training_cfg.learning_rate_schedule}"
         )
 
-    # Apply gradient accumulation if needed
     if training_cfg.gradient_accumulation_steps > 1:
         opt = optax.MultiSteps(
             opt, every_k_schedule=training_cfg.gradient_accumulation_steps
         )
 
-    # Apply gradient clipping if needed
     if training_cfg.gradient_clipping is not None:
         clip = optax.clip_by_global_norm(training_cfg.gradient_clipping)
     else:
         clip = optax.identity()
     opt = optax.chain(clip, opt)
 
-    # Apply adaptive gradient clip if needed
     if training_cfg.adaptive_gradient_clip:
         opt = adaptive_gradient_clip(
             opt,
@@ -96,35 +99,40 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int):
             training_cfg.adaptive_gradient_clip_threshold_factor,
         )
 
-    # Apply finite check
     opt = optax.apply_if_finite(opt, 20)
 
     return opt
 
 
-class TrainState(train_state.TrainState):
+class BaseTrainState(train_state.TrainState):
+    """Base class for all train states."""
+
     rng: jax.Array
 
-    @staticmethod
-    def new(rng, mdl, training_cfg, batches_total):
-        """Create a new TrainState with random initial parameters."""
+    @classmethod
+    def new(cls, rng, mdl, training_cfg, batches_total):
+        """
+        Create a new train state with random initial parameters.
 
-        # Set up parameters
-        images_dummy, clip_embeddings_dummy, max_cos_distance_dummy = mdl.dummy_inputs()
-        params = jax.jit(mdl.init)(
-            rng, images_dummy, clip_embeddings_dummy, max_cos_distance_dummy
-        )
+        Args:
+            rng: JAX random key
+            mdl: The model instance
+            training_cfg: Training configuration
+            batches_total: Total batches for the training run
 
+        Returns:
+            A new train state with initialized parameters
+        """
+        params = jax.jit(mdl.init)(rng, *mdl.dummy_inputs())
         opt = setup_optimizer(training_cfg, batches_total)
 
-        # Validate Adam beta2. The default is 0.999, which rounds to 1.0 in bfloat16.
         beta2_in_dtype = jnp.astype(training_cfg.adam_beta2, mdl.weights_dtype)
         if beta2_in_dtype >= 1.0:
             raise ValueError(
                 f"Adam beta2 {training_cfg.adam_beta2} is too large for {mdl.weights_dtype}"
             )
 
-        return TrainState.create(
+        return cls.create(
             apply_fn=mdl.apply,
             params=params,
             tx=opt,
@@ -133,8 +141,12 @@ class TrainState(train_state.TrainState):
 
     def replicate_for_multi_gpu(self, mesh: Mesh):
         """Replicate parameters for multi-GPU training."""
-
         return jax.device_put(self, NamedSharding(mesh, PartitionSpec()))
+
+    @classmethod
+    def _create_model_from_config(cls, model_cfg):
+        """Create a model instance from configuration. To be implemented by subclasses."""
+        raise NotImplementedError("Subclasses must implement this method")
 
     @classmethod
     def load_from_checkpoint(
@@ -142,32 +154,47 @@ class TrainState(train_state.TrainState):
         checkpoint_manager: ocp.CheckpointManager,
         step: int,
         batches_total: Optional[int] = None,
-    ) -> Tuple["TrainState", ImageModel]:
-        """Load a TrainState from a checkpoint.
+    ):
+        """
+        Load a train state from a checkpoint.
+
         Args:
-            checkpoint_manager: The CheckpointManager to load from.
-            step: The step to load from.
-            batches_total: The total number of batches to train for. If None, training may be
-                broken, since learning rate schedules depend on knowing the total number of batches.
+            checkpoint_manager: The CheckpointManager to load from
+            step: The step to load from
+            batches_total: Total number of batches (needed for learning rate schedules)
+
         Returns:
-            A tuple containing the TrainState and the ImageModel.
+            A tuple of (train_state, model)
         """
         metadata = checkpoint_manager.metadata()
-        model_cfg = ModelConfig.from_json_dict(metadata["model_cfg"])
+        model_cfg = BaseModelConfig.from_json_dict(metadata["model_cfg"])
         training_cfg = TrainingConfig.from_json_dict(metadata["training_cfg"])
-        mdl = ImageModel(**model_cfg.__dict__)
 
-        template_ts = TrainState.new(
-            jax.random.PRNGKey(0), mdl, training_cfg, batches_total=batches_total
+        # Create model based on config - this is model-specific and implemented by subclasses
+        mdl = cls._create_model_from_config(model_cfg)
+
+        # Create a template train state. We need to know the shapes & dtypes to get orbax to load
+        # our checkpoint.
+        template_state = cls.new(
+            jax.random.PRNGKey(0), mdl, training_cfg, batches_total
         )
 
-        # Free the memory of the templates as soon as we know the shapes and dtypes
-        params_template, opt_state_template, rng_template = map(
-            lambda x: jax.tree.map(ocp.utils.to_shape_dtype_struct, x),
-            (template_ts.params, template_ts.opt_state, template_ts.rng),
+        # Convert to shape/dtype structs
+        params_template = jax.tree.map(
+            ocp.utils.to_shape_dtype_struct, template_state.params
         )
-        del template_ts
+        opt_state_template = jax.tree.map(
+            ocp.utils.to_shape_dtype_struct, template_state.opt_state
+        )
+        rng_template = jax.tree.map(ocp.utils.to_shape_dtype_struct, template_state.rng)
+        # Save optimizer (python object, no arrays)
+        opt = template_state.tx
 
+        # Delete the template to free VRAM.
+        del template_state
+        gc.collect()
+
+        # Restore from checkpoint using the templates
         restored = checkpoint_manager.restore(
             step,
             args=ocp.args.Composite(
@@ -177,8 +204,7 @@ class TrainState(train_state.TrainState):
             ),
         )
 
-        opt = setup_optimizer(training_cfg, batches_total)
-
+        # Create and return the train state
         train_state = cls(
             apply_fn=mdl.apply,
             params=restored.params,
@@ -197,6 +223,8 @@ class TrainState(train_state.TrainState):
         # Find the innermost optimizer state
         if isinstance(self.opt_state, optax.ApplyIfFiniteState):
             opt_state = self.opt_state.inner_state
+        else:
+            opt_state = self.opt_state
 
         # adaptive gradient clip
         if isinstance(opt_state, AdaptiveGradientClipState):
@@ -222,6 +250,8 @@ class TrainState(train_state.TrainState):
         return None."""
         if isinstance(self.opt_state, optax.ApplyIfFiniteState):
             opt_state = self.opt_state.inner_state
+        else:
+            opt_state = self.opt_state
         if isinstance(opt_state, AdaptiveGradientClipState):
             return opt_state.last_norm
         return None
@@ -255,6 +285,28 @@ class TrainState(train_state.TrainState):
                 time.sleep(60)
 
 
+class TransformerTrainState(BaseTrainState):
+    """Train state specific to transformer models."""
+
+    @classmethod
+    def _create_model_from_config(cls, model_cfg):
+        """Create a transformer model instance from configuration."""
+        if not isinstance(model_cfg, TransformerModelConfig):
+            raise ValueError(f"Expected TransformerModelConfig, got {type(model_cfg)}")
+        return ImageModel(**model_cfg.__dict__)
+
+
+class FlowMatchingTrainState(BaseTrainState):
+    """Train state specific to flow matching models."""
+
+    @classmethod
+    def _create_model_from_config(cls, model_cfg):
+        """Create a flow matching model instance from configuration."""
+        if not isinstance(model_cfg, FlowMatchingModelConfig):
+            raise ValueError(f"Expected FlowMatchingModelConfig, got {type(model_cfg)}")
+        return CapConditionedVectorField(**model_cfg.__dict__)
+
+
 def mk_checkpoint_manager(
     checkpoint_dir: Path,
     checkpoint_manager_options: Optional[ocp.CheckpointManagerOptions] = None,
@@ -269,21 +321,44 @@ def mk_checkpoint_manager(
     )
 
 
-def get_imagemodel_from_checkpoint(checkpoint_dir: Path) -> ImageModel:
-    """Get the ImageModel from a checkpoint.
+def get_model_from_checkpoint(checkpoint_dir: Path):
+    """Get the model config and instance from a checkpoint.
     Args:
         checkpoint_dir: The directory path containing the checkpoints.
     Returns:
-        The ImageModel instance.
+        A tuple of (model config, model instance)
     """
-    return ModelConfig.from_json_dict(
-        mk_checkpoint_manager(checkpoint_dir).metadata()["model_cfg"]
-    )
+    metadata = mk_checkpoint_manager(checkpoint_dir).metadata()
+    model_cfg = BaseModelConfig.from_json_dict(metadata["model_cfg"])
+
+    # Use the appropriate train state class to create the model based on config type
+    if isinstance(model_cfg, TransformerModelConfig):
+        return model_cfg, TransformerTrainState._create_model_from_config(model_cfg)
+    elif isinstance(model_cfg, FlowMatchingModelConfig):
+        return model_cfg, FlowMatchingTrainState._create_model_from_config(model_cfg)
+    else:
+        raise ValueError(f"Unknown model type: {type(model_cfg)}")
+
+
+def _init_model_with_dummy_inputs(mdl, rng=None):
+    """Initialize model parameters with appropriate dummy inputs based on model type.
+
+    Args:
+        mdl: The model instance to initialize
+        rng: Optional JAX PRNGKey. If None, creates a new one.
+
+    Returns:
+        The initialized parameters
+    """
+    if rng is None:
+        rng = jax.random.PRNGKey(0)
+
+    return jax.jit(mdl.init)(rng, *mdl.dummy_inputs())
 
 
 def load_params(
     checkpoint_dir: Path, step: Optional[int] = None
-) -> Tuple[dict, int, ImageModel]:
+) -> Tuple[dict, int, Any]:
     """Load the evaluation parameters from a checkpoint.
     Args:
         checkpoint_dir: The directory path containing the checkpoints.
@@ -292,16 +367,19 @@ def load_params(
         A tuple containing:
         - A dictionary of parameters
         - The step number
-        - The ImageModel instance
+        - The model instance
     """
     checkpoint_manager = mk_checkpoint_manager(checkpoint_dir, for_training=False)
     if step is None:
         step = checkpoint_manager.latest_step()
-    mdl_config = ModelConfig.from_json_dict(checkpoint_manager.metadata()["model_cfg"])
-    mdl = ImageModel(**mdl_config.__dict__)
-    params_template = jax.jit(mdl.init)(jax.random.PRNGKey(0), *mdl.dummy_inputs())
+
+    model_cfg, mdl = get_model_from_checkpoint(checkpoint_dir)
+
+    # Create dummy inputs and initialize model
+    params_template = _init_model_with_dummy_inputs(mdl)
     params_template = jax.tree.map(ocp.utils.to_shape_dtype_struct, params_template)
     gc.collect()
+
     restored = checkpoint_manager.restore(
         step,
         args=ocp.args.Composite(
@@ -320,13 +398,13 @@ def setup_checkpoint_manager_and_initial_state(
     checkpoint_options: ocp.CheckpointManagerOptions,
     checkpoint_dir: Path,
     run_id: str,
-    model_cfg: ModelConfig,
+    model_cfg: BaseModelConfig,
     training_cfg: TrainingConfig,
     rng: jax.random.PRNGKey,
     batches_total: int,
     data_offset: int = 0,
     extra_metadata: Optional[Tuple[str, Any]] = None,
-) -> Tuple[ocp.CheckpointManager, TrainState]:
+) -> Tuple[ocp.CheckpointManager, Union[TransformerTrainState, FlowMatchingTrainState]]:
     """
     Set up a CheckpointManager and create an initial TrainState. Does NOT save an initial
     checkpoint.
@@ -339,6 +417,8 @@ def setup_checkpoint_manager_and_initial_state(
         training_cfg: Training configuration.
         rng: JAX random number generator key.
         batches_total: Total number of batches for the entire training run.
+        data_offset: Offset in the dataset (for finetuning)
+        extra_metadata: Optional extra metadata to include in the checkpoint.
 
     Returns:
         A tuple containing the CheckpointManager and the initial TrainState.
@@ -374,9 +454,17 @@ def setup_checkpoint_manager_and_initial_state(
         | extra_metadata,
     )
 
-    # Create the initial TrainState
-    mdl = ImageModel(**model_cfg.__dict__)
-    initial_state = TrainState.new(rng, mdl, training_cfg, batches_total)
+    # Create the appropriate model and initial train state based on model config type
+    if isinstance(model_cfg, TransformerModelConfig):
+        mdl = TransformerTrainState._create_model_from_config(model_cfg)
+        initial_state = TransformerTrainState.new(rng, mdl, training_cfg, batches_total)
+    elif isinstance(model_cfg, FlowMatchingModelConfig):
+        mdl = FlowMatchingTrainState._create_model_from_config(model_cfg)
+        initial_state = FlowMatchingTrainState.new(
+            rng, mdl, training_cfg, batches_total
+        )
+    else:
+        raise ValueError(f"Unsupported model config type: {type(model_cfg)}")
 
     return checkpoint_manager, initial_state
 
@@ -431,7 +519,7 @@ def test_get_eval_params(
     # Initialize parameters with random values
     params = jax.random.normal(rng, (10,))
 
-    state = TrainState.create(
+    state = TransformerTrainState.create(
         apply_fn=lambda x: x,  # dummy apply function
         params=params,
         tx=optimizer,

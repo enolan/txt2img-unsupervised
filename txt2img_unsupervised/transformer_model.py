@@ -21,7 +21,7 @@ from typing import Any, Callable, Optional, Tuple
 from tqdm import tqdm, trange
 
 from .cap_sampling import LogitsTable, random_pt_with_cosine_similarity, sample_cap
-from .config import ModelConfig
+from .config import TransformerModelConfig
 from .gpu_check import gpu_is_ampere_or_newer
 from .load_pq_dir import load_pq_to_infinidata
 
@@ -1836,7 +1836,7 @@ def loss_batch(
 
 
 # Parameters taken from GPT-1, except seq_len is 256 instead of 1024
-gpt_1_config = ModelConfig(
+gpt_1_config = TransformerModelConfig(
     d_model=768,
     num_heads=12,
     ff_dim=3072,

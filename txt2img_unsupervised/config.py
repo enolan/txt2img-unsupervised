@@ -8,27 +8,73 @@ import pytest
 from copy import copy
 from enum import Enum
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, ClassVar, Dict, Optional, Type
+
+
+class BaseModelConfig:
+    """Base interface for all model configs."""
+
+    model_type: ClassVar[str] = "base"
+
+    @classmethod
+    def from_json_dict(cls, dict: dict[str, Any]) -> "BaseModelConfig":
+        """Convert a dictionary parsed from JSON to a ModelConfig object."""
+        # Determine which subclass to use based on model_type in the dictionary
+        if "model_type" in dict:
+            model_type = dict["model_type"]
+            subclass_map = {
+                "transformer": TransformerModelConfig,
+                "flow_matching": FlowMatchingModelConfig,
+            }
+
+            if model_type in subclass_map:
+                return subclass_map[model_type].from_json_dict(dict)
+
+        # For backward compatibility - if no model_type, assume transformer
+        if any(k in dict for k in ["image_tokens", "num_heads", "ff_dim"]):
+            return TransformerModelConfig.from_json_dict(dict)
+
+        # If it has flow matching specific fields
+        if any(
+            k in dict
+            for k in ["domain_dim", "reference_directions", "conditioning_dim"]
+        ):
+            return FlowMatchingModelConfig.from_json_dict(dict)
+
+        # Otherwise, we can't determine the type
+        raise ValueError("Could not determine model type from config")
+
+    def to_json_dict(self) -> dict[str, Any]:
+        """Convert a ModelConfig object to a dictionary that can be serialized to JSON."""
+        raise NotImplementedError("Subclasses must implement this method")
+
+    def validate(self):
+        """Validate the configuration."""
+        # To be implemented by subclasses
+        pass
 
 
 @dataclass
-class ModelConfig:
-    """Configuration for the transformer models."""
+class TransformerModelConfig(BaseModelConfig):
+    """Configuration for transformer models."""
 
+    # Required parameters first
+    n_layers: int
     d_model: int
     num_heads: int
     ff_dim: int
     dropout: Optional[float]
-    n_layers: int
     image_tokens: int
     use_biases: bool
     activation_function: Callable[[jax.Array], jax.Array]
+
+    # Optional parameters with defaults
     activations_dtype: jnp.dtype = jnp.float32
     weights_dtype: jnp.dtype = jnp.float32
     pre_norm: bool = False
     clip_conditioning: bool = False
     clip_caps: bool = False
-    clip_cap_count: int = None
+    clip_cap_count: Optional[int] = None
     # Should always be true, defaults to false for backwards compatability
     corrected_cap_projections: bool = False
     do_clip_feedforward: bool = False
@@ -36,9 +82,12 @@ class ModelConfig:
     image_dropout: Optional[float] = None
     clip_dropout: Optional[float] = None
 
-    @staticmethod
-    def from_json_dict(dict: dict[str, Any]) -> "ModelConfig":
-        """Convert a dictionary parsed from JSON to a ModelConfig object."""
+    # Class variable to store the model type
+    model_type: ClassVar[str] = "transformer"
+
+    @classmethod
+    def from_json_dict(cls, dict: dict[str, Any]) -> "TransformerModelConfig":
+        """Convert a dictionary parsed from JSON to a TransformerModelConfig object."""
         out = copy(dict)
         if "activation_function" not in dict:
             out["activation_function"] = jax.nn.relu  # make old checkpoints work
@@ -46,48 +95,153 @@ class ModelConfig:
             out["activation_function"] = str_to_x_or_valueerror(
                 dict["activation_function"], str_to_activation, "activation function"
             )
-        out["activations_dtype"] = str_to_x_or_valueerror(
-            dict["activations_dtype"], str_to_dtype, "activations dtype"
-        )
+
+        if "activations_dtype" in dict:
+            out["activations_dtype"] = str_to_x_or_valueerror(
+                dict["activations_dtype"], str_to_dtype, "activations dtype"
+            )
+
         if "weights_dtype" not in dict:
             out["weights_dtype"] = jnp.float32
         else:
             out["weights_dtype"] = str_to_x_or_valueerror(
                 dict["weights_dtype"], str_to_dtype, "weights dtype"
             )
+
         if "image_tokens" not in dict and "seq_len" in dict:
             out["image_tokens"] = dict["seq_len"]
+
         out = dacite.from_dict(
-            data_class=ModelConfig, data=out, config=dacite.Config(check_types=False)
+            data_class=cls, data=out, config=dacite.Config(check_types=False)
         )
         out.validate()
         return out
 
     def to_json_dict(self) -> dict[str, Any]:
-        """Convert a ModelConfig object to a dictionary that can be serialized to JSON."""
+        """Convert a TransformerModelConfig object to a dictionary that can be serialized to JSON."""
         out = copy(self.__dict__)
-        out["activation_function"] = x_to_str_or_valueerror(
-            self.activation_function, activation_to_str, "activation function"
-        )
+
+        # Add model type to identify this config
+        out["model_type"] = self.model_type
+
+        # Convert dtypes to strings
         out["activations_dtype"] = x_to_str_or_valueerror(
             self.activations_dtype, dtype_to_str, "dtype"
         )
         out["weights_dtype"] = x_to_str_or_valueerror(
             self.weights_dtype, dtype_to_str, "dtype"
         )
+
+        # Convert activation function to string
+        out["activation_function"] = x_to_str_or_valueerror(
+            self.activation_function, activation_to_str, "activation function"
+        )
+
         return out
 
     def validate(self):
         """Validate the configuration."""
-        dtypes_error = (
-            "float16 and bfloat16 activations must be used with weights of the same dtype or "
-            f"float32 weights, got activations in {self.activations_dtype} and weights in "
-            f"{self.weights_dtype}"
-        )
+        # Common validation for transformer models
         if self.activations_dtype == jnp.float32 and self.weights_dtype != jnp.float32:
             raise ValueError(
                 "It doesn't make sense to use float32 activations with float16 or bfloat16 weights"
             )
+
+
+@dataclass
+class FlowMatchingModelConfig(BaseModelConfig):
+    """Configuration for flow matching models."""
+
+    # Required parameters first
+    n_layers: int
+    domain_dim: int
+    reference_directions: Optional[int]
+    conditioning_dim: int
+    time_dim: int
+    use_pre_mlp_projection: bool
+    d_model: int
+    mlp_expansion_factor: int
+    mlp_dropout_rate: Optional[float]
+    input_dropout_rate: Optional[float]
+
+    # Optional parameters with defaults
+    activations_dtype: jnp.dtype = jnp.float32
+    weights_dtype: jnp.dtype = jnp.float32
+    d_model_base: int = 512
+    variance_base: float = 1 / 512
+    alpha_input: float = 1.0
+    alpha_output: float = 1.0
+
+    # Class variable to store the model type
+    model_type: ClassVar[str] = "flow_matching"
+
+    @classmethod
+    def from_json_dict(cls, dict: dict[str, Any]) -> "FlowMatchingModelConfig":
+        """Convert a dictionary parsed from JSON to a FlowMatchingModelConfig object."""
+        out = copy(dict)
+
+        if "activations_dtype" in dict:
+            out["activations_dtype"] = str_to_x_or_valueerror(
+                dict["activations_dtype"], str_to_dtype, "activations dtype"
+            )
+
+        if "weights_dtype" not in dict:
+            out["weights_dtype"] = jnp.float32
+        else:
+            out["weights_dtype"] = str_to_x_or_valueerror(
+                dict["weights_dtype"], str_to_dtype, "weights dtype"
+            )
+
+        out = dacite.from_dict(
+            data_class=cls, data=out, config=dacite.Config(check_types=False)
+        )
+        out.validate()
+        return out
+
+    def to_json_dict(self) -> dict[str, Any]:
+        """Convert a FlowMatchingModelConfig object to a dictionary that can be serialized to JSON."""
+        out = copy(self.__dict__)
+
+        # Add model type to identify this config
+        out["model_type"] = self.model_type
+
+        # Convert dtypes to strings
+        out["activations_dtype"] = x_to_str_or_valueerror(
+            self.activations_dtype, dtype_to_str, "dtype"
+        )
+        out["weights_dtype"] = x_to_str_or_valueerror(
+            self.weights_dtype, dtype_to_str, "dtype"
+        )
+
+        return out
+
+    def validate(self):
+        """Validate flow matching specific configuration."""
+        # Common validation for flow matching models
+        if self.activations_dtype == jnp.float32 and self.weights_dtype != jnp.float32:
+            raise ValueError(
+                "It doesn't make sense to use float32 activations with float16 or bfloat16 weights"
+            )
+
+        # Flow matching specific validation
+        if not self.use_pre_mlp_projection:
+            total_input_dim = (
+                (
+                    self.reference_directions
+                    if self.reference_directions is not None
+                    else self.domain_dim
+                )
+                + self.conditioning_dim
+                + self.time_dim
+            )
+            if total_input_dim > self.d_model:
+                raise ValueError(
+                    f"Input dimensions ({total_input_dim}) exceed d_model ({self.d_model}). "
+                    f"Increase d_model or reduce input dimensions."
+                )
+
+        if self.time_dim % 2 != 0:
+            raise ValueError("Time dimension must be even")
 
 
 def invert_dict(d: dict[Any, Any]) -> dict[Any, Any]:
@@ -129,8 +283,8 @@ def x_to_str_or_valueerror(x: Any, d: dict[Any, str], tyname: str) -> str:
         raise ValueError(f"Unknown {tyname} {x}")
 
 
-def test_modelconfig_roundtrip_from_json() -> None:
-    """Test that converting from json and back is the identity."""
+def test_transformermodelconfig_roundtrip_from_json() -> None:
+    """Test that converting TransformerModelConfig from json and back is the identity."""
     json_str = """{
         "d_model": 512,
         "num_heads": 8,
@@ -152,13 +306,13 @@ def test_modelconfig_roundtrip_from_json() -> None:
         "do_clip_feedforward": false,
         "norm_clip_embeddings": false
         }"""
-    cfg = ModelConfig.from_json_dict(json.loads(json_str))
-    assert ModelConfig.to_json_dict(cfg) == json.loads(json_str)
+    cfg = TransformerModelConfig.from_json_dict(json.loads(json_str))
+    assert TransformerModelConfig.to_json_dict(cfg) == json.loads(json_str)
 
 
-def test_modelconfig_roundtrip_from_object() -> None:
-    """Test that converting from a ModelConfig object and back is the identity."""
-    cfg = ModelConfig(
+def test_transformermodelconfig_roundtrip_from_object() -> None:
+    """Test that converting from a TransformerModelConfig object and back is the identity."""
+    cfg = TransformerModelConfig(
         d_model=420_69,
         num_heads=8,
         ff_dim=2048,
@@ -169,7 +323,10 @@ def test_modelconfig_roundtrip_from_object() -> None:
         activations_dtype=jnp.bfloat16,
         activation_function=jax.nn.gelu,
     )
-    assert ModelConfig.from_json_dict(ModelConfig.to_json_dict(cfg)) == cfg
+    assert (
+        TransformerModelConfig.from_json_dict(TransformerModelConfig.to_json_dict(cfg))
+        == cfg
+    )
 
 
 class LearningRateSchedule(Enum):

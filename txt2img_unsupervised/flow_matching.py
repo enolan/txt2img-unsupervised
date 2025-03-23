@@ -402,6 +402,18 @@ class VectorField(nn.Module):
             "mlp_input": mlp_in,
         }
 
+    def dummy_inputs(self):
+        """Create dummy inputs for model initialization with the correct shapes.
+
+        Returns:
+            Tuple of (x, t, cond_vec) with appropriate shapes for initialization.
+        """
+        batch_size = 2
+        x = jnp.ones((batch_size, self.domain_dim))
+        t = jnp.ones((batch_size,))
+        cond_vec = jnp.ones((batch_size, self.conditioning_dim))
+        return x, t, cond_vec
+
     def __call__(self, x, t, cond_vec):
         batch_size = x.shape[0]
         assert x.shape == (batch_size, self.domain_dim)
@@ -2337,6 +2349,19 @@ class CapConditionedVectorField(VectorField):
             "cap_d_maxes_transformed": cap_d_maxes_transformed,
             "cap_info": cap_info,
         }
+
+    def dummy_inputs(self):
+        """Create dummy inputs for model initialization with the correct shapes.
+
+        Returns:
+            Tuple of (x, t, cap_centers, cap_d_maxes) with appropriate shapes for initialization.
+        """
+        batch_size = 2
+        x = jnp.ones((batch_size, self.domain_dim))
+        t = jnp.ones((batch_size,))
+        cap_centers = jnp.ones((batch_size, self.domain_dim))
+        cap_d_maxes = jnp.ones((batch_size,))
+        return x, t, cap_centers, cap_d_maxes
 
     def __call__(self, x, t, cap_centers, cap_d_maxes):
         assert len(x.shape) == 2

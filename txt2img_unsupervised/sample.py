@@ -30,12 +30,12 @@ from tqdm import tqdm, trange
 from typing import List, Tuple, Union
 
 from . import ldm_autoencoder
-from .checkpoint import get_imagemodel_from_checkpoint, load_params
+from .checkpoint import get_model_from_checkpoint, load_params
 from .ldm_autoencoder import LDMAutoencoder
 from .transformer_model import (
     ImageModel,
     LogitFilterMethod,
-    ModelConfig,
+    TransformerModelConfig,
     gpt_1_config,
     sample,
 )
@@ -325,7 +325,7 @@ def test_sample_loop_batch_equivalence():
     This should fail with certain busted cudnn versions."""
 
     # Set up ImageModel
-    model_cfg = ModelConfig(
+    model_cfg = TransformerModelConfig(
         image_tokens=256,
         clip_conditioning=True,
         clip_caps=True,
@@ -522,7 +522,8 @@ def main():
     print("Loading transformer model metadata...")
     # We need to minimize VRAM usage, so we don't load the transformer parameters until after
     # computing CLIP embeddings.
-    im_mdl = get_imagemodel_from_checkpoint(args.transformer_checkpoint_dir)
+    model_cfg, im_mdl = get_model_from_checkpoint(args.transformer_checkpoint_dir)
+    assert isinstance(im_mdl, ImageModel), f"Expected ImageModel, got {type(im_mdl)}"
 
     if im_mdl.clip_conditioning and (args.cond_img or args.cond_txt):
         print("Loading CLIP model...")
