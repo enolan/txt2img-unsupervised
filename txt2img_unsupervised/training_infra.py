@@ -8,6 +8,7 @@ import importlib.util
 import jax
 import jax.numpy as jnp
 import json
+import optax
 import orbax.checkpoint as ocp
 import signal
 import wandb
@@ -633,8 +634,9 @@ def train_loop(
         get_batch_fn: Function to fetch a batch of data. Takes (step: int) -> batch.
         loss_fn: Function to calculate the loss. Takes (params: Any, batch: Any, rng: jax.random.PRNGKey) -> loss: float.
                  This function will be used with jax.value_and_grad.
-        post_step_hook_fn: Function called after each step. Takes (loss: float, state: Any, step: int) -> should_stop: bool.
+        post_step_hook_fn: Function called after each step. Takes (loss: float, state: Any, step: int, norm: float) -> should_stop: bool.
                            The step provided is the global step that just completed (counting from initial_step).
+                           The norm is the global norm of the gradients.
         post_epoch_hook_fn: Optional function called after each epoch. Takes (state: BaseTrainState, epoch_idx: int, global_step: int).
 
     Returns:
@@ -645,15 +647,23 @@ def train_loop(
     start_epoch = initial_step // steps_per_epoch
 
     @partial(jax.jit, donate_argnames=["state"])
-    def _train_step(state: BaseTrainState, batch: Any) -> Tuple[BaseTrainState, float]:
+    def _train_step(
+        state: BaseTrainState, batch: Any
+    ) -> Tuple[BaseTrainState, float, float]:
         step_rng, new_rng = jax.random.split(state.rng)
 
         grad_fn = jax.value_and_grad(loss_fn, argnums=0)
         loss, grads = grad_fn(state.params, batch, step_rng)
         new_state = state.apply_gradients(grads=grads)
 
+        # Use the gradient norm from state if available, otherwise compute it
+        if new_state.get_last_norm() is not None:
+            norm = new_state.get_last_norm()
+        else:
+            norm = optax.global_norm(grads)
+
         new_state = new_state.replace(rng=new_rng)
-        return new_state, loss
+        return new_state, loss, norm
 
     pbar_epoch = trange(
         start_epoch,
@@ -699,11 +709,11 @@ def train_loop(
 
             batch = get_batch_fn(global_step)
 
-            train_state, loss = _train_step(train_state, batch)
+            train_state, loss, norm = _train_step(train_state, batch)
 
             pbar_step.set_description(f"Loss: {loss:.4f}")
 
-            should_stop = post_step_hook_fn(loss, train_state, global_step)
+            should_stop = post_step_hook_fn(loss, train_state, global_step, norm)
 
             if should_stop:
                 tqdm.write(

@@ -724,14 +724,7 @@ def train_loop_with_infra(
             batch_max_cos_distances,
         )
 
-    def post_step_hook(loss, state, global_step):
-        if training_cfg.adaptive_gradient_clip:
-            norm = state.get_last_norm()
-            assert norm is not None
-        else:
-            # Approximation as we don't have access to gradients here
-            norm = 0.0
-
+    def post_step_hook(loss, state, global_step, norm):
         to_log = {
             "train/loss": loss,
             "grad_global_norm": norm,
