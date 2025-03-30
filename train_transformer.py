@@ -607,268 +607,186 @@ def save_checkpoint_and_log_images(
         tqdm.write("Skipping sampling")
 
 
-def train_loop_with_infra(
-    global_step,
-    train_state,
-    train_imgs,
-    test_imgs,
-    mdl,
-    training_cfg,
-    total_steps,
-    total_epochs,
-    steps_per_epoch,
-    steps_in_partial_epoch,
-    sample_batch_size,
-    data_offset,
-    args,
-    examples_sharding,
-):
-    """Run the training loop across epochs using the generic training infrastructure."""
-    assert global_step < total_steps, "training run is over my dude"
+# Loss function that processes batches and handles cap generation
+def loss_fn(params, batch, rng, mdl=None):
+    dropout_rng, caps_rng = jax.random.split(rng)
 
-    if data_offset > 0:
-        print(f"Using data offset for finetuning: {data_offset} batches")
+    batch_imgs = batch["batch_imgs"]
+    batch_clips = batch["batch_clips"]
 
-    def checkpoint_callback(
-        ts, global_step, skip_sampling=args.skip_sampling, skip_saving=args.skip_saving
-    ):
-        save_checkpoint_and_log_images(
-            ts, sample_batch_size, global_step, skip_sampling, skip_saving
+    # Generate caps if needed
+    if mdl.clip_caps:
+        batch_cap_centers, batch_max_cos_distances = gen_caps(
+            caps_rng, batch_clips, mdl.clip_cap_count, mdl
+        )
+        assert batch_cap_centers.shape == (
+            batch_clips.shape[0],
+            mdl.clip_cap_count,
+            768,
+        )
+        assert batch_max_cos_distances.shape == (
+            batch_clips.shape[0],
+            mdl.clip_cap_count,
+        )
+        batch_clips = batch_cap_centers
+    else:
+        batch_max_cos_distances = jnp.zeros(
+            (batch_clips.shape[0], 0), dtype=jnp.float32
         )
 
-    checkpoint_timer = IntervalTimer(
-        datetime.timedelta(minutes=30),
-        checkpoint_callback,
+    # Call the model's loss function
+    return transformer_model.loss_batch(
+        mdl,
+        params,
+        dropout_rng,
+        batch_imgs,
+        batch_clips,
+        batch_max_cos_distances,
     )
 
-    @jax.jit
-    def eval_loss_fn(params, rng, imgs, clips, max_cos_distances):
-        return transformer_model.loss_batch(
-            mdl,
-            params,
-            rng,
-            imgs,
-            clips,
-            max_cos_distances,
+
+# Fast path hook that runs operations that don't need the full train state
+def fast_post_step_hook(loss, metrics, global_step, norm):
+    to_log = {
+        "train/loss": loss,
+        "grad_global_norm": norm,
+        "global_step": global_step,
+    }
+
+    # Add metrics that were copied before donation
+    if "notfinite_count" in metrics:
+        to_log["debug/notfinite_count"] = metrics["notfinite_count"]
+    if "clip_count" in metrics:
+        to_log["debug/clipped_updates"] = metrics["clip_count"]
+    else:
+        to_log["debug/clipped_updates"] = 0
+
+    # Log warnings based on metrics
+    if not np.isfinite(loss):
+        tqdm.write(f"Loss nonfinite 😢 ({loss})")
+
+    if metrics.get("notfinite_count", 0) > 50:
+        tqdm.write(f"Too many nonfinite values in gradients, giving up")
+        exit(1)
+
+    if metrics.get("clipped_last", False):
+        tqdm.write(f"Clipped update due to large gradient norm: {norm}")
+
+    # Log to wandb - this will materialize the JAX arrays, but that's OK
+    # because we've already enqueued the next step
+    wandb.log(to_log)
+
+
+# Slow path hook that runs operations that need the full train state
+def slow_post_step_hook(loss, state, global_step, norm):
+    if signal_handler.exit_requested:
+        tqdm.write("Saving checkpoint and exiting early")
+        save_checkpoint_and_log_images(
+            state,
+            sample_batch_size,
+            global_step,
+            skip_sampling=True,
+            skip_saving=args.skip_saving,
         )
+        exit(0)
 
-    # Set up the signal handler
-    signal_handler = SignalHandler()
+    # If we got a signal to save a checkpoint, do so. If we didn't, save a checkpoint only if it's
+    # time.
+    if signal_handler.early_checkpoint_requested:
+        checkpoint_timer.run_and_reset(
+            state,
+            global_step,
+            skip_sampling=args.skip_sampling,
+            skip_saving=args.skip_saving,
+        )
+        signal_handler.reset_checkpoint_flag()
+    else:
+        checkpoint_timer.check_and_run(state, global_step)
 
-    def get_batch_fn(step):
+    # Schedule-free specific logging, stubbed out. I'm going to drop support for schedule free
+    # optimizers soon, so I'm not bothering to make this work.
+    if (
+        global_step % 20 == 0
+        and training_cfg.learning_rate_schedule
+        == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+    ):
+        eval_params = state.get_eval_params()
+        # TODO: Add evaluation metrics logging for schedule-free optimizer
+        del eval_params
+
+    # Always continue training unless explicitly exited above
+    return False
+
+
+# Function to determine if we need to run the slow path
+def slow_path_condition(global_step):
+    if signal_handler.exit_requested or signal_handler.early_checkpoint_requested:
+        return True
+    if checkpoint_timer.check_if_should_run():
+        return True
+    if (
+        global_step % 20 == 0
+        and training_cfg.learning_rate_schedule
+        == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+    ):
+        return True
+    return False
+
+
+def post_epoch_hook(state, epoch_idx, global_step):
+    checkpoint_timer.run_and_reset(
+        state, global_step, skip_sampling=False, skip_saving=args.skip_saving
+    )
+    losses = []
+    eval_params = state.get_eval_params()
+    test_rng = jax.random.PRNGKey(7357)
+
+    for batch_idx in trange(
+        len(test_imgs) // training_cfg.batch_size,
+        desc="test batches",
+    ):
+        dropout_rng, cap_rng, test_rng = jax.random.split(test_rng, 3)
         fields = ["encoded_img"]
         if mdl.clip_conditioning:
             fields.append("clip_embedding")
 
         batch = get_batch(
-            train_imgs,
+            test_imgs,
             training_cfg.batch_size,
-            # Include data_offset for finetuning support
-            step + data_offset,
+            batch_idx,
             fields=fields,
             sharding=examples_sharding,
         )
 
         batch_imgs = batch["encoded_img"]
-        batch_clips = (
-            batch["clip_embedding"]
-            if "clip_embedding" in batch
-            else jnp.zeros((training_cfg.batch_size, 0))
+        batch_clips = batch.get(
+            "clip_embedding", jnp.zeros((training_cfg.batch_size, 0))
         )
-
-        if mdl.clip_conditioning:
-            assert batch_clips.shape == (training_cfg.batch_size, 768)
-        else:
-            assert batch_clips.shape == (training_cfg.batch_size, 0)
-
-        # Return batch data to be processed in loss_fn
-        return {
-            "batch_imgs": batch_imgs,
-            "batch_clips": batch_clips,
-        }
-
-    # Function to calculate loss that will be used by the generic train_loop
-    def loss_fn(params, batch, rng):
-        dropout_rng, caps_rng = jax.random.split(rng)
-
-        batch_imgs = batch["batch_imgs"]
-        batch_clips = batch["batch_clips"]
-
-        # Generate caps if needed
         if mdl.clip_caps:
-            batch_cap_centers, batch_max_cos_distances = gen_caps(
-                caps_rng, batch_clips, mdl.clip_cap_count, mdl
+            batch_clips, batch_max_cos_distances = gen_caps(
+                cap_rng, batch_clips, mdl.clip_cap_count, mdl
             )
-            assert batch_cap_centers.shape == (
-                batch_clips.shape[0],
-                mdl.clip_cap_count,
-                768,
-            )
-            assert batch_max_cos_distances.shape == (
-                batch_clips.shape[0],
-                mdl.clip_cap_count,
-            )
-            batch_clips = batch_cap_centers
         else:
             batch_max_cos_distances = jnp.zeros(
                 (batch_clips.shape[0], 0), dtype=jnp.float32
             )
 
-        # Call the model's loss function
-        return transformer_model.loss_batch(
-            mdl,
-            params,
-            dropout_rng,
-            batch_imgs,
-            batch_clips,
-            batch_max_cos_distances,
+        losses.append(
+            eval_loss_fn(
+                eval_params,
+                dropout_rng,
+                batch_imgs,
+                batch_clips,
+                batch_max_cos_distances,
+            )
         )
 
-    def post_step_hook(loss, state, global_step, norm):
-        to_log = {
-            "train/loss": loss,
-            "grad_global_norm": norm,
-            "global_step": global_step,
-        }
+    del test_rng
+    del eval_params
 
-        opt_state = state.opt_state
-        to_log["debug/notfinite_count"] = jax.device_get(opt_state.notfinite_count)
-
-        if training_cfg.adaptive_gradient_clip:
-            to_log["debug/clipped_updates"] = jax.device_get(
-                opt_state.inner_state.clip_count
-            )
-            clipped_last = jax.device_get(opt_state.inner_state.clipped_last)
-            if clipped_last:
-                tqdm.write(
-                    f"Clipped update due to large gradient norm: {to_log['grad_global_norm']}"
-                )
-        else:
-            to_log["debug/clipped_updates"] = 0
-            clipped_last = False
-
-        if not np.isfinite(loss):
-            tqdm.write(f"Loss nonfinite 😢 ({loss})")
-
-        if to_log["debug/notfinite_count"] > 50:
-            tqdm.write(f"Too many nonfinite values in gradients, giving up")
-            exit(1)
-
-        if signal_handler.exit_requested:
-            tqdm.write("Saving checkpoint and exiting early")
-            save_checkpoint_and_log_images(
-                state,
-                sample_batch_size,
-                global_step,
-                skip_sampling=True,
-                skip_saving=args.skip_saving,
-            )
-            exit(0)
-
-        if signal_handler.early_checkpoint_requested:
-            checkpoint_timer.run_and_reset(
-                state,
-                global_step,
-                skip_sampling=args.skip_sampling,
-                skip_saving=args.skip_saving,
-            )
-            signal_handler.reset_checkpoint_flag()
-        else:
-            checkpoint_timer.check_and_run(state, global_step)
-
-        if (
-            global_step % 20 == 0
-            and training_cfg.learning_rate_schedule
-            == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
-        ):
-            eval_params = state.get_eval_params()
-            # TODO: Add evaluation metrics logging for schedule-free optimizer
-            del eval_params
-
-        wandb.log(to_log)
-
-        return False
-
-    def post_epoch_hook(state, epoch_idx, global_step):
-        checkpoint_timer.run_and_reset(
-            state, global_step, skip_sampling=False, skip_saving=args.skip_saving
-        )
-        losses = []
-        eval_params = state.get_eval_params()
-        test_rng = jax.random.PRNGKey(7357)
-
-        for batch_idx in trange(
-            len(test_imgs) // training_cfg.batch_size,
-            desc="test batches",
-        ):
-            dropout_rng, cap_rng, test_rng = jax.random.split(test_rng, 3)
-            fields = ["encoded_img"]
-            if mdl.clip_conditioning:
-                fields.append("clip_embedding")
-
-            batch = get_batch(
-                test_imgs,
-                training_cfg.batch_size,
-                batch_idx,
-                fields=fields,
-                sharding=examples_sharding,
-            )
-
-            batch_imgs = batch["encoded_img"]
-            batch_clips = batch.get(
-                "clip_embedding", jnp.zeros((training_cfg.batch_size, 0))
-            )
-            if mdl.clip_caps:
-                batch_clips, batch_max_cos_distances = gen_caps(
-                    cap_rng, batch_clips, mdl.clip_cap_count, mdl
-                )
-            else:
-                batch_max_cos_distances = jnp.zeros(
-                    (batch_clips.shape[0], 0), dtype=jnp.float32
-                )
-
-            losses.append(
-                eval_loss_fn(
-                    eval_params,
-                    dropout_rng,
-                    batch_imgs,
-                    batch_clips,
-                    batch_max_cos_distances,
-                )
-            )
-
-        del test_rng
-        del eval_params
-
-        test_loss = jnp.mean(jnp.stack(losses))
-        wandb.log({"global_step": global_step, "test/loss": test_loss})
-        tqdm.write(f"Epoch {epoch_idx} done, test loss {test_loss:.4f}")
-
-    # Use the generic train_loop from training_infra
-    final_train_state, final_global_step = training_infra.train_loop(
-        steps_per_epoch=steps_per_epoch,
-        total_steps=total_steps,
-        complete_epochs=total_epochs - 1,  # Adjust for zero-indexing
-        total_epochs=total_epochs,
-        steps_in_partial_epoch=steps_in_partial_epoch,
-        initial_step=global_step,
-        initial_train_state=train_state,
-        get_batch_fn=get_batch_fn,
-        loss_fn=loss_fn,
-        post_step_hook_fn=post_step_hook,
-        post_epoch_hook_fn=post_epoch_hook,
-    )
-
-    # Only save a final checkpoint if not at an epoch boundary
-    if final_global_step % steps_per_epoch != 0:
-        checkpoint_callback(
-            final_train_state,
-            final_global_step,
-            skip_sampling=False,
-            skip_saving=args.skip_saving,
-        )
-
-    return final_global_step, final_train_state
+    test_loss = jnp.mean(jnp.stack(losses))
+    wandb.log({"global_step": global_step, "test/loss": test_loss})
+    tqdm.write(f"Epoch {epoch_idx} done, test loss {test_loss:.4f}")
 
 
 cap_logits_table = cap_sampling.LogitsTable(767, 16384)
@@ -940,8 +858,6 @@ if __name__ == "__main__":
     train_state = train_state.replicate_for_multi_gpu(mesh)
     examples_sharding = NamedSharding(mesh, PartitionSpec("dev"))
 
-    loss_fn = jax.jit(partial(transformer_model.loss_batch, mdl))
-
     image_prompts_to_sample = 8
     clip_mdl, clip_processor = get_clip_mdl()
 
@@ -958,20 +874,65 @@ if __name__ == "__main__":
 
     ae_cfg, ae_mdl, ae_params_torch = load_autoencoder(args.ae_cfg, args.ae_ckpt)
 
-    # Use the new infrastructure-based training loop
-    global_step, train_state = train_loop_with_infra(
-        global_step,
-        train_state,
-        train_imgs,
-        test_imgs,
-        mdl,
-        training_cfg,
-        total_steps,
-        total_epochs,
-        steps_per_epoch,
-        steps_in_partial_epoch,
-        sample_batch_size,
-        data_offset,
-        args,
-        examples_sharding,
+    # Create checkpoint timer and signal handler
+    checkpoint_timer = IntervalTimer(
+        datetime.timedelta(minutes=30),
+        lambda state, step, **kwargs: save_checkpoint_and_log_images(
+            state,
+            sample_batch_size,
+            step,
+            skip_sampling=kwargs.get("skip_sampling", args.skip_sampling),
+            skip_saving=kwargs.get("skip_saving", args.skip_saving),
+        ),
     )
+    signal_handler = SignalHandler()
+
+    # Create loss function for training
+    jitted_loss_fn = jax.jit(partial(loss_fn, mdl=mdl))
+
+    # Define eval loss function for post-epoch hook
+    eval_loss_fn = jax.jit(partial(transformer_model.loss_batch, mdl))
+
+    # Use the generic train loop with async execution
+    global_step, train_state = train_loop(
+        steps_per_epoch=steps_per_epoch,
+        total_steps=total_steps,
+        complete_epochs=complete_epochs,
+        total_epochs=total_epochs,
+        steps_in_partial_epoch=steps_in_partial_epoch,
+        initial_step=global_step,
+        initial_train_state=train_state,
+        get_batch_fn=lambda step: (
+            lambda b: {
+                "batch_imgs": b["encoded_img"],
+                "batch_clips": b.get(
+                    "clip_embedding", jnp.zeros((training_cfg.batch_size, 0))
+                ),
+            }
+        )(
+            get_batch(
+                train_imgs,
+                training_cfg.batch_size,
+                step + data_offset,
+                fields=["encoded_img"]
+                + (["clip_embedding"] if mdl.clip_conditioning else []),
+                sharding=examples_sharding,
+            )
+        ),
+        loss_fn=jitted_loss_fn,
+        post_step_hook_fn=None,  # Not used with async implementation
+        post_epoch_hook_fn=post_epoch_hook,
+        fast_post_step_hook_fn=fast_post_step_hook,
+        slow_post_step_hook_fn=slow_post_step_hook,
+        slow_path_condition_fn=slow_path_condition,
+    )
+
+    # Only save a final checkpoint if not at an epoch boundary
+    if global_step % steps_per_epoch != 0:
+        save_checkpoint_and_log_images(
+            train_state,
+            sample_batch_size,
+            global_step,
+            skip_sampling=False,
+            skip_saving=args.skip_saving,
+        )

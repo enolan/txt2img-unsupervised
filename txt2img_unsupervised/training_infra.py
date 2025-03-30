@@ -607,50 +607,36 @@ def test_plan_steps(
     assert steps_in_partial_epoch == expected_steps_in_partial_epoch
 
 
-def train_loop(
-    steps_per_epoch: int,
-    total_steps: int,
-    complete_epochs: int,
-    total_epochs: int,
-    steps_in_partial_epoch: Optional[int],
-    initial_step: int,
-    initial_train_state: BaseTrainState,
-    get_batch_fn: Callable[[int], Any],
-    loss_fn: Callable[[Any, Any, jax.random.PRNGKey], float],
-    post_step_hook_fn: Callable[[float, Any, int], bool],
-    post_epoch_hook_fn: Optional[Callable[[BaseTrainState, int, int], None]] = None,
-) -> Tuple[Any, int]:
-    """
-    Runs a generic training loop.
-
-    Args:
-        steps_per_epoch: Number of steps per epoch.
-        total_steps: Total number of steps to train for.
-        complete_epochs: Number of full epochs to train for.
-        total_epochs: Total number of epochs (including partial).
-        steps_in_partial_epoch: Number of steps in the final partial epoch, if any.
-        initial_step: The step number to start training from (0-indexed).
-        initial_train_state: The initial state of the training process (must have apply_gradients method).
-        get_batch_fn: Function to fetch a batch of data. Takes (step: int) -> batch.
-        loss_fn: Function to calculate the loss. Takes (params: Any, batch: Any, rng: jax.random.PRNGKey) -> loss: float.
-                 This function will be used with jax.value_and_grad.
-        post_step_hook_fn: Function called after each step. Takes (loss: float, state: Any, step: int, norm: float) -> should_stop: bool.
-                           The step provided is the global step that just completed (counting from initial_step).
-                           The norm is the global norm of the gradients.
-        post_epoch_hook_fn: Optional function called after each epoch. Takes (state: BaseTrainState, epoch_idx: int, global_step: int).
-
-    Returns:
-        A tuple containing the final training state and the final step number (the number of steps completed).
-    """
-    train_state = initial_train_state
-    global_step = initial_step
-    start_epoch = initial_step // steps_per_epoch
-
+def make_train_step_with_metrics(loss_fn):
     @partial(jax.jit, donate_argnames=["state"])
-    def _train_step(
+    def _train_step_with_metrics(
         state: BaseTrainState, batch: Any
-    ) -> Tuple[BaseTrainState, float, float]:
+    ) -> Tuple[BaseTrainState, float, float, Dict[str, Any]]:
+        """
+        Performs a single training step, extracting metrics before donation.
+
+        Args:
+            state: Current training state
+            batch: Batch of data to train on
+
+        Returns:
+            Tuple of (new_state, loss, gradient_norm, metrics_dict)
+        """
         step_rng, new_rng = jax.random.split(state.rng)
+
+        # Extract any metrics we need to preserve before donation
+        metrics = {}
+        if hasattr(state, "opt_state"):
+            if hasattr(state.opt_state, "notfinite_count"):
+                metrics["notfinite_count"] = state.opt_state.notfinite_count.copy()
+            if hasattr(state.opt_state, "inner_state") and hasattr(
+                state.opt_state.inner_state, "clip_count"
+            ):
+                metrics["clip_count"] = state.opt_state.inner_state.clip_count.copy()
+                if hasattr(state.opt_state.inner_state, "clipped_last"):
+                    metrics[
+                        "clipped_last"
+                    ] = state.opt_state.inner_state.clipped_last.copy()
 
         grad_fn = jax.value_and_grad(loss_fn, argnums=0)
         loss, grads = grad_fn(state.params, batch, step_rng)
@@ -663,7 +649,63 @@ def train_loop(
             norm = optax.global_norm(grads)
 
         new_state = new_state.replace(rng=new_rng)
-        return new_state, loss, norm
+        return new_state, loss, norm, metrics
+
+    return _train_step_with_metrics
+
+
+def train_loop_async(
+    steps_per_epoch: int,
+    total_steps: int,
+    complete_epochs: int,
+    total_epochs: int,
+    steps_in_partial_epoch: Optional[int],
+    initial_step: int,
+    initial_train_state: BaseTrainState,
+    get_batch_fn: Callable[[int], Any],
+    loss_fn: Callable[[Any, Any, jax.random.PRNGKey], float],
+    fast_post_step_hook_fn: Callable[[float, Dict[str, Any], int, float], None],
+    slow_post_step_hook_fn: Callable[[float, BaseTrainState, int, float], bool],
+    slow_path_condition_fn: Callable[[int], bool],
+    post_epoch_hook_fn: Optional[Callable[[BaseTrainState, int, int], None]] = None,
+) -> Tuple[Any, int]:
+    """
+    Runs an asynchronous training loop that maximizes GPU utilization. In general, this keeps at
+    least one batch in flight on the GPU at all times, enqueueing the next batch before using the
+    results of the previous one. 
+
+    Args:
+        steps_per_epoch: Number of steps per epoch.
+        total_steps: Total number of steps to train for.
+        complete_epochs: Number of full epochs to train for.
+        total_epochs: Total number of epochs (including partial).
+        steps_in_partial_epoch: Number of steps in the final partial epoch, if any.
+        initial_step: The step number to start training from (0-indexed).
+        initial_train_state: The initial state of the training process (must have apply_gradients method).
+        get_batch_fn: Function to fetch a batch of data. Takes (step: int) -> batch.
+        loss_fn: Function to calculate the loss. Takes (params: Any, batch: Any, rng: jax.random.PRNGKey) -> loss: float.
+                 This function will be used with jax.value_and_grad.
+        fast_post_step_hook_fn: Callback to run after every step. Cannot access the train state.
+                                Takes (loss: float, metrics: Dict[str, Any], step: int, norm: float) -> None.
+        slow_post_step_hook_fn: Callback to run after train steps for which slow_path_condition_fn
+                                returns True. Can access the train state.
+                                Takes (loss: float, state: BaseTrainState, step: int, norm: float) -> should_stop: bool.
+        slow_path_condition_fn: Function that determines if slow path should run. As the name
+                                implies, this slows down training substantially, since we can't have
+                                two batches in flight if we need to access the state between steps.
+                                Takes (step: int) -> should_run_slow_path: bool.
+        post_epoch_hook_fn: Optional function called after each epoch.
+                           Takes (state: BaseTrainState, epoch_idx: int, global_step: int).
+
+    Returns:
+        A tuple containing the final training state and the final step number (the number of steps completed).
+    """
+    train_state = initial_train_state
+    global_step = initial_step
+    start_epoch = initial_step // steps_per_epoch
+
+    # Create our training step function
+    _train_step_with_metrics = make_train_step_with_metrics(loss_fn)
 
     pbar_epoch = trange(
         start_epoch,
@@ -675,6 +717,19 @@ def train_loop(
         leave=True,
         position=0,
     )
+
+    # Start the first step before entering the main loop
+    if global_step < total_steps:
+        initial_batch = get_batch_fn(global_step)
+        (
+            current_state,
+            current_loss,
+            current_norm,
+            current_metrics,
+        ) = _train_step_with_metrics(train_state, initial_batch)
+    else:
+        # Already done
+        return train_state, global_step
 
     for current_epoch_idx in pbar_epoch:
         is_partial_epoch = (current_epoch_idx == total_epochs - 1) and (
@@ -703,25 +758,70 @@ def train_loop(
         )
 
         for step_in_epoch_idx in pbar_step:
-            global_step = epoch_start_step + step_in_epoch_idx
-            if global_step >= total_steps:
-                break
+            current_step = global_step
+            global_step = current_step + 1  # Update for next iteration
 
-            batch = get_batch_fn(global_step)
+            # Check if we need the slow path
+            need_slow_path = slow_path_condition_fn(current_step)
 
-            train_state, loss, norm = _train_step(train_state, batch)
-
-            pbar_step.set_description(f"Loss: {loss:.4f}")
-
-            should_stop = post_step_hook_fn(loss, train_state, global_step, norm)
-
-            if should_stop:
-                tqdm.write(
-                    f"Stopping training early after step {global_step} due to post_step_hook."
+            if need_slow_path:
+                # Call fast path hook first (with metrics extracted before donation)
+                fast_post_step_hook_fn(
+                    current_loss, current_metrics, current_step, current_norm
                 )
-                pbar_step.close()
-                pbar_epoch.close()
-                return train_state, global_step
+
+                # Run slow path hook with full train state (will materialize implicitly when used)
+                should_stop = slow_post_step_hook_fn(
+                    current_loss, current_state, current_step, current_norm
+                )
+
+                if should_stop:
+                    tqdm.write(
+                        f"Stopping training early after step {current_step} due to slow_post_step_hook."
+                    )
+                    pbar_step.close()
+                    pbar_epoch.close()
+                    return current_state, global_step
+
+                # Get ready for next step after slow path is done
+                if global_step < total_steps:
+                    next_batch = get_batch_fn(global_step)
+                    (
+                        current_state,
+                        current_loss,
+                        current_norm,
+                        current_metrics,
+                    ) = _train_step_with_metrics(current_state, next_batch)
+                else:
+                    # Done with all steps
+                    break
+            else:
+                # Get the next batch and enqueue right away (fast path)
+                if global_step < total_steps:
+                    next_batch = get_batch_fn(global_step)
+                    (
+                        next_state,
+                        next_loss,
+                        next_norm,
+                        next_metrics,
+                    ) = _train_step_with_metrics(current_state, next_batch)
+
+                # Call fast path hook
+                fast_post_step_hook_fn(
+                    current_loss, current_metrics, current_step, current_norm
+                )
+
+                # Move to next step
+                if global_step < total_steps:
+                    current_state = next_state
+                    current_loss = next_loss
+                    current_norm = next_norm
+                    current_metrics = next_metrics
+                else:
+                    # Done with all steps
+                    break
+
+            pbar_step.set_description(f"Loss: {current_loss:.4f}")
 
         pbar_step.close()
 
@@ -730,11 +830,72 @@ def train_loop(
             tqdm.write(
                 f"Epoch {current_epoch_idx + 1} finished. Running post-epoch hook..."
             )
-            post_epoch_hook_fn(train_state, current_epoch_idx, global_step)
+            post_epoch_hook_fn(current_state, current_epoch_idx, current_step)
             tqdm.write("Post-epoch hook complete.")
 
     pbar_epoch.close()
-    return train_state, global_step
+    return current_state, global_step
+
+
+def train_loop(
+    steps_per_epoch: int,
+    total_steps: int,
+    complete_epochs: int,
+    total_epochs: int,
+    steps_in_partial_epoch: Optional[int],
+    initial_step: int,
+    initial_train_state: BaseTrainState,
+    get_batch_fn: Callable[[int], Any],
+    loss_fn: Callable[[Any, Any, jax.random.PRNGKey], float],
+    fast_post_step_hook_fn: Callable[[float, Dict[str, Any], int, float], None],
+    slow_post_step_hook_fn: Callable[[float, BaseTrainState, int, float], bool],
+    slow_path_condition_fn: Callable[[int], bool],
+    post_epoch_hook_fn: Optional[Callable[[BaseTrainState, int, int], None]] = None,
+    post_step_hook_fn: Optional[
+        Callable[[float, Any, int, float], bool]
+    ] = None,  # Kept for API compatibility but not used
+) -> Tuple[Any, int]:
+    """
+    Entry point for asynchronous training loop that maximizes GPU utilization.
+
+    Args:
+        steps_per_epoch: Number of steps per epoch.
+        total_steps: Total number of steps to train for.
+        complete_epochs: Number of full epochs to train for.
+        total_epochs: Total number of epochs (including partial).
+        steps_in_partial_epoch: Number of steps in the final partial epoch, if any.
+        initial_step: The step number to start training from (0-indexed).
+        initial_train_state: The initial state of the training process (must have apply_gradients method).
+        get_batch_fn: Function to fetch a batch of data. Takes (step: int) -> batch.
+        loss_fn: Function to calculate the loss. Takes (params: Any, batch: Any, rng: jax.random.PRNGKey) -> loss: float.
+                 This function will be used with jax.value_and_grad.
+        fast_post_step_hook_fn: Function for fast operations that don't need realized train state.
+                                Takes (loss: float, metrics: Dict[str, Any], step: int, norm: float) -> None.
+        slow_post_step_hook_fn: Function for slow operations that need realized train state.
+                                Takes (loss: float, state: BaseTrainState, step: int, norm: float) -> should_stop: bool.
+        slow_path_condition_fn: Function that determines if slow path should run.
+                                Takes (step: int) -> should_run_slow_path: bool.
+        post_epoch_hook_fn: Optional function called after each epoch. Takes (state: BaseTrainState, epoch_idx: int, global_step: int).
+        post_step_hook_fn: Legacy parameter, not used but kept for API compatibility.
+
+    Returns:
+        A tuple containing the final training state and the final step number (the number of steps completed).
+    """
+    return train_loop_async(
+        steps_per_epoch=steps_per_epoch,
+        total_steps=total_steps,
+        complete_epochs=complete_epochs,
+        total_epochs=total_epochs,
+        steps_in_partial_epoch=steps_in_partial_epoch,
+        initial_step=initial_step,
+        initial_train_state=initial_train_state,
+        get_batch_fn=get_batch_fn,
+        loss_fn=loss_fn,
+        fast_post_step_hook_fn=fast_post_step_hook_fn,
+        slow_post_step_hook_fn=slow_post_step_hook_fn,
+        slow_path_condition_fn=slow_path_condition_fn,
+        post_epoch_hook_fn=post_epoch_hook_fn,
+    )
 
 
 class IntervalTimer:
@@ -761,6 +922,16 @@ class IntervalTimer:
         self.callback_fn = callback_fn
         # Initialize last_trigger_time to the past so the first check triggers immediately
         self.last_trigger_time = datetime.datetime.min
+
+    def check_if_should_run(self) -> bool:
+        """
+        Check if the specified interval has passed since the last time the callback was run.
+
+        Returns:
+            True if the interval has passed, False otherwise.
+        """
+        now = datetime.datetime.now()
+        return now - self.last_trigger_time >= self.interval
 
     def check_and_run(self, *args, **kwargs) -> bool:
         """
