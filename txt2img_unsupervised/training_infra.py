@@ -604,3 +604,184 @@ def test_plan_steps(
     assert complete_epochs == expected_complete_epochs
     assert total_epochs == expected_total_epochs
     assert steps_in_partial_epoch == expected_steps_in_partial_epoch
+
+
+def train_loop(
+    steps_per_epoch: int,
+    total_steps: int,
+    complete_epochs: int,
+    total_epochs: int,
+    steps_in_partial_epoch: Optional[int],
+    initial_step: int,
+    initial_train_state: BaseTrainState,
+    get_batch_fn: Callable[[int], Any],
+    loss_fn: Callable[[Any, Any, jax.random.PRNGKey], float],
+    post_step_hook_fn: Callable[[float, Any, int], bool],
+    post_epoch_hook_fn: Optional[Callable[[BaseTrainState, int, int], None]] = None,
+) -> Tuple[Any, int]:
+    """
+    Runs a generic training loop.
+
+    Args:
+        steps_per_epoch: Number of steps per epoch.
+        total_steps: Total number of steps to train for.
+        complete_epochs: Number of full epochs to train for.
+        total_epochs: Total number of epochs (including partial).
+        steps_in_partial_epoch: Number of steps in the final partial epoch, if any.
+        initial_step: The step number to start training from (0-indexed).
+        initial_train_state: The initial state of the training process (must have apply_gradients method).
+        get_batch_fn: Function to fetch a batch of data. Takes (step: int) -> batch.
+        loss_fn: Function to calculate the loss. Takes (params: Any, batch: Any, rng: jax.random.PRNGKey) -> loss: float.
+                 This function will be used with jax.value_and_grad.
+        post_step_hook_fn: Function called after each step. Takes (loss: float, state: Any, step: int) -> should_stop: bool.
+                           The step provided is the global step that just completed (counting from initial_step).
+        post_epoch_hook_fn: Optional function called after each epoch. Takes (state: BaseTrainState, epoch_idx: int, global_step: int).
+
+    Returns:
+        A tuple containing the final training state and the final step number (the number of steps completed).
+    """
+    train_state = initial_train_state
+    global_step = initial_step
+    start_epoch = initial_step // steps_per_epoch
+
+    @partial(jax.jit, donate_argnames=["state"])
+    def _train_step(state: BaseTrainState, batch: Any) -> Tuple[BaseTrainState, float]:
+        step_rng, new_rng = jax.random.split(state.rng)
+
+        grad_fn = jax.value_and_grad(loss_fn, argnums=0)
+        loss, grads = grad_fn(state.params, batch, step_rng)
+        new_state = state.apply_gradients(grads=grads)
+
+        new_state = new_state.replace(rng=new_rng)
+        return new_state, loss
+
+    pbar_epoch = trange(
+        start_epoch,
+        total_epochs,
+        initial=start_epoch,
+        total=total_epochs,
+        desc=f"Epoch",
+        unit="epoch",
+        leave=True,
+        position=0,
+    )
+
+    for current_epoch_idx in pbar_epoch:
+        is_partial_epoch = (current_epoch_idx == total_epochs - 1) and (
+            steps_in_partial_epoch is not None
+        )
+        steps_in_this_epoch = (
+            steps_in_partial_epoch if is_partial_epoch else steps_per_epoch
+        )
+
+        epoch_start_step = current_epoch_idx * steps_per_epoch
+        epoch_end_step = epoch_start_step + steps_in_this_epoch
+
+        start_step_in_epoch = 0
+        if global_step > epoch_start_step:
+            start_step_in_epoch = global_step - epoch_start_step
+
+        pbar_step = trange(
+            start_step_in_epoch,
+            steps_in_this_epoch,
+            initial=start_step_in_epoch,
+            total=steps_in_this_epoch,
+            desc=f"Step",
+            unit="step",
+            leave=False,
+            position=1,
+        )
+
+        for step_in_epoch_idx in pbar_step:
+            global_step = epoch_start_step + step_in_epoch_idx
+            if global_step >= total_steps:
+                break
+
+            batch = get_batch_fn(global_step)
+
+            train_state, loss = _train_step(train_state, batch)
+
+            pbar_step.set_description(f"Loss: {loss:.4f}")
+
+            should_stop = post_step_hook_fn(loss, train_state, global_step)
+
+            if should_stop:
+                tqdm.write(
+                    f"Stopping training early after step {global_step} due to post_step_hook."
+                )
+                pbar_step.close()
+                pbar_epoch.close()
+                return train_state, global_step
+
+        pbar_step.close()
+
+        # Run post-epoch hook if provided
+        if post_epoch_hook_fn is not None:
+            tqdm.write(
+                f"Epoch {current_epoch_idx + 1} finished. Running post-epoch hook..."
+            )
+            post_epoch_hook_fn(train_state, current_epoch_idx, global_step)
+            tqdm.write("Post-epoch hook complete.")
+
+    pbar_epoch.close()
+    return train_state, global_step
+
+
+class IntervalTimer:
+    """
+    Helper class to track time intervals and trigger actions periodically by calling a callback.
+    """
+
+    def __init__(self, interval: datetime.timedelta, callback_fn: Callable[..., Any]):
+        """
+        Initialize the timer with a specific interval and a callback function.
+
+        Args:
+            interval: The time duration that needs to pass before check_and_run() calls the callback.
+            callback_fn: The function to call when the interval has passed. It can accept arguments.
+        """
+        if not isinstance(interval, datetime.timedelta):
+            raise ValueError("Interval must be a datetime.timedelta object")
+        if interval <= datetime.timedelta(0):
+            raise ValueError("Interval must be positive")
+        if not callable(callback_fn):
+            raise ValueError("callback_fn must be callable")
+
+        self.interval = interval
+        self.callback_fn = callback_fn
+        # Initialize last_trigger_time to the past so the first check triggers immediately
+        self.last_trigger_time = datetime.datetime.min
+
+    def check_and_run(self, *args, **kwargs) -> bool:
+        """
+        Check if the specified interval has passed since the last time the callback was run.
+
+        If the interval has passed, runs the callback with the provided *args and **kwargs,
+        updates the internal last trigger time, and returns True. Otherwise, returns False.
+
+        Args:
+            *args: Positional arguments to pass to the callback function.
+            **kwargs: Keyword arguments to pass to the callback function.
+
+        Returns:
+            True if the callback was run, False otherwise.
+        """
+        now = datetime.datetime.now()
+        if now - self.last_trigger_time >= self.interval:
+            self.callback_fn(*args, **kwargs)
+            self.last_trigger_time = now
+            return True
+        return False
+
+    def run_and_reset(self, *args, **kwargs):
+        """
+        Unconditionally run the callback function with the provided *args and **kwargs,
+        and reset the timer's last trigger time.
+
+        Args:
+            *args: Positional arguments to pass to the callback function.
+            **kwargs: Keyword arguments to pass to the callback function.
+        """
+        now = datetime.datetime.now()
+        self.callback_fn(*args, **kwargs)
+        self.last_trigger_time = now
