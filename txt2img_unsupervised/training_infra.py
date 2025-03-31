@@ -463,6 +463,7 @@ def init_wandb_training(
     args,
     wandb_settings,
     extra_config=None,
+    project=None,
 ):
     """
     Initialize Weights & Biases for training.
@@ -474,6 +475,7 @@ def init_wandb_training(
         args: Parsed command-line arguments
         wandb_settings: W&B settings
         extra_config: Optional additional config to log to W&B
+        project: Optional project name for wandb (defaults to "txt2img-unsupervised")
 
     Returns:
         Tuple of (model_cfg, training_cfg, extra config values)
@@ -510,11 +512,19 @@ def init_wandb_training(
         print(f"Model Config {json_pretty(model_cfg.to_json_dict())}")
         print(f"TrainingConfig {json_pretty(training_cfg.to_json_dict())}")
 
-        wandb.init(id=run_id, resume="must", settings=wandb_settings)
+        # Use the provided project name or default
+        wandb_init_kwargs = {"id": run_id, "resume": "must", "settings": wandb_settings}
+        if project:
+            wandb_init_kwargs["project"] = project
+        wandb.init(**wandb_init_kwargs)
     else:
         print("Starting new run...")
 
-        wandb.init(settings=wandb_settings)
+        # Use the provided project name or default
+        wandb_init_kwargs = {"settings": wandb_settings}
+        if project:
+            wandb_init_kwargs["project"] = project
+        wandb.init(**wandb_init_kwargs)
 
         with open(model_cfg_path) as f:
             model_cfg = BaseModelConfig.from_json_dict(json.load(f))
@@ -674,7 +684,7 @@ def train_loop_async(
     """
     Runs an asynchronous training loop that maximizes GPU utilization. In general, this keeps at
     least one batch in flight on the GPU at all times, enqueueing the next batch before using the
-    results of the previous one. 
+    results of the previous one.
 
     Args:
         steps_per_epoch: Number of steps per epoch.

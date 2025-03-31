@@ -156,7 +156,7 @@ class FlowMatchingModelConfig(BaseModelConfig):
     n_layers: int
     domain_dim: int
     reference_directions: Optional[int]
-    conditioning_dim: int
+    conditioning_dim: Optional[int]
     time_dim: int
     use_pre_mlp_projection: bool
     d_model: int
