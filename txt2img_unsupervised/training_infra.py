@@ -271,17 +271,19 @@ def init_common_train_state(
         print(f"Resuming from checkpoint {resume_checkpoint_path}...")
         checkpoint_dir = resume_checkpoint_path.absolute()
         checkpoint_manager = mk_checkpoint_manager(checkpoint_dir, checkpoint_options)
-        # The step recorded in a checkpoint is the number of steps completed, so our starting step
-        # index is that number. If the checkpoint we're resuming from completed 0 steps, we start
-        # at step 0, if it completed 5 steps, that means it did 0-4 inclusive, so we start at step
-        # 5.
-        global_step = checkpoint_manager.latest_step()
+        # The step recorded in a checkpoint is the index of the last completed step.
+        # We need to start from the next step (index + 1).
+        # For example: If checkpoint step is 0, we've completed step 0, so we start at step 1.
+        # If checkpoint step is 5, we've completed steps 0-5, so we start at step 6.
+        checkpoint_step = checkpoint_manager.latest_step()
+        # Start from the next step after the one in the checkpoint
+        global_step = checkpoint_step + 1
         data_offset = checkpoint_manager.metadata().get("data_offset", 0)
 
         # Use the provided train state class to load the checkpoint
         train_state, mdl = train_state_class.load_from_checkpoint(
             checkpoint_manager,
-            global_step,
+            checkpoint_step,  # Use the original checkpoint step for loading
             total_steps,
         )
     else:
