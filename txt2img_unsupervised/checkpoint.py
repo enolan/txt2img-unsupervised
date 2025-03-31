@@ -30,56 +30,101 @@ from .transformer_model import ImageModel
 from .triangle_schedule import triangle_schedule
 
 
-def setup_optimizer(training_cfg: TrainingConfig, batches_total: int):
+def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
     """Set up an optimizer based on the TrainingConfig.
     Args:
         training_cfg: The TrainingConfig to set up the optimizer for.
         batches_total: The total number of batches to train for.
+        mdl: The model instance, used for muP learning rate scaling if it has partition_map and scale_lr properties.
     Returns:
         An optax optimizer.
     """
+    # If we're using muP, the learning rate will be different for different parameters.
+    use_mup_scaling = (
+        mdl is not None and hasattr(mdl, "partition_map") and hasattr(mdl, "scale_lr")
+    )
+
     if training_cfg.learning_rate_schedule == LearningRateSchedule.CONSTANT:
-        opt = optax.adamw(
-            learning_rate=training_cfg.learning_rate,
-            weight_decay=training_cfg.weight_decay,
-            b2=training_cfg.adam_beta2,
-        )
+        lr_schedule = training_cfg.learning_rate
     elif training_cfg.learning_rate_schedule == LearningRateSchedule.TRIANGLE:
-        opt = optax.adamw(
-            learning_rate=triangle_schedule(
-                training_cfg.learning_rate,
-                batches_total,
-            ),
-            weight_decay=training_cfg.weight_decay,
-            b2=training_cfg.adam_beta2,
+        lr_schedule = triangle_schedule(
+            training_cfg.learning_rate,
+            batches_total,
         )
     elif training_cfg.learning_rate_schedule == LearningRateSchedule.WARMUP_PLUS_COSINE:
-        opt = optax.adamw(
-            learning_rate=optax.warmup_cosine_decay_schedule(
-                init_value=0.0,
-                peak_value=training_cfg.learning_rate,
-                warmup_steps=training_cfg.warmup_steps,
-                decay_steps=batches_total,
-                end_value=training_cfg.learning_rate * 0.05,
-            ),
-            weight_decay=training_cfg.weight_decay,
-            b2=training_cfg.adam_beta2,
+        lr_schedule = optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=training_cfg.learning_rate,
+            warmup_steps=training_cfg.warmup_steps,
+            decay_steps=batches_total,
+            end_value=training_cfg.learning_rate * 0.05,
         )
     elif (
         training_cfg.learning_rate_schedule
         == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
     ):
-        opt = optax.contrib.schedule_free_adamw(
-            learning_rate=training_cfg.learning_rate,
-            warmup_steps=training_cfg.warmup_steps,
-            b1=training_cfg.schedule_free_beta1,
-            b2=training_cfg.adam_beta2,
-            weight_decay=training_cfg.weight_decay,
-        )
+        # Schedule-free Adam uses a different optimizer constructor
+        if use_mup_scaling:
+            opt_fixed_lr = optax.contrib.schedule_free_adamw(
+                learning_rate=training_cfg.learning_rate,
+                warmup_steps=training_cfg.warmup_steps,
+                b1=training_cfg.schedule_free_beta1,
+                b2=training_cfg.adam_beta2,
+                weight_decay=training_cfg.weight_decay,
+            )
+            opt_scaled_lr = optax.contrib.schedule_free_adamw(
+                learning_rate=mdl.scale_lr(training_cfg.learning_rate),
+                warmup_steps=training_cfg.warmup_steps,
+                b1=training_cfg.schedule_free_beta1,
+                b2=training_cfg.adam_beta2,
+                weight_decay=training_cfg.weight_decay,
+            )
+            opt = optax.transforms.partition(
+                {"fixed_lr": opt_fixed_lr, "scaled_lr": opt_scaled_lr},
+                mdl.partition_map,
+            )
+        else:
+            opt = optax.contrib.schedule_free_adamw(
+                learning_rate=training_cfg.learning_rate,
+                warmup_steps=training_cfg.warmup_steps,
+                b1=training_cfg.schedule_free_beta1,
+                b2=training_cfg.adam_beta2,
+                weight_decay=training_cfg.weight_decay,
+            )
     else:
         raise ValueError(
             f"Unknown learning rate schedule {training_cfg.learning_rate_schedule}"
         )
+
+    # Without schedule-free, use the regular AdamW
+    if (
+        training_cfg.learning_rate_schedule
+        != LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+    ):
+        # Common optimizer parameters
+        common_params = {
+            "weight_decay": training_cfg.weight_decay,
+            "b2": training_cfg.adam_beta2,
+        }
+
+        if use_mup_scaling:
+            # For function schedules, we need to create a wrapper function for scaling
+            if callable(lr_schedule):
+                scaled_lr_schedule = lambda step: mdl.scale_lr(lr_schedule(step))
+            else:
+                scaled_lr_schedule = mdl.scale_lr(lr_schedule)
+
+            opt_fixed_lr = optax.adamw(learning_rate=lr_schedule, **common_params)
+            opt_scaled_lr = optax.adamw(
+                learning_rate=scaled_lr_schedule, **common_params
+            )
+
+            opt = optax.transforms.partition(
+                {"fixed_lr": opt_fixed_lr, "scaled_lr": opt_scaled_lr},
+                mdl.partition_map,
+            )
+        else:
+            opt = optax.adamw(learning_rate=lr_schedule, **common_params)
 
     if training_cfg.gradient_accumulation_steps > 1:
         opt = optax.MultiSteps(
@@ -124,7 +169,7 @@ class BaseTrainState(train_state.TrainState):
             A new train state with initialized parameters
         """
         params = jax.jit(mdl.init)(rng, *mdl.dummy_inputs())
-        opt = setup_optimizer(training_cfg, batches_total)
+        opt = setup_optimizer(training_cfg, batches_total, mdl=mdl)
 
         beta2_in_dtype = jnp.astype(training_cfg.adam_beta2, mdl.weights_dtype)
         if beta2_in_dtype >= 1.0:
@@ -514,7 +559,7 @@ def test_get_eval_params(
             **adaptive_gradient_clip_cfg,
         )
 
-    optimizer = setup_optimizer(training_cfg, batches_total=1000)
+    optimizer = setup_optimizer(training_cfg, batches_total=1000, mdl=None)
 
     # Initialize parameters with random values
     params = jax.random.normal(rng, (10,))
