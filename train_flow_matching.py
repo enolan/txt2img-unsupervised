@@ -242,14 +242,11 @@ def slow_post_step_hook(loss, state, global_step, norm):
         checkpoint_timer.run_and_reset(
             state,
             global_step,
-            skip_saving=args.skip_saving,
             test_dataset=test_dataset,
             training_cfg=training_cfg,
             examples_sharding=examples_sharding,
             mdl=mdl,
-            kappa_value=args.kappa_value,
             logits_table=cap_logits_table,
-            vector_column=args.vector_column,
         )
         signal_handler.reset_checkpoint_flag()
     else:
@@ -272,14 +269,11 @@ def post_epoch_hook(state, epoch_idx, global_step):
     checkpoint_timer.run_and_reset(
         state,
         global_step,
-        skip_saving=args.skip_saving,
         test_dataset=test_dataset,
         training_cfg=training_cfg,
         examples_sharding=examples_sharding,
         mdl=mdl,
-        kappa_value=args.kappa_value,
         logits_table=cap_logits_table,
-        vector_column=args.vector_column,
     )
 
 
