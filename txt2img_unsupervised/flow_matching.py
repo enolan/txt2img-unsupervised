@@ -1158,7 +1158,7 @@ def _train_loop_for_tests(
                     step_rng, nll_rng = jax.random.split(step_rng)
                     train_nlls = -compute_log_probability(
                         model,
-                        state,
+                        state.params,
                         batch["point_vec"],
                         batch["cond_vec"],
                         100,
@@ -1207,7 +1207,7 @@ def _train_loop_for_tests(
                     test_nlls.append(
                         -compute_log_probability(
                             model,
-                            state,
+                            state.params,
                             test_batch["point_vec"],
                             test_batch["cond_vec"],
                             100,
@@ -1277,7 +1277,7 @@ def test_train_trivial(domain_dim):
     print(f"Final loss: {loss:.6f}")
     samples = generate_samples(
         model,
-        state,
+        state.params,
         jax.random.PRNGKey(0),
         20,
         cond_vecs=jnp.zeros((20, 0)),
@@ -1413,7 +1413,7 @@ def test_train_vmf(domain_dim):
     n_test_samples = 1_000
     samples = generate_samples(
         model,
-        state,
+        state.params,
         jax.random.PRNGKey(42),
         n_test_samples,
         cond_vecs=jnp.zeros((n_test_samples, 0)),
@@ -1521,7 +1521,7 @@ def test_train_conditional_vmf(domain_dim):
 
     samples_0 = generate_samples(
         model,
-        state,
+        state.params,
         seed1,
         n_eval_samples,
         cond_vecs=cond_vec_0,
@@ -1530,7 +1530,7 @@ def test_train_conditional_vmf(domain_dim):
     )
     samples_1 = generate_samples(
         model,
-        state,
+        state.params,
         seed2,
         n_eval_samples,
         cond_vecs=cond_vec_1,
@@ -1719,23 +1719,31 @@ def spherical_rk4_step(f, x, t, dt, rng=None):
 
 @partial(jax.jit, static_argnames=("model",), inline=True)
 def spherical_rk4_step_with_model(
-    model, state, x, t, dt, cond_vecs=None, cap_centers=None, cap_d_maxes=None, rng=None
+    model,
+    params,
+    x,
+    t,
+    dt,
+    cond_vecs=None,
+    cap_centers=None,
+    cap_d_maxes=None,
+    rng=None,
 ):
     vector_field_fn = lambda x, t, rng: _compute_vector_field_for_sampling(
-        model, state, x, t, cond_vecs, cap_centers, cap_d_maxes, rng
+        model, params, x, t, cond_vecs, cap_centers, cap_d_maxes, rng
     )
     return spherical_rk4_step(vector_field_fn, x, t, dt, rng)
 
 
 @partial(jax.jit, static_argnames=("model",), inline=True)
 def _compute_vector_field_for_sampling(
-    model, state, x, t, cond_vecs=None, cap_centers=None, cap_d_maxes=None, rng=None
+    model, params, x, t, cond_vecs=None, cap_centers=None, cap_d_maxes=None, rng=None
 ):
     rngs_dict = {"dropout": rng} if rng is not None else {}
     if isinstance(model, CapConditionedVectorField):
         assert cond_vecs is None
         return model.apply(
-            state.params,
+            params,
             x,
             jnp.full((x.shape[0],), t),
             cap_centers,
@@ -1744,7 +1752,7 @@ def _compute_vector_field_for_sampling(
         )
     else:
         return model.apply(
-            state.params,
+            params,
             x,
             jnp.full((x.shape[0],), t),
             cond_vecs,
@@ -1754,7 +1762,7 @@ def _compute_vector_field_for_sampling(
 
 def generate_samples(
     model,
-    state,
+    params,
     rng,
     batch_size,
     cond_vecs=None,
@@ -1768,7 +1776,7 @@ def generate_samples(
 
     Args:
         model: Vector field model
-        state: Training state with model parameters
+        params: Model parameters
         rng: JAX random key
         batch_size: Number of samples to generate
         cond_vecs: Conditioning vectors [batch_size, cond_dim]
@@ -1794,7 +1802,7 @@ def generate_samples(
     x0 = sample_sphere(x0_rng, batch_size, model.domain_dim)
 
     vector_field_fn = lambda x, t, rng: _compute_vector_field_for_sampling(
-        model, state, x, t, cond_vecs, cap_centers, cap_d_maxes, rng
+        model, params, x, t, cond_vecs, cap_centers, cap_d_maxes, rng
     )
 
     # Solve ODE
@@ -1824,7 +1832,7 @@ def generate_samples(
             t = i * dt
             x = spherical_rk4_step_with_model(
                 model,
-                state,
+                params,
                 x,
                 t,
                 dt,
@@ -1843,14 +1851,14 @@ def generate_samples(
 
 
 @partial(jax.jit, static_argnames=("model", "n_projections"))
-def hutchinson_estimator(model, state, x, t, cond_vecs, step_rng, n_projections):
+def hutchinson_estimator(model, params, x, t, cond_vecs, step_rng, n_projections):
     """
     Estimate the divergence of a vector field on a spherical manifold using Hutchinson's trace
     estimator. Properly handles the (d-1)-dimensional tangent space of the d-dimensional sphere.
 
     Args:
         model: Vector field model
-        state: Training state with model parameters
+        params: Model parameters
         x: Current points on the sphere [batch_size, dim]
         t: Current time
         cond_vecs: Conditioning vectors [batch_size, cond_dim]
@@ -1864,14 +1872,14 @@ def hutchinson_estimator(model, state, x, t, cond_vecs, step_rng, n_projections)
 
 
 @partial(jax.jit, static_argnames=("model",))
-def exact_divergence(model, state, x, t, cond_vecs, step_rng=None, n_projections=None):
+def exact_divergence(model, params, x, t, cond_vecs, step_rng=None, n_projections=None):
     """
     Compute the exact divergence of a vector field on a spherical manifold.
     Has the same interface as hutchinson_estimator for easy substitution.
 
     Args:
         model: Vector field model
-        state: Training state with model parameters
+        params: Model parameters
         x: Current points on the sphere [batch_size, dim]
         t: Current time (scalar)
         cond_vecs: Conditioning vectors [batch_size, cond_dim]
@@ -1895,7 +1903,7 @@ def exact_divergence(model, state, x, t, cond_vecs, step_rng=None, n_projections
             # t is a scalar; we wrap it as [t] to form a batch of one.
             # cond has shape [cond_dim] and we reshape it to [1, cond_dim].
             return model.apply(
-                state.params, x_single[None, :], jnp.array([t]), cond[None, :]
+                params, x_single[None, :], jnp.array([t]), cond[None, :]
             )[0]
 
         # Compute the Jacobian (of shape [dim, dim]) with respect to x_i.
@@ -1910,14 +1918,14 @@ def exact_divergence(model, state, x, t, cond_vecs, step_rng=None, n_projections
 
 @partial(jax.jit, static_argnames=("model", "n_steps", "n_projections"))
 def _reverse_path_and_compute_divergence(
-    model, model_state, samples, cond_vecs, n_steps, rng, n_projections=1
+    model, params, samples, cond_vecs, n_steps, rng, n_projections=1
 ):
     """
     Compute the reverse path and integrate the divergence.
 
     Args:
         model: Vector field model
-        model_state: Training state with model parameters
+        params: Model parameters
         samples: Points on the sphere to evaluate [batch_size, dim]
         cond_vecs: Conditioning vectors [batch_size, cond_dim]
         n_steps: Number of integration steps
@@ -1946,14 +1954,14 @@ def _reverse_path_and_compute_divergence(
         # Compute divergence at current point
         step_rng, rng = jax.random.split(rng)
         div_t = exact_divergence(
-            model, model_state, x_t, t, cond_vecs, step_rng, n_projections
+            model, params, x_t, t, cond_vecs, step_rng, n_projections
         )
         div_sum = div_sum + div_t * (1.0 / n_steps)
 
         # Take a step backward along the path
         next_x = spherical_rk4_step_with_model(
             model,
-            model_state,
+            params,
             x_t,
             t,
             -1.0 / n_steps,
@@ -1972,14 +1980,14 @@ def _reverse_path_and_compute_divergence(
 
 
 def compute_log_probability(
-    model, state, samples, cond_vecs, n_steps=100, rng=None, n_projections=1
+    model, params, samples, cond_vecs, n_steps=100, rng=None, n_projections=1
 ):
     """
     Compute the log probability of samples under the flow-matching model.
 
     Args:
         model: Vector field model
-        state: Training state with model parameters
+        params: Model parameters
         samples: Points on the sphere to evaluate [batch_size, dim]
         cond_vecs: Conditioning vectors [batch_size, cond_dim]
         n_steps: Number of integration steps
@@ -1999,7 +2007,7 @@ def compute_log_probability(
     samples = samples / jnp.linalg.norm(samples, axis=1, keepdims=True)
 
     div_sum = _reverse_path_and_compute_divergence(
-        model, state, samples, cond_vecs, n_steps, rng, n_projections
+        model, params, samples, cond_vecs, n_steps, rng, n_projections
     )
 
     # Density of the base distribution
@@ -2009,6 +2017,23 @@ def compute_log_probability(
     )
     log_p1 = log_p0 - div_sum
     return log_p1
+
+
+# Used only for test below. It's important that this hashes to different values depending on the
+# field, so the divergence functions get recompiled for the two fields.
+@dataclass(frozen=True)
+class _DummyModel:
+    domain_dim: int
+    conditioning_dim: int
+    field: str
+
+    def apply(self, params, x, t, cond_vecs, rngs=None):
+        if self.field == "zero_divergence":
+            return jax.vmap(lambda x_i: jnp.array([-x_i[1], x_i[0], 0]))(x)
+        elif self.field == "variable_divergence":
+            return jax.vmap(lambda x_i: jnp.array([0, 0, 1]) - x_i * x_i[2])(x)
+        else:
+            raise ValueError(f"Unknown field: {self.field}")
 
 
 @pytest.mark.parametrize(
@@ -2039,40 +2064,14 @@ def test_divergence_estimate(divergence_fn, n_projections, field):
         n_projections: Number of random projections to use (only for hutchinson_estimator)
     """
 
-    # Create a simple vector field with known divergence on the sphere
-    def simple_vector_field(params, x, t, cond_vecs):
-        if field == "zero_divergence":
-            # Always 0
-            return jax.vmap(lambda x_i: jnp.array([-x_i[1], x_i[0], 0]))(x)
-        elif field == "variable_divergence":
-            # -2 * x[2]
-            return jax.vmap(lambda x_i: jnp.array([0, 0, 1]) - x_i * x_i[2])(x)
-        else:
-            raise ValueError(f"Unknown field: {field}")
-
-    # Create a dummy model
-    model = VectorField(
-        activations_dtype=jnp.float32,
-        weights_dtype=jnp.float32,
+    model = _DummyModel(
         domain_dim=3,
         conditioning_dim=0,
-        reference_directions=1,
-        n_layers=1,
-        d_model=16,
-        time_dim=2,
-        mlp_expansion_factor=2,
-        use_pre_mlp_projection=False,
-        input_dropout_rate=None,
-        mlp_dropout_rate=None,
+        field=field,
     )
 
     # Create state with patched apply function
     rng = jax.random.PRNGKey(42)
-    state = create_train_state(rng, model, 1e-3)
-
-    # Replace the model's apply function with our test field
-    original_apply = model.apply
-    model.apply = simple_vector_field
 
     # Generate test points
     batch_size = 1000
@@ -2091,7 +2090,7 @@ def test_divergence_estimate(divergence_fn, n_projections, field):
     cond_vecs = jnp.zeros((batch_size, 0))
 
     # Call the appropriate divergence function
-    div_estimates = divergence_fn(model, state, x, t, cond_vecs, rng, n_projections)
+    div_estimates = divergence_fn(model, {}, x, t, cond_vecs, rng, n_projections)
 
     # Calculate error
     error = jnp.abs(div_estimates - expected_divergence)
@@ -2109,9 +2108,6 @@ def test_divergence_estimate(divergence_fn, n_projections, field):
         assert (
             abs(mean_error) < 0.2
         ), f"Hutchinson estimator not calculating correct divergence: got {mean_error}, expected {expected_divergence}"
-
-    # Restore original apply function
-    model.apply = original_apply
 
 
 def test_vector_field_evaluation():
@@ -2594,7 +2590,7 @@ def test_train_cap_conditioned_model(domain_dim, kappa_1, epochs):
         # Higher number of steps and RK4 method dramatically improves cap constraint satisfaction
         cap_samples = generate_samples(
             model,
-            train_state,
+            train_state.params,
             pt_sample_rng,
             n_samples,
             cap_centers=centers,
