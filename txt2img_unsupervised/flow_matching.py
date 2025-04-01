@@ -410,10 +410,9 @@ class VectorField(nn.Module):
         Returns:
             Tuple of (x, t, cond_vec) with appropriate shapes for initialization.
         """
-        batch_size = 2
-        x = jnp.ones((batch_size, self.domain_dim))
-        t = jnp.ones((batch_size,))
-        cond_vec = jnp.ones((batch_size, self.conditioning_dim))
+        x = jnp.ones((1, self.domain_dim))
+        t = jnp.ones((1,))
+        cond_vec = jnp.ones((1, self.conditioning_dim))
         return x, t, cond_vec
 
     def __call__(self, x, t, cond_vec):
@@ -2435,11 +2434,10 @@ class CapConditionedVectorField(VectorField):
         Returns:
             Tuple of (x, t, cap_centers, cap_d_maxes) with appropriate shapes for initialization.
         """
-        batch_size = 2
-        x = jnp.ones((batch_size, self.domain_dim))
-        t = jnp.ones((batch_size,))
-        cap_centers = jnp.ones((batch_size, self.domain_dim))
-        cap_d_maxes = jnp.ones((batch_size,))
+        x = jnp.ones((1, self.domain_dim))
+        t = jnp.ones((1,))
+        cap_centers = jnp.ones((1, self.domain_dim))
+        cap_d_maxes = jnp.ones((1,))
         return x, t, cap_centers, cap_d_maxes
 
     def __call__(self, x, t, cap_centers, cap_d_maxes):
