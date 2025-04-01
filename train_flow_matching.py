@@ -12,9 +12,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import wandb
+import matplotlib.pyplot as plt
 from distutils.util import strtobool
 from functools import partial
 from jax.sharding import NamedSharding, PartitionSpec
+from math import ceil
 from pathlib import Path
 from tqdm import tqdm, trange
 from typing import Optional
@@ -27,6 +29,8 @@ from txt2img_unsupervised.config import (
 from txt2img_unsupervised.flow_matching import (
     compute_batch_loss,
     LogitsTable,
+    sample_loop,
+    create_mollweide_projection_figure,
 )
 from txt2img_unsupervised.train_data_loading import get_batch
 from txt2img_unsupervised.training_infra import (
@@ -59,6 +63,18 @@ def parse_arguments():
         type=str,
         default="clip_embedding",
         help="Column name in the dataset that contains the vectors to train on",
+    )
+    parser.add_argument(
+        "--viz-samples",
+        type=int,
+        default=100,
+        help="Number of samples to generate for visualization (only used when domain_dim=3)",
+    )
+    parser.add_argument(
+        "--viz-batch-size",
+        type=int,
+        default=2048,
+        help="Number of samples to generate for visualization (only used when domain_dim=3)",
     )
 
     # Add arguments for FlowMatchingModelConfig fields
@@ -139,6 +155,66 @@ def init_train_state(
     )
 
 
+def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step):
+    """
+    Generate samples from the model and visualize them using a Mollweide projection.
+
+    Args:
+        mdl: The model instance
+        params: Model parameters
+        n_samples: Number of samples to generate
+        batch_size: Batch size for generation
+        rng: JAX random key
+        step: Current training step (for logging)
+
+    Returns:
+        None, but logs the visualization to wandb
+    """
+    # Only visualize for 3D models
+    if mdl.domain_dim != 3:
+        return
+
+    # Generate random unit vectors as cap centers for unconditioned sampling
+    centers_rng, samples_rng = jax.random.split(rng)
+
+    cap_centers = jax.random.normal(centers_rng, (n_samples, mdl.domain_dim))
+    cap_centers = cap_centers / jnp.linalg.norm(cap_centers, axis=1, keepdims=True)
+
+    # Use maximum cap size (2.0) for unconditioned sampling
+    cap_d_maxes = jnp.full((n_samples,), 2.0)
+
+    # Generate samples using the sample_loop function
+    samples = sample_loop(
+        mdl,
+        params,
+        n_samples,
+        batch_size,
+        samples_rng,
+        cap_centers=cap_centers,
+        cap_d_maxes=cap_d_maxes,
+    )
+
+    samples = jax.device_get(samples)
+    assert samples.shape == (n_samples, 3), f"Samples shape: {samples.shape}"
+
+    # Create visualization using the function from flow_matching.py
+    fig = create_mollweide_projection_figure(
+        samples, title=f"Flow Matching Model Samples at Step {step}"
+    )
+
+    # Log to wandb directly with the figure object
+    wandb.log(
+        {
+            "global_step": step,
+            "model_samples": wandb.Image(
+                fig, caption=f"Spherical Distribution (Step {step})"
+            ),
+        }
+    )
+
+    plt.close(fig)
+
+
 def save_checkpoint_and_evaluate(
     my_train_state,
     global_step: int,
@@ -150,11 +226,22 @@ def save_checkpoint_and_evaluate(
     kappa_value: float,
     logits_table,
     vector_column: str = "clip_embedding",
+    viz_samples: int = 100,
+    viz_batch_size: int = 2048,
 ) -> None:
     """Save checkpoint and evaluate on test dataset."""
     save_checkpoint(my_train_state, checkpoint_manager, global_step, skip_saving)
 
     eval_params = my_train_state.get_eval_params()
+
+    # Generate and visualize samples if domain_dim is 3
+    if mdl.domain_dim == 3:
+        viz_rng = jax.random.PRNGKey(
+            global_step
+        )  # Use step as seed for reproducibility
+        visualize_model_samples(
+            mdl, eval_params, viz_samples, viz_batch_size, viz_rng, global_step
+        )
 
     losses = []
     test_rng = jax.random.PRNGKey(7357)
@@ -233,6 +320,8 @@ def slow_post_step_hook(loss, state, global_step, norm):
             kappa_value=args.kappa_value,
             logits_table=cap_logits_table,
             vector_column=args.vector_column,
+            viz_samples=args.viz_samples,
+            viz_batch_size=args.viz_batch_size,
         )
         exit(0)
 
@@ -352,6 +441,8 @@ if __name__ == "__main__":
             kappa_value=kwargs.get("kappa_value", args.kappa_value),
             logits_table=kwargs.get("logits_table", cap_logits_table),
             vector_column=kwargs.get("vector_column", args.vector_column),
+            viz_samples=kwargs.get("viz_samples", args.viz_samples),
+            viz_batch_size=kwargs.get("viz_batch_size", args.viz_batch_size),
         ),
     )
     signal_handler = SignalHandler()
@@ -406,4 +497,6 @@ if __name__ == "__main__":
             kappa_value=args.kappa_value,
             logits_table=cap_logits_table,
             vector_column=args.vector_column,
+            viz_samples=args.viz_samples,
+            viz_batch_size=args.viz_batch_size,
         )

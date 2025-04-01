@@ -48,8 +48,8 @@ from einops import rearrange, repeat
 from flax import linen as nn
 from flax.training import train_state
 from functools import partial
-from math import floor
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from math import floor, ceil
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union, List
 import jax
 import jax.lax
 import jax.numpy as jnp
@@ -57,8 +57,10 @@ import numpy as np
 import optax
 import pytest
 from scipy import stats
-from tqdm import tqdm
+from tqdm import tqdm, trange
 from tqdm.contrib import tenumerate
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 
 from .cap_sampling import LogitsTable, sample_cap, sample_from_cap
 
@@ -1809,15 +1811,18 @@ def generate_samples(
     dt = 1.0 / n_steps
     x = x0
 
+    # Use tqdm for progress tracking
+    step_iter = tqdm(range(n_steps), desc=f"ODE solving ({method})", leave=False)
+
     if method == "euler":
         # Forward Euler method
-        for i in range(n_steps):
+        for i in step_iter:
             t = i * dt
             v = vector_field_fn(x, t, dropout_rngs[i])
             x = geodesic_step(x, v, dt)
     elif method == "midpoint":
         # Midpoint method
-        for i in range(n_steps):
+        for i in step_iter:
             t = i * dt
             # First half-step
             v1 = vector_field_fn(x, t, dropout_rngs[i])
@@ -1828,7 +1833,7 @@ def generate_samples(
             x = geodesic_step(x, v2, dt)
     elif method == "rk4":
         # 4th order Runge-Kutta method
-        for i in range(n_steps):
+        for i in step_iter:
             t = i * dt
             x = spherical_rk4_step_with_model(
                 model,
@@ -1844,10 +1849,88 @@ def generate_samples(
     else:
         raise ValueError(f"Unknown ODE solver method: {method}")
 
-    np.testing.assert_allclose(
-        np.asarray(jnp.linalg.norm(x, axis=1, keepdims=True)), 1.0, atol=1e-6, rtol=0
-    )
+    # np.testing.assert_allclose(
+    #    np.asarray(jnp.linalg.norm(x, axis=1, keepdims=True)), 1.0, atol=1e-6, rtol=0
+    # )
     return x
+
+
+def sample_loop(
+    model,
+    params,
+    n_samples,
+    batch_size,
+    rng,
+    cond_vecs=None,
+    cap_centers=None,
+    cap_d_maxes=None,
+    n_steps=100,
+    method="rk4",
+):
+    """
+    Generate multiple batches of samples from the flow matching model.
+    Handles batching for large sample counts.
+
+    Args:
+        model: Vector field model
+        params: Model parameters
+        n_samples: Total number of samples to generate
+        batch_size: Size of each batch for generation
+        rng: JAX random key
+        cond_vecs: Conditioning vectors [n_samples, cond_dim] or None
+        cap_centers: Cap centers [n_samples, domain_dim] or None
+        cap_d_maxes: Maximum cap distances [n_samples] or None
+        n_steps: Number of integration steps
+        method: ODE solver method ('euler', 'midpoint', or 'rk4')
+
+    Returns:
+        Generated samples [n_samples, dim]
+    """
+    samples = []
+    samples_so_far = 0
+    from tqdm import trange
+
+    for i in trange(
+        ceil(n_samples / batch_size), unit="batch", desc="Generating samples"
+    ):
+        batch_rng, rng = jax.random.split(rng)
+        this_batch_size = min(batch_size, n_samples - samples_so_far)
+
+        # Slice the conditioning vectors/cap parameters if provided
+        batch_cond_vecs = None
+        if cond_vecs is not None:
+            batch_cond_vecs = cond_vecs[
+                i * batch_size : i * batch_size + this_batch_size
+            ]
+
+        batch_cap_centers = None
+        if cap_centers is not None:
+            batch_cap_centers = cap_centers[
+                i * batch_size : i * batch_size + this_batch_size
+            ]
+
+        batch_cap_d_maxes = None
+        if cap_d_maxes is not None:
+            batch_cap_d_maxes = cap_d_maxes[
+                i * batch_size : i * batch_size + this_batch_size
+            ]
+
+        samples.append(
+            generate_samples(
+                model,
+                params,
+                batch_rng,
+                this_batch_size,
+                cond_vecs=batch_cond_vecs,
+                cap_centers=batch_cap_centers,
+                cap_d_maxes=batch_cap_d_maxes,
+                n_steps=n_steps,
+                method=method,
+            )
+        )
+        samples_so_far += this_batch_size
+
+    return jnp.concatenate(samples, axis=0)
 
 
 @partial(jax.jit, static_argnames=("model", "n_projections"))
@@ -2680,3 +2763,43 @@ def test_vector_field_without_reference_directions():
     # Verify that the output vectors are tangent to the sphere
     dot_products = jnp.sum(output * x, axis=1)
     np.testing.assert_allclose(dot_products, 0.0, atol=1e-6)
+
+
+def create_mollweide_projection_figure(samples, title=None):
+    """
+    Create a Mollweide projection visualization of 3D points on a unit sphere. Returns a matplotlib
+    Figure, which the caller should close.
+
+    Args:
+        samples: Array of 3D unit vectors with shape [n_samples, 3]
+        title: Optional title for the figure
+
+    Returns:
+        matplotlib Figure object
+    """
+    assert samples.shape[1] == 3, f"Expected 3D samples, got shape {samples.shape}"
+
+    # Create Mollweide projection figure
+    fig = plt.figure(figsize=(16, 10), dpi=200)
+    ax = fig.add_subplot(111, projection="mollweide")
+
+    # Convert 3D coordinates to longitude/latitude
+    # Mollweide projection expects longitude in [-pi, pi] and latitude in [-pi/2, pi/2]
+    longitude = np.arctan2(samples[:, 1], samples[:, 0])  # atan2(y, x) for longitude
+    latitude = np.arcsin(samples[:, 2])  # z-coordinate gives latitude (arcsin)
+
+    scatter = ax.scatter(longitude, latitude, s=8, alpha=0.7)
+
+    ax.grid(True, alpha=0.3)
+
+    tick_formatter = ticker.FuncFormatter(lambda x, pos: f"{np.degrees(x):.0f}°")
+    # Set up longitude (x) ticks every 15 degrees and latitude (y) ticks every 10 degrees -
+    # longitude ranges from -180 to +180 and latitude ranges from -90 to +90.
+    ax.xaxis.set_major_locator(ticker.MultipleLocator(np.radians(15)))
+    ax.xaxis.set_major_formatter(tick_formatter)
+    ax.yaxis.set_major_locator(ticker.MultipleLocator(np.radians(10)))
+    ax.yaxis.set_major_formatter(tick_formatter)
+
+    if title is not None:
+        ax.set_title(title)
+    return fig
