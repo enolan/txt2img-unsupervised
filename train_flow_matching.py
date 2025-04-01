@@ -206,9 +206,7 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step):
     wandb.log(
         {
             "global_step": step,
-            "model_samples": wandb.Image(
-                fig, caption=f"Spherical Distribution (Step {step})"
-            ),
+            "model_samples": wandb.Image(fig),
         }
     )
 
