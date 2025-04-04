@@ -28,8 +28,11 @@ from txt2img_unsupervised.config import (
 )
 from txt2img_unsupervised.flow_matching import (
     compute_batch_loss,
+    compute_log_probability,
+    CapConditionedVectorField,
     LogitsTable,
     sample_loop,
+    sample_cap,
     create_mollweide_projection_figure,
 )
 from txt2img_unsupervised.train_data_loading import get_batch
@@ -75,6 +78,18 @@ def parse_arguments():
         type=int,
         default=2048,
         help="Number of samples to generate for visualization (only used when domain_dim=3)",
+    )
+    parser.add_argument(
+        "--integration-steps",
+        type=int,
+        default=16,
+        help="Number of integration steps for both sampling and NLL calculation",
+    )
+    parser.add_argument(
+        "--nll-n-projections",
+        type=int,
+        default=1,
+        help="Number of projections for NLL calculation during evaluation",
     )
 
     # Add arguments for FlowMatchingModelConfig fields
@@ -155,7 +170,7 @@ def init_train_state(
     )
 
 
-def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step):
+def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_steps=100):
     """
     Generate samples from the model and visualize them using a Mollweide projection.
 
@@ -166,6 +181,7 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step):
         batch_size: Batch size for generation
         rng: JAX random key
         step: Current training step (for logging)
+        n_steps: Number of integration steps for sample generation
 
     Returns:
         None, but logs the visualization to wandb
@@ -192,6 +208,7 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step):
         samples_rng,
         cap_centers=cap_centers,
         cap_d_maxes=cap_d_maxes,
+        n_steps=n_steps,
     )
 
     samples = jax.device_get(samples)
@@ -226,6 +243,8 @@ def save_checkpoint_and_evaluate(
     vector_column: str = "clip_embedding",
     viz_samples: int = 100,
     viz_batch_size: int = 2048,
+    integration_steps: int = 100,
+    nll_n_projections: int = 1,
 ) -> None:
     """Save checkpoint and evaluate on test dataset."""
     save_checkpoint(my_train_state, checkpoint_manager, global_step, skip_saving)
@@ -238,17 +257,24 @@ def save_checkpoint_and_evaluate(
             global_step
         )  # Use step as seed for reproducibility
         visualize_model_samples(
-            mdl, eval_params, viz_samples, viz_batch_size, viz_rng, global_step
+            mdl,
+            eval_params,
+            viz_samples,
+            viz_batch_size,
+            viz_rng,
+            global_step,
+            n_steps=integration_steps,
         )
 
     losses = []
+    nlls = []
     test_rng = jax.random.PRNGKey(7357)
 
     for batch_idx in trange(
         len(test_dataset) // training_cfg.batch_size,
         desc="test batches",
     ):
-        test_rng, batch_rng = jax.random.split(test_rng)
+        test_rng, batch_rng, nll_batch_rng = jax.random.split(test_rng, 3)
 
         batch = get_batch(
             test_dataset,
@@ -269,9 +295,41 @@ def save_checkpoint_and_evaluate(
         )
         losses.append(loss)
 
+        # Compute NLL using full caps. It's non-obvious what the correct way to test NLL with
+        # conditioning is, and the stat without conditioning is clearly useful.
+        batch_size = test_batch["point_vec"].shape[0]
+        cap_centers = jax.random.normal(nll_batch_rng, (batch_size, mdl.domain_dim))
+        cap_centers = cap_centers / jnp.linalg.norm(cap_centers, axis=1, keepdims=True)
+
+        cap_d_maxes = jnp.full((batch_size,), 2.0)
+
+        log_prob = compute_log_probability(
+            mdl,
+            eval_params,
+            test_batch["point_vec"],
+            cond_vecs=None,
+            n_steps=integration_steps,
+            rng=nll_batch_rng,
+            n_projections=nll_n_projections,
+            cap_centers=cap_centers,
+            cap_d_maxes=cap_d_maxes,
+        )
+        nll = -jnp.mean(log_prob)
+        nlls.append(nll)
+
     test_loss = jnp.mean(jnp.stack(losses))
-    wandb.log({"global_step": global_step, "test/loss": test_loss})
-    tqdm.write(f"Test loss at step {global_step}: {test_loss:.4f}")
+    test_nll = jnp.mean(jnp.stack(nlls))
+
+    wandb.log(
+        {
+            "global_step": global_step,
+            "test/loss": test_loss,
+            "test/nll": test_nll,
+        }
+    )
+    tqdm.write(
+        f"Test loss at step {global_step}: {test_loss:.4f}, Test NLL: {test_nll:.4f}"
+    )
 
 
 # Fast path hook that runs operations that don't need the full train state
@@ -320,6 +378,8 @@ def slow_post_step_hook(loss, state, global_step, norm):
             vector_column=args.vector_column,
             viz_samples=args.viz_samples,
             viz_batch_size=args.viz_batch_size,
+            integration_steps=args.integration_steps,
+            nll_n_projections=args.nll_n_projections,
         )
         exit(0)
 
@@ -441,6 +501,8 @@ if __name__ == "__main__":
             vector_column=kwargs.get("vector_column", args.vector_column),
             viz_samples=kwargs.get("viz_samples", args.viz_samples),
             viz_batch_size=kwargs.get("viz_batch_size", args.viz_batch_size),
+            integration_steps=kwargs.get("integration_steps", args.integration_steps),
+            nll_n_projections=kwargs.get("nll_n_projections", args.nll_n_projections),
         ),
     )
     signal_handler = SignalHandler()
@@ -497,4 +559,6 @@ if __name__ == "__main__":
             vector_column=args.vector_column,
             viz_samples=args.viz_samples,
             viz_batch_size=args.viz_batch_size,
+            integration_steps=args.integration_steps,
+            nll_n_projections=args.nll_n_projections,
         )

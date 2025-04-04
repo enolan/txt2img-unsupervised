@@ -1161,10 +1161,10 @@ def _train_loop_for_tests(
                         model,
                         state.params,
                         batch["point_vec"],
-                        batch["cond_vec"],
-                        100,
-                        nll_rng,
-                        10,
+                        cond_vecs=batch["cond_vec"],
+                        n_steps=100,
+                        rng=nll_rng,
+                        n_projections=10,
                     )
                     train_nll = float(np.mean(train_nlls))
                 if first_step:
@@ -1210,10 +1210,10 @@ def _train_loop_for_tests(
                             model,
                             state.params,
                             test_batch["point_vec"],
-                            test_batch["cond_vec"],
-                            100,
-                            test_nll_rng,
-                            10,
+                            cond_vecs=test_batch["cond_vec"],
+                            n_steps=100,
+                            rng=test_nll_rng,
+                            n_projections=10,
                         )
                     )
 
@@ -1933,7 +1933,17 @@ def sample_loop(
 
 
 @partial(jax.jit, static_argnames=("model", "n_projections"))
-def hutchinson_estimator(model, params, x, t, cond_vecs, step_rng, n_projections):
+def hutchinson_estimator(
+    model,
+    params,
+    x,
+    t,
+    cond_vecs=None,
+    cap_centers=None,
+    cap_d_maxes=None,
+    step_rng=None,
+    n_projections=None,
+):
     """
     Estimate the divergence of a vector field on a spherical manifold using Hutchinson's trace
     estimator. Properly handles the (d-1)-dimensional tangent space of the d-dimensional sphere.
@@ -1950,21 +1960,32 @@ def hutchinson_estimator(model, params, x, t, cond_vecs, step_rng, n_projections
     Returns:
         Divergence estimate [batch_size]
     """
-    pass
+    raise NotImplementedError("Hutchinson estimator not implemented yet")
 
 
 @partial(jax.jit, static_argnames=("model",))
-def exact_divergence(model, params, x, t, cond_vecs, step_rng=None, n_projections=None):
+def exact_divergence(
+    model,
+    params,
+    x,
+    t,
+    cond_vecs=None,
+    cap_centers=None,
+    cap_d_maxes=None,
+    step_rng=None,
+    n_projections=None,
+):
     """
     Compute the exact divergence of a vector field on a spherical manifold.
-    Has the same interface as hutchinson_estimator for easy substitution.
 
     Args:
-        model: Vector field model
+        model: Vector field model (VectorField or CapConditionedVectorField)
         params: Model parameters
         x: Current points on the sphere [batch_size, dim]
         t: Current time (scalar)
-        cond_vecs: Conditioning vectors [batch_size, cond_dim]
+        cond_vecs: Conditioning vectors [batch_size, cond_dim] (only for VectorField)
+        cap_centers: Cap centers [batch_size, domain_dim] (only for CapConditionedVectorField)
+        cap_d_maxes: Maximum cap distances [batch_size] (only for CapConditionedVectorField)
         step_rng: JAX random key (unused, but kept for interface compatibility)
         n_projections: Number of random projections (unused, but kept for interface compatibility)
 
@@ -1974,42 +1995,74 @@ def exact_divergence(model, params, x, t, cond_vecs, step_rng=None, n_projection
     batch_size, dim = x.shape
     assert dim == model.domain_dim
     assert isinstance(t, float) or (isinstance(t, jnp.ndarray) and t.shape == ())
-    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
 
-    # Helper to compute divergence for a single instance.
-    def divergence_single(x_i, cond):
-        # Define a function f: R^(dim) -> R^(dim) that wraps model.apply.
-        # We add a batch dimension of 1 to x, t, and cond.
-        def f(x_single):
-            # x_single has shape [dim], so we reshape to [1, dim]
-            # t is a scalar; we wrap it as [t] to form a batch of one.
-            # cond has shape [cond_dim] and we reshape it to [1, cond_dim].
-            return model.apply(
-                params, x_single[None, :], jnp.array([t]), cond[None, :]
-            )[0]
+    if isinstance(model, CapConditionedVectorField):
+        assert (
+            cond_vecs is None
+        ), "cond_vecs should be None for CapConditionedVectorField"
+        assert (
+            cap_centers is not None
+        ), "cap_centers is required for CapConditionedVectorField"
+        assert (
+            cap_d_maxes is not None
+        ), "cap_d_maxes is required for CapConditionedVectorField"
+        assert cap_centers.shape == (batch_size, model.domain_dim)
+        assert cap_d_maxes.shape == (batch_size,)
 
-        # Compute the Jacobian (of shape [dim, dim]) with respect to x_i.
-        jac = jax.jacfwd(f)(x_i)
-        # The intrinsic divergence on the sphere is given by the trace of the projected Jacobian:
-        #   divergence = trace(Df) - x^T (Df) x
-        return jnp.trace(jac) - jnp.dot(x_i, jac @ x_i)
+        # Helper to compute divergence for cap-conditioned model
+        def divergence_single(x_i, center_i, d_max_i):
+            def f(x_single):
+                return model.apply(
+                    params,
+                    x_single[None, :],
+                    jnp.array([t]),
+                    center_i[None, :],
+                    d_max_i[None],
+                )[0]
 
-    # Vectorize the divergence computation over the batch dimension.
-    return jax.vmap(divergence_single)(x, cond_vecs)
+            jac = jax.jacfwd(f)(x_i)
+            return jnp.trace(jac) - jnp.dot(x_i, jac @ x_i)
+
+        return jax.vmap(divergence_single)(x, cap_centers, cap_d_maxes)
+    else:
+        assert cond_vecs is not None, "cond_vecs is required for VectorField"
+        assert cond_vecs.shape == (batch_size, model.conditioning_dim)
+
+        # Helper to compute divergence for regular vector field
+        def divergence_single(x_i, cond):
+            def f(x_single):
+                return model.apply(
+                    params, x_single[None, :], jnp.array([t]), cond[None, :]
+                )[0]
+
+            jac = jax.jacfwd(f)(x_i)
+            return jnp.trace(jac) - jnp.dot(x_i, jac @ x_i)
+
+        return jax.vmap(divergence_single)(x, cond_vecs)
 
 
 @partial(jax.jit, static_argnames=("model", "n_steps", "n_projections"))
 def _reverse_path_and_compute_divergence(
-    model, params, samples, cond_vecs, n_steps, rng, n_projections=1
+    model,
+    params,
+    samples,
+    cond_vecs=None,
+    cap_centers=None,
+    cap_d_maxes=None,
+    n_steps=100,
+    rng=None,
+    n_projections=1,
 ):
     """
     Compute the reverse path and integrate the divergence.
 
     Args:
-        model: Vector field model
+        model: Vector field model (VectorField or CapConditionedVectorField)
         params: Model parameters
         samples: Points on the sphere to evaluate [batch_size, dim]
-        cond_vecs: Conditioning vectors [batch_size, cond_dim]
+        cond_vecs: Conditioning vectors [batch_size, cond_dim] (only for VectorField)
+        cap_centers: Cap centers [batch_size, domain_dim] (only for CapConditionedVectorField)
+        cap_d_maxes: Maximum cap distances [batch_size] (only for CapConditionedVectorField)
         n_steps: Number of integration steps
         rng: JAX random key for stochastic estimation
         n_projections: Number of random projections to use for divergence estimation
@@ -2019,7 +2072,24 @@ def _reverse_path_and_compute_divergence(
     """
     batch_size = samples.shape[0]
     assert samples.shape == (batch_size, model.domain_dim)
-    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
+
+    if isinstance(model, CapConditionedVectorField):
+        assert (
+            cond_vecs is None
+        ), "cond_vecs should be None for CapConditionedVectorField"
+        assert (
+            cap_centers is not None
+        ), "cap_centers is required for CapConditionedVectorField"
+        assert (
+            cap_d_maxes is not None
+        ), "cap_d_maxes is required for CapConditionedVectorField"
+        assert cap_centers.shape == (batch_size, model.domain_dim)
+        assert cap_d_maxes.shape == (batch_size,)
+    else:
+        assert cond_vecs is not None, "cond_vecs is required for VectorField"
+        assert cond_vecs.shape == (batch_size, model.conditioning_dim)
+        assert cap_centers is None, "cap_centers should be None for VectorField"
+        assert cap_d_maxes is None, "cap_d_maxes should be None for VectorField"
 
     ts = jnp.linspace(1.0, 0.0, n_steps)
 
@@ -2036,7 +2106,15 @@ def _reverse_path_and_compute_divergence(
         # Compute divergence at current point
         step_rng, rng = jax.random.split(rng)
         div_t = exact_divergence(
-            model, params, x_t, t, cond_vecs, step_rng, n_projections
+            model,
+            params,
+            x_t,
+            t,
+            cond_vecs,
+            cap_centers,
+            cap_d_maxes,
+            step_rng,
+            n_projections,
         )
         div_sum = div_sum + div_t * (1.0 / n_steps)
 
@@ -2048,6 +2126,9 @@ def _reverse_path_and_compute_divergence(
             t,
             -1.0 / n_steps,
             cond_vecs,
+            cap_centers,
+            cap_d_maxes,
+            step_rng,
         )
 
         return next_x, div_sum, rng
@@ -2062,16 +2143,26 @@ def _reverse_path_and_compute_divergence(
 
 
 def compute_log_probability(
-    model, params, samples, cond_vecs, n_steps=100, rng=None, n_projections=1
+    model,
+    params,
+    samples,
+    cond_vecs=None,
+    cap_centers=None,
+    cap_d_maxes=None,
+    n_steps=100,
+    rng=None,
+    n_projections=1,
 ):
     """
     Compute the log probability of samples under the flow-matching model.
 
     Args:
-        model: Vector field model
+        model: Vector field model (VectorField or CapConditionedVectorField)
         params: Model parameters
         samples: Points on the sphere to evaluate [batch_size, dim]
-        cond_vecs: Conditioning vectors [batch_size, cond_dim]
+        cond_vecs: Conditioning vectors [batch_size, cond_dim] (only for VectorField)
+        cap_centers: Cap centers [batch_size, domain_dim] (only for CapConditionedVectorField)
+        cap_d_maxes: Maximum cap distances [batch_size] (only for CapConditionedVectorField)
         n_steps: Number of integration steps
         rng: JAX random key for stochastic estimation (if None, uses deterministic keys)
         n_projections: Number of random projections to use for divergence estimation
@@ -2081,15 +2172,39 @@ def compute_log_probability(
     """
     batch_size = samples.shape[0]
     assert samples.shape == (batch_size, model.domain_dim)
-    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
+
+    if isinstance(model, CapConditionedVectorField):
+        assert (
+            cond_vecs is None
+        ), "cond_vecs should be None for CapConditionedVectorField"
+        assert (
+            cap_centers is not None
+        ), "cap_centers is required for CapConditionedVectorField"
+        assert (
+            cap_d_maxes is not None
+        ), "cap_d_maxes is required for CapConditionedVectorField"
+        assert cap_centers.shape == (batch_size, model.domain_dim)
+        assert cap_d_maxes.shape == (batch_size,)
+    else:
+        assert cond_vecs is not None, "cond_vecs is required for VectorField"
+        assert cond_vecs.shape == (batch_size, model.conditioning_dim)
 
     if rng is None:
         rng = jax.random.PRNGKey(0)
+
     # Normalize samples to ensure they're on the unit sphere
     samples = samples / jnp.linalg.norm(samples, axis=1, keepdims=True)
 
     div_sum = _reverse_path_and_compute_divergence(
-        model, params, samples, cond_vecs, n_steps, rng, n_projections
+        model,
+        params,
+        samples,
+        cond_vecs=cond_vecs,
+        cap_centers=cap_centers,
+        cap_d_maxes=cap_d_maxes,
+        n_steps=n_steps,
+        rng=rng,
+        n_projections=n_projections,
     )
 
     # Density of the base distribution
@@ -2172,7 +2287,9 @@ def test_divergence_estimate(divergence_fn, n_projections, field):
     cond_vecs = jnp.zeros((batch_size, 0))
 
     # Call the appropriate divergence function
-    div_estimates = divergence_fn(model, {}, x, t, cond_vecs, rng, n_projections)
+    div_estimates = divergence_fn(
+        model, {}, x, t, cond_vecs=cond_vecs, step_rng=rng, n_projections=n_projections
+    )
 
     # Calculate error
     error = jnp.abs(div_estimates - expected_divergence)

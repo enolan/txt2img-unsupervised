@@ -381,7 +381,7 @@ def load_dataset(dir: Path) -> Tuple[Dataset, Dataset]:
         Tuple of (train_dataset, test_dataset)
     """
     dset_all = load_pq_dir(dir)
-    dset_split = dset_all.train_test_split(test_size=0.01, seed=19900515)
+    dset_split = dset_all.train_test_split(test_size=10_000, seed=19900515)
     train_dset = dset_split["train"]
     test_dset = dset_split["test"]
     print(f"Train set {train_dset.shape}, test set {test_dset.shape}")
