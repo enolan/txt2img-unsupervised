@@ -163,6 +163,7 @@ class FlowMatchingModelConfig(BaseModelConfig):
     mlp_expansion_factor: int
     mlp_dropout_rate: Optional[float]
     input_dropout_rate: Optional[float]
+    kappa_1: float
 
     # Optional parameters with defaults
     activations_dtype: jnp.dtype = jnp.float32

@@ -59,9 +59,6 @@ def parse_arguments():
 
     # Add flow matching-specific arguments
     parser.add_argument(
-        "--kappa-value", type=float, default=5.0, help="Kappa value for flow matching"
-    )
-    parser.add_argument(
         "--vector-column",
         type=str,
         default="clip_embedding",
@@ -117,6 +114,9 @@ def parse_arguments():
     )
     parser.add_argument(
         "--input-dropout-rate", type=float, help="Dropout rate for inputs"
+    )
+    parser.add_argument(
+        "--kappa-1", type=float, help="kappa_1, max concentration parameter"
     )
     parser.add_argument("--alpha-input", type=float, help="Alpha scaling for inputs")
     parser.add_argument("--alpha-output", type=float, help="Alpha scaling for outputs")
@@ -238,7 +238,6 @@ def save_checkpoint_and_evaluate(
     training_cfg,
     examples_sharding,
     mdl,
-    kappa_value: float,
     logits_table,
     vector_column: str = "clip_embedding",
     viz_samples: int = 100,
@@ -290,7 +289,6 @@ def save_checkpoint_and_evaluate(
             eval_params,
             test_batch,
             batch_rng,
-            kappa_value,
             logits_table,
         )
         losses.append(loss)
@@ -373,7 +371,6 @@ def slow_post_step_hook(loss, state, global_step, norm):
             training_cfg=training_cfg,
             examples_sharding=examples_sharding,
             mdl=mdl,
-            kappa_value=args.kappa_value,
             logits_table=cap_logits_table,
             vector_column=args.vector_column,
             viz_samples=args.viz_samples,
@@ -496,7 +493,6 @@ if __name__ == "__main__":
             training_cfg=kwargs.get("training_cfg", training_cfg),
             examples_sharding=kwargs.get("examples_sharding", examples_sharding),
             mdl=kwargs.get("mdl", mdl),
-            kappa_value=kwargs.get("kappa_value", args.kappa_value),
             logits_table=kwargs.get("logits_table", cap_logits_table),
             vector_column=kwargs.get("vector_column", args.vector_column),
             viz_samples=kwargs.get("viz_samples", args.viz_samples),
@@ -507,11 +503,11 @@ if __name__ == "__main__":
     )
     signal_handler = SignalHandler()
 
-    @partial(jax.jit, static_argnames=("mdl", "kappa_1"))
-    def loss_fn(params, batch, rng, mdl=None, kappa_1=5.0, logits_table=None):
+    @partial(jax.jit, static_argnames=("mdl"))
+    def loss_fn(params, batch, rng, mdl=None, logits_table=None):
         # The loss function expects a batch with 'point_vec' key
         flow_batch = {"point_vec": batch[args.vector_column]}
-        return compute_batch_loss(mdl, params, flow_batch, rng, kappa_1, logits_table)
+        return compute_batch_loss(mdl, params, flow_batch, rng, logits_table)
 
     train_state, global_step = train_loop(
         steps_per_epoch=steps_per_epoch,
@@ -534,9 +530,7 @@ if __name__ == "__main__":
                 sharding=examples_sharding,
             )
         ),
-        loss_fn=partial(
-            loss_fn, mdl=mdl, kappa_1=args.kappa_value, logits_table=cap_logits_table
-        ),
+        loss_fn=partial(loss_fn, mdl=mdl, logits_table=cap_logits_table),
         post_step_hook_fn=None,  # Not used with async implementation
         post_epoch_hook_fn=post_epoch_hook,
         fast_post_step_hook_fn=fast_post_step_hook,
@@ -554,7 +548,6 @@ if __name__ == "__main__":
             training_cfg=training_cfg,
             examples_sharding=examples_sharding,
             mdl=mdl,
-            kappa_value=args.kappa_value,
             logits_table=cap_logits_table,
             vector_column=args.vector_column,
             viz_samples=args.viz_samples,

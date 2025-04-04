@@ -66,10 +66,10 @@ def process_intermediates(intermediates):
 
 @partial(
     jax.jit,
-    static_argnames=["mdl", "kappa_1"],
+    static_argnames=["mdl"],
     donate_argnames=["rng"],
 )
-def compute_loss_no_grad(logits_tbl, mdl, kappa_1, params, rng, pts):
+def compute_loss_no_grad(logits_tbl, mdl, params, rng, pts):
     """Compute loss without gradients for test evaluation."""
     rng, next_rng = jax.random.split(rng)
     loss = flow_matching.compute_batch_loss(
@@ -77,14 +77,13 @@ def compute_loss_no_grad(logits_tbl, mdl, kappa_1, params, rng, pts):
         params,
         {"point_vec": pts},
         rng,
-        kappa_1,
         logits_tbl,
         capture_intermediates=False,
     )
     return loss, next_rng
 
 
-def compute_test_loss(logits_tbl, mdl, kappa_1, params, rng, test_pts, batch_size):
+def compute_test_loss(logits_tbl, mdl, params, rng, test_pts, batch_size):
     """Compute average loss over the test dataset."""
     n_batches = len(test_pts) // batch_size
     total_loss = 0.0
@@ -93,7 +92,7 @@ def compute_test_loss(logits_tbl, mdl, kappa_1, params, rng, test_pts, batch_siz
         start_idx = i * batch_size
         end_idx = start_idx + batch_size
         batch = test_pts[start_idx:end_idx]
-        loss, rng = compute_loss_no_grad(logits_tbl, mdl, kappa_1, params, rng, batch)
+        loss, rng = compute_loss_no_grad(logits_tbl, mdl, params, rng, batch)
         total_loss += loss
 
     return total_loss / n_batches
@@ -101,10 +100,10 @@ def compute_test_loss(logits_tbl, mdl, kappa_1, params, rng, test_pts, batch_siz
 
 @partial(
     jax.jit,
-    static_argnames=["mdl", "kappa_1"],
+    static_argnames=["mdl"],
     donate_argnames=["rng"],
 )
-def compute_gradients(logits_tbl, mdl, kappa_1, params, rng, pts):
+def compute_gradients(logits_tbl, mdl, params, rng, pts):
     """
     Compute gradients. This is split from apply_updates so we can do this on GPU and
     apply_updates on CPU.
@@ -116,7 +115,6 @@ def compute_gradients(logits_tbl, mdl, kappa_1, params, rng, pts):
         params,
         {"point_vec": pts},
         rng,
-        kappa_1,
         logits_tbl,
         capture_intermediates=True,
     )
@@ -146,7 +144,7 @@ str_devices = lambda x: jax.tree.map(lambda y: y.device, x)
 
 
 def train_step(
-    logits_tbl, mdl, opt, kappa_1, params, opt_state, rng, pts, use_cpu_offload=False
+    logits_tbl, mdl, opt, params, opt_state, rng, pts, use_cpu_offload=False
 ):
     """Complete training step, optionally with CPU-GPU split."""
     gpu_params = (
@@ -155,7 +153,7 @@ def train_step(
         else params
     )
     loss, processed_intermediates, grad, next_rng = compute_gradients(
-        logits_tbl, mdl, kappa_1, gpu_params, rng, pts
+        logits_tbl, mdl, gpu_params, rng, pts
     )
 
     if use_cpu_offload:
@@ -333,6 +331,7 @@ def main():
                 mlp_expansion_factor=args.mlp_expansion_factor,
                 mlp_dropout_rate=None,
                 input_dropout_rate=None,
+                kappa_1=args.kappa_1,
             )
             tqdm.write(f"Model: {model}")
             tqdm.write(f"m_d = {model.d_model_scale_factor}")
@@ -385,7 +384,6 @@ def main():
                         logits_table,
                         model,
                         opt,
-                        args.kappa_1,
                         params,
                         opt_state,
                         rng,
@@ -405,7 +403,6 @@ def main():
                 test_loss = compute_test_loss(
                     logits_table,
                     model,
-                    args.kappa_1,
                     params,
                     rng,
                     dset_test["vec"],

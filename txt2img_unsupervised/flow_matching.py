@@ -173,6 +173,8 @@ class VectorField(nn.Module):
     # Dropout rate for the input
     input_dropout_rate: Optional[float]
 
+    kappa_1: float
+
     activations_dtype: jnp.dtype = jnp.float32
     weights_dtype: jnp.dtype = jnp.float32
 
@@ -471,6 +473,7 @@ def test_vector_field_time_encoding_statistics(time_dim):
         mlp_dropout_rate=None,
         input_dropout_rate=None,
         use_pre_mlp_projection=False,
+        kappa_1=10.0,
     )
 
     params = model.init(rng, jnp.ones((1, 3)), jnp.ones((1,)), jnp.ones((1, 0)))
@@ -535,6 +538,7 @@ def test_vector_field_projections_normalization(domain_dim, conditioning_dim):
         mlp_expansion_factor=1,
         input_dropout_rate=None,
         mlp_dropout_rate=None,
+        kappa_1=10.0,
     )
 
     params_rng, sample_rng = jax.random.split(rng)
@@ -870,7 +874,6 @@ def conditional_flow_matching_loss(
     x1,
     t,
     conds=None,
-    kappa_1=10.0,
     logits_table=None,
     rng=None,
     capture_intermediates=False,
@@ -886,7 +889,6 @@ def conditional_flow_matching_loss(
         x1: Target samples from p1 (batched) [batch_size, dim]
         t: Time parameters (batched) in [0, 1] [batch_size]
         conds: Conditioning vectors (batched) [batch_size, cond_dim] (only for VectorField)
-        kappa_1: Concentration parameter of the final vMF distribution
         logits_table: LogitsTable for CapConditionedVectorField (required if model is CapConditionedVectorField)
         caps_rng: JAX random key for cap sampling (required if model is CapConditionedVectorField)
 
@@ -921,7 +923,7 @@ def conditional_flow_matching_loss(
 
     # Compute target vector field (ground truth OT field)
     target_field = jax.vmap(spherical_ot_field, in_axes=(0, 0, 0, None))(
-        psi_t, x1, t, kappa_1
+        psi_t, x1, t, model.kappa_1
     )
     assert target_field.shape == x0.shape
 
@@ -997,11 +999,9 @@ def sample_sphere(rng, batch_size, dim):
     return normal_samples / jnp.linalg.norm(normal_samples, axis=1, keepdims=True)
 
 
-@partial(
-    jax.jit, inline=True, static_argnames=("model", "kappa_1", "capture_intermediates")
-)
+@partial(jax.jit, inline=True, static_argnames=("model", "capture_intermediates"))
 def compute_batch_loss(
-    model, params, batch, rng, kappa_1, logits_table=None, capture_intermediates=False
+    model, params, batch, rng, logits_table=None, capture_intermediates=False
 ):
     """
     Compute the loss for a batch of data.
@@ -1011,7 +1011,6 @@ def compute_batch_loss(
         params: Model parameters
         batch: Batch of data containing "point_vec" and "cond_vec" (cond_vec only needed for VectorField)
         rng: JAX random key
-        kappa_1: Parameter for the flow matching loss
         logits_table: LogitsTable for CapConditionedVectorField (required if model is CapConditionedVectorField)
 
     Returns:
@@ -1046,23 +1045,19 @@ def compute_batch_loss(
         x1_batch,
         t,
         conds=conds,
-        kappa_1=kappa_1,
         logits_table=logits_table,
         rng=rng,
         capture_intermediates=capture_intermediates,
     )
 
 
-@partial(
-    jax.jit, static_argnames=("model", "kappa_1"), donate_argnames=("state", "rng")
-)
-def train_step(model, kappa_1, state, batch, rng, logits_table=None):
+@partial(jax.jit, static_argnames=("model"), donate_argnames=("state", "rng"))
+def train_step(model, state, batch, rng, logits_table=None):
     """
     Train for a single step.
 
     Args:
         model: The vector field model
-        kappa_1: Parameter for the flow matching loss
         state: Training state
         batch: Batch of data containing "point_vec" and "cond_vec"
         rng: JAX random key
@@ -1073,7 +1068,7 @@ def train_step(model, kappa_1, state, batch, rng, logits_table=None):
     rng, next_rng = jax.random.split(rng)
 
     def loss_fn(params):
-        loss = compute_batch_loss(model, params, batch, rng, kappa_1, logits_table)
+        loss = compute_batch_loss(model, params, batch, rng, logits_table)
         return loss
 
     grad_fn = jax.value_and_grad(loss_fn)
@@ -1092,7 +1087,6 @@ def _train_loop_for_tests(
     learning_rate,
     epochs,
     test_dataset=None,
-    kappa_1=10.0,
 ):
     """
     Simple training loop for unit tests.
@@ -1104,7 +1098,6 @@ def _train_loop_for_tests(
         learning_rate: Initial learning rate (will use cosine schedule)
         epochs: Number of epochs to train for
         test_dataset: Optional test dataset for evaluation after each epoch
-        kappa_1: Parameter for the flow matching loss
 
     Returns:
         state: Final training state
@@ -1149,7 +1142,7 @@ def _train_loop_for_tests(
                 np.testing.assert_allclose(np.asarray(norms), 1.0, rtol=0, atol=1e-6)
 
                 state, train_loss, grad_norm, step_rng = train_step(
-                    model, kappa_1, state, batch, step_rng
+                    model, state, batch, step_rng
                 )
 
                 step_count += 1
@@ -1200,7 +1193,7 @@ def _train_loop_for_tests(
                     )
 
                     batch_test_loss = compute_batch_loss(
-                        model, state.params, test_batch, test_batch_rng, kappa_1
+                        model, state.params, test_batch, test_batch_rng
                     )
 
                     test_losses.append(batch_test_loss)
@@ -1260,6 +1253,7 @@ _baseline_model = VectorField(
     input_dropout_rate=None,
     mlp_dropout_rate=None,
     use_pre_mlp_projection=True,
+    kappa_1=10.0,
 )
 
 
@@ -1274,7 +1268,7 @@ def test_train_trivial(domain_dim):
     first_dim_vec = first_dim_vec.at[0].set(1.0)
     points = repeat(first_dim_vec, "v -> b v", b=batch_size * 100)
     dset = Dataset.from_dict({"point_vec": points}).with_format("np")
-    state, loss = _train_loop_for_tests(model, dset, batch_size, 1e-3, 2, kappa_1=10.0)
+    state, loss = _train_loop_for_tests(model, dset, batch_size, 1e-3, 2)
     print(f"Final loss: {loss:.6f}")
     samples = generate_samples(
         model,
@@ -1377,7 +1371,7 @@ def test_train_vmf(domain_dim):
     """
     Train a model with data from a von Mises-Fisher distribution and evaluate the samples.
     """
-    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2)
+    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2, kappa_1=5.0)
 
     batch_size = 512
     n_samples = 32768
@@ -1403,7 +1397,7 @@ def test_train_vmf(domain_dim):
     print(f"vMF distribution entropy: {differential_entropy:.6f}")
 
     state, train_loss, test_loss, test_nll = _train_loop_for_tests(
-        model, dset, batch_size, 1e-3, 1, test_dset, kappa_1=5.0
+        model, dset, batch_size, 1e-3, 1, test_dset
     )
     print(f"Final train loss: {train_loss:.6f}")
     print(f"Final test loss: {test_loss:.6f}")
@@ -1463,7 +1457,11 @@ def test_train_conditional_vmf(domain_dim):
     When conditioning vector is 1, samples should come from the second vMF distribution.
     """
     model = replace(
-        _baseline_model, domain_dim=domain_dim, conditioning_dim=1, n_layers=2
+        _baseline_model,
+        domain_dim=domain_dim,
+        conditioning_dim=1,
+        n_layers=2,
+        kappa_1=5.0,
     )
 
     # Define two different vMF distributions
@@ -1505,7 +1503,6 @@ def test_train_conditional_vmf(domain_dim):
         1e-4 if domain_dim == 3 else 1e-3,
         4 if domain_dim == 3 else 8,
         test_dataset,
-        kappa_1=5.0,
     )
     print(
         f"Final loss - Train: {train_loss:.4f}, Test: {test_loss:.4f}, Test NLL: {test_nll:.4f}"
@@ -2330,6 +2327,7 @@ def test_vector_field_evaluation():
         use_pre_mlp_projection=False,
         input_dropout_rate=None,
         mlp_dropout_rate=None,
+        kappa_1=10.0,
     )
     state = create_train_state(rng, model, 1e-3)
 
@@ -2599,6 +2597,7 @@ def test_cap_conditioned_vector_field_normalization(domain_dim, reference_direct
         input_dropout_rate=None,
         mlp_dropout_rate=None,
         use_pre_mlp_projection=False,
+        kappa_1=10.0,
     )
 
     params_rng, sample_rng = jax.random.split(rng)
@@ -2685,6 +2684,7 @@ def test_train_cap_conditioned_model(domain_dim, kappa_1, epochs):
         input_dropout_rate=None,
         mlp_dropout_rate=None,
         use_pre_mlp_projection=True,
+        kappa_1=kappa_1,
     )
 
     distribution_rng, shuffle_rng, params_rng, train_rng, sample_rng = jax.random.split(
@@ -2736,7 +2736,7 @@ def test_train_cap_conditioned_model(domain_dim, kappa_1, epochs):
                 train_dset.iter(batch_size, drop_last_batch=True)
             ):
                 train_state, loss, grad_norm, train_rng = train_step(
-                    model, kappa_1, train_state, batch, train_rng, logits_table
+                    model, train_state, batch, train_rng, logits_table
                 )
                 pbar.set_postfix(loss=loss, grad_norm=grad_norm)
                 pbar.update(1)
@@ -2753,7 +2753,6 @@ def test_train_cap_conditioned_model(domain_dim, kappa_1, epochs):
                         train_state.params,
                         batch,
                         train_rng,
-                        kappa_1,
                         logits_table,
                     )
                 )
@@ -2848,6 +2847,7 @@ def test_vector_field_without_reference_directions():
         input_dropout_rate=None,
         activations_dtype=jnp.float32,
         weights_dtype=jnp.float32,
+        kappa_1=10.0,
     )
 
     # Initialize the model
