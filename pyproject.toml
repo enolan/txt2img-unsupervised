@@ -37,6 +37,7 @@ warcat = "^2.2.5"
 xdg-base-dirs = "^6.0.1"
 flash-attn-jax = "^0.2.2"
 rasterio = "^1.4.3"
+seaborn = "^0.13.2"
 
 [tool.poetry.group.cuda.dependencies]
 jax = {extras = ["cuda12"], version = "^0.4.33"}
