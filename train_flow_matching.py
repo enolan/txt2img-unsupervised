@@ -167,6 +167,19 @@ def init_train_state(
     )
 
 
+def mean_cosine_similarity(points: jnp.ndarray) -> float:
+    "Compute the mean cosine similarity between all pairs of unit vectors"
+    # Compute n x n matrix of singularities. Diagonal is self-similarity (all ones), matrix is
+    # symmetric across the diagonal.
+    similarities = points @ points.T
+    # Set the diagonal to 0.
+    similarities = similarities.at[
+        jnp.arange(points.shape[0]), jnp.arange(points.shape[0])
+    ].set(0)
+    # Compute the mean of the off-diagonal elements.
+    return jnp.mean(similarities)
+
+
 def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_steps=100):
     """
     Generate samples from the model and visualize them using a Mollweide projection.
@@ -196,7 +209,6 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_ste
     # Use maximum cap size (2.0) for unconditioned sampling
     cap_d_maxes = jnp.full((n_samples,), 2.0)
 
-    # Generate samples using the sample_loop function
     samples = sample_loop(
         mdl,
         params,
@@ -208,19 +220,20 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_ste
         n_steps=n_steps,
     )
 
+    mean_sim = mean_cosine_similarity(samples)
+
     samples = jax.device_get(samples)
     assert samples.shape == (n_samples, 3), f"Samples shape: {samples.shape}"
 
-    # Create visualization using the function from flow_matching.py
     fig = create_mollweide_projection_figure(
         samples, title=f"Flow Matching Model Samples at Step {step}"
     )
 
-    # Log to wandb directly with the figure object
     wandb.log(
         {
             "global_step": step,
             "model_samples": wandb.Image(fig),
+            "sample_mean_cosine_similarity": mean_sim,
         }
     )
 
@@ -418,6 +431,12 @@ def post_epoch_hook(state, epoch_idx, global_step):
     )
 
 
+def log_test_set_mean_cosine_similarity(test_dataset, vector_column):
+    vecs = test_dataset[vector_column]
+    mean_sim = mean_cosine_similarity(jax.device_put(vecs))
+    wandb.log({"test/mean_cosine_similarity": mean_sim})
+
+
 if __name__ == "__main__":
     args = parse_arguments()
 
@@ -437,6 +456,8 @@ if __name__ == "__main__":
     )
 
     train_dataset, test_dataset = load_dataset(args.pq_dir)
+
+    log_test_set_mean_cosine_similarity(test_dataset, args.vector_column)
 
     (
         steps_per_epoch,
