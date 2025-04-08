@@ -115,9 +115,6 @@ def parse_arguments():
     parser.add_argument(
         "--input-dropout-rate", type=float, help="Dropout rate for inputs"
     )
-    parser.add_argument(
-        "--kappa-1", type=float, help="kappa_1, max concentration parameter"
-    )
     parser.add_argument("--alpha-input", type=float, help="Alpha scaling for inputs")
     parser.add_argument("--alpha-output", type=float, help="Alpha scaling for outputs")
 

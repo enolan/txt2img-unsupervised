@@ -212,7 +212,6 @@ def main():
     parser.add_argument("--use-pre-mlp-projection", type=bool, required=True)
     parser.add_argument("--n-layers", type=int, required=True)
     parser.add_argument("--mlp-expansion-factor", type=int, required=False, default=4)
-    parser.add_argument("--kappa-1", type=float, required=False, default=5.0)
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--n-seeds", type=int, required=False, default=5)
     parser.add_argument(
@@ -331,7 +330,6 @@ def main():
                 mlp_expansion_factor=args.mlp_expansion_factor,
                 mlp_dropout_rate=None,
                 input_dropout_rate=None,
-                kappa_1=args.kappa_1,
             )
             tqdm.write(f"Model: {model}")
             tqdm.write(f"m_d = {model.d_model_scale_factor}")
@@ -484,7 +482,6 @@ def generate_activation_charts(d_model_values, activations, n_layers, args):
         "use_pre_mlp_projection": args.use_pre_mlp_projection,
         "n_layers": args.n_layers,
         "mlp_expansion_factor": args.mlp_expansion_factor,
-        "kappa_1": args.kappa_1,
         "batch_size": args.batch_size,
         "n_seeds": args.n_seeds,
         "n_train_steps": args.n_train_steps,
@@ -615,7 +612,6 @@ def generate_loss_charts(d_model_values, lr_values, losses, test_losses, args):
             f"pre_mlp_projection: {args.use_pre_mlp_projection}\n"
             f"n_layers: {args.n_layers}\n"
             f"mlp_expansion_factor: {args.mlp_expansion_factor}\n"
-            f"kappa_1: {args.kappa_1}\n"
             f"batch_size: {args.batch_size}\n"
             f"n_seeds: {args.n_seeds}\n"
             f"n_test_batches: {args.n_test_batches}\n"
@@ -725,7 +721,6 @@ def generate_loss_charts(d_model_values, lr_values, losses, test_losses, args):
         f"pre_mlp_projection: {args.use_pre_mlp_projection}\n"
         f"n_layers: {args.n_layers}\n"
         f"mlp_expansion_factor: {args.mlp_expansion_factor}\n"
-        f"kappa_1: {args.kappa_1}\n"
         f"batch_size: {args.batch_size}\n"
         f"n_seeds: {args.n_seeds}\n"
         f"n_test_batches: {args.n_test_batches}\n"

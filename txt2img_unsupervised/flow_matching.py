@@ -1,34 +1,40 @@
 """
 Flow matching model for spherical data.
 
-Explanation from Claude:
+Explanation, with help from Claude 3.7 Sonnet and Gemini 2.5 Pro:
 
-This implementation extends Flow Matching with Optimal Transport (FM-OT) from Euclidean spaces 
-to the unit sphere, preserving its key theoretical properties while respecting the manifold's geometry.
+This implementation extends Flow Matching with Optimal Transport (FM-OT) from Euclidean spaces to
+the unit sphere, preserving its key theoretical properties while respecting the manifold's geometry.
 
 ## Theory and Design
 
-In Euclidean spaces, standard FM-OT uses conditional probability paths based on Gaussian distributions 
-that interpolate linearly between a noise distribution and the target. The resulting vector field
-produces straight-line trajectories with constant direction - the most efficient paths in Euclidean space.
+In Euclidean spaces, standard FM-OT uses conditional probability paths based on Gaussian
+distributions that interpolate linearly between a noise distribution and the target. The resulting
+vector field produces straight-line trajectories with constant direction - the most efficient paths
+in Euclidean space.
 
 On the sphere, we adapt this paradigm by:
 
-1. **Conditional Probability Paths**: Instead of Gaussian distributions, we use von Mises-Fisher (vMF) 
-   distributions. At t=0, we begin with a uniform distribution on the sphere (kappa_0=0). As t increases, 
-   the vMF distribution becomes more concentrated around the target (kappa_t = t*kappa_1).
+1. **Conditional Probability Paths**: Instead of Gaussian distributions, we use von Mises-Fisher
+   (vMF) distributions. At t=0, we begin with a uniform distribution on the sphere (kappa_0=0). As t
+   increases, the vMF distribution becomes more concentrated around the target (kappa_t =
+   t*kappa_1). Note that kappa_1, the kappa parameter at t=1, is part of the definition of our
+   probability paths, but not used in when calculating the target vector field or flow map. We leave
+   it out of the definitions of our models.
 
 2. **Geodesic Trajectories**: While Euclidean FM-OT follows straight lines, spherical FM-OT follows 
    geodesics (great circles) - the spherical equivalent of straight lines. These paths represent the 
    optimal transport solution on the sphere, minimizing the distance traveled along the manifold.
 
 3. **Vector Field**: The vector field at point x points toward the target x1 along the geodesic 
-   connecting them. Mathematically, this is achieved by projecting x1 onto the tangent space at x:
-   u_t(x|x1) = kappa_t * normalize(x1 - (x1·x)x)
+   connecting them, and has magnitude equal to the length of the geodesic connecting the origin
+   sample x0 from the base distribution to the target x1. Mathematically, this is achieved by
+   projecting x1 onto the tangent space at x: u_t(x|x1) = acos(x1·x0) * normalize(x1 - (x1·x)x)
    
    This field has two key properties:
    - It is always tangent to the sphere (orthogonal to x)
    - It points along the geodesic toward x1
+   - Integrating it from t=0 to t=1 generates a geodesic connecting x0 to x1
 
 4. **Flow Map**: The flow map represents the position at time t of a particle starting at x0 
    and flowing toward x1. In Euclidean space, this is a linear interpolation; on the sphere, 
@@ -36,10 +42,10 @@ On the sphere, we adapt this paradigm by:
    ψ_t(x0) = sin((1-t)θ)/sin(θ) · x0 + sin(tθ)/sin(θ) · x1
    where θ is the angle between x0 and x1.
 
-Like Euclidean FM-OT, this spherical formulation maintains: (1) simplicity of paths, (2) constant 
-tangent direction along geodesics, (3) efficient sampling with fewer integration steps, and 
-(4) theoretical guarantees from continuous normalizing flows. The difference is that all computations 
-respect the geometry of the sphere, ensuring flows remain on the manifold.
+Like Euclidean FM-OT, this spherical formulation maintains: (1) paths of constant velocity (now
+constant angular velocity), (2) efficient sampling with fewer integration steps, and (3) theoretical
+guarantees from continuous normalizing flows. The difference is that all computations respect the
+geometry of the sphere, ensuring flows remain on the manifold.
 
 """
 from dataclasses import dataclass, replace
@@ -172,8 +178,6 @@ class VectorField(nn.Module):
     mlp_dropout_rate: Optional[float]
     # Dropout rate for the input
     input_dropout_rate: Optional[float]
-
-    kappa_1: float
 
     activations_dtype: jnp.dtype = jnp.float32
     weights_dtype: jnp.dtype = jnp.float32
@@ -473,7 +477,6 @@ def test_vector_field_time_encoding_statistics(time_dim):
         mlp_dropout_rate=None,
         input_dropout_rate=None,
         use_pre_mlp_projection=False,
-        kappa_1=10.0,
     )
 
     params = model.init(rng, jnp.ones((1, 3)), jnp.ones((1,)), jnp.ones((1, 0)))
@@ -538,7 +541,6 @@ def test_vector_field_projections_normalization(domain_dim, conditioning_dim):
         mlp_expansion_factor=1,
         input_dropout_rate=None,
         mlp_dropout_rate=None,
-        kappa_1=10.0,
     )
 
     params_rng, sample_rng = jax.random.split(rng)
@@ -654,7 +656,6 @@ def test_optimal_transport_field_direction(dim):
 
     # Test parameters
     n_samples = 100
-    kappa_1 = 100.0
 
     # Generate random points on the sphere
     key1, key2, key3 = jax.random.split(rng, 3)
@@ -663,7 +664,7 @@ def test_optimal_transport_field_direction(dim):
     t_values = jax.random.uniform(key3, (n_samples,))
 
     def compute_and_compare(x, x1, t):
-        ot_field = spherical_ot_field(x, x1, t, kappa_1)
+        ot_field = spherical_ot_field(x, x1, t)
 
         # Compute direct vector from x to x1 and project to tangent space
         direct = x1 - x
@@ -714,17 +715,16 @@ def slerp(x, y, t):
     )
 
 
-def spherical_ot_field(x, x1, t, kappa_1):
+def spherical_ot_field(x, x1, t):
     """
     Special fancy spherical version of the OT field. Compute a tangent vector field on the sphere
-    that generates paths resembling optimal transport with regularization but follow geodesics
-    on the sphere rather than straight lines. Based on vMF distributions instead of gaussians.
+    that generates geodesics on the sphere rather than straight lines. Based on vMF distributions
+    instead of gaussians.
 
     Args:
         x: Current point on the sphere [dim]
         x1: Target point on the sphere [dim]
         t: Time parameter in [0, 1]
-        kappa_1: Concentration parameter of the final vMF distribution
 
     Returns:
         Vector field at x, tangent to the sphere
@@ -733,10 +733,12 @@ def spherical_ot_field(x, x1, t, kappa_1):
     assert x.shape == x1.shape
     assert t.shape == ()
 
-    kappa_t = t * kappa_1
-
     cos_angle = jnp.clip(jnp.dot(x, x1), -1.0, 1.0)
+    # angle between x and x1
     angle = jnp.arccos(cos_angle)
+    # angle between x0 and x1. This is also the speed (magnitude of the vector field) since we need
+    # to move that far between t=0 and t=1. Minimum for numerical stability when t is very small.
+    total_angle = jnp.minimum(angle / (1 - t), jnp.pi)
 
     def handle_close_or_opposite():
         return jax.lax.cond(
@@ -744,17 +746,17 @@ def spherical_ot_field(x, x1, t, kappa_1):
             # Field is 0 if x is very close to x1
             lambda: jnp.zeros_like(x),
             # If points are opposite/almost opposite, pick an orthogonal vector
-            lambda: get_consistent_tangent_direction(x) * kappa_t,
+            lambda: get_consistent_tangent_direction(x) * total_angle,
         )
 
     def handle_general_case():
-        # Vector field points towards x1 from x1, in the tangent space at x.
+        # Vector field points towards x1 from x, in the tangent space at x.
         proj_scalar = jnp.dot(x1, x)
         tangent_component = x1 - proj_scalar * x
         tangent_norm = jnp.linalg.norm(tangent_component)
         return jax.lax.cond(
             tangent_norm > 1e-8,
-            lambda: kappa_t * tangent_component / tangent_norm,
+            lambda: total_angle * tangent_component / tangent_norm,
             lambda: jnp.zeros_like(x),
         )
 
@@ -922,9 +924,7 @@ def conditional_flow_matching_loss(
     assert psi_t.shape == x0.shape
 
     # Compute target vector field (ground truth OT field)
-    target_field = jax.vmap(spherical_ot_field, in_axes=(0, 0, 0, None))(
-        psi_t, x1, t, model.kappa_1
-    )
+    target_field = jax.vmap(spherical_ot_field, in_axes=(0, 0, 0))(psi_t, x1, t)
     assert target_field.shape == x0.shape
 
     # Compute predicted vector field from our model (different for each model type)
@@ -1253,12 +1253,11 @@ _baseline_model = VectorField(
     input_dropout_rate=None,
     mlp_dropout_rate=None,
     use_pre_mlp_projection=True,
-    kappa_1=10.0,
 )
 
 
-@pytest.mark.parametrize("domain_dim", [3, 16])
-def test_train_trivial(domain_dim):
+@pytest.mark.parametrize("domain_dim,epochs", [(3, 1), (16, 2)])
+def test_train_trivial(domain_dim, epochs):
     "Train a model with a single example"
     model = replace(_baseline_model, domain_dim=domain_dim)
 
@@ -1268,7 +1267,7 @@ def test_train_trivial(domain_dim):
     first_dim_vec = first_dim_vec.at[0].set(1.0)
     points = repeat(first_dim_vec, "v -> b v", b=batch_size * 100)
     dset = Dataset.from_dict({"point_vec": points}).with_format("np")
-    state, loss = _train_loop_for_tests(model, dset, batch_size, 1e-3, 2)
+    state, loss = _train_loop_for_tests(model, dset, batch_size, 1e-3, epochs)
     print(f"Final loss: {loss:.6f}")
     samples = generate_samples(
         model,
@@ -1371,7 +1370,7 @@ def test_train_vmf(domain_dim):
     """
     Train a model with data from a von Mises-Fisher distribution and evaluate the samples.
     """
-    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2, kappa_1=5.0)
+    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2)
 
     batch_size = 512
     n_samples = 32768
@@ -1461,7 +1460,6 @@ def test_train_conditional_vmf(domain_dim):
         domain_dim=domain_dim,
         conditioning_dim=1,
         n_layers=2,
-        kappa_1=5.0,
     )
 
     # Define two different vMF distributions
@@ -1500,8 +1498,8 @@ def test_train_conditional_vmf(domain_dim):
         model,
         train_dataset,
         batch_size,
-        1e-4 if domain_dim == 3 else 1e-3,
-        4 if domain_dim == 3 else 8,
+        1e-3,
+        2 if domain_dim == 3 else 4,
         test_dataset,
     )
     print(
@@ -2327,7 +2325,6 @@ def test_vector_field_evaluation():
         use_pre_mlp_projection=False,
         input_dropout_rate=None,
         mlp_dropout_rate=None,
-        kappa_1=10.0,
     )
     state = create_train_state(rng, model, 1e-3)
 
@@ -2597,7 +2594,6 @@ def test_cap_conditioned_vector_field_normalization(domain_dim, reference_direct
         input_dropout_rate=None,
         mlp_dropout_rate=None,
         use_pre_mlp_projection=False,
-        kappa_1=10.0,
     )
 
     params_rng, sample_rng = jax.random.split(rng)
@@ -2656,8 +2652,8 @@ def test_cap_conditioned_vector_field_normalization(domain_dim, reference_direct
     ), f"Cap distances variance should be close to 1, got {cap_d_maxes_var}"
 
 
-@pytest.mark.parametrize("domain_dim,kappa_1,epochs", [(3, 5.0, 25), (16, 5.0, 60)])
-def test_train_cap_conditioned_model(domain_dim, kappa_1, epochs):
+@pytest.mark.parametrize("domain_dim,epochs", [(3, 10), (16, 30)])
+def test_train_cap_conditioned_model(domain_dim, epochs):
     """
     Train a cap conditioned model on a simple 3d training distribution and check the samples are
     inside the input caps and correctly distributed.
@@ -2684,7 +2680,6 @@ def test_train_cap_conditioned_model(domain_dim, kappa_1, epochs):
         input_dropout_rate=None,
         mlp_dropout_rate=None,
         use_pre_mlp_projection=True,
-        kappa_1=kappa_1,
     )
 
     distribution_rng, shuffle_rng, params_rng, train_rng, sample_rng = jax.random.split(
@@ -2847,7 +2842,6 @@ def test_vector_field_without_reference_directions():
         input_dropout_rate=None,
         activations_dtype=jnp.float32,
         weights_dtype=jnp.float32,
-        kappa_1=10.0,
     )
 
     # Initialize the model

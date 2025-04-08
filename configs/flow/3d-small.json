@@ -5,6 +5,5 @@
     "time_dim": 128,
     "use_pre_mlp_projection": true,
     "d_model": 512,
-    "mlp_expansion_factor": 4,
-    "kappa_1": 5
+    "mlp_expansion_factor": 4
 }
