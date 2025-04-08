@@ -53,6 +53,12 @@ def parse_arguments():
     parser.add_argument(
         "--cap-radius", type=float, help="Angular radius of the cap in degrees"
     )
+    parser.add_argument(
+        "--n-steps",
+        type=int,
+        default=8,
+        help="Number of integration steps for sampling",
+    )
 
     return parser.parse_args()
 
@@ -246,6 +252,7 @@ def main():
         samples_rng,
         cap_centers=cap_centers,
         cap_d_maxes=cap_d_maxes,
+        n_steps=args.n_steps,
     )
 
     samples = jax.device_get(samples)
