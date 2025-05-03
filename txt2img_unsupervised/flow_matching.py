@@ -737,7 +737,8 @@ def spherical_ot_field(x, x1, t):
     # angle between x and x1
     angle = jnp.arccos(cos_angle)
     # angle between x0 and x1. This is also the speed (magnitude of the vector field) since we need
-    # to move that far between t=0 and t=1. Minimum for numerical stability when t is very small.
+    # to move that far between t=0 and t=1. Minimum for numerical stability when t is very close to
+    # 1.
     total_angle = jnp.minimum(angle / (1 - t), jnp.pi)
 
     def handle_close_or_opposite():
