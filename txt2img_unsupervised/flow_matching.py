@@ -659,12 +659,13 @@ def test_optimal_transport_field_direction(dim):
 
     # Generate random points on the sphere
     key1, key2, key3 = jax.random.split(rng, 3)
-    x_samples = sample_sphere(key1, n_samples, dim)
+    x0_samples = sample_sphere(key1, n_samples, dim)
     x1_samples = sample_sphere(key2, n_samples, dim)
     t_values = jax.random.uniform(key3, (n_samples,))
 
-    def compute_and_compare(x, x1, t):
-        ot_field = spherical_ot_field(x, x1, t)
+    def compute_and_compare(x0, x1, t):
+        # Get the current position and vector field
+        x, ot_field = spherical_ot_field(x0, x1, t)
 
         # Compute direct vector from x to x1 and project to tangent space
         direct = x1 - x
@@ -685,7 +686,7 @@ def test_optimal_transport_field_direction(dim):
         )
 
     # Apply to all samples
-    similarities = jax.vmap(compute_and_compare)(x_samples, x1_samples, t_values)
+    similarities = jax.vmap(compute_and_compare)(x0_samples, x1_samples, t_values)
 
     # Check alignment
     avg_similarity = jnp.mean(similarities)
@@ -715,40 +716,32 @@ def slerp(x, y, t):
     )
 
 
-def spherical_ot_field(x, x1, t):
+def spherical_ot_field(x0, x1, t):
     """
     Special fancy spherical version of the OT field. Compute a tangent vector field on the sphere
     that generates geodesics on the sphere rather than straight lines. Based on vMF distributions
     instead of gaussians.
 
     Args:
-        x: Current point on the sphere [dim]
+        x0: Starting point on the sphere [dim]
         x1: Target point on the sphere [dim]
         t: Time parameter in [0, 1]
 
     Returns:
-        Vector field at x, tangent to the sphere
+        Tuple of (x, field_value) where:
+        - x: Current point on the sphere computed from x0, x1, t
+        - field_value: Vector field at x, tangent to the sphere
     """
-    assert len(x.shape) == 1
-    assert x.shape == x1.shape
+    assert len(x0.shape) == 1
+    assert x0.shape == x1.shape
     assert t.shape == ()
 
-    cos_angle = jnp.clip(jnp.dot(x, x1), -1.0, 1.0)
-    # angle between x and x1
-    angle = jnp.arccos(cos_angle)
-    # angle between x0 and x1. This is also the speed (magnitude of the vector field) since we need
-    # to move that far between t=0 and t=1. Minimum for numerical stability when t is very close to
-    # 1.
-    total_angle = jnp.minimum(angle / (1 - t), jnp.pi)
+    # Compute the current point by flowing x0 toward x1 for time t
+    x = compute_psi_t_spherical(x0, x1, t)
 
-    def handle_close_or_opposite():
-        return jax.lax.cond(
-            angle < 1e-8,
-            # Field is 0 if x is very close to x1
-            lambda: jnp.zeros_like(x),
-            # If points are opposite/almost opposite, pick an orthogonal vector
-            lambda: get_consistent_tangent_direction(x) * total_angle,
-        )
+    # Compute the angle between x0 and x1, which determines the speed
+    cos_angle = jnp.clip(jnp.dot(x0, x1), -1.0, 1.0)
+    angle = jnp.arccos(cos_angle)
 
     def handle_general_case():
         # Vector field points towards x1 from x, in the tangent space at x.
@@ -757,15 +750,18 @@ def spherical_ot_field(x, x1, t):
         tangent_norm = jnp.linalg.norm(tangent_component)
         return jax.lax.cond(
             tangent_norm > 1e-8,
-            lambda: total_angle * tangent_component / tangent_norm,
+            lambda: angle * tangent_component / tangent_norm,
             lambda: jnp.zeros_like(x),
         )
 
-    return jax.lax.cond(
-        jnp.logical_or(angle < 1e-8, angle > jnp.pi - 1e-8),
-        handle_close_or_opposite,
+    field_value = jax.lax.cond(
+        angle > jnp.pi - 1e-8,
+        # If points are opposite/almost opposite, pick an orthogonal vector
+        lambda: get_consistent_tangent_direction(x) * angle,
         handle_general_case,
     )
+
+    return x, field_value
 
 
 def get_consistent_tangent_direction(x):
@@ -921,12 +917,10 @@ def conditional_flow_matching_loss(
         if model.input_dropout_rate is not None or model.mlp_dropout_rate is not None:
             assert rng is not None, "rng is required for VectorField with dropout"
 
-    psi_t = jax.vmap(compute_psi_t_spherical)(x0, x1, t)
-    assert psi_t.shape == x0.shape
-
-    # Compute target vector field (ground truth OT field)
-    target_field = jax.vmap(spherical_ot_field, in_axes=(0, 0, 0))(psi_t, x1, t)
-    assert target_field.shape == x0.shape
+    # Compute target vector field (ground truth OT field) and current positions
+    psi_ts, target_fields = jax.vmap(spherical_ot_field, in_axes=(0, 0, 0))(x0, x1, t)
+    assert psi_ts.shape == x0.shape
+    assert target_fields.shape == x0.shape
 
     # Compute predicted vector field from our model (different for each model type)
     if is_cap_conditioned:
@@ -937,7 +931,7 @@ def conditional_flow_matching_loss(
 
         apply_res = model.apply(
             params,
-            psi_t,
+            psi_ts,
             t,
             cap_centers,
             cap_d_maxes,
@@ -947,7 +941,7 @@ def conditional_flow_matching_loss(
     else:
         apply_res = model.apply(
             params,
-            psi_t,
+            psi_ts,
             t,
             conds,
             rngs={"dropout": rng},
@@ -960,7 +954,7 @@ def conditional_flow_matching_loss(
         predicted_field = apply_res
     assert predicted_field.shape == x0.shape
 
-    loss = jnp.mean(jnp.sum((predicted_field - target_field) ** 2, axis=1))
+    loss = jnp.mean(jnp.sum((predicted_field - target_fields) ** 2, axis=1))
 
     if capture_intermediates:
         return loss, intermediates
