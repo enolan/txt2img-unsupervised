@@ -1766,6 +1766,7 @@ def generate_samples(
     cap_d_maxes=None,
     n_steps=100,
     method="rk4",
+    return_paths=False,
 ):
     """
     Generate samples from the flow matching model by solving the ODE.
@@ -1797,6 +1798,10 @@ def generate_samples(
     # Sample initial points uniformly from the sphere
     x0 = sample_sphere(x0_rng, batch_size, model.domain_dim)
 
+    all_xs = []
+    if return_paths:
+        all_xs.append(x0)
+
     vector_field_fn = lambda x, t, rng: _compute_vector_field_for_sampling(
         model, params, x, t, cond_vecs, cap_centers, cap_d_maxes, rng
     )
@@ -1814,6 +1819,8 @@ def generate_samples(
             t = i * dt
             v = vector_field_fn(x, t, dropout_rngs[i])
             x = geodesic_step(x, v, dt)
+            if return_paths:
+                all_xs.append(x)
     elif method == "midpoint":
         # Midpoint method
         for i in step_iter:
@@ -1825,6 +1832,8 @@ def generate_samples(
             # Second half-step using midpoint derivative
             v2 = vector_field_fn(x_mid, t + 0.5 * dt, dropout_rngs[i])
             x = geodesic_step(x, v2, dt)
+            if return_paths:
+                all_xs.append(x)
     elif method == "rk4":
         # 4th order Runge-Kutta method
         for i in step_iter:
@@ -1840,13 +1849,21 @@ def generate_samples(
                 cap_d_maxes,
                 dropout_rngs[i],
             )
+            if return_paths:
+                all_xs.append(x)
     else:
         raise ValueError(f"Unknown ODE solver method: {method}")
 
     # np.testing.assert_allclose(
     #    np.asarray(jnp.linalg.norm(x, axis=1, keepdims=True)), 1.0, atol=1e-6, rtol=0
     # )
-    return x
+    if return_paths:
+        # Stack along a new dimension (axis=1 for time steps)
+        paths_array = jnp.stack(all_xs, axis=1)
+        # paths_array will be (batch_size, n_steps + 1, domain_dim)
+        return x, paths_array
+    else:
+        return x
 
 
 def sample_loop(
@@ -1860,6 +1877,7 @@ def sample_loop(
     cap_d_maxes=None,
     n_steps=100,
     method="rk4",
+    return_paths=False,
 ):
     """
     Generate multiple batches of samples from the flow matching model.
@@ -1878,9 +1896,11 @@ def sample_loop(
         method: ODE solver method ('euler', 'midpoint', or 'rk4')
 
     Returns:
-        Generated samples [n_samples, dim]
+        Generated samples [n_samples, dim] or (Generated samples [n_samples, dim], paths [n_samples, n_steps+1, dim])
     """
-    samples = []
+    all_samples = []
+    if return_paths:
+        all_paths = []
     samples_so_far = 0
     from tqdm import trange
 
@@ -1909,22 +1929,34 @@ def sample_loop(
                 i * batch_size : i * batch_size + this_batch_size
             ]
 
-        samples.append(
-            generate_samples(
-                model,
-                params,
-                batch_rng,
-                this_batch_size,
-                cond_vecs=batch_cond_vecs,
-                cap_centers=batch_cap_centers,
-                cap_d_maxes=batch_cap_d_maxes,
-                n_steps=n_steps,
-                method=method,
-            )
+        generated_output = generate_samples(
+            model,
+            params,
+            batch_rng,
+            this_batch_size,
+            cond_vecs=batch_cond_vecs,
+            cap_centers=batch_cap_centers,
+            cap_d_maxes=batch_cap_d_maxes,
+            n_steps=n_steps,
+            method=method,
+            return_paths=return_paths,
         )
+
+        if return_paths:
+            batch_samples, batch_paths = generated_output
+            all_samples.append(batch_samples)
+            all_paths.append(batch_paths)
+        else:
+            all_samples.append(generated_output)
+
         samples_so_far += this_batch_size
 
-    return jnp.concatenate(samples, axis=0)
+    concatenated_samples = jnp.concatenate(all_samples, axis=0)
+    if return_paths:
+        concatenated_paths = jnp.concatenate(all_paths, axis=0)
+        return concatenated_samples, concatenated_paths
+    else:
+        return concatenated_samples
 
 
 @partial(jax.jit, static_argnames=("model", "n_projections"))
