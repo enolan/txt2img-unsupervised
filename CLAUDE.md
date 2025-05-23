@@ -44,6 +44,8 @@ model that generates embeddings is a spherical flow matching model with optimal 
   ```
   notice how the second version gives you exactly the same information as the first, but it's one
   line shorter.
+- NEVER write comments that only explain changes. The purpose of comments is to explain the code as
+  it is, not explain changes that the reader can't even see.
 - NEVER silently ignore exceptions. If there's no valid reason for an exception to be thrown - e.g.
   if the exception indicates a bug in the code that throws the exception, or some unrecoverable
   broken state - then it should NOT be caught, and allowed to propagate up and end program
