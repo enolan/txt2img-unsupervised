@@ -964,18 +964,19 @@ def conditional_flow_matching_loss(
 
 def create_train_state(rng, model, learning_rate_or_schedule):
     """Create initial training state."""
-    dummy_x = jnp.ones((1, model.domain_dim))
-    dummy_t = jnp.full((1,), 0.5)
-    if isinstance(model, CapConditionedVectorField):
-        params = model.init(
-            rng, dummy_x, dummy_t, jnp.ones((1, model.domain_dim)), jnp.ones((1,))
-        )
+    dummy_inputs = model.dummy_inputs()
+    params = model.init(rng, *dummy_inputs)
+    if callable(learning_rate_or_schedule):
+        scaled_lr_or_schedule = lambda step: model.scale_lr(learning_rate_or_schedule(step))
     else:
-        params = model.init(
-            rng, dummy_x, dummy_t, jnp.ones((1, model.conditioning_dim))
-        )
-    adamw = optax.adamw(learning_rate_or_schedule, weight_decay=0.001)
-    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=adamw)
+        scaled_lr_or_schedule = model.scale_lr(learning_rate_or_schedule)
+    opt_fixed_lr = optax.adamw(learning_rate_or_schedule, weight_decay=0.001)
+    opt_scaled_lr = optax.adamw(scaled_lr_or_schedule, weight_decay=0.001)
+    opt = optax.transforms.partition(
+        {"fixed_lr": opt_fixed_lr, "scaled_lr": opt_scaled_lr},
+        model.partition_map,
+    )
+    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=opt)
 
 
 def sample_sphere(rng, batch_size, dim):
@@ -2892,7 +2893,7 @@ def create_mollweide_projection_figure(samples, title=None):
     longitude = np.arctan2(samples[:, 1], samples[:, 0])  # atan2(y, x) for longitude
     latitude = np.arcsin(samples[:, 2])  # z-coordinate gives latitude (arcsin)
 
-    scatter = ax.scatter(longitude, latitude, s=8, alpha=0.7)
+    scatter = ax.scatter(longitude, latitude, s=8, alpha=0.25)
 
     ax.grid(True, alpha=0.3)
 
