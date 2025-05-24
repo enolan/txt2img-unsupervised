@@ -967,7 +967,9 @@ def create_train_state(rng, model, learning_rate_or_schedule):
     dummy_inputs = model.dummy_inputs()
     params = model.init(rng, *dummy_inputs)
     if callable(learning_rate_or_schedule):
-        scaled_lr_or_schedule = lambda step: model.scale_lr(learning_rate_or_schedule(step))
+        scaled_lr_or_schedule = lambda step: model.scale_lr(
+            learning_rate_or_schedule(step)
+        )
     else:
         scaled_lr_or_schedule = model.scale_lr(learning_rate_or_schedule)
     opt_fixed_lr = optax.adamw(learning_rate_or_schedule, weight_decay=0.001)
