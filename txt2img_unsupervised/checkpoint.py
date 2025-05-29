@@ -91,6 +91,21 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
         ):
             # Schedule-free is handled separately
             return base_lr
+        elif (
+            training_cfg.learning_rate_schedule
+            == LearningRateSchedule.CONSTANT_PLUS_LINEAR_DECAY
+        ):
+            # Constant learning rate for (batches_total - decay_steps), then linear decay over decay_steps
+            constant_schedule = optax.constant_schedule(base_lr)
+            decay_schedule = optax.linear_schedule(
+                init_value=base_lr,
+                end_value=0.0,
+                transition_steps=training_cfg.decay_steps,
+            )
+            return optax.join_schedules(
+                schedules=[constant_schedule, decay_schedule],
+                boundaries=[batches_total - training_cfg.decay_steps],
+            )
         else:
             raise ValueError(
                 f"Unknown learning rate schedule {training_cfg.learning_rate_schedule}"

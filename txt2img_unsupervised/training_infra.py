@@ -166,6 +166,7 @@ def setup_common_arguments(parser: argparse.ArgumentParser) -> argparse.Argument
         type=argparse_from_dict(str_to_learning_rate_schedule),
     )
     parser.add_argument("--warmup-steps", type=int, default=None)
+    parser.add_argument("--decay-steps", type=int, default=None)
     parser.add_argument("--schedule-free-beta1", type=float, default=None)
     parser.add_argument("--gradient-accumulation-steps", type=int)
     parser.add_argument("--use-biases", type=lambda x: bool(strtobool(x)))

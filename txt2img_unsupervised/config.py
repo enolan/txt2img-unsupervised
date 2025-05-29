@@ -339,6 +339,7 @@ class LearningRateSchedule(Enum):
         "warmup_plus_cosine"  # Linear warmup for a fixed # of steps, then cosine decay.
     )
     WARMUP_PLUS_SCHEDULE_FREE = "warmup_plus_schedule_free"  # Linear warmup for a fixed # of steps, then schedule-free Adam.
+    CONSTANT_PLUS_LINEAR_DECAY = "constant_plus_linear_decay"  # Constant learning rate for a fixed # of steps, then linear decay to 0.
 
 
 str_to_learning_rate_schedule = {
@@ -346,6 +347,7 @@ str_to_learning_rate_schedule = {
     "triangle": LearningRateSchedule.TRIANGLE,
     "warmup_plus_cosine": LearningRateSchedule.WARMUP_PLUS_COSINE,
     "warmup_plus_schedule_free": LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE,
+    "constant_plus_linear_decay": LearningRateSchedule.CONSTANT_PLUS_LINEAR_DECAY,
 }
 
 
@@ -369,6 +371,9 @@ class TrainingConfig:
     # How many steps to linearly increase the learning rate when using WARMUP_PLUS_COSINE_LR. With
     # the other schedules this value must be None
     warmup_steps: Optional[int] = None
+    # How many steps to decay the learning rate over when using CONSTANT_PLUS_LINEAR_DECAY. With
+    # the other schedules this value must be None
+    decay_steps: Optional[int] = None
     schedule_free_beta1: Optional[float] = None
     adam_beta2: float = 0.999
     weight_decay: float = 0.0
@@ -431,29 +436,38 @@ class TrainingConfig:
                     "adaptive_gradient_clip is disabled"
                 )
 
-        def get_schedule_error_message(schedule, warmup_required, beta1_required):
+        def get_schedule_error_message(schedule, warmup_required, beta1_required, decay_required=False):
             warmup_state = "set" if warmup_required else "unset"
             beta1_state = "set" if beta1_required else "unset"
-            return f"{schedule} schedule requires warmup_steps to be {warmup_state} and schedule_free_beta1 to be {beta1_state}"
+            decay_state = "set" if decay_required else "unset"
+            return f"{schedule} schedule requires warmup_steps to be {warmup_state}, schedule_free_beta1 to be {beta1_state}, and decay_steps to be {decay_state}"
 
         if self.learning_rate_schedule == LearningRateSchedule.CONSTANT:
-            if self.warmup_steps is not None or self.schedule_free_beta1 is not None:
-                raise ValueError(get_schedule_error_message("constant", False, False))
+            if self.warmup_steps is not None or self.schedule_free_beta1 is not None or self.decay_steps is not None:
+                raise ValueError(get_schedule_error_message("constant", False, False, False))
         elif self.learning_rate_schedule == LearningRateSchedule.TRIANGLE:
-            if self.warmup_steps is not None or self.schedule_free_beta1 is not None:
-                raise ValueError(get_schedule_error_message("triangle", False, False))
+            if self.warmup_steps is not None or self.schedule_free_beta1 is not None or self.decay_steps is not None:
+                raise ValueError(get_schedule_error_message("triangle", False, False, False))
         elif self.learning_rate_schedule == LearningRateSchedule.WARMUP_PLUS_COSINE:
-            if self.warmup_steps is None or self.schedule_free_beta1 is not None:
+            if self.warmup_steps is None or self.schedule_free_beta1 is not None or self.decay_steps is not None:
                 raise ValueError(
-                    get_schedule_error_message("warmup plus cosine", True, False)
+                    get_schedule_error_message("warmup plus cosine", True, False, False)
                 )
         elif (
             self.learning_rate_schedule
             == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
         ):
-            if self.warmup_steps is None or self.schedule_free_beta1 is None:
+            if self.warmup_steps is None or self.schedule_free_beta1 is None or self.decay_steps is not None:
                 raise ValueError(
-                    get_schedule_error_message("warmup plus schedule-free", True, True)
+                    get_schedule_error_message("warmup plus schedule-free", True, True, False)
+                )
+        elif (
+            self.learning_rate_schedule
+            == LearningRateSchedule.CONSTANT_PLUS_LINEAR_DECAY
+        ):
+            if self.decay_steps is None or self.warmup_steps is not None or self.schedule_free_beta1 is not None:
+                raise ValueError(
+                    get_schedule_error_message("constant plus linear decay", False, False, True)
                 )
         else:
             raise ValueError(
@@ -556,6 +570,19 @@ _test_json_strs = [
         "muon_beta": 0.95,
         "muon_learning_rate": 1e-2,
         "adam_learning_rate": 1e-3
+        }""",
+    """{
+        "batch_size": 8,
+        "epochs": 50,
+        "training_images": 0,
+        "learning_rate_schedule": "constant_plus_linear_decay",
+        "decay_steps": 1000,
+        "gradient_accumulation_steps": 1,
+        "adaptive_gradient_clip": false,
+        "weight_decay": 0.0,
+        "adam_beta2": 0.999,
+        "use_muon": false,
+        "muon_beta": 0.95
         }""",
 ]
 
