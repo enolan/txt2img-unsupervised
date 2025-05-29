@@ -2120,7 +2120,7 @@ def test_learn_sequential(
     # Compute test loss
     test_mdl = mdl.clone(dropout=None, image_dropout=None, clip_dropout=None)
     calc_loss = jax.jit(
-        lambda imgs: loss_batch(
+        lambda imgs, params: loss_batch(
             test_mdl,
             params,
             jax.random.PRNGKey(0),
@@ -2136,7 +2136,7 @@ def test_learn_sequential(
     for batch in tqdm(
         dset_test.batch_iter(batch_size, drop_last_batch=False), total=test_batches
     ):
-        test_losses.append(calc_loss(batch["encoded_img"]))
+        test_losses.append(calc_loss(batch["encoded_img"], params))
     test_loss = jnp.mean(jnp.array(test_losses))
     print(f"Final test loss: {test_loss}")
     assert test_loss < 0.04
