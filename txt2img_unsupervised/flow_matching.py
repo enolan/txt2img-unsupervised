@@ -1991,13 +1991,89 @@ def hutchinson_estimator(
         x: Current points on the sphere [batch_size, dim]
         t: Current time
         cond_vecs: Conditioning vectors [batch_size, cond_dim]
+        cap_centers: Cap centers [batch_size, domain_dim] (only for CapConditionedVectorField)
+        cap_d_maxes: Maximum cap distances [batch_size] (only for CapConditionedVectorField)
         step_rng: JAX random key for this step
         n_projections: Number of random projections to use
 
     Returns:
         Divergence estimate [batch_size]
     """
-    raise NotImplementedError("Hutchinson estimator not implemented yet")
+    batch_size, dim = x.shape
+    assert dim == model.domain_dim
+    assert isinstance(t, float) or (isinstance(t, jnp.ndarray) and t.shape == ())
+    assert step_rng is not None, "step_rng is required for Hutchinson estimator"
+    assert (
+        n_projections is not None and n_projections > 0
+    ), "n_projections must be positive"
+
+    def hutchinson_single(x_i, rng_i, *args):
+        """Compute Hutchinson divergence estimate for a single point."""
+        # Create model function based on model type and args
+        if isinstance(model, CapConditionedVectorField):
+            center_i, d_max_i = args
+
+            def f(x_single):
+                return model.apply(
+                    params,
+                    x_single[None, :],
+                    jnp.array([t]),
+                    center_i[None, :],
+                    d_max_i[None],
+                )[0]
+
+        else:
+            (cond_i,) = args
+
+            def f(x_single):
+                return model.apply(
+                    params, x_single[None, :], jnp.array([t]), cond_i[None, :]
+                )[0]
+
+        # Generate random projection vectors (Rademacher distribution)
+        projection_keys = jax.random.split(rng_i, n_projections)
+        v_samples = jax.vmap(
+            lambda key: jax.random.rademacher(key, (dim,), dtype=x_i.dtype)
+        )(projection_keys)
+
+        # Compute v^T * J * v for each random vector v
+        def vjp_fn(v):
+            _, vjp = jax.vjp(f, x_i)
+            return jnp.dot(v, vjp(v)[0])
+
+        trace_estimates = jax.vmap(vjp_fn)(v_samples)
+        trace_estimate = jnp.mean(trace_estimates)
+
+        # Compute the curvature correction term: x^T J x
+        # We can compute this exactly using forward-mode autodiff
+        jac = jax.jacfwd(f)(x_i)
+        curvature_term = jnp.dot(x_i, jac @ x_i)
+
+        return trace_estimate - curvature_term
+
+    # Split random keys for each batch element
+    batch_keys = jax.random.split(step_rng, batch_size)
+
+    # Handle different model types with appropriate arguments
+    if isinstance(model, CapConditionedVectorField):
+        assert (
+            cond_vecs is None
+        ), "cond_vecs should be None for CapConditionedVectorField"
+        assert (
+            cap_centers is not None
+        ), "cap_centers is required for CapConditionedVectorField"
+        assert (
+            cap_d_maxes is not None
+        ), "cap_d_maxes is required for CapConditionedVectorField"
+        assert cap_centers.shape == (batch_size, model.domain_dim)
+        assert cap_d_maxes.shape == (batch_size,)
+
+        return jax.vmap(hutchinson_single)(x, batch_keys, cap_centers, cap_d_maxes)
+    else:
+        assert cond_vecs is not None, "cond_vecs is required for VectorField"
+        assert cond_vecs.shape == (batch_size, model.conditioning_dim)
+
+        return jax.vmap(hutchinson_single)(x, batch_keys, cond_vecs)
 
 
 @partial(jax.jit, static_argnames=("model",))
@@ -2088,7 +2164,7 @@ def _reverse_path_and_compute_divergence(
     cap_d_maxes=None,
     n_steps=100,
     rng=None,
-    n_projections=1,
+    n_projections=10,
 ):
     """
     Compute the reverse path and integrate the divergence.
@@ -2141,8 +2217,8 @@ def _reverse_path_and_compute_divergence(
         t = ts[i]
 
         # Compute divergence at current point
-        step_rng, rng = jax.random.split(rng)
-        div_t = exact_divergence(
+        step_rng_model, step_rng_div, rng = jax.random.split(rng, 3)
+        div_t = hutchinson_estimator(
             model,
             params,
             x_t,
@@ -2150,7 +2226,7 @@ def _reverse_path_and_compute_divergence(
             cond_vecs,
             cap_centers,
             cap_d_maxes,
-            step_rng,
+            step_rng_div,
             n_projections,
         )
         div_sum = div_sum + div_t * (1.0 / n_steps)
@@ -2165,7 +2241,7 @@ def _reverse_path_and_compute_divergence(
             cond_vecs,
             cap_centers,
             cap_d_maxes,
-            step_rng,
+            step_rng_model,
         )
 
         return next_x, div_sum, rng
@@ -2188,7 +2264,7 @@ def compute_log_probability(
     cap_d_maxes=None,
     n_steps=100,
     rng=None,
-    n_projections=1,
+    n_projections=10,
 ):
     """
     Compute the log probability of samples under the flow-matching model.
@@ -2273,18 +2349,8 @@ class _DummyModel:
 @pytest.mark.parametrize(
     "divergence_fn,n_projections,field",
     [
-        pytest.param(
-            hutchinson_estimator,
-            10,
-            "zero_divergence",
-            marks=pytest.mark.xfail(reason="Hutchinson estimator not implemented yet"),
-        ),
-        pytest.param(
-            hutchinson_estimator,
-            10,
-            "variable_divergence",
-            marks=pytest.mark.xfail(reason="Hutchinson estimator not implemented yet"),
-        ),
+        (hutchinson_estimator, 10, "zero_divergence"),
+        (hutchinson_estimator, 10, "variable_divergence"),
         (exact_divergence, None, "zero_divergence"),
         (exact_divergence, None, "variable_divergence"),
     ],

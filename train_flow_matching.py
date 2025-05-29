@@ -85,7 +85,7 @@ def parse_arguments():
     parser.add_argument(
         "--nll-n-projections",
         type=int,
-        default=1,
+        default=10,
         help="Number of projections for NLL calculation during evaluation",
     )
 
