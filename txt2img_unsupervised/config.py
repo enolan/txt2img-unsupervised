@@ -304,7 +304,8 @@ def test_transformermodelconfig_roundtrip_from_json() -> None:
         "clip_conditioning": false,
         "corrected_cap_projections": true,
         "do_clip_feedforward": false,
-        "norm_clip_embeddings": false
+        "norm_clip_embeddings": false,
+        "model_type": "transformer"
         }"""
     cfg = TransformerModelConfig.from_json_dict(json.loads(json_str))
     assert TransformerModelConfig.to_json_dict(cfg) == json.loads(json_str)
