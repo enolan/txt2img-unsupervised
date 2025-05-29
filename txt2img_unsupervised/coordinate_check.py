@@ -15,10 +15,12 @@ import numpy as np
 import optax
 import optax.transforms
 from contextlib import nullcontext
+from mpl_toolkits.mplot3d import Axes3D
 
 from .cap_sampling import LogitsTable
 from .flow_matching import CapConditionedVectorField
 from . import flow_matching
+from .muon import muon
 
 
 def process_intermediates(intermediates):
@@ -242,6 +244,38 @@ def main():
         default=".",
         help="Directory to save charts in",
     )
+    # Muon optimizer arguments
+    parser.add_argument(
+        "--use-muon",
+        action="store_true",
+        help="Enable Muon optimizer for MLP projection kernels (Adam for other parameters)",
+    )
+    parser.add_argument(
+        "--muon-beta",
+        type=float,
+        required=False,
+        default=0.95,
+        help="Momentum parameter for Muon optimizer (default: 0.95)",
+    )
+    parser.add_argument(
+        "--muon-lr-low",
+        type=float,
+        required=False,
+        help="Lowest Muon learning rate to test (only used with --use-muon)",
+    )
+    parser.add_argument(
+        "--muon-lr-high",
+        type=float,
+        required=False,
+        help="Highest Muon learning rate to test (only used with --use-muon)",
+    )
+    parser.add_argument(
+        "--n-muon-lr-points",
+        type=int,
+        required=False,
+        default=5,
+        help="Number of Muon learning rate points to test between muon-lr-low and muon-lr-high",
+    )
 
     args = parser.parse_args()
 
@@ -271,17 +305,53 @@ def main():
     elif not doing_lr_sweep and args.lr_base is None:
         raise ValueError("Either lr-base or both lr-low and lr-high must be provided")
 
+    # Validate Muon arguments
+    if args.use_muon:
+        if args.muon_lr_low is None or args.muon_lr_high is None:
+            raise ValueError(
+                "When using Muon, both --muon-lr-low and --muon-lr-high must be provided"
+            )
+        if args.muon_beta <= 0 or args.muon_beta >= 1:
+            raise ValueError(f"muon-beta must be between 0 and 1, got {args.muon_beta}")
+        print(f"Using Muon optimizer with beta={args.muon_beta}")
+    else:
+        if args.muon_lr_low is not None or args.muon_lr_high is not None:
+            print(
+                "Warning: Muon learning rate arguments are ignored when --use-muon is not specified"
+            )
+
+    # Set up learning rate ranges
     if doing_lr_sweep:
-        lr_values = list(
+        adam_lr_values = list(
             np.logspace(np.log10(args.lr_low), np.log10(args.lr_high), args.n_lr_points)
         )
-        print(f"Testing learning rates: {lr_values}")
+        print(f"Testing Adam learning rates: {adam_lr_values}")
     else:
-        lr_values = [args.lr_base]
+        adam_lr_values = [args.lr_base]
 
-    print(f"Number of learning rates to test: {len(lr_values)}")
-    if len(lr_values) == 0:
-        raise ValueError("No learning rates to test!")
+    if args.use_muon:
+        muon_lr_values = list(
+            np.logspace(
+                np.log10(args.muon_lr_low),
+                np.log10(args.muon_lr_high),
+                args.n_muon_lr_points,
+            )
+        )
+        print(f"Testing Muon learning rates: {muon_lr_values}")
+        # Create cartesian product of Adam and Muon learning rates
+        lr_combinations = [
+            (adam_lr, muon_lr)
+            for adam_lr in adam_lr_values
+            for muon_lr in muon_lr_values
+        ]
+        print(f"Total learning rate combinations: {len(lr_combinations)}")
+    else:
+        muon_lr_values = []
+        lr_combinations = [(adam_lr, None) for adam_lr in adam_lr_values]
+
+    print(f"Number of learning rate combinations to test: {len(lr_combinations)}")
+    if len(lr_combinations) == 0:
+        raise ValueError("No learning rate combinations to test!")
 
     # Generate exponentially spaced d_model values with base 2
     low_exp = math.log2(args.d_model_low)
@@ -298,17 +368,19 @@ def main():
     print(f"Testing d_model values: {d_model_values}")
 
     activations = []
-    losses = np.zeros((len(d_model_values), len(lr_values), args.n_train_steps))
-    test_losses = np.zeros((len(d_model_values), len(lr_values)))
+    losses = np.zeros((len(d_model_values), len(lr_combinations), args.n_train_steps))
+    test_losses = np.zeros((len(d_model_values), len(lr_combinations)))
 
-    n_combinations = len(d_model_values) * len(lr_values)
+    n_combinations = len(d_model_values) * len(lr_combinations)
     all_keys = jax.random.split(jax.random.PRNGKey(20250319), n_combinations)
     key_idx = 0
 
     for d_model_idx, d_model in tenumerate(d_model_values, desc="d_model values"):
-        for lr_idx, lr in tenumerate(lr_values, desc=f"LR for d_model={d_model}"):
+        for lr_idx, (adam_lr, muon_lr) in tenumerate(
+            lr_combinations, desc=f"LR for d_model={d_model}"
+        ):
             tqdm.write(
-                f"\nTraining with d_model = {d_model}, lr = {lr}, lr_idx = {lr_idx}"
+                f"\nTraining with d_model = {d_model}, Adam LR = {adam_lr}, Muon LR = {muon_lr}"
             )
 
             use_cpu_offload = d_model > args.cpu_offload_threshold
@@ -334,14 +406,40 @@ def main():
             tqdm.write(f"Model: {model}")
             tqdm.write(f"m_d = {model.d_model_scale_factor}")
 
-            opt_fixed_lr = optax.adam(lr)
-            opt_scaled_lr = optax.adam(model.scale_lr(lr))
+            if args.use_muon:
+                # Mixed Muon/Adam optimization
+                adam_fixed_opt = optax.adam(adam_lr)
+                adam_scaled_opt = optax.adam(model.scale_lr(adam_lr))
+                muon_fixed_opt = muon(
+                    learning_rate=muon_lr,
+                    beta=args.muon_beta,
+                    weight_decay=0.0,
+                )
+                muon_scaled_opt = muon(
+                    learning_rate=model.scale_lr(muon_lr),
+                    beta=args.muon_beta,
+                    weight_decay=0.0,
+                )
 
-            # Use the partition_map property from the model for proper muP scaling
-            opt = optax.transforms.partition(
-                {"fixed_lr": opt_fixed_lr, "scaled_lr": opt_scaled_lr},
-                model.partition_map,
-            )
+                opt = optax.transforms.partition(
+                    {
+                        "adam_fixed": adam_fixed_opt,
+                        "adam_scaled": adam_scaled_opt,
+                        "muon_fixed": muon_fixed_opt,
+                        "muon_scaled": muon_scaled_opt,
+                    },
+                    model.mk_partition_map(use_muon=True),
+                )
+            else:
+                # Pure Adam optimization
+                opt_fixed_lr = optax.adam(adam_lr)
+                opt_scaled_lr = optax.adam(model.scale_lr(adam_lr))
+
+                # Use the mk_partition_map method from the model for proper muP scaling
+                opt = optax.transforms.partition(
+                    {"fixed_lr": opt_fixed_lr, "scaled_lr": opt_scaled_lr},
+                    model.mk_partition_map(use_muon=False),
+                )
             init_opt_state = jax.jit(opt.init)
 
             # List to hold activations for all seeds for this d_model and learning rate
@@ -452,7 +550,7 @@ def main():
 
     # Generate loss charts if doing a learning rate sweep
     if doing_lr_sweep:
-        generate_loss_charts(d_model_values, lr_values, losses, test_losses, args)
+        generate_loss_charts(d_model_values, lr_combinations, losses, test_losses, args)
 
 
 def generate_activation_charts(d_model_values, activations, n_layers, args):
@@ -567,15 +665,15 @@ def generate_activation_charts(d_model_values, activations, n_layers, args):
     print("Charts generated successfully!")
 
 
-def generate_loss_charts(d_model_values, lr_values, losses, test_losses, args):
+def generate_loss_charts(d_model_values, lr_combinations, losses, test_losses, args):
     """
     Generate charts showing loss values across different learning rates for each d_model.
 
     Args:
         d_model_values: List of d_model values used in training
-        lr_values: List of learning rate values used in training
-        losses: 3D numpy array of shape (n_d_models, n_lr_values, n_steps) containing loss values
-        test_losses: 2D numpy array of shape (n_d_models, n_lr_values) containing test loss values
+        lr_combinations: List of learning rate combinations used in training (tuples of (adam_lr, muon_lr))
+        losses: 3D numpy array of shape (n_d_models, n_lr_combinations, n_steps) containing loss values
+        test_losses: 2D numpy array of shape (n_d_models, n_lr_combinations) containing test loss values
         args: Command-line arguments to include in the legend
     """
     # Select 10 evenly spaced steps (or all steps if fewer than 10)
@@ -585,20 +683,56 @@ def generate_loss_charts(d_model_values, lr_values, losses, test_losses, args):
     else:
         step_indices = np.array(range(args.n_train_steps))
 
+    # Extract learning rate values for plotting
+    if args.use_muon:
+        # For mixed optimization, we'll plot against Adam LR with different lines for each Muon LR
+        adam_lrs = [lr_combo[0] for lr_combo in lr_combinations]
+        muon_lrs = [lr_combo[1] for lr_combo in lr_combinations]
+        unique_adam_lrs = sorted(list(set(adam_lrs)))
+        unique_muon_lrs = sorted(list(set(muon_lrs)))
+
+        # Create a mapping from lr_combinations to indices
+        lr_combo_to_idx = {combo: idx for idx, combo in enumerate(lr_combinations)}
+    else:
+        # For Adam-only, just extract the Adam learning rates
+        adam_lrs = [lr_combo[0] for lr_combo in lr_combinations]
+
     # Generate charts for the selected steps
     for plot_idx, step_idx in enumerate(step_indices):
         plt.figure(figsize=(12, 8))
 
         for d_idx, d_model in enumerate(d_model_values):
-            # Extract losses for this d_model at all learning rates for this step
-            step_losses = losses[d_idx, :, step_idx]
-            plt.plot(lr_values, step_losses, marker="o", label=f"d_model={d_model}")
+            if args.use_muon:
+                # For mixed optimization, plot separate lines for each Muon LR
+                for muon_lr in unique_muon_lrs:
+                    step_losses = []
+                    x_values = []
+                    for adam_lr in unique_adam_lrs:
+                        if (adam_lr, muon_lr) in lr_combo_to_idx:
+                            combo_idx = lr_combo_to_idx[(adam_lr, muon_lr)]
+                            step_losses.append(losses[d_idx, combo_idx, step_idx])
+                            x_values.append(adam_lr)
+
+                    if step_losses:  # Only plot if we have data
+                        plt.plot(
+                            x_values,
+                            step_losses,
+                            marker="o",
+                            label=f"d_model={d_model}, Muon_LR={muon_lr:.2e}",
+                        )
+            else:
+                # For Adam-only optimization
+                step_losses = losses[d_idx, :, step_idx]
+                plt.plot(adam_lrs, step_losses, marker="o", label=f"d_model={d_model}")
 
         plt.xscale("log")
         plt.ylim(bottom=0)
-        plt.xlabel("Learning Rate (log scale)")
+        plt.xlabel("Adam Learning Rate (log scale)")
         plt.ylabel("Loss")
-        plt.title(f"Loss vs Learning Rate at Step {step_idx+1}/{args.n_train_steps}")
+        title = f"Loss vs Learning Rate at Step {step_idx+1}/{args.n_train_steps}"
+        if args.use_muon:
+            title += " (Mixed Adam/Muon)"
+        plt.title(title)
         plt.grid(True, which="both", linestyle="--", alpha=0.6)
         plt.legend()
 
@@ -606,7 +740,19 @@ def generate_loss_charts(d_model_values, lr_values, losses, test_losses, args):
         param_info = (
             f"Dataset: {args.dataset_path}\n"
             f"d_model range: {args.d_model_low}-{args.d_model_high}\n"
-            f"LR range: {args.lr_low}-{args.lr_high}, n_points={args.n_lr_points}\n"
+        )
+        if args.use_muon:
+            param_info += (
+                f"Adam LR range: {args.lr_low}-{args.lr_high}, n_points={args.n_lr_points}\n"
+                f"Muon LR range: {args.muon_lr_low}-{args.muon_lr_high}, n_points={args.n_muon_lr_points}\n"
+                f"Muon beta: {args.muon_beta}\n"
+            )
+        else:
+            param_info += (
+                f"LR range: {args.lr_low}-{args.lr_high}, n_points={args.n_lr_points}\n"
+            )
+
+        param_info += (
             f"reference_directions: {args.reference_directions}\n"
             f"time_dim: {args.time_dim}\n"
             f"pre_mlp_projection: {args.use_pre_mlp_projection}\n"
@@ -626,8 +772,8 @@ def generate_loss_charts(d_model_values, lr_values, losses, test_losses, args):
         )
         plt.close()
 
-    # Generate a chart for the test losses instead of final training losses
-    plt.figure(figsize=(12, 8))
+    # Generate a chart for the test losses
+    plt.figure(figsize=(15, 10))
 
     # Define colors for each d_model
     model_colors = plt.cm.viridis(np.linspace(0, 1, len(d_model_values)))
@@ -635,79 +781,134 @@ def generate_loss_charts(d_model_values, lr_values, losses, test_losses, args):
     # Track minimum loss points and their values
     min_points = []
 
-    # First plot all lines
+    # Plot test losses
     for d_idx, d_model in enumerate(d_model_values):
-        # Extract test losses for this d_model at all learning rates
         model_test_losses = test_losses[d_idx, :]
 
-        # Find the learning rate with the lowest test loss
+        # Find the learning rate combination with the lowest test loss
         min_loss_idx = np.argmin(model_test_losses)
         min_loss = model_test_losses[min_loss_idx]
-        min_lr = lr_values[min_loss_idx]
+        min_lr_combo = lr_combinations[min_loss_idx]
 
         # Store the minimum point information
-        min_points.append((d_model, min_lr, min_loss, model_colors[d_idx]))
+        min_points.append((d_model, min_lr_combo, min_loss, model_colors[d_idx]))
 
-        # Plot the line with a marker
-        line = plt.plot(
-            lr_values,
-            model_test_losses,
-            marker="o",
-            label=f"d_model={d_model}",
-            color=model_colors[d_idx],
-        )
+        if args.use_muon:
+            # For mixed optimization, plot separate lines for each Muon LR
+            for muon_lr in unique_muon_lrs:
+                test_losses_for_muon_lr = []
+                x_values = []
+                for adam_lr in unique_adam_lrs:
+                    if (adam_lr, muon_lr) in lr_combo_to_idx:
+                        combo_idx = lr_combo_to_idx[(adam_lr, muon_lr)]
+                        test_losses_for_muon_lr.append(model_test_losses[combo_idx])
+                        x_values.append(adam_lr)
 
-        # Highlight the minimum point with a larger marker
-        plt.plot(
-            min_lr,
-            min_loss,
-            "o",
-            markersize=8,
-            color=model_colors[d_idx],
-            markeredgecolor="black",
-            markeredgewidth=1.5,
-        )
+                if test_losses_for_muon_lr:  # Only plot if we have data
+                    line = plt.plot(
+                        x_values,
+                        test_losses_for_muon_lr,
+                        marker="o",
+                        label=f"d_model={d_model}, Muon_LR={muon_lr:.2e}",
+                        color=model_colors[d_idx],
+                        alpha=0.7,
+                    )
 
-    # Create a proper table instead of manually positioning text
-    # Prepare the table data
+                    # Highlight the minimum point if it's in this line
+                    for i, (adam_lr, loss) in enumerate(
+                        zip(x_values, test_losses_for_muon_lr)
+                    ):
+                        if (adam_lr, muon_lr) == min_lr_combo:
+                            plt.plot(
+                                adam_lr,
+                                loss,
+                                "o",
+                                markersize=10,
+                                color=model_colors[d_idx],
+                                markeredgecolor="black",
+                                markeredgewidth=2,
+                            )
+        else:
+            # For Adam-only optimization
+            line = plt.plot(
+                adam_lrs,
+                model_test_losses,
+                marker="o",
+                label=f"d_model={d_model}",
+                color=model_colors[d_idx],
+            )
+
+            # Highlight the minimum point
+            plt.plot(
+                min_lr_combo[0],
+                min_loss,
+                "o",
+                markersize=8,
+                color=model_colors[d_idx],
+                markeredgecolor="black",
+                markeredgewidth=1.5,
+            )
+
+    # Create a table showing the best results
     table_data = []
-    for d_model, min_lr, min_loss, color in min_points:
-        table_data.append([d_model, f"{min_lr:.2e}", f"{min_loss:.4f}"])
+    if args.use_muon:
+        for d_model, min_lr_combo, min_loss, color in min_points:
+            table_data.append(
+                [
+                    d_model,
+                    f"{min_lr_combo[0]:.2e}",
+                    f"{min_lr_combo[1]:.2e}",
+                    f"{min_loss:.4f}",
+                ]
+            )
+        col_labels = ["d_model", "Best Adam LR", "Best Muon LR", "Min Loss"]
+        col_widths = [0.08, 0.12, 0.12, 0.08]
+        bbox = [0.60, 0.60, 0.38, 0.30]
+    else:
+        for d_model, min_lr_combo, min_loss, color in min_points:
+            table_data.append([d_model, f"{min_lr_combo[0]:.2e}", f"{min_loss:.4f}"])
+        col_labels = ["d_model", "Best LR", "Min Loss"]
+        col_widths = [0.1, 0.15, 0.1]
+        bbox = [0.65, 0.65, 0.33, 0.25]
 
     # Get the current axes for the plot
     ax = plt.gca()
 
-    # Create a table at the top right of the plot using axes coordinates
-    # (0,0) is bottom left, (1,1) is top right
+    # Create a table
     table = ax.table(
         cellText=table_data,
-        colLabels=["d_model", "Best LR", "Min Loss"],
-        colWidths=[0.1, 0.15, 0.1],
+        colLabels=col_labels,
+        colWidths=col_widths,
         cellLoc="center",
         loc="upper right",
-        bbox=[0.65, 0.65, 0.33, 0.25],  # [x, y, width, height]
+        bbox=bbox,
     )
 
     # Style the table
     table.auto_set_font_size(False)
     table.set_fontsize(9)
 
-    # Style the header row
+    # Style the header row and data
     for (i, j), cell in table.get_celld().items():
         if i == 0:  # Header row
             cell.set_text_props(weight="bold")
             cell.set_facecolor("lightgray")
-        else:  # Color the d_model values to match the plot lines
+        else:  # Data rows
             if j == 0:  # d_model column
                 cell.set_text_props(color=model_colors[i - 1], weight="bold")
-            elif j == 2:  # Min loss column
+            elif (not args.use_muon and j == 2) or (
+                args.use_muon and j == 3
+            ):  # Min loss column
                 cell.set_text_props(weight="bold")
 
     plt.xscale("log")
     plt.ylim(bottom=0)
-    plt.xlabel("Learning Rate (log scale)")
+    plt.xlabel("Adam Learning Rate (log scale)")
     plt.ylabel("Test Loss")
-    plt.title(f"Test Loss vs Learning Rate (Averaged Over Test Set)")
+    title = "Test Loss vs Learning Rate (Averaged Over Test Set)"
+    if args.use_muon:
+        title += " - Mixed Adam/Muon Optimization"
+    plt.title(title)
     plt.grid(True, which="both", linestyle="--", alpha=0.6)
     plt.legend()
 
@@ -715,7 +916,19 @@ def generate_loss_charts(d_model_values, lr_values, losses, test_losses, args):
     param_info = (
         f"Dataset: {args.dataset_path}\n"
         f"d_model range: {args.d_model_low}-{args.d_model_high}\n"
-        f"LR range: {args.lr_low}-{args.lr_high}, n_points={args.n_lr_points}\n"
+    )
+    if args.use_muon:
+        param_info += (
+            f"Adam LR range: {args.lr_low}-{args.lr_high}, n_points={args.n_lr_points}\n"
+            f"Muon LR range: {args.muon_lr_low}-{args.muon_lr_high}, n_points={args.n_muon_lr_points}\n"
+            f"Muon beta: {args.muon_beta}\n"
+        )
+    else:
+        param_info += (
+            f"LR range: {args.lr_low}-{args.lr_high}, n_points={args.n_lr_points}\n"
+        )
+
+    param_info += (
         f"reference_directions: {args.reference_directions}\n"
         f"time_dim: {args.time_dim}\n"
         f"pre_mlp_projection: {args.use_pre_mlp_projection}\n"
@@ -730,7 +943,241 @@ def generate_loss_charts(d_model_values, lr_values, losses, test_losses, args):
     plt.tight_layout()
     plt.savefig(args.output_dir / "final_loss_vs_lr.png", bbox_inches="tight", dpi=300)
 
+    # Generate 3D plots for mixed optimization
+    if args.use_muon:
+        generate_3d_loss_plots(d_model_values, lr_combinations, test_losses, args)
+
     print("Loss charts generated successfully!")
+
+
+def generate_3d_loss_plots(d_model_values, lr_combinations, test_losses, args):
+    """
+    Generate 3D plots showing Adam LR vs Muon LR vs Test Loss.
+
+    Args:
+        d_model_values: List of d_model values used in training
+        lr_combinations: List of (adam_lr, muon_lr) tuples
+        test_losses: 2D numpy array of shape (n_d_models, n_lr_combinations)
+        args: Command-line arguments
+    """
+    # Extract unique learning rates
+    adam_lrs = [lr_combo[0] for lr_combo in lr_combinations]
+    muon_lrs = [lr_combo[1] for lr_combo in lr_combinations]
+    unique_adam_lrs = sorted(list(set(adam_lrs)))
+    unique_muon_lrs = sorted(list(set(muon_lrs)))
+
+    # Create grids for 3D plotting
+    adam_grid, muon_grid = np.meshgrid(unique_adam_lrs, unique_muon_lrs)
+
+    # Create a mapping from lr_combinations to indices for quick lookup
+    lr_combo_to_idx = {combo: idx for idx, combo in enumerate(lr_combinations)}
+
+    # Generate a 3D plot for each d_model
+    for d_idx, d_model in enumerate(d_model_values):
+        fig = plt.figure(figsize=(12, 10))
+        ax = fig.add_subplot(111, projection="3d")
+
+        # Create loss grid for this d_model
+        loss_grid = np.full_like(adam_grid, np.nan)
+
+        for i, adam_lr in enumerate(unique_adam_lrs):
+            for j, muon_lr in enumerate(unique_muon_lrs):
+                if (adam_lr, muon_lr) in lr_combo_to_idx:
+                    combo_idx = lr_combo_to_idx[(adam_lr, muon_lr)]
+                    loss_grid[j, i] = test_losses[d_idx, combo_idx]
+
+        # Create the surface plot
+        surf = ax.plot_surface(
+            np.log10(adam_grid),
+            np.log10(muon_grid),
+            loss_grid,
+            cmap="viridis",
+            alpha=0.8,
+            edgecolor="none",
+        )
+
+        # Add scatter points for actual data points
+        adam_log = [np.log10(combo[0]) for combo in lr_combinations]
+        muon_log = [np.log10(combo[1]) for combo in lr_combinations]
+        losses_flat = test_losses[d_idx, :]
+
+        scatter = ax.scatter(
+            adam_log,
+            muon_log,
+            losses_flat,
+            c=losses_flat,
+            cmap="viridis",
+            s=50,
+            alpha=0.9,
+            edgecolor="black",
+            linewidth=0.5,
+        )
+
+        # Find and highlight the minimum loss point
+        min_loss_idx = np.argmin(losses_flat)
+        min_adam_lr, min_muon_lr = lr_combinations[min_loss_idx]
+        min_loss = losses_flat[min_loss_idx]
+
+        ax.scatter(
+            [np.log10(min_adam_lr)],
+            [np.log10(min_muon_lr)],
+            [min_loss],
+            c="red",
+            s=200,
+            marker="*",
+            edgecolor="black",
+            linewidth=2,
+            label=f"Best: Adam={min_adam_lr:.2e}, Muon={min_muon_lr:.2e}, Loss={min_loss:.4f}",
+        )
+
+        # Set labels and title
+        ax.set_xlabel("log₁₀(Adam Learning Rate)")
+        ax.set_ylabel("log₁₀(Muon Learning Rate)")
+        ax.set_zlabel("Test Loss")
+        ax.set_title(
+            f"Test Loss vs Learning Rates\nd_model={d_model}, muon_beta={args.muon_beta}"
+        )
+
+        # Add colorbar
+        fig.colorbar(surf, ax=ax, shrink=0.5, aspect=20, label="Test Loss")
+
+        # Add legend
+        ax.legend(loc="upper left")
+
+        # Set custom tick formatters to show actual learning rates
+        def log_tick_formatter(x, pos):
+            return f"{10**x:.1e}"
+
+        # Create custom ticks at reasonable intervals
+        adam_log_min, adam_log_max = np.log10(min(unique_adam_lrs)), np.log10(
+            max(unique_adam_lrs)
+        )
+        muon_log_min, muon_log_max = np.log10(min(unique_muon_lrs)), np.log10(
+            max(unique_muon_lrs)
+        )
+
+        adam_ticks = np.linspace(
+            adam_log_min, adam_log_max, min(5, len(unique_adam_lrs))
+        )
+        muon_ticks = np.linspace(
+            muon_log_min, muon_log_max, min(5, len(unique_muon_lrs))
+        )
+
+        ax.set_xticks(adam_ticks)
+        ax.set_yticks(muon_ticks)
+        ax.set_xticklabels([f"{10**x:.1e}" for x in adam_ticks])
+        ax.set_yticklabels([f"{10**x:.1e}" for x in muon_ticks])
+
+        # Rotate tick labels for better readability
+        ax.tick_params(axis="x", rotation=45)
+        ax.tick_params(axis="y", rotation=45)
+
+        plt.tight_layout()
+        plt.savefig(
+            args.output_dir / f"3d_loss_surface_d_model_{d_model}.png",
+            bbox_inches="tight",
+            dpi=300,
+        )
+        plt.close()
+
+    # Generate a combined 3D plot with all d_model values
+    fig = plt.figure(figsize=(15, 12))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Define colors for each d_model
+    model_colors = plt.cm.tab10(np.linspace(0, 1, len(d_model_values)))
+
+    # Plot scatter points for each d_model
+    for d_idx, d_model in enumerate(d_model_values):
+        adam_log = [np.log10(combo[0]) for combo in lr_combinations]
+        muon_log = [np.log10(combo[1]) for combo in lr_combinations]
+        losses_flat = test_losses[d_idx, :]
+
+        scatter = ax.scatter(
+            adam_log,
+            muon_log,
+            losses_flat,
+            c=[model_colors[d_idx]] * len(losses_flat),
+            s=60,
+            alpha=0.7,
+            label=f"d_model={d_model}",
+            edgecolor="black",
+            linewidth=0.5,
+        )
+
+        # Highlight the minimum loss point for this d_model
+        min_loss_idx = np.argmin(losses_flat)
+        min_adam_lr, min_muon_lr = lr_combinations[min_loss_idx]
+        min_loss = losses_flat[min_loss_idx]
+
+        ax.scatter(
+            [np.log10(min_adam_lr)],
+            [np.log10(min_muon_lr)],
+            [min_loss],
+            c=[model_colors[d_idx]],
+            s=200,
+            marker="*",
+            edgecolor="black",
+            linewidth=2,
+            alpha=1.0,
+        )
+
+    # Set labels and title
+    ax.set_xlabel("log₁₀(Adam Learning Rate)")
+    ax.set_ylabel("log₁₀(Muon Learning Rate)")
+    ax.set_zlabel("Test Loss")
+    ax.set_title(
+        f"Test Loss vs Learning Rates (All d_model values)\nmuon_beta={args.muon_beta}"
+    )
+
+    # Add legend
+    ax.legend(loc="upper left", bbox_to_anchor=(0.02, 0.98))
+
+    # Set custom ticks
+    adam_log_min, adam_log_max = np.log10(min(unique_adam_lrs)), np.log10(
+        max(unique_adam_lrs)
+    )
+    muon_log_min, muon_log_max = np.log10(min(unique_muon_lrs)), np.log10(
+        max(unique_muon_lrs)
+    )
+
+    adam_ticks = np.linspace(adam_log_min, adam_log_max, min(5, len(unique_adam_lrs)))
+    muon_ticks = np.linspace(muon_log_min, muon_log_max, min(5, len(unique_muon_lrs)))
+
+    ax.set_xticks(adam_ticks)
+    ax.set_yticks(muon_ticks)
+    ax.set_xticklabels([f"{10**x:.1e}" for x in adam_ticks])
+    ax.set_yticklabels([f"{10**x:.1e}" for x in muon_ticks])
+
+    # Rotate tick labels for better readability
+    ax.tick_params(axis="x", rotation=45)
+    ax.tick_params(axis="y", rotation=45)
+
+    # Add parameter information as text
+    param_text = (
+        f"Adam LR: {args.lr_low:.1e} - {args.lr_high:.1e} ({args.n_lr_points} points)\n"
+        f"Muon LR: {args.muon_lr_low:.1e} - {args.muon_lr_high:.1e} ({args.n_muon_lr_points} points)\n"
+        f"d_model range: {args.d_model_low} - {args.d_model_high}\n"
+        f"Stars (*) indicate best LR combination for each d_model"
+    )
+
+    # Position text in the plot
+    ax.text2D(
+        0.02,
+        0.02,
+        param_text,
+        transform=ax.transAxes,
+        fontsize=10,
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+    )
+
+    plt.tight_layout()
+    plt.savefig(
+        args.output_dir / "3d_loss_surface_combined.png", bbox_inches="tight", dpi=300
+    )
+    plt.close()
+
+    print("3D loss surface plots generated successfully!")
 
 
 if __name__ == "__main__":

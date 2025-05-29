@@ -360,12 +360,12 @@ def remove_nones_from_dict(d):
 
 @dataclass
 class TrainingConfig:
-    learning_rate: float  # peak learning rate
     batch_size: int
     epochs: int  # How many epochs to train for
     learning_rate_schedule: LearningRateSchedule
     gradient_accumulation_steps: int
     gradient_clipping: Optional[float]
+    learning_rate: Optional[float] = None  # peak learning rate when using single lr
     # How many steps to linearly increase the learning rate when using WARMUP_PLUS_COSINE_LR. With
     # the other schedules this value must be None
     warmup_steps: Optional[int] = None
@@ -377,6 +377,15 @@ class TrainingConfig:
     adaptive_gradient_clip_history_len: Optional[int] = None
     adaptive_gradient_clip_threshold_factor: Optional[float] = None
     adaptive_gradient_clip_quantile: Optional[float] = None
+    # Muon optimizer settings
+    use_muon: bool = False
+    muon_beta: float = 0.95  # Momentum parameter for Muon optimizer
+    muon_learning_rate: Optional[
+        float
+    ] = None  # Learning rate for Muon parameters (if None, uses learning_rate)
+    adam_learning_rate: Optional[
+        float
+    ] = None  # Learning rate for Adam parameters when using Muon (if None, uses learning_rate)
 
     @staticmethod
     def from_json_dict(dict: dict[str, Any]) -> "TrainingConfig":
@@ -451,6 +460,21 @@ class TrainingConfig:
                 f"Unknown learning rate schedule {self.learning_rate_schedule}"
             )
 
+        # Muon validation
+        if self.use_muon:
+            if (
+                self.learning_rate_schedule
+                == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+            ):
+                raise ValueError(
+                    "Muon optimizer is not compatible with schedule-free optimizers. "
+                    "Use a different learning rate schedule when use_muon=True."
+                )
+            if self.muon_beta <= 0 or self.muon_beta >= 1:
+                raise ValueError(
+                    f"muon_beta must be between 0 and 1, got {self.muon_beta}"
+                )
+
 
 def merge_attrs(data_class, args: Any) -> None:
     """Merge arguments from argparse/wandb.config into a configuration."""
@@ -501,10 +525,11 @@ _test_json_strs = [
         "adaptive_gradient_clip_threshold_factor": 1.1,
         "adaptive_gradient_clip_quantile": 0.95,
         "weight_decay": 0.1,
-        "adam_beta2": 0.999
+        "adam_beta2": 0.999,
+        "use_muon": false,
+        "muon_beta": 0.95
         }""",
     """{
-        "learning_rate": 1e-4,
         "batch_size": 4,
         "epochs": 100,
         "training_images": 0,
@@ -514,7 +539,23 @@ _test_json_strs = [
         "gradient_accumulation_steps": 1,
         "adaptive_gradient_clip": false,
         "weight_decay": 0.0,
-        "adam_beta2": 0.9
+        "adam_beta2": 0.9,
+        "use_muon": false,
+        "muon_beta": 0.95
+        }""",
+    """{
+        "batch_size": 4,
+        "epochs": 100,
+        "training_images": 0,
+        "learning_rate_schedule": "constant",
+        "gradient_accumulation_steps": 1,
+        "adaptive_gradient_clip": false,
+        "weight_decay": 0.0,
+        "adam_beta2": 0.999,
+        "use_muon": true,
+        "muon_beta": 0.95,
+        "muon_learning_rate": 1e-2,
+        "adam_learning_rate": 1e-3
         }""",
 ]
 
@@ -537,3 +578,68 @@ def test_trainingconfig_roundtrip_from_object() -> None:
         gradient_clipping=0.5,
     )
     assert TrainingConfig.from_json_dict(TrainingConfig.to_json_dict(cfg)) == cfg
+
+
+def test_trainingconfig_muon_validation():
+    """Test Muon-specific validation in TrainingConfig."""
+    # Test valid Muon configuration
+    valid_muon_cfg = TrainingConfig(
+        learning_rate=1e-3,
+        batch_size=32,
+        epochs=1,
+        learning_rate_schedule=LearningRateSchedule.CONSTANT,
+        gradient_accumulation_steps=1,
+        gradient_clipping=None,
+        use_muon=True,
+        muon_beta=0.95,
+        muon_learning_rate=2e-3,
+        adam_learning_rate=1e-3,
+    )
+    # Should not raise
+    valid_muon_cfg.validate()
+
+    # Test Muon with schedule-free (should fail)
+    with pytest.raises(
+        ValueError,
+        match="Muon optimizer is not compatible with schedule-free optimizers",
+    ):
+        invalid_cfg = TrainingConfig(
+            learning_rate=1e-3,
+            batch_size=32,
+            epochs=1,
+            learning_rate_schedule=LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE,
+            warmup_steps=100,
+            schedule_free_beta1=0.9,
+            gradient_accumulation_steps=1,
+            gradient_clipping=None,
+            use_muon=True,
+            muon_beta=0.95,
+        )
+        invalid_cfg.validate()
+
+    # Test invalid muon_beta values
+    with pytest.raises(ValueError, match="muon_beta must be between 0 and 1"):
+        invalid_beta_cfg = TrainingConfig(
+            learning_rate=1e-3,
+            batch_size=32,
+            epochs=1,
+            learning_rate_schedule=LearningRateSchedule.CONSTANT,
+            gradient_accumulation_steps=1,
+            gradient_clipping=None,
+            use_muon=True,
+            muon_beta=1.5,  # Invalid: > 1
+        )
+        invalid_beta_cfg.validate()
+
+    with pytest.raises(ValueError, match="muon_beta must be between 0 and 1"):
+        invalid_beta_cfg = TrainingConfig(
+            learning_rate=1e-3,
+            batch_size=32,
+            epochs=1,
+            learning_rate_schedule=LearningRateSchedule.CONSTANT,
+            gradient_accumulation_steps=1,
+            gradient_clipping=None,
+            use_muon=True,
+            muon_beta=0.0,  # Invalid: = 0
+        )
+        invalid_beta_cfg.validate()

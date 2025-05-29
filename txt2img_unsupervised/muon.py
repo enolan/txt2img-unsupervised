@@ -3,7 +3,7 @@ Implementation of the Muon optimizer.
 Adapted from https://kellerjordan.github.io/posts/muon/
 """
 
-from typing import NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional, Tuple, Union
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -461,8 +461,9 @@ def test_muonize_assertion_1d_parameter():
         optimizer.update(grads, opt_state)
 
 
-def test_muonize_toy_neural_network():
-    """Test muonize on a toy neural network with 2D and 3D parameters."""
+@pytest.mark.parametrize("weight_decay", [0.0, 0.01])
+def test_muon_toy_neural_network(weight_decay):
+    """Test muon on a toy neural network with 2D and 3D parameters."""
     rng = jax.random.PRNGKey(42)
     param_rng, data_rng = jax.random.split(rng, 2)
 
@@ -482,8 +483,7 @@ def test_muonize_toy_neural_network():
         * 0.1,  # 3D
     }
 
-    # Set up Muon optimizer with learning rate scaling
-    optimizer = optax.chain(muonize(beta=0.95), optax.scale_by_learning_rate(0.03))
+    optimizer = muon(learning_rate=0.03, beta=0.95, weight_decay=weight_decay)
 
     opt_state = optimizer.init(params)
 
@@ -553,3 +553,29 @@ def test_muonize_toy_neural_network():
         f"Loss should generally decrease over training: "
         f"early_avg={early_avg:.4f}, late_avg={late_avg:.4f}"
     )
+
+
+def muon(
+    learning_rate: Union[float, optax.Schedule],
+    beta: float = 0.95,
+    weight_decay: float = 0.0,
+) -> optax.GradientTransformation:
+    """Create a complete Muon optimizer with learning rate scaling and weight decay.
+
+    This combines the core Muon orthogonalization with learning rate scaling and
+    optional AdamW-like decoupled weight decay.
+
+    Args:
+        learning_rate: Learning rate or learning rate schedule.
+        beta: Momentum parameter for the exponential moving average (default: 0.95).
+        weight_decay: Weight decay coefficient (default: 0.0, no weight decay).
+
+    Returns:
+        A complete Muon optimizer transformation.
+    """
+    transformations = [muonize(beta)]
+    if weight_decay > 0.0:
+        transformations.append(optax.add_decayed_weights(weight_decay))
+    transformations.append(optax.scale_by_learning_rate(learning_rate))
+
+    return optax.chain(*transformations)

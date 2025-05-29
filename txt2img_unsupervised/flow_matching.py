@@ -204,31 +204,75 @@ class VectorField(nn.Module):
         "m_d in muP."
         return self.d_model / self.d_model_base
 
-    @property
-    def partition_map(self):
+    def mk_partition_map(self, use_muon: bool):
         """
-        A map of parameter names to learning rate groups, used with optax.transforms.partition to
-        implement muP properly. Parameters will be in either the "fixed_lr" or "scaled_lr" group.
-        """
-        dense_layer_partition_map = {"bias": "fixed_lr", "kernel": "scaled_lr"}
+        Create a partition map for optimizer configuration with muP scaling.
 
-        params_map = {
-            "final_norm": "fixed_lr",
-            "out_proj": dense_layer_partition_map,
-            "mlp_blocks": {
-                "norm": "fixed_lr",
-                "gate_proj": dense_layer_partition_map,
-                "value_proj": dense_layer_partition_map,
-                "out_proj": dense_layer_partition_map,
-            },
-        }
-        if self.use_pre_mlp_projection:
-            # pre_mlp_proj should have its learning rate scaled by 1/m_d because it feeds into the
-            # MLP and gradients go backwards but its initialization should be determined by
-            # total_input_dim because activations go forwards. I think.
-            params_map["pre_mlp_proj"] = dense_layer_partition_map
+        Args:
+            use_muon: If False, creates a simple muP partition map with "fixed_lr" and "scaled_lr" groups.
+                     If True, creates a mixed Muon/Adam partition map with four groups:
+                     - adam_fixed: Adam parameters with fixed learning rate (biases, norms, pre_mlp_proj, out_proj)
+                     - adam_scaled: Adam parameters with scaled learning rate (some parameter groups)
+                     - muon_fixed: Muon parameters with fixed learning rate (none in typical flow matching models)
+                     - muon_scaled: Muon parameters with scaled learning rate (MLP projection kernels)
+
+        Returns:
+            Dictionary suitable for optax.transforms.partition
+        """
+        if use_muon:
+            # Define which parameters use which optimizer
+            # https://kellerjordan.github.io/posts/muon/ says "When training a neural network with
+            # Muon, scalar and vector parameters of the network, as well as the input and output
+            # layers, should be optimized by a standard method such as AdamW" so pre_mlp_proj and
+            # out_proj use Adam, while MLP projection kernels use Muon. Which learning rates to
+            # scale or not is based on the muP rules.
+            muon_dense_layer_partition_map = {
+                "bias": "adam_fixed",
+                "kernel": "muon_scaled",
+            }
+            params_map = {
+                "final_norm": "adam_fixed",
+                "out_proj": {
+                    "bias": "adam_fixed",
+                    "kernel": "adam_scaled",
+                },
+                "mlp_blocks": {
+                    "norm": "adam_fixed",
+                    "gate_proj": muon_dense_layer_partition_map,
+                    "value_proj": muon_dense_layer_partition_map,
+                    "out_proj": muon_dense_layer_partition_map,
+                },
+            }
+
+            if self.use_pre_mlp_projection:
+                # pre_mlp_proj uses Adam with appropriate muP scaling
+                params_map["pre_mlp_proj"] = {
+                    "bias": "adam_fixed",
+                    "kernel": "adam_scaled",
+                }
+            else:
+                params_map["mlp_in_bias"] = "adam_fixed"
         else:
-            params_map["mlp_in_bias"] = "fixed_lr"
+            # Simple muP partition map
+            dense_layer_partition_map = {"bias": "fixed_lr", "kernel": "scaled_lr"}
+
+            params_map = {
+                "final_norm": "fixed_lr",
+                "out_proj": dense_layer_partition_map,
+                "mlp_blocks": {
+                    "norm": "fixed_lr",
+                    "gate_proj": dense_layer_partition_map,
+                    "value_proj": dense_layer_partition_map,
+                    "out_proj": dense_layer_partition_map,
+                },
+            }
+            if self.use_pre_mlp_projection:
+                # pre_mlp_proj should have its learning rate scaled by 1/m_d because it feeds into the
+                # MLP and gradients go backwards but its initialization should be determined by
+                # total_input_dim because activations go forwards. I think.
+                params_map["pre_mlp_proj"] = dense_layer_partition_map
+            else:
+                params_map["mlp_in_bias"] = "fixed_lr"
 
         return {"params": params_map}
 
@@ -976,7 +1020,7 @@ def create_train_state(rng, model, learning_rate_or_schedule):
     opt_scaled_lr = optax.adamw(scaled_lr_or_schedule, weight_decay=0.001)
     opt = optax.transforms.partition(
         {"fixed_lr": opt_fixed_lr, "scaled_lr": opt_scaled_lr},
-        model.partition_map,
+        model.mk_partition_map(use_muon=False),
     )
     return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=opt)
 

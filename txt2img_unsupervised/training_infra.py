@@ -201,7 +201,28 @@ def setup_common_arguments(parser: argparse.ArgumentParser) -> argparse.Argument
         default=0,
         help="Log weights and gradients every N steps",
     )
-
+    # Muon optimizer arguments
+    parser.add_argument(
+        "--use-muon",
+        type=lambda x: bool(strtobool(x)),
+        help="Whether to use Muon optimizer for projection matrices",
+    )
+    parser.add_argument(
+        "--muon-beta",
+        type=float,
+        default=0.95,
+        help="Momentum parameter for Muon optimizer",
+    )
+    parser.add_argument(
+        "--muon-learning-rate",
+        type=float,
+        help="Learning rate for Muon parameters (if None, uses learning_rate)",
+    )
+    parser.add_argument(
+        "--adam-learning-rate",
+        type=float,
+        help="Learning rate for Adam parameters when using Muon (if None, uses learning_rate)",
+    )
     return parser
 
 
