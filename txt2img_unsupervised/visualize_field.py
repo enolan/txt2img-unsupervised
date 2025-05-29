@@ -9,7 +9,7 @@ import pandas as pd
 import os
 
 # Import the necessary components from flow_matching.py
-from flow_matching import (
+from .flow_matching import (
     VectorField,
     create_train_state,
     sample_sphere,
