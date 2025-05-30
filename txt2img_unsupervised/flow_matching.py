@@ -2046,8 +2046,8 @@ def hutchinson_estimator(
 
         # Compute the curvature correction term: x^T J x
         # We can compute this exactly using forward-mode autodiff
-        jac = jax.jacfwd(f)(x_i)
-        curvature_term = jnp.dot(x_i, jac @ x_i)
+        _, jvp_result = jax.jvp(f, (x_i,), (x_i,))
+        curvature_term = jnp.dot(x_i, jvp_result)
 
         return trace_estimate - curvature_term
 
@@ -2320,9 +2320,13 @@ def compute_log_probability(
         n_projections=n_projections,
     )
 
-    # Density of the base distribution
+    # Density of the base distribution (uniform on unit sphere)
+    # Surface area of unit sphere in d dimensions: A_d = 2 * π^(d/2) / Γ(d/2)
+    # Log probability density: log_p0 = -log(A_d) = -log(2) - (d/2)*log(π) + log(Γ(d/2))
+    # Use logarithms throughout to avoid overflow for large dimensions
     log_p0 = -(
-        jnp.log(2 * jnp.power(jnp.pi, model.domain_dim / 2))
+        jnp.log(2.0)
+        + (model.domain_dim / 2) * jnp.log(jnp.pi)
         - jax.lax.lgamma(model.domain_dim / 2)
     )
     log_p1 = log_p0 - div_sum
@@ -2350,7 +2354,7 @@ class _DummyModel:
     "divergence_fn,n_projections,field",
     [
         (hutchinson_estimator, 10, "zero_divergence"),
-        (hutchinson_estimator, 10, "variable_divergence"),
+        (hutchinson_estimator, 50, "variable_divergence"),
         (exact_divergence, None, "zero_divergence"),
         (exact_divergence, None, "variable_divergence"),
     ],
