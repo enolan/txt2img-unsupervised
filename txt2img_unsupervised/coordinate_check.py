@@ -169,14 +169,14 @@ def train_step(
     return loss, processed_intermediates, new_params, new_opt_state, next_rng
 
 
-@partial(jax.jit, static_argnames=["model"])
-def init_model_params(model, init_key):
+@partial(jax.jit, static_argnames=["model", "domain_dim"])
+def init_model_params(model, init_key, domain_dim):
     """JIT-compiled model initialization function."""
     return model.init(
         init_key,
-        jnp.zeros((1, 3)),
+        jnp.zeros((1, domain_dim)),
         jnp.zeros((1,)),
-        jnp.zeros((1, 3)),
+        jnp.zeros((1, domain_dim)),
         jnp.zeros((1,)),
     )
 
@@ -220,7 +220,7 @@ def main():
         "--cpu-offload-threshold",
         type=int,
         required=False,
-        default=2048,
+        default=None,
         help="d_model threshold above which optimizer state and weight updates are offloaded to CPU",
     )
     parser.add_argument(
@@ -293,11 +293,17 @@ def main():
     )
     dset_train = dsets["train"]
     dset_test = dsets["test"]
+
+    # Get metadata for model config
+    metadata_example = dset_train[0]
+    vec_column = "clip_embedding" if "clip_embedding" in metadata_example else "vec"
+    domain_dim = metadata_example[vec_column].shape[0]
+
     print(
         f"Dataset loaded with {len(dset_train)} training examples and {len(dset_test)} test examples. First example: {dset_train[0]}"
     )
     dset_train = dset_train.select(range(args.batch_size * args.n_train_steps))
-    logits_table = LogitsTable(d=3 - 1, n=8192)
+    logits_table = LogitsTable(d=domain_dim - 1, n=8192)
 
     doing_lr_sweep = args.lr_low is not None and args.lr_high is not None
     if doing_lr_sweep and args.lr_base is not None:
@@ -383,7 +389,10 @@ def main():
                 f"\nTraining with d_model = {d_model}, Adam LR = {adam_lr}, Muon LR = {muon_lr}"
             )
 
-            use_cpu_offload = d_model > args.cpu_offload_threshold
+            use_cpu_offload = (
+                args.cpu_offload_threshold is not None
+                and d_model > args.cpu_offload_threshold
+            )
             if use_cpu_offload:
                 tqdm.write(f"Using CPU offloading for d_model={d_model}")
 
@@ -392,7 +401,7 @@ def main():
             seed_keys = jax.random.split(master_key, args.n_seeds)
 
             model = CapConditionedVectorField(
-                domain_dim=3,
+                domain_dim=domain_dim,
                 reference_directions=args.reference_directions,
                 conditioning_dim=None,
                 time_dim=args.time_dim,
@@ -463,7 +472,7 @@ def main():
                 )
                 with device_ctx:
                     tqdm.write("Initializing parameters")
-                    params = init_model_params(model, init_key)
+                    params = init_model_params(model, init_key, domain_dim)
 
                     tqdm.write(f"Initializing optimizer state")
                     opt_state = init_opt_state(params)
@@ -483,7 +492,7 @@ def main():
                         params,
                         opt_state,
                         rng,
-                        batch["vec"],
+                        batch[vec_column],
                         use_cpu_offload,
                     )
                     activations_this_seed.append(processed_intermediates)
@@ -501,7 +510,7 @@ def main():
                     model,
                     params,
                     rng,
-                    dset_test["vec"],
+                    dset_test[vec_column],
                     args.batch_size,
                 )
                 seed_test_losses[seed_idx] = np.array(test_loss)
