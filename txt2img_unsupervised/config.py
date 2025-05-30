@@ -436,20 +436,38 @@ class TrainingConfig:
                     "adaptive_gradient_clip is disabled"
                 )
 
-        def get_schedule_error_message(schedule, warmup_required, beta1_required, decay_required=False):
+        def get_schedule_error_message(
+            schedule, warmup_required, beta1_required, decay_required=False
+        ):
             warmup_state = "set" if warmup_required else "unset"
             beta1_state = "set" if beta1_required else "unset"
             decay_state = "set" if decay_required else "unset"
             return f"{schedule} schedule requires warmup_steps to be {warmup_state}, schedule_free_beta1 to be {beta1_state}, and decay_steps to be {decay_state}"
 
         if self.learning_rate_schedule == LearningRateSchedule.CONSTANT:
-            if self.warmup_steps is not None or self.schedule_free_beta1 is not None or self.decay_steps is not None:
-                raise ValueError(get_schedule_error_message("constant", False, False, False))
+            if (
+                self.warmup_steps is not None
+                or self.schedule_free_beta1 is not None
+                or self.decay_steps is not None
+            ):
+                raise ValueError(
+                    get_schedule_error_message("constant", False, False, False)
+                )
         elif self.learning_rate_schedule == LearningRateSchedule.TRIANGLE:
-            if self.warmup_steps is not None or self.schedule_free_beta1 is not None or self.decay_steps is not None:
-                raise ValueError(get_schedule_error_message("triangle", False, False, False))
+            if (
+                self.warmup_steps is not None
+                or self.schedule_free_beta1 is not None
+                or self.decay_steps is not None
+            ):
+                raise ValueError(
+                    get_schedule_error_message("triangle", False, False, False)
+                )
         elif self.learning_rate_schedule == LearningRateSchedule.WARMUP_PLUS_COSINE:
-            if self.warmup_steps is None or self.schedule_free_beta1 is not None or self.decay_steps is not None:
+            if (
+                self.warmup_steps is None
+                or self.schedule_free_beta1 is not None
+                or self.decay_steps is not None
+            ):
                 raise ValueError(
                     get_schedule_error_message("warmup plus cosine", True, False, False)
                 )
@@ -457,17 +475,29 @@ class TrainingConfig:
             self.learning_rate_schedule
             == LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
         ):
-            if self.warmup_steps is None or self.schedule_free_beta1 is None or self.decay_steps is not None:
+            if (
+                self.warmup_steps is None
+                or self.schedule_free_beta1 is None
+                or self.decay_steps is not None
+            ):
                 raise ValueError(
-                    get_schedule_error_message("warmup plus schedule-free", True, True, False)
+                    get_schedule_error_message(
+                        "warmup plus schedule-free", True, True, False
+                    )
                 )
         elif (
             self.learning_rate_schedule
             == LearningRateSchedule.CONSTANT_PLUS_LINEAR_DECAY
         ):
-            if self.decay_steps is None or self.warmup_steps is not None or self.schedule_free_beta1 is not None:
+            if (
+                self.decay_steps is None
+                or self.warmup_steps is not None
+                or self.schedule_free_beta1 is not None
+            ):
                 raise ValueError(
-                    get_schedule_error_message("constant plus linear decay", False, False, True)
+                    get_schedule_error_message(
+                        "constant plus linear decay", False, False, True
+                    )
                 )
         else:
             raise ValueError(
