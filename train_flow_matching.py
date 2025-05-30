@@ -281,7 +281,7 @@ def save_checkpoint_and_evaluate(
 
     for batch_idx in trange(
         len(test_dataset) // training_cfg.batch_size,
-        desc="test batches",
+        desc="test loss batches",
     ):
         test_rng, batch_rng, nll_batch_rng = jax.random.split(test_rng, 3)
 
@@ -302,6 +302,13 @@ def save_checkpoint_and_evaluate(
             logits_table,
         )
         losses.append(loss)
+
+    # Computing NLL is slow so we only do 1k examples.
+    for batch_idx in trange(
+        ceil(min(1000, len(test_dataset)) / training_cfg.batch_size),
+        desc="test nll batches",
+    ):
+        test_rng, batch_rng, nll_batch_rng = jax.random.split(test_rng, 3)
 
         # Compute NLL using full caps. It's non-obvious what the correct way to test NLL with
         # conditioning is, and the stat without conditioning is clearly useful.
