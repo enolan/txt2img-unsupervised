@@ -8,6 +8,7 @@ from tqdm.contrib import tenumerate
 import argparse
 import gc
 import jax
+import jax.nn as nn
 import jax.numpy as jnp
 import math
 import matplotlib.pyplot as plt
@@ -20,6 +21,8 @@ from mpl_toolkits.mplot3d import Axes3D
 from .cap_sampling import LogitsTable
 from .flow_matching import CapConditionedVectorField
 from . import flow_matching
+from .transformer_model import ImageModel, loss_batch
+from . import transformer_model
 from .muon import muon
 
 
@@ -66,66 +69,168 @@ def process_intermediates(intermediates):
     return result
 
 
+def process_transformer_intermediates(intermediates, model):
+    """
+    Convert the raw intermediates dictionary from transformer model into a readable format.
+
+    This extracts activation values from the transformer layers for muP analysis.
+
+    Args:
+        intermediates: The raw intermediates dictionary from transformer model execution
+        model: The ImageModel instance to determine which components are present
+
+    Returns:
+        A dictionary with human-readable keys and extracted activation values
+    """
+    result = {}
+
+    result["input_embedding"] = intermediates["in_embed"]["__call__"][0]
+    result["clip_projection"] = intermediates["clip_proj"]["__call__"][0]
+
+    transformer_intermediates = intermediates["transformer_layers"]
+    n_layers = transformer_intermediates["__call__"][0][0].shape[0]
+    
+    for layer_idx in range(n_layers):
+        mha = transformer_intermediates["mha"]
+        result[f"transformer_layer_{layer_idx}_query"] = mha["query"]["__call__"][0][layer_idx]
+        result[f"transformer_layer_{layer_idx}_key"] = mha["key"]["__call__"][0][layer_idx]
+        result[f"transformer_layer_{layer_idx}_value"] = mha["value"]["__call__"][0][layer_idx]
+        result[f"transformer_layer_{layer_idx}_attention_out"] = mha["out"]["__call__"][0][layer_idx]
+        
+        result[f"transformer_layer_{layer_idx}_linear_1"] = transformer_intermediates["linear_1"]["__call__"][0][layer_idx]
+        result[f"transformer_layer_{layer_idx}_linear_2"] = transformer_intermediates["linear_2"]["__call__"][0][layer_idx]
+        
+        result[f"transformer_layer_{layer_idx}_layer_norm_1"] = transformer_intermediates["layer_norm_1"]["__call__"][0][layer_idx]
+        result[f"transformer_layer_{layer_idx}_layer_norm_2"] = transformer_intermediates["layer_norm_2"]["__call__"][0][layer_idx]
+
+    result["final_layer_norm"] = intermediates["final_layer_norm"]["__call__"][0]
+    result["output_projection"] = intermediates["logits_decoder"]["__call__"][0]
+    result["model_output"] = intermediates["__call__"][0]
+
+    return result
+
+
 @partial(
     jax.jit,
-    static_argnames=["mdl"],
+    static_argnames=["mdl", "model_type"],
     donate_argnames=["rng"],
 )
-def compute_loss_no_grad(logits_tbl, mdl, params, rng, pts):
+def compute_loss_no_grad(logits_tbl, mdl, params, rng, data, model_type="flow"):
     """Compute loss without gradients for test evaluation."""
     rng, next_rng = jax.random.split(rng)
-    loss = flow_matching.compute_batch_loss(
-        mdl,
-        params,
-        {"point_vec": pts},
-        rng,
-        logits_tbl,
-        capture_intermediates=False,
-    )
+    
+    if model_type == "flow":
+        loss = flow_matching.compute_batch_loss(
+            mdl,
+            params,
+            {"point_vec": data},
+            rng,
+            logits_tbl,
+            capture_intermediates=False,
+        )
+    else:  # transformer
+        images, clips = data
+        max_cos_distances = jnp.empty((images.shape[0], 0))  # empty for clip_caps=False
+        loss = loss_batch(
+            mdl,
+            params,
+            rng,
+            images,
+            clips,
+            max_cos_distances,
+        )
+    
     return loss, next_rng
 
 
-def compute_test_loss(logits_tbl, mdl, params, rng, test_pts, batch_size):
+def compute_test_loss(
+    logits_tbl, mdl, params, rng, test_data, batch_size, model_type="flow"
+):
     """Compute average loss over the test dataset."""
-    n_batches = len(test_pts) // batch_size
-    total_loss = 0.0
+    if model_type == "flow":
+        n_batches = len(test_data) // batch_size
+        total_loss = 0.0
 
-    for i in trange(n_batches, desc="Evaluating test batches"):
-        start_idx = i * batch_size
-        end_idx = start_idx + batch_size
-        batch = test_pts[start_idx:end_idx]
-        loss, rng = compute_loss_no_grad(logits_tbl, mdl, params, rng, batch)
-        total_loss += loss
+        for i in trange(n_batches, desc="Evaluating test batches"):
+            start_idx = i * batch_size
+            end_idx = start_idx + batch_size
+            batch = test_data[start_idx:end_idx]
+            loss, rng = compute_loss_no_grad(logits_tbl, mdl, params, rng, batch, model_type)
+            total_loss += loss
 
-    return total_loss / n_batches
+        return total_loss / n_batches
+    else:  # transformer
+        images, clips = test_data
+        n_batches = len(images) // batch_size
+        total_loss = 0.0
+
+        for i in trange(n_batches, desc="Evaluating test batches"):
+            start_idx = i * batch_size
+            end_idx = start_idx + batch_size
+            images_batch = images[start_idx:end_idx]
+            clips_batch = clips[start_idx:end_idx]
+            
+            batch = (images_batch, clips_batch)
+            loss, rng = compute_loss_no_grad(logits_tbl, mdl, params, rng, batch, model_type)
+            total_loss += loss
+
+        return total_loss / n_batches
 
 
 @partial(
     jax.jit,
-    static_argnames=["mdl"],
+    static_argnames=["mdl", "model_type"],
     donate_argnames=["rng"],
 )
-def compute_gradients(logits_tbl, mdl, params, rng, pts):
+def compute_gradients(logits_tbl, mdl, params, rng, data, model_type="flow"):
     """
     Compute gradients. This is split from apply_updates so we can do this on GPU and
     apply_updates on CPU.
     """
     rng, next_rng = jax.random.split(rng)
 
-    loss_fn = lambda params: flow_matching.compute_batch_loss(
-        mdl,
-        params,
-        {"point_vec": pts},
-        rng,
-        logits_tbl,
-        capture_intermediates=True,
-    )
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, intermediates), grad = grad_fn(params)
-    processed_intermediates = jax.tree.map(
-        lambda x: jnp.mean(jnp.abs(x)),
-        process_intermediates(intermediates["intermediates"]),
-    )
+    if model_type == "flow":
+        loss_fn = lambda params: flow_matching.compute_batch_loss(
+            mdl,
+            params,
+            {"point_vec": data},
+            rng,
+            logits_tbl,
+            capture_intermediates=True,
+        )
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, intermediates), grad = grad_fn(params)
+        processed_intermediates = jax.tree.map(
+            lambda x: jnp.mean(jnp.abs(x)),
+            process_intermediates(intermediates["intermediates"]),
+        )
+    else:  # transformer
+        # data contains (images, clips)
+        images, clips = data
+        max_cos_distances = jnp.empty((images.shape[0], 0))  # empty for clip_caps=False
+
+        def transformer_loss_fn(params):
+            # Capture intermediates during forward pass
+            logits, intermediates = mdl.apply(
+                params,
+                rngs={"dropout": rng},
+                images=images,
+                clip_embeddings=clips,
+                max_cos_distances=max_cos_distances,
+                capture_intermediates=True,
+            )
+            per_token_loss = optax.softmax_cross_entropy(
+                logits, jax.nn.one_hot(images, 8192)
+            )
+            loss = jnp.mean(per_token_loss)
+            return loss, intermediates
+
+        grad_fn = jax.value_and_grad(transformer_loss_fn, has_aux=True)
+        (loss, intermediates), grad = grad_fn(params)
+        processed_intermediates = jax.tree.map(
+            lambda x: jnp.mean(jnp.abs(x)),
+            process_transformer_intermediates(intermediates["intermediates"], mdl),
+        )
 
     return loss, processed_intermediates, grad, next_rng
 
@@ -146,7 +251,15 @@ str_devices = lambda x: jax.tree.map(lambda y: y.device, x)
 
 
 def train_step(
-    logits_tbl, mdl, opt, params, opt_state, rng, pts, use_cpu_offload=False
+    logits_tbl,
+    mdl,
+    opt,
+    params,
+    opt_state,
+    rng,
+    data,
+    use_cpu_offload=False,
+    model_type="flow",
 ):
     """Complete training step, optionally with CPU-GPU split."""
     gpu_params = (
@@ -155,7 +268,7 @@ def train_step(
         else params
     )
     loss, processed_intermediates, grad, next_rng = compute_gradients(
-        logits_tbl, mdl, gpu_params, rng, pts
+        logits_tbl, mdl, gpu_params, rng, data, model_type
     )
 
     if use_cpu_offload:
@@ -170,21 +283,33 @@ def train_step(
 
 
 @partial(jax.jit, static_argnames=["model"])
-def init_model_params(model, init_key):
-    """JIT-compiled model initialization function."""
-    return model.init(
-        init_key,
-        jnp.zeros((1, 3)),
-        jnp.zeros((1,)),
-        jnp.zeros((1, 3)),
-        jnp.zeros((1,)),
-    )
+def init_flow_model_params(model, init_key):
+    """JIT-compiled flow model initialization function."""
+    dummy_inputs = model.dummy_inputs()
+    return model.init(init_key, *dummy_inputs)
+
+
+@partial(jax.jit, static_argnames=["model"])
+def init_transformer_model_params(model, init_key):
+    """JIT-compiled transformer model initialization function."""
+    dummy_inputs = model.dummy_inputs()
+    return model.init(init_key, *dummy_inputs)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--dataset-path", type=Path, required=True, help="Path to a 3D dataset"
+        "--model-type",
+        type=str,
+        choices=["flow", "transformer"],
+        required=True,
+        help="Type of model to test: 'flow' or 'transformer'",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=Path,
+        required=True,
+        help="Path to dataset (3D for flow, image for transformer)",
     )
     parser.add_argument(
         "--lr-base",
@@ -207,13 +332,23 @@ def main():
     )
     parser.add_argument("--d-model-low", type=int, required=True)
     parser.add_argument("--d-model-high", type=int, required=True)
+
+    # Flow model specific arguments
     parser.add_argument(
         "--reference-directions", type=int, required=False, default=None
     )
-    parser.add_argument("--time-dim", type=int, required=True)
-    parser.add_argument("--use-pre-mlp-projection", type=bool, required=True)
-    parser.add_argument("--n-layers", type=int, required=True)
+    parser.add_argument("--time-dim", type=int, required=False)
+    parser.add_argument("--use-pre-mlp-projection", type=bool, required=False)
     parser.add_argument("--mlp-expansion-factor", type=int, required=False, default=4)
+
+    # Transformer model specific arguments
+    parser.add_argument("--num-heads", type=int, required=False, default=8)
+    parser.add_argument("--ff-dim", type=int, required=False)
+    parser.add_argument("--image-tokens", type=int, required=False, default=256)
+    parser.add_argument("--dropout", type=float, required=False, default=0.1)
+
+    # Common arguments
+    parser.add_argument("--n-layers", type=int, required=True)
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--n-seeds", type=int, required=False, default=5)
     parser.add_argument(
@@ -279,6 +414,19 @@ def main():
 
     args = parser.parse_args()
 
+    # Validate model-specific arguments
+    if args.model_type == "flow":
+        if args.time_dim is None:
+            raise ValueError("--time-dim is required for flow models")
+        if args.use_pre_mlp_projection is None:
+            raise ValueError("--use-pre-mlp-projection is required for flow models")
+    elif args.model_type == "transformer":
+        if args.ff_dim is None:
+            args.ff_dim = 4 * args.d_model_low  # Default ff_dim as 4x d_model
+        # Set defaults for transformer-specific args if not provided
+        if args.num_heads is None:
+            args.num_heads = 8
+
     if args.n_seeds <= 0:
         raise ValueError("n_seeds must be at least 1")
     if args.n_train_steps <= 0:
@@ -297,7 +445,9 @@ def main():
         f"Dataset loaded with {len(dset_train)} training examples and {len(dset_test)} test examples. First example: {dset_train[0]}"
     )
     dset_train = dset_train.select(range(args.batch_size * args.n_train_steps))
-    logits_table = LogitsTable(d=3 - 1, n=8192)
+
+    # Create logits table only for flow models
+    logits_table = LogitsTable(d=3 - 1, n=8192) if args.model_type == "flow" else None
 
     doing_lr_sweep = args.lr_low is not None and args.lr_high is not None
     if doing_lr_sweep and args.lr_base is not None:
@@ -391,18 +541,41 @@ def main():
             key_idx += 1
             seed_keys = jax.random.split(master_key, args.n_seeds)
 
-            model = CapConditionedVectorField(
-                domain_dim=3,
-                reference_directions=args.reference_directions,
-                conditioning_dim=None,
-                time_dim=args.time_dim,
-                use_pre_mlp_projection=args.use_pre_mlp_projection,
-                n_layers=args.n_layers,
-                d_model=d_model,
-                mlp_expansion_factor=args.mlp_expansion_factor,
-                mlp_dropout_rate=None,
-                input_dropout_rate=None,
-            )
+            if args.model_type == "flow":
+                model = CapConditionedVectorField(
+                    domain_dim=3,
+                    reference_directions=args.reference_directions,
+                    conditioning_dim=None,
+                    time_dim=args.time_dim,
+                    use_pre_mlp_projection=args.use_pre_mlp_projection,
+                    n_layers=args.n_layers,
+                    d_model=d_model,
+                    mlp_expansion_factor=args.mlp_expansion_factor,
+                    mlp_dropout_rate=None,
+                    input_dropout_rate=None,
+                )
+            else:  # transformer
+                model = ImageModel(
+                    d_model=d_model,
+                    num_heads=args.num_heads,
+                    ff_dim=args.ff_dim,
+                    dropout=args.dropout,
+                    image_dropout=None,
+                    clip_dropout=None,
+                    n_layers=args.n_layers,
+                    image_tokens=args.image_tokens,
+                    clip_conditioning=True,
+                    clip_caps=False,
+                    clip_cap_count=3,
+                    corrected_cap_projections=True,
+                    do_clip_feedforward=False,
+                    norm_clip_embeddings=True,
+                    use_biases=True,
+                    activations_dtype=jnp.float32,
+                    activation_function=nn.gelu,
+                    weights_dtype=jnp.float32,
+                    pre_norm=True,
+                )
             tqdm.write(f"Model: {model}")
             tqdm.write(f"m_d = {model.d_model_scale_factor}")
 
@@ -463,7 +636,10 @@ def main():
                 )
                 with device_ctx:
                     tqdm.write("Initializing parameters")
-                    params = init_model_params(model, init_key)
+                    if args.model_type == "flow":
+                        params = init_flow_model_params(model, init_key)
+                    else:  # transformer
+                        params = init_transformer_model_params(model, init_key)
 
                     tqdm.write(f"Initializing optimizer state")
                     opt_state = init_opt_state(params)
@@ -476,6 +652,14 @@ def main():
                     desc=f"Seed {seed_idx+1} steps",
                     total=args.n_train_steps,
                 ):
+                    if args.model_type == "flow":
+                        batch_data = batch["vec"]
+                    else:  # transformer
+                        batch_data = (
+                            batch["encoded_img"],
+                            batch["clip_embedding"],  # single CLIP embedding per sample (batch, 768)
+                        )
+
                     loss, processed_intermediates, params, opt_state, rng = train_step(
                         logits_table,
                         model,
@@ -483,26 +667,35 @@ def main():
                         params,
                         opt_state,
                         rng,
-                        batch["vec"],
+                        batch_data,
                         use_cpu_offload,
+                        args.model_type,
                     )
                     activations_this_seed.append(processed_intermediates)
                     # Convert loss to numpy and store
                     seed_losses[seed_idx, i] = np.array(loss)
                     # Only log losses occasionally to avoid flooding the output
-                    log_interval = args.n_train_steps // 10
+                    log_interval = max(1, args.n_train_steps // 10)
                     if i % log_interval == 0 or i == args.n_train_steps - 1:
                         tqdm.write(f"Loss: {loss}, Step {i}/{args.n_train_steps}")
 
                 # After training, evaluate on test set
                 tqdm.write("Evaluating on test set")
+                if args.model_type == "flow":
+                    test_data = dset_test["vec"]
+                else:  # transformer
+                    test_data = (
+                        dset_test["encoded_img"],
+                        dset_test["clip_embedding"],  # single CLIP embedding per sample (batch, 768)
+                    )
                 test_loss = compute_test_loss(
                     logits_table,
                     model,
                     params,
                     rng,
-                    dset_test["vec"],
+                    test_data,
                     args.batch_size,
+                    args.model_type,
                 )
                 seed_test_losses[seed_idx] = np.array(test_loss)
                 tqdm.write(f"Test loss: {test_loss}")
@@ -568,6 +761,7 @@ def generate_activation_charts(d_model_values, activations, n_layers, args):
     colors = plt.cm.viridis(np.linspace(0, 1, num_train_steps))
 
     params = {
+        "model_type": args.model_type,
         "dataset": args.dataset_path,
         "lr_base": args.lr_base if args.lr_base is not None else "N/A",
         "lr_range": f"{args.lr_low}-{args.lr_high}"
@@ -627,35 +821,63 @@ def generate_activation_charts(d_model_values, activations, n_layers, args):
         plt.tight_layout()
         plt.savefig(args.output_dir / filename, bbox_inches="tight", dpi=300)
 
-    # Chart for pre_mlp_projection
-    if "pre_mlp_projection" in activations[0][0]:
+    if args.model_type == "transformer":
+        create_chart(
+            "input_embedding",
+            "Input Embedding Activations",
+            "input_embedding_activation_chart.png",
+        )
+
+        create_chart(
+            "clip_projection",
+            "CLIP Projection Activations",
+            "clip_projection_activation_chart.png",
+        )
+
+        for layer_idx in range(n_layers):
+            create_chart(
+                f"transformer_layer_{layer_idx}_attention_out",
+                f"Transformer Layer {layer_idx} Attention Output Activations",
+                f"transformer_layer_{layer_idx}_attention_out_chart.png",
+            )
+
+            create_chart(
+                f"transformer_layer_{layer_idx}_linear_2",
+                f"Transformer Layer {layer_idx} FFW Output Activations",
+                f"transformer_layer_{layer_idx}_linear_2_chart.png",
+            )
+
+        create_chart(
+            "final_layer_norm",
+            "Final Layer Norm Activations",
+            "final_layer_norm_activation_chart.png",
+        )
+    else:
         create_chart(
             "pre_mlp_projection",
             "Pre-MLP Projection Activations",
             "pre_mlp_activation_chart.png",
         )
 
-    # Charts for each MLP block's output projection, gate, and value
-    for layer_idx in range(n_layers):
-        create_chart(
-            f"mlp_block_{layer_idx}_out_proj",
-            f"MLP Block {layer_idx} Output Projection Activations",
-            f"mlp_block_{layer_idx}_out_proj_activation_chart.png",
-        )
+        for layer_idx in range(n_layers):
+            create_chart(
+                f"mlp_block_{layer_idx}_out_proj",
+                f"MLP Block {layer_idx} Output Projection Activations",
+                f"mlp_block_{layer_idx}_out_proj_activation_chart.png",
+            )
 
-        create_chart(
-            f"mlp_block_{layer_idx}_gate",
-            f"MLP Block {layer_idx} Gate Activations",
-            f"mlp_block_{layer_idx}_gate_activation_chart.png",
-        )
+            create_chart(
+                f"mlp_block_{layer_idx}_gate",
+                f"MLP Block {layer_idx} Gate Activations",
+                f"mlp_block_{layer_idx}_gate_activation_chart.png",
+            )
 
-        create_chart(
-            f"mlp_block_{layer_idx}_value",
-            f"MLP Block {layer_idx} Value Activations",
-            f"mlp_block_{layer_idx}_value_activation_chart.png",
-        )
+            create_chart(
+                f"mlp_block_{layer_idx}_value",
+                f"MLP Block {layer_idx} Value Activations",
+                f"mlp_block_{layer_idx}_value_activation_chart.png",
+            )
 
-    # Chart for model's output projection
     create_chart(
         "output_projection",
         "Model Output Projection Activations",

@@ -57,11 +57,80 @@ class ImageModel(nn.Module):
         False  # whether to record attention weights for visualization
     )
 
+    d_model_base: int = 512  # Baseline d_model that muP scaling is relative to
+    variance_base: float = 1 / 512  # baseline variance used when d_model = d_model_base
+
+    @property
+    def d_model_scale_factor(self) -> float:
+        "m_d in muP."
+        return self.d_model / self.d_model_base
+
+    def scale_lr(self, lr: float) -> float:
+        "Scaled learning rate for hidden layers."
+        return lr / self.d_model_scale_factor
+
+    def mk_partition_map(self, use_muon: bool):
+        """
+        Create a partition map for optimizer configuration with muP scaling.
+
+        Args:
+            use_muon: If False, creates a simple muP partition map with "fixed_lr" and "scaled_lr" groups.
+
+        Returns:
+            Dictionary suitable for optax.transforms.partition
+        """
+        if use_muon:
+            raise NotImplementedError("Muon optimizer support for transformer models is not implemented yet")
+        
+        dense_layer_partition_map = {"bias": "fixed_lr", "kernel": "scaled_lr"}
+
+        # Build params_map based on what parameters actually exist in the model
+        params_map = {
+            # Input embedding - fixed learning rate (input/output layers)
+            "in_embed": "fixed_lr",
+            # Positional encoding - fixed learning rate  
+            "positional_encoding": "fixed_lr",
+            # CLIP conditioning projections - scaled learning rate (hidden layer connections)
+            "clip_proj": dense_layer_partition_map,
+            # Transformer layers - proper muP scaling for each component
+            "transformer_layers": {
+                # Layer norms use fixed learning rate (biases and scales)
+                "layer_norm_1": "fixed_lr",
+                "layer_norm_2": "fixed_lr", 
+                # Feedforward layers use scaled learning rate for weights, fixed for biases
+                "linear_1": dense_layer_partition_map,  # first FFN layer (up projection)
+                "linear_2": dense_layer_partition_map,  # second FFN layer (down projection)
+                # Multi-head attention layers
+                "mha": {
+                    "query": dense_layer_partition_map,
+                    "key": dense_layer_partition_map, 
+                    "value": dense_layer_partition_map,
+                    "out": dense_layer_partition_map,
+                },
+            },
+            # Final layer norm - fixed learning rate
+            "final_layer_norm": "fixed_lr", 
+            # Output projection - scaled learning rate  
+            "logits_decoder": dense_layer_partition_map,
+        }
+        
+        # Add optional components if they exist
+        if self.clip_caps:
+            params_map["max_cos_distance_proj"] = dense_layer_partition_map
+            
+        if self.do_clip_feedforward:
+            params_map["clip_ff_up"] = dense_layer_partition_map
+            params_map["clip_ff_down"] = dense_layer_partition_map
+            params_map["cond_tokens_layernorm"] = "fixed_lr"
+
+        return {"params": params_map}
+
     def setup(self) -> None:
         # Follows PaLM: "PaLM: Scaling Language Modeling with Pathways"
         # https://arxiv.org/abs/2204.02311
+        hidden_init_variance = self.variance_base / self.d_model_scale_factor
         default_kernel_init = nn.initializers.variance_scaling(
-            scale=1.0, mode="fan_in", distribution="normal"
+            scale=hidden_init_variance, mode="fan_in", distribution="normal"
         )
         self.in_embed = nn.Embed(
             num_embeddings=8192,
@@ -220,8 +289,7 @@ class ImageModel(nn.Module):
         # optimization in JAX or XLA.
         self.transformer_layers = nn.scan(
             nn.remat(TransformerLayer),
-            variable_axes={"params": 0, "cache": 0}
-            | ({"intermediates": 0} if self.record_attention_weights else {}),
+            variable_axes={"params": 0, "cache": 0, "intermediates": 0},
             variable_broadcast=False,
             split_rngs={"params": True, "dropout": True},
             length=self.n_layers,
