@@ -53,6 +53,25 @@ model that generates embeddings is a spherical flow matching model with optimal 
   for an exception to be thrown (e.g. the caller has a bug, or the user passed a path to a file that
   doesn't exist etc), then it may make sense to catch it and reraise with a better message or
   recover. When in doubt, err on the side of allowing the program to crash.
+- NEVER silently ignore errors. In particular, the following patterns are wrong:
+  ```python
+  # Checking for keys you know should exist
+  if 'key' in my_dict:
+    # do something with my_dict['key']
+  else:
+    # fallback code that should never run
+  ```
+  ```python
+  # Same pattern for attributes
+  if hasattr(my_obj, 'prop'):
+    # do something with my_obj.prop
+  else:
+    # fallback code that should never run
+  ```
+  If you know something should exist, simply access it. Don't check for its presence and write
+  fallback code that shouldn't ever run. If whatever it is doesn't exist, allow the code to throw
+  an exception or otherwise error out. "Defensive" programming that only serves to hide bugs is
+  bullshit. This principle applies in general, not just to exceptions or missing keys or attributes.
 - Prefer functional code with minimal state. Small, independent functions that have a clear purpose
   are easier to understand and test.
 - When state is necessary, use classes to manage it. Use dataclasses where they make sense.
