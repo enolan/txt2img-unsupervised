@@ -894,7 +894,7 @@ if __name__ == "__main__":
     eval_loss_fn = jax.jit(partial(transformer_model.loss_batch, mdl))
 
     # Use the generic train loop with async execution
-    global_step, train_state = train_loop(
+    train_state, global_step = train_loop(
         steps_per_epoch=steps_per_epoch,
         total_steps=total_steps,
         complete_epochs=complete_epochs,
