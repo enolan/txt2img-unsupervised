@@ -29,7 +29,7 @@ from random import randint
 from tqdm import tqdm, trange
 from typing import List, Tuple, Union
 
-from . import ldm_autoencoder
+from . import flow_matching, ldm_autoencoder
 from .checkpoint import get_model_from_checkpoint, load_params
 from .ldm_autoencoder import LDMAutoencoder
 from .transformer_model import (
@@ -476,6 +476,208 @@ def mk_png_metadata(
     return metadata
 
 
+def two_stage_sample_loop(
+    im_mdl,
+    im_params,
+    flow_mdl,
+    flow_params,
+    ae_mdl,
+    ae_params,
+    batch_size,
+    cap_centers,
+    max_cos_distances,
+    rng,
+    logit_filter_method=LogitFilterMethod.TOP_P,
+    logit_filter_threshold=0.9,
+    temperature=1.0,
+    force_f32=True,
+    n_flow_steps=100,
+):
+    """Two-stage sampling pipeline that uses a flow model to generate CLIP embeddings,
+    then uses an image model to generate codes, then decodes with an autoencoder.
+
+    Args:
+        im_mdl: ImageModel instance
+        im_params: Parameters for the ImageModel (on CPU)
+        flow_mdl: CapConditionedVectorField instance
+        flow_params: Parameters for the CapConditionedVectorField (on CPU)
+        ae_mdl: LDMAutoencoder instance
+        ae_params: Parameters for the LDMAutoencoder (on CPU)
+        batch_size: Batch size for processing
+        cap_centers: Array of cap centers [n_imgs, 768]
+        max_cos_distances: Array of max cosine distances [n_imgs]
+        rng: JAX random key
+        logit_filter_method: Logit filtering method for transformer sampling
+        logit_filter_threshold: Threshold for logit filtering
+        temperature: Temperature for transformer sampling
+        force_f32: Whether to force float32 precision for transformer
+        n_flow_steps: Number of ODE integration steps for flow model
+
+    Returns:
+        List of PIL images
+    """
+
+    assert isinstance(cap_centers, np.ndarray)
+    assert isinstance(max_cos_distances, np.ndarray)
+    n_imgs = cap_centers.shape[0]
+    assert cap_centers.shape == (n_imgs, 768)
+    assert max_cos_distances.shape == (n_imgs,)
+
+    if not im_mdl.clip_conditioning:
+        raise ValueError(
+            "Image model must support CLIP conditioning for two-stage sampling"
+        )
+
+    # Validate flow model domain
+    if flow_mdl.domain_dim != 768:
+        raise ValueError(
+            f"Flow model domain_dim must be 768 (CLIP embedding size), got {flow_mdl.domain_dim}"
+        )
+
+    # Stage 1: Generate CLIP embeddings using flow model
+    print("Stage 1: Generating CLIP embeddings with flow model...")
+
+    # Put flow model parameters on GPU
+    devices = mesh_utils.create_device_mesh((jax.device_count(),))
+    mesh = Mesh(devices, axis_names=("dev",))
+    flow_params_gpu = jax.device_put(
+        flow_params, NamedSharding(mesh, PartitionSpec(None))
+    )
+
+    # Sample CLIP embeddings from flow model
+    flow_rng, rng = jax.random.split(rng)
+    generated_clip_embeddings = []
+
+    batches = batches_split(batch_size, n_imgs)
+    with tqdm(total=n_imgs, desc="flow sampling", unit="embed") as pbar:
+        ctr = 0
+        for batch in batches:
+            batch_cap_centers = cap_centers[ctr : ctr + batch]
+            batch_max_cos_distances = max_cos_distances[ctr : ctr + batch]
+
+            batch_rng, flow_rng = jax.random.split(flow_rng)
+
+            # Generate embeddings for this batch
+            print(f"{batch_max_cos_distances=}")
+            batch_embeddings = flow_matching.generate_samples(
+                flow_mdl,
+                flow_params_gpu,
+                batch_rng,
+                batch,
+                cap_centers=batch_cap_centers,
+                cap_d_maxes=batch_max_cos_distances,
+                n_steps=n_flow_steps,
+            )
+
+            generated_clip_embeddings.append(jax.device_get(batch_embeddings))
+            pbar.update(batch)
+            ctr += batch
+
+    generated_clip_embeddings = np.concatenate(generated_clip_embeddings, axis=0)
+    assert generated_clip_embeddings.shape == (n_imgs, 768)
+    cos_distances = 1 - np.sum(generated_clip_embeddings * cap_centers, axis=1)
+    assert cos_distances.shape == (n_imgs,)
+    print(f"Cosine distances to cap centers: {cos_distances}")
+
+    # Free GPU memory used by flow model
+    del flow_params_gpu
+    gc.collect()
+
+    # Stage 2: Generate image codes using transformer model
+    print("Stage 2: Generating image codes with transformer model...")
+
+    # Put image model parameters on GPU
+    im_params_gpu = jax.device_put(im_params, NamedSharding(mesh, PartitionSpec(None)))
+
+    if force_f32:
+        im_mdl = im_mdl.clone(activations_dtype=jnp.float32)
+
+    # Prepare inputs for image model based on its conditioning type
+    if im_mdl.clip_caps:
+        # For cap-conditioned models, use generated embeddings with max_cos_distance=0
+        # This means "use this exact embedding"
+        cap_centers_for_im = generated_clip_embeddings.reshape(n_imgs, 1, 768)
+        cap_centers_for_im = np.tile(cap_centers_for_im, (1, im_mdl.clip_cap_count, 1))
+        max_cos_distances_for_im = np.zeros(
+            (n_imgs, im_mdl.clip_cap_count), dtype=jnp.float32
+        )
+    else:
+        # For models with CLIP conditioning but no caps, use embeddings directly
+        cap_centers_for_im = generated_clip_embeddings
+        max_cos_distances_for_im = np.zeros((n_imgs, 0), dtype=jnp.float32)
+
+    # Sample codes from transformer model
+    sampled_codes_arrs = []
+    trans_rng, rng = jax.random.split(rng)
+
+    with tqdm(total=n_imgs, desc="transformer sampling", unit="img") as pbar:
+        ctr = 0
+        for batch in batches:
+            # Generate fresh random keys for this batch
+            batch_rngs = jax.random.split(trans_rng, batch + 1)
+            trans_rng = batch_rngs[0]  # Update for next iteration
+            rngs_batch = batch_rngs[1:]  # Use the rest for sampling
+
+            cap_centers_batch = cap_centers_for_im[ctr : ctr + batch]
+            max_cos_distances_batch = max_cos_distances_for_im[ctr : ctr + batch]
+
+            codes = sample(
+                im_mdl,
+                im_params_gpu,
+                cap_centers_batch,
+                max_cos_distances_batch,
+                rngs_batch,
+                logit_filter_method,
+                logit_filter_threshold,
+                temperature,
+            )
+            sampled_codes_arrs.append(jax.device_get(codes))
+            pbar.update(batch)
+            ctr += batch
+
+    sampled_codes = np.concatenate(sampled_codes_arrs, axis=0)
+    assert sampled_codes.shape == (n_imgs, im_mdl.image_tokens)
+
+    # Free GPU memory used by image model
+    del im_params_gpu
+    gc.collect()
+
+    # Stage 3: Decode codes using autoencoder
+    print("Stage 3: Decoding images with autoencoder...")
+
+    # Put autoencoder parameters on GPU
+    ae_params_gpu = jax.device_put(ae_params, NamedSharding(mesh, PartitionSpec(None)))
+
+    ae_res = int(im_mdl.image_tokens**0.5)
+    decoded_imgs = []
+
+    with tqdm(total=n_imgs, desc="autoencoder decoding", unit="img") as pbar:
+        ctr = 0
+        for batch in batches:
+            codes_batch = sampled_codes[ctr : ctr + batch]
+
+            imgs = ldm_autoencoder.decode_jv(
+                ae_mdl, ae_params_gpu, (ae_res, ae_res), codes_batch
+            )
+            decoded_imgs.append(jax.device_get(imgs))
+            pbar.update(batch)
+            ctr += batch
+
+    decoded_imgs = np.concatenate(decoded_imgs, axis=0)
+    assert decoded_imgs.shape[0] == n_imgs
+
+    # Free GPU memory used by autoencoder
+    del ae_params_gpu
+    gc.collect()
+
+    # Convert to PIL images
+    pil_imgs = []
+    for img in tqdm(decoded_imgs, desc="PILifying", unit="img"):
+        pil_imgs.append(PIL.Image.fromarray(img))
+
+    return pil_imgs
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n", type=int, default=1)
@@ -491,6 +693,17 @@ def main():
     parser.add_argument("--cond-txt", type=str, nargs="*")
     parser.add_argument(
         "--force-fp32", type=bool, default=True, help="Force float32 precision"
+    )
+    parser.add_argument(
+        "--flow-model",
+        type=Path,
+        help="Optional flow model checkpoint directory for two-stage sampling",
+    )
+    parser.add_argument(
+        "--n-flow-steps",
+        type=int,
+        default=100,
+        help="Number of ODE integration steps for flow model",
     )
     parser.add_argument("transformer_checkpoint_dir", type=Path)
     parser.add_argument("autoencoder_checkpoint", type=Path)
@@ -525,6 +738,12 @@ def main():
     model_cfg, im_mdl = get_model_from_checkpoint(args.transformer_checkpoint_dir)
     assert isinstance(im_mdl, ImageModel), f"Expected ImageModel, got {type(im_mdl)}"
 
+    if args.flow_model is not None:
+        if not im_mdl.clip_conditioning:
+            raise ValueError(
+                "Image model must support CLIP conditioning for two-stage sampling"
+            )
+
     if im_mdl.clip_conditioning and (args.cond_img or args.cond_txt):
         print("Loading CLIP model...")
 
@@ -547,7 +766,24 @@ def main():
         del clip_mdl, clip_processor
         gc.collect()
 
-        if im_mdl.clip_caps:
+        # Handle conditioning inputs (both single-stage and two-stage)
+        if args.flow_model is not None:
+            # Flow models act like they have a single cap constraint
+            assert (
+                len(cond_dicts) == 1
+            ), "Flow models support only one CLIP embedding (like clip_cap_count=1)"
+            clip_embedding = cond_dicts[0]["clip_embedding"]
+            max_cos_distance = cond_dicts[0]["max_cos_distance"]
+            assert clip_embedding.shape == (768,)
+            assert (
+                max_cos_distance is not None
+            ), "Must specify max cosine distance for flow model"
+
+            # Flow model expects cap centers and distances for n images
+            cap_centers = repeat(clip_embedding, "clip -> n clip", n=args.n)
+            max_cos_distances = np.full((args.n,), max_cos_distance, dtype=np.float32)
+        elif im_mdl.clip_caps:
+            # Single-stage sampling with caps
             total_conds = len(cond_dicts)
             assert all(
                 [d["max_cos_distance"] is not None for d in cond_dicts]
@@ -586,6 +822,7 @@ def main():
             cap_centers = repeat(cap_centers, "cap clip -> n cap clip", n=args.n)
             max_cos_distances = repeat(max_cos_distances, "cap -> n cap", n=args.n)
         else:
+            # Single-stage sampling without caps
             assert (
                 len(cond_dicts) == 1
             ), "Can only specify one CLIP embedding without clip caps"
@@ -596,33 +833,49 @@ def main():
             ), "Can't specify max cosine distance without clip caps"
             cap_centers = repeat(clip_embeddings, "clip -> n clip", n=args.n)
             max_cos_distances = None
-    elif im_mdl.clip_conditioning:
-        # Unconditioned sampling
-        if im_mdl.clip_caps:
-            rng, rng2 = jax.random.split(rng)
-            cap_centers, max_cos_distances = mk_filler_caps(im_mdl, args.n, 0, rng2)
-            cond_img_inputs, cond_txt_inputs = [], []
-        else:
-            assert False, "Unconditioned sampling with no clip caps doesn't make sense"
     else:
-        cap_centers = None
-        max_cos_distances = None
-        assert (
-            args.cond_img is None and args.cond_txt is None
-        ), "Can't specify --cond-img or --cond-txt without CLIP conditioning"
+        # Handle unconditioned sampling
         cond_img_inputs, cond_txt_inputs = [], []
 
+        if args.flow_model is not None:
+            # Two-stage unconditioned sampling: use deterministic caps for flow model
+            print("Using unconditioned two-stage sampling with flow model...")
+            # Use straight north (first dimension = 1, rest = 0) for all cap centers
+            cap_centers = np.zeros((args.n, 768), dtype=np.float32)
+            cap_centers[:, 0] = 1.0  # Set first dimension to 1 for "straight north"
+            # Use max cosine distance of 2 (no restriction)
+            max_cos_distances = np.full((args.n,), 2.0, dtype=np.float32)
+        elif im_mdl.clip_conditioning:
+            # Single-stage unconditioned sampling with CLIP conditioning
+            if im_mdl.clip_caps:
+                # Use filler caps for cap-conditioned models
+                rng, rng2 = jax.random.split(rng)
+                cap_centers, max_cos_distances = mk_filler_caps(im_mdl, args.n, 0, rng2)
+            else:
+                # Models that expect a single CLIP embedding don't support unconditioned sampling
+                assert (
+                    False
+                ), "Unconditioned sampling with single CLIP embedding models doesn't make sense"
+        else:
+            # Single-stage unconditioned sampling without CLIP conditioning
+            cap_centers = np.zeros((args.n, 0), dtype=np.float32)
+            max_cos_distances = None
+
     # Load the transformer model parameters
-    im_params, checkpoint_step, im_mdl = load_params(args.transformer_checkpoint_dir)
+    im_params, checkpoint_step, im_mdl = load_params(
+        args.transformer_checkpoint_dir, device="cpu"
+    )
 
     print(
         f"Loaded transformer model step {checkpoint_step} from "
         f"{args.transformer_checkpoint_dir}"
     )
 
-    devices = mesh_utils.create_device_mesh((jax.device_count(),))
-    mesh = Mesh(devices, axis_names=("dev",))
-    im_params = jax.device_put(im_params, NamedSharding(mesh, PartitionSpec(None)))
+    # Only put transformer params on GPU if not using two-stage sampling
+    if args.flow_model is None:
+        devices = mesh_utils.create_device_mesh((jax.device_count(),))
+        mesh = Mesh(devices, axis_names=("dev",))
+        im_params = jax.device_put(im_params, NamedSharding(mesh, PartitionSpec(None)))
 
     print("Loading autoencoder model...")
     ae_res = int(im_mdl.image_tokens**0.5)
@@ -637,20 +890,58 @@ def main():
 
     logit_filter_method = LogitFilterMethod[args.logit_filter_method.upper()]
 
-    imgs = sample_loop(
-        mdl=im_mdl,
-        params=im_params,
-        ae_mdl=ae_mdl,
-        ae_params=ae_params,
-        batch_size=args.batch_size,
-        cap_centers=cap_centers,
-        max_cos_distances=max_cos_distances,
-        rng=rng,
-        logit_filter_method=logit_filter_method,
-        logit_filter_threshold=args.logit_filter_threshold,
-        temperature=args.temperature,
-        force_f32=args.force_fp32,
-    )
+    # Load flow model after CLIP processing to minimize peak memory usage
+    flow_mdl = None
+    flow_params = None
+    if args.flow_model is not None:
+        print(f"Loading flow model from {args.flow_model}...")
+        flow_params, flow_step, flow_mdl = load_params(args.flow_model, device="cpu")
+        print(f"Loaded flow model step {flow_step}")
+
+        # Validate flow model compatibility
+        if not isinstance(flow_mdl, flow_matching.CapConditionedVectorField):
+            raise ValueError(
+                f"Flow model must be a CapConditionedVectorField, got {type(flow_mdl)}"
+            )
+        if flow_mdl.domain_dim != 768:
+            raise ValueError(
+                f"Flow model domain_dim must be 768 (CLIP embedding size), got {flow_mdl.domain_dim}"
+            )
+
+    # Choose sampling method based on whether flow model is provided
+    if args.flow_model is not None:
+        imgs = two_stage_sample_loop(
+            im_mdl=im_mdl,
+            im_params=im_params,
+            flow_mdl=flow_mdl,
+            flow_params=flow_params,
+            ae_mdl=ae_mdl,
+            ae_params=ae_params,
+            batch_size=args.batch_size,
+            cap_centers=cap_centers,
+            max_cos_distances=max_cos_distances,
+            rng=rng,
+            logit_filter_method=logit_filter_method,
+            logit_filter_threshold=args.logit_filter_threshold,
+            temperature=args.temperature,
+            force_f32=args.force_fp32,
+            n_flow_steps=args.n_flow_steps,
+        )
+    else:
+        imgs = sample_loop(
+            mdl=im_mdl,
+            params=im_params,
+            ae_mdl=ae_mdl,
+            ae_params=ae_params,
+            batch_size=args.batch_size,
+            cap_centers=cap_centers,
+            max_cos_distances=max_cos_distances,
+            rng=rng,
+            logit_filter_method=logit_filter_method,
+            logit_filter_threshold=args.logit_filter_threshold,
+            temperature=args.temperature,
+            force_f32=args.force_fp32,
+        )
 
     args.out_dir.mkdir(exist_ok=True, parents=True)
 

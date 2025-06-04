@@ -10,12 +10,13 @@ import pytest
 import time
 import subprocess
 
+from contextlib import nullcontext
 from flax.training import train_state
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from pathlib import Path
 from tqdm import tqdm
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Literal, Optional, Tuple, Union
 
 from .adaptive_gradient_clip import AdaptiveGradientClipState, adaptive_gradient_clip
 from .config import (
@@ -495,18 +496,24 @@ def _init_model_with_dummy_inputs(mdl, rng=None):
 
 
 def load_params(
-    checkpoint_dir: Path, step: Optional[int] = None
+    checkpoint_dir: Path,
+    step: Optional[int] = None,
+    device: Literal["gpu", "cpu"] = "gpu",
 ) -> Tuple[dict, int, Any]:
     """Load the evaluation parameters from a checkpoint.
     Args:
         checkpoint_dir: The directory path containing the checkpoints.
         step: The step to load from. If None, loads the latest checkpoint.
+        device: Device to load parameters to. Either "gpu" or "cpu". Defaults to "gpu".
     Returns:
         A tuple containing:
         - A dictionary of parameters
         - The step number
         - The model instance
     """
+    if device not in ("gpu", "cpu"):
+        raise ValueError(f"Device must be 'gpu' or 'cpu', got '{device}'")
+
     checkpoint_manager = mk_checkpoint_manager(checkpoint_dir, for_training=False)
     if step is None:
         step = checkpoint_manager.latest_step()
@@ -518,17 +525,22 @@ def load_params(
     params_template = jax.tree.map(ocp.utils.to_shape_dtype_struct, params_template)
     gc.collect()
 
-    restored = checkpoint_manager.restore(
-        step,
-        args=ocp.args.Composite(
-            params=ocp.args.StandardRestore(params_template),
-        ),
-    )
+    # Load parameters on system memory
+    with jax.default_device(jax.devices("cpu")[0]):
+        restored = checkpoint_manager.restore(
+            step,
+            args=ocp.args.Composite(
+                params=ocp.args.StandardRestore(params_template),
+            ),
+        )
+        params = restored.params
 
-    # Replicate params for multi-GPU inference
-    devices = mesh_utils.create_device_mesh((jax.device_count(),))
-    mesh = Mesh(devices, axis_names=("dev",))
-    params = jax.device_put(restored.params, NamedSharding(mesh, PartitionSpec(None)))
+    # Send the params to all GPUs if requested.
+    if device == "gpu":
+        devices = mesh_utils.create_device_mesh((jax.device_count(),))
+        mesh = Mesh(devices, axis_names=("dev",))
+        params = jax.device_put(params, NamedSharding(mesh, PartitionSpec(None)))
+
     return params, step, mdl
 
 
