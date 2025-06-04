@@ -489,7 +489,22 @@ class VectorField(nn.Module):
         dot_products = jnp.sum(points_out * x, axis=1, keepdims=True)
         tangent_outputs = points_out - dot_products * x
         assert tangent_outputs.shape == (batch_size, self.domain_dim)
-        tangent_outputs = tangent_outputs * self.alpha_output
+
+        # At initialization, we want the mean magnitude of our output vectors to be pi/2, since the
+        # average geodesic distance between 2 uniform random points on a sphere is pi/2. This should
+        # make our initial loss values reasonable. Without scaling, the initial loss values are
+        # gigantic - ~766 for 768d model. With it they're ~5.
+        # The tangent space projection of a d-dimensional Gaussian has magnitude following a chi
+        # distribution with (d-1) degrees of freedom. The expectation is:
+        # E[chi(k)] = sqrt(2) * Gamma((k+1)/2) / Gamma(k/2)
+        expected_magnitude = jnp.sqrt(2) * jnp.exp(
+            jax.lax.lgamma(self.domain_dim / 2)
+            - jax.lax.lgamma((self.domain_dim - 1) / 2)
+        )
+
+        domain_scale_factor = (jnp.pi / 2) / expected_magnitude
+
+        tangent_outputs = tangent_outputs * domain_scale_factor * self.alpha_output
 
         return tangent_outputs
 
@@ -1025,6 +1040,7 @@ def create_train_state(rng, model, learning_rate_or_schedule):
     return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=opt)
 
 
+@partial(jax.jit, static_argnames=("batch_size", "dim"), inline=True)
 def sample_sphere(rng, batch_size, dim):
     """
     Sample points uniformly from the unit sphere.
@@ -3024,3 +3040,112 @@ def create_mollweide_projection_figure(samples, title=None):
     if title is not None:
         ax.set_title(title)
     return fig
+
+
+@pytest.mark.parametrize("domain_dim", [2, 3, 8, 16, 32, 768])
+def test_vector_field_output_magnitude_statistics(domain_dim):
+    """
+    Test that measures the magnitude statistics of VectorField outputs.
+
+    Initializes a VectorField, generates random input data, computes output vector magnitudes,
+    and prints the mean and standard deviation of those magnitudes.
+    """
+    rng = jax.random.PRNGKey(20250602)
+
+    # Create a VectorField model
+    model = VectorField(
+        activations_dtype=jnp.float32,
+        weights_dtype=jnp.float32,
+        domain_dim=domain_dim,
+        conditioning_dim=0,
+        time_dim=32,
+        reference_directions=64,
+        n_layers=4,
+        d_model=256,
+        mlp_expansion_factor=4,
+        mlp_dropout_rate=None,
+        input_dropout_rate=None,
+        use_pre_mlp_projection=True,
+    )
+
+    # Initialize model parameters
+    params_rng, data_rng = jax.random.split(rng)
+    params = model.init(params_rng, *model.dummy_inputs())
+
+    # Generate random input data
+    n_samples = 1_000_000
+    batch_size = 8192
+    keys = jax.random.split(data_rng, 3)
+
+    # Generate points uniformly on the sphere
+    x = sample_sphere(keys[0], n_samples, domain_dim)
+
+    # Generate random times in [0, 1]
+    t = jax.random.uniform(keys[1], (n_samples,))
+
+    # Generate conditioning vectors (empty since conditioning_dim=0)
+    cond_vec = jnp.zeros((n_samples, 0))
+
+    # Compute model outputs in batches
+    jitted_apply = jax.jit(
+        lambda x_batch, t_batch, cond_batch: model.apply(
+            params, x_batch, t_batch, cond_batch
+        )
+    )
+
+    all_magnitudes = []
+    all_dot_products = []
+
+    n_batches = (n_samples + batch_size - 1) // batch_size
+    for i in tqdm(range(n_batches), desc=f"Processing batches (dim={domain_dim})"):
+        start_idx = i * batch_size
+        end_idx = min((i + 1) * batch_size, n_samples)
+
+        x_batch = x[start_idx:end_idx]
+        t_batch = t[start_idx:end_idx]
+        cond_batch = cond_vec[start_idx:end_idx]
+
+        # Compute model outputs for this batch
+        output_vectors_batch = jitted_apply(x_batch, t_batch, cond_batch)
+
+        # Compute magnitudes for this batch
+        magnitudes_batch = jnp.linalg.norm(output_vectors_batch, axis=1)
+        all_magnitudes.append(magnitudes_batch)
+
+        # Compute dot products for this batch
+        dot_products_batch = jnp.sum(output_vectors_batch * x_batch, axis=1)
+        all_dot_products.append(dot_products_batch)
+
+    # Concatenate all results
+    magnitudes = jnp.concatenate(all_magnitudes, axis=0)
+    dot_products = jnp.concatenate(all_dot_products, axis=0)
+    assert magnitudes.shape == dot_products.shape == (n_samples,)
+
+    # Calculate statistics
+    mean_magnitude = jnp.mean(magnitudes)
+    std_magnitude = jnp.std(magnitudes)
+    min_magnitude = jnp.min(magnitudes)
+    max_magnitude = jnp.max(magnitudes)
+
+    # Print results
+    print(f"\nVectorField Output Magnitude Statistics (domain_dim={domain_dim}):")
+    print(f"Number of samples: {n_samples}")
+    print(f"Mean magnitude: {mean_magnitude:.6f}")
+    print(f"Std magnitude: {std_magnitude:.6f}")
+    print(f"Min magnitude: {min_magnitude:.6f}")
+    print(f"Max magnitude: {max_magnitude:.6f}")
+
+    # Verify outputs are tangent to the sphere (should have zero dot product with input points)
+    max_dot_product = jnp.max(jnp.abs(dot_products))
+    print(f"Max |dot product| with input points: {max_dot_product:.8f} (should be ~0)")
+
+    # For low dimensionality, there's more variance in magnitudes due to the smaller number of
+    # weights. I think that's why anyway.
+    np.testing.assert_allclose(
+        mean_magnitude, jnp.pi / 2, atol=0.1 if domain_dim > 3 else 0.5
+    )
+    np.testing.assert_allclose(max_dot_product, 0.0, atol=1e-5)
+
+    # Basic sanity check that magnitudes are non-negative and finite
+    assert jnp.all(magnitudes >= 0), "All magnitudes should be non-negative"
+    assert jnp.all(jnp.isfinite(magnitudes)), "All magnitudes should be finite"
