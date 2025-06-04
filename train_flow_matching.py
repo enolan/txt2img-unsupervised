@@ -34,6 +34,7 @@ from txt2img_unsupervised.flow_matching import (
     sample_loop,
     sample_cap,
     create_mollweide_projection_figure,
+    generate_samples,
 )
 from txt2img_unsupervised.train_data_loading import get_batch
 from txt2img_unsupervised.training_infra import (
@@ -332,6 +333,67 @@ def save_checkpoint_and_evaluate(
         nll = -jnp.mean(log_prob)
         nlls.append(nll)
 
+    # Evaluate cap conditioning performance by sampling conditioned on caps centered on test
+    # examples
+    cap_metrics = {}
+    cap_rng = jax.random.PRNGKey(42 + global_step)  # Reproducible but unique per step
+
+    for d_max in tqdm([1.0, 0.5], unit="d_max", desc="cap conditioning eval"):
+        cap_distances = []
+        within_cap_counts = []
+        total_samples = 0
+
+        for batch_idx in trange(
+            ceil(min(1000, len(test_dataset)) / training_cfg.batch_size),
+            desc=f"cap conditioning eval (d_max={d_max})",
+        ):
+            cap_rng, batch_cap_rng = jax.random.split(cap_rng)
+
+            batch = get_batch(
+                test_dataset,
+                training_cfg.batch_size,
+                batch_idx,
+                fields=[vector_column],
+                sharding=examples_sharding,
+            )
+
+            cap_centers = batch[vector_column]
+            batch_size = cap_centers.shape[0]
+            cap_d_maxes = jnp.full((batch_size,), d_max)
+
+            samples = generate_samples(
+                mdl,
+                eval_params,
+                batch_cap_rng,
+                batch_size,
+                cap_centers=cap_centers,
+                cap_d_maxes=cap_d_maxes,
+                n_steps=integration_steps,
+            )
+
+            cosine_similarities = jnp.sum(samples * cap_centers, axis=1)
+            cosine_distances = 1.0 - cosine_similarities
+
+            within_cap = cosine_distances <= d_max
+
+            cap_distances.append(cosine_distances)
+            within_cap_counts.append(jnp.sum(within_cap))
+            total_samples += batch_size
+
+        # Compute aggregate metrics
+        all_distances = jnp.concatenate(cap_distances)
+        total_within_cap = jnp.sum(jnp.stack(within_cap_counts))
+
+        mean_distance = jnp.mean(all_distances)
+        fraction_within_cap = total_within_cap / total_samples
+
+        cap_metrics[
+            f"test/cap_conditioning/d_max_{d_max}/mean_cosine_distance"
+        ] = mean_distance
+        cap_metrics[
+            f"test/cap_conditioning/d_max_{d_max}/fraction_within_cap"
+        ] = fraction_within_cap
+
     test_loss = jnp.mean(jnp.stack(losses))
     test_nll = jnp.mean(jnp.stack(nlls))
 
@@ -340,6 +402,7 @@ def save_checkpoint_and_evaluate(
             "global_step": global_step,
             "test/loss": test_loss,
             "test/nll": test_nll,
+            **cap_metrics,
         }
     )
     tqdm.write(
