@@ -2025,6 +2025,8 @@ def hutchinson_estimator(
 
     def hutchinson_single(x_i, rng_i, *args):
         """Compute Hutchinson divergence estimate for a single point."""
+        dropout_rng, projection_rng = jax.random.split(rng_i)
+
         # Create model function based on model type and args
         if isinstance(model, CapConditionedVectorField):
             center_i, d_max_i = args
@@ -2036,6 +2038,7 @@ def hutchinson_estimator(
                     jnp.array([t]),
                     center_i[None, :],
                     d_max_i[None],
+                    rngs={"dropout": dropout_rng},
                 )[0]
 
         else:
@@ -2043,11 +2046,15 @@ def hutchinson_estimator(
 
             def f(x_single):
                 return model.apply(
-                    params, x_single[None, :], jnp.array([t]), cond_i[None, :]
+                    params,
+                    x_single[None, :],
+                    jnp.array([t]),
+                    cond_i[None, :],
+                    rngs={"dropout": dropout_rng},
                 )[0]
 
         # Generate random projection vectors (Rademacher distribution)
-        projection_keys = jax.random.split(rng_i, n_projections)
+        projection_keys = jax.random.split(projection_rng, n_projections)
         v_samples = jax.vmap(
             lambda key: jax.random.rademacher(key, (dim,), dtype=x_i.dtype)
         )(projection_keys)
@@ -2147,6 +2154,7 @@ def exact_divergence(
                     jnp.array([t]),
                     center_i[None, :],
                     d_max_i[None],
+                    rngs={"dropout": step_rng} if step_rng is not None else {},
                 )[0]
 
             jac = jax.jacfwd(f)(x_i)
@@ -2161,7 +2169,11 @@ def exact_divergence(
         def divergence_single(x_i, cond):
             def f(x_single):
                 return model.apply(
-                    params, x_single[None, :], jnp.array([t]), cond[None, :]
+                    params,
+                    x_single[None, :],
+                    jnp.array([t]),
+                    cond[None, :],
+                    rngs={"dropout": step_rng} if step_rng is not None else {},
                 )[0]
 
             jac = jax.jacfwd(f)(x_i)
