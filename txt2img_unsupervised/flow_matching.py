@@ -2615,28 +2615,91 @@ def test_vector_field_evaluation():
     np.testing.assert_allclose(dot_products, 0.0, atol=1e-6)
 
 
-@dataclass
-class CapConditionedVectorField(VectorField):
+class CapConditionedVectorField(nn.Module):
     """
     Model of a vector field that learns a distribution on the unit sphere and can sample conditional
     on the sample being within an arbitrary spherical cap.
     """
 
-    conditioning_dim: Optional[int]  # Pass None, will be overwritten.
+    # Parameters for the underlying VectorField
+    domain_dim: int
+    reference_directions: Optional[int]
+    time_dim: int
+    use_pre_mlp_projection: bool
+    n_layers: int
+    d_model: int
+    mlp_expansion_factor: int
+    mlp_dropout_rate: Optional[float]
+    input_dropout_rate: Optional[float]
+    activations_dtype: jnp.dtype = jnp.float32
+    weights_dtype: jnp.dtype = jnp.float32
+    d_model_base: int = 512
+    variance_base: float = 1 / 512
+    alpha_input: float = 1.0
+    alpha_output: float = 1.0
 
-    def __post_init__(self):
+    @nn.nowrap
+    def mk_vector_field(self):
+        # We need a VectorField object for various calculations, and some of them should happen
+        # outside of a flax init/apply, when setup() won't have run yet. So we define a function to
+        # create one. They're immutable and pure functions of the constructor params, so we can make
+        # as many as we feel like and they'll all be identical.
+        return VectorField(
+            domain_dim=self.domain_dim,
+            reference_directions=self.reference_directions,
+            conditioning_dim=self.conditioning_dim,
+            time_dim=self.time_dim,
+            use_pre_mlp_projection=self.use_pre_mlp_projection,
+            n_layers=self.n_layers,
+            d_model=self.d_model,
+            mlp_expansion_factor=self.mlp_expansion_factor,
+            mlp_dropout_rate=self.mlp_dropout_rate,
+            input_dropout_rate=self.input_dropout_rate,
+            activations_dtype=self.activations_dtype,
+            weights_dtype=self.weights_dtype,
+            d_model_base=self.d_model_base,
+            variance_base=self.variance_base,
+            alpha_input=self.alpha_input,
+            alpha_output=self.alpha_output,
+        )
+
+    def setup(self):
+        # Create the underlying VectorField. Needs to be an attribute set here so that the vector
+        # field paramters will get set up.
+        self.vector_field = self.mk_vector_field()
+
+    @property
+    def conditioning_dim(self):
         cap_center_dim = (
             self.domain_dim
             if self.reference_directions is None
             else self.reference_directions
         )
-        correct_conditioning_dim = cap_center_dim + 1
-        assert (
-            self.conditioning_dim is None
-            or self.conditioning_dim == correct_conditioning_dim
-        ), f"conditioning_dim can't be user controlled in CapConditionedVectorFields, but was {self.conditioning_dim}"
-        self.conditioning_dim = correct_conditioning_dim
-        super().__post_init__()
+        return cap_center_dim + 1
+
+    @property
+    def d_model_scale_factor(self) -> float:
+        "m_d in muP."
+        return self.mk_vector_field().d_model_scale_factor
+
+    @nn.nowrap
+    def mk_partition_map(self, use_muon: bool):
+        """
+        Create a partition map for optimizer configuration with muP scaling.
+        Delegates to the underlying VectorField.
+        """
+        return {
+            "params": {
+                "vector_field": self.mk_vector_field().mk_partition_map(use_muon)[
+                    "params"
+                ]
+            }
+        }
+
+    @nn.nowrap
+    def scale_lr(self, lr: float) -> float:
+        "Scaled learning rate for hidden layers. Delegates to the underlying VectorField."
+        return self.mk_vector_field().scale_lr(lr)
 
     def process_cap_inputs(self, cap_centers, cap_d_maxes):
         """
@@ -2661,7 +2724,7 @@ class CapConditionedVectorField(VectorField):
         # Both unit vectors and cosine similarities have mean 0 standard deviation 1/sqrt(d)
         if self.reference_directions is not None:
             cap_centers_transformed = (
-                cap_centers @ self.reference_vectors.T
+                cap_centers @ self.vector_field.reference_vectors.T
             ) * jnp.sqrt(self.domain_dim)
         else:
             cap_centers_transformed = cap_centers * jnp.sqrt(self.domain_dim)
@@ -2701,7 +2764,7 @@ class CapConditionedVectorField(VectorField):
         assert cap_d_maxes.shape == (batch_size,)
 
         processed = self.process_cap_inputs(cap_centers, cap_d_maxes)
-        return super().__call__(x, t, processed["cap_info"])
+        return self.vector_field(x, t, processed["cap_info"])
 
 
 @pytest.mark.parametrize("domain_dim", [3, 5, 8])
@@ -2730,7 +2793,6 @@ def test_cap_conditioned_vector_field_normalization(domain_dim, reference_direct
         d_model=128,
         time_dim=time_dim,
         mlp_expansion_factor=1,
-        conditioning_dim=None,
         input_dropout_rate=None,
         mlp_dropout_rate=None,
         use_pre_mlp_projection=False,
@@ -2816,7 +2878,6 @@ def test_train_cap_conditioned_model(domain_dim, epochs):
         mlp_expansion_factor=4,
         activations_dtype=jnp.float32,
         weights_dtype=jnp.float32,
-        conditioning_dim=None,
         input_dropout_rate=None,
         mlp_dropout_rate=None,
         use_pre_mlp_projection=True,
@@ -2893,8 +2954,6 @@ def test_train_cap_conditioned_model(domain_dim, epochs):
                 )
             test_loss = jnp.mean(jnp.array(test_losses))
             tqdm.write(f"Test loss: {test_loss}")
-
-    print(f"distribution points: {distribution_points}")
 
     n_samples = 100
 
