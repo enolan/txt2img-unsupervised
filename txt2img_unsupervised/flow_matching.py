@@ -995,7 +995,7 @@ def conditional_flow_matching_loss(
             t,
             cap_centers,
             cap_d_maxes,
-            None,
+            logits_table,
             rngs={"dropout": rngs[-1]},
             capture_intermediates=capture_intermediates,
         )
@@ -3012,7 +3012,8 @@ def test_cap_conditioned_vector_field_normalization(
 
 
 @pytest.mark.parametrize("domain_dim,epochs", [(3, 10), (16, 30)])
-def test_train_cap_conditioned_model(domain_dim, epochs):
+@pytest.mark.parametrize("use_cap_area", [True, False])
+def test_train_cap_conditioned_model(domain_dim, epochs, use_cap_area):
     """
     Train a cap conditioned model on a simple 3d training distribution and check the samples are
     inside the input caps and correctly distributed.
@@ -3038,6 +3039,8 @@ def test_train_cap_conditioned_model(domain_dim, epochs):
         input_dropout_rate=None,
         mlp_dropout_rate=None,
         use_pre_mlp_projection=True,
+        use_cap_area=use_cap_area,
+        min_d_max=0.05 if use_cap_area else None,
     )
 
     distribution_rng, shuffle_rng, params_rng, train_rng, sample_rng = jax.random.split(
@@ -3083,6 +3086,7 @@ def test_train_cap_conditioned_model(domain_dim, epochs):
         params_rng, model, learning_rate_or_schedule=cosine_schedule
     )
 
+    print("")  # Make sure progress bars don't delete the test name in console output
     for epoch in tqdm(range(epochs), desc="Epochs"):
         with tqdm(total=batches_per_epoch, desc=f"Epoch {epoch}") as pbar:
             for i, batch in enumerate(
@@ -3143,6 +3147,7 @@ def test_train_cap_conditioned_model(domain_dim, epochs):
             n_samples,
             cap_centers=centers,
             cap_d_maxes=d_maxes,
+            table=logits_table,
             n_steps=1000,
             method="rk4",
         )
