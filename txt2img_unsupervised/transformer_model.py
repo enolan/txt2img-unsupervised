@@ -555,7 +555,7 @@ class ImageModel(nn.Module):
         # Draw a complete set of caps. Because of JAX tracing constraints we can't only do n_caps
         # caps, we have to generate a static number of caps and select afterward.
         cap_centers, cap_d_maxes = jax.vmap(
-            lambda rng: sample_cap(tbl, rng, clip_embedding, bias_d_max=True)
+            lambda rng: sample_cap(tbl, rng, clip_embedding, [(0.95, 1.0), (0.05, 2.0)])
         )(jax.random.split(caps_rng, self.clip_cap_count))
         assert cap_centers.shape == (self.clip_cap_count, 768)
         assert cap_d_maxes.shape == (self.clip_cap_count,)

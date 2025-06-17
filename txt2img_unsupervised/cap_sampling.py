@@ -87,9 +87,10 @@ def test_log_surface_area_symmetry():
 
 @jax.tree_util.register_pytree_node_class
 class LogitsTable:
-    """Precomputed table of the log measures of slices of an arbitrary dimensional sphere. Used for
-    sampling points in caps, specifically sampling the distance of the output to the center of the
-    cap. I'm sure a direct way of sampling this exists but my brain is too smooth for math.
+    """Precomputed table of the measures of slices of an arbitrary dimensional sphere, stored as
+    the logs of the total measure. Used for sampling points in caps with uniform distribution over
+    the surface of the cap, and for computing the areas of caps. I'm sure a more direct way of doing
+    these things exists but my brain is too smooth for math.
     """
 
     def __init__(self, d, n):
@@ -106,7 +107,7 @@ class LogitsTable:
 
         self.d = d
         self.buckets = n
-        self.table = jnp.array(slice_logits)
+        self.table = jax.nn.log_softmax(jnp.array(slice_logits))
 
     def tree_flatten(self):
         # For some reason you can't just return the array as the first element of the returned
@@ -188,12 +189,9 @@ class LogitsTable:
         """Calculate the log of the size of a cap with a given max cosine distance to its center, as
         a fraction of the total surface area of the sphere.
         """
-        # The table contains logged areas of slices, if we want logged fractions of the total we
-        # need to take the softmax.
-        log_area_fracs = jax.nn.log_softmax(self.table)
         d_max_idx = self._height_to_idx(d_max - 1)
         filtered_log_area_fracs = jnp.where(
-            jnp.arange(self.buckets) <= d_max_idx, log_area_fracs, -jnp.inf
+            jnp.arange(self.buckets) <= d_max_idx, self.table, -jnp.inf
         )
         return jax.nn.logsumexp(filtered_log_area_fracs)
 
@@ -339,12 +337,49 @@ def sample_from_cap(rng, table, v, d_max):
     return pt
 
 
+def process_d_max_dist(
+    d_max_dist: list[tuple[float, float]] = None
+) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    """Process a d_max_dist parameter into normalized weights, range starts, and range ends. Used
+    when sampling maximum cosine distances from mixtures of uniform distributions.
+
+    Args:
+        d_max_dist: List of (weight, max_value) tuples defining the mixture distribution.
+                   If None, defaults to [(1.0, 2.0)] (uniform U[0, 2])
+
+    Returns:
+        Tuple of (weights, range_starts, range_ends) as JAX arrays
+    """
+    # Set default distribution if none provided
+    if d_max_dist is None:
+        d_max_dist = [(1.0, 2.0)]
+
+    if not d_max_dist:
+        raise ValueError("d_max_dist cannot be empty")
+
+    # Extract weights and create component ranges
+    weights = jnp.array([weight for weight, _ in d_max_dist], dtype=jnp.float32)
+    max_values = jnp.array([max_val for _, max_val in d_max_dist], dtype=jnp.float32)
+
+    # Normalize weights to ensure they sum to 1
+    weights = weights / jnp.sum(weights)
+
+    # Create ranges: [0, max_values[0]), [max_values[0], max_values[1]), etc.
+    range_starts = jnp.concatenate([jnp.array([0.0]), max_values[:-1]])
+    range_ends = max_values
+
+    return weights, range_starts, range_ends
+
+
 def sample_cap(
-    table: LogitsTable, rng: jax.Array, v: jax.Array, bias_d_max: bool = False
+    table: LogitsTable,
+    rng: jax.Array,
+    v: jax.Array,
+    d_max_dist: list[tuple[float, float]] = None,
 ) -> Tuple[jax.Array, jax.Array]:
-    """Given a unit vector v, sample a spherical cap that contains it. With bias_d_max = False, the
-    max cosine distance will be drawn from U[0, 2]. With it set to true, it'll be a mixture of two
-    uniform distributions: 95% U[0, 1.0] and 5% U[1.0, 2.0]. Important properties:
+    """Given a unit vector v, sample a spherical cap that contains it. The max cosine distance will be
+    drawn from a mixture of uniform distributions specified by d_max_dist. If d_max_dist is None,
+    defaults to uniform U[0, 2]. Important properties:
     * Given two vectors, a cap that contains both of them is equally likely to be sampled from
       either.
     * Knowing the cap a vector is in gives you no more information than the fact that the vector is
@@ -354,12 +389,23 @@ def sample_cap(
     These properties are necessary for embedding guided content generation to work.
 
     The algorithm is this:
-    * Sample a max cosine distance d_max from the distribution described above. A cap with that
-      d_max that contains v can have a center anywhere with cosine distance to v <= d_max. That's
-      the definition of a spherical cap - the set of valid centers is the cap centered on v with
+    * Sample a max cosine distance d_max from the mixture distribution described by d_max_dist.
+      A cap with that d_max that contains v can have a center anywhere with cosine distance to v <= d_max.
+      That's the definition of a spherical cap - the set of valid centers is the cap centered on v with
       d_max = d_max.
     * Sample a point uniformly from that cap.
 
+    Args:
+        table: LogitsTable for the sphere dimension
+        rng: JAX random key
+        v: Unit vector that must be contained in the sampled cap
+        d_max_dist: List of (weight, max_value) tuples defining the mixture distribution.
+                   If None, defaults to [(1.0, 2.0)] (uniform U[0, 2])
+
+    Examples:
+        [(1.0, 2.0)] = 100% U[0.0, 2.0] (uniform over full range)
+        [(0.95, 1.0), (0.05, 2.0)] = 95% U[0.0, 1.0] + 5% U[1.0, 2.0]
+        [(0.4, 0.8), (0.4, 1.2), (0.2, 2.0)] = 40% U[0.0, 0.8] + 40% U[0.8, 1.2] + 20% U[1.2, 2.0]
 
     Argument that the properties are satisfied:
     * The former implies the latter. If a cap is equally likely to be sampled starting from any
@@ -378,43 +424,135 @@ def sample_cap(
 
     d_max_rng, ctr_rng = jax.random.split(rng, 2)
 
-    # Sample max cosine distance
-    if bias_d_max:
-        rand = jax.random.uniform(d_max_rng, minval=0.0, maxval=1.0)
-        d_max = jax.lax.cond(
-            rand < 0.95, lambda r: r / 0.95, lambda r: 1 + (r - 0.95) / 0.05, rand
-        )
-    else:
-        d_max = jax.random.uniform(d_max_rng, minval=0.0, maxval=2.0)
+    # sample d_max
+    weights, range_starts, range_ends = process_d_max_dist(d_max_dist)
+    component_idx = jax.random.categorical(d_max_rng, jnp.log(weights))
+    d_max = jax.random.uniform(
+        d_max_rng, minval=range_starts[component_idx], maxval=range_ends[component_idx]
+    )
 
-    # Sample the center of the output cap from the cap centered at v with max cosine distance
-    # d_max.
+    # sample the center of the output cap from the cap centered at v with max cosine distance d_max
     pt = sample_from_cap(ctr_rng, table, v, d_max)
     return pt, d_max
 
 
-@pytest.mark.parametrize("bias_d_max", [False, True])
-def test_sample_cap(bias_d_max: bool) -> None:
+@pytest.mark.parametrize(
+    "d_max_dist",
+    [
+        None,  # Default: uniform U[0, 2]
+        [(1.0, 2.0)],  # Explicit uniform U[0, 2]
+        [(0.95, 1.0), (0.05, 2.0)],  # Biased distribution
+        [(0.45, 0.8), (0.45, 1.2), (0.1, 2.0)],  # Triangular distribution
+    ],
+)
+def test_sample_cap(d_max_dist) -> None:
+    "Test the distribution of samples generated with sample_cap"
     table = LogitsTable(767, 8192)
 
-    # Generate some inputs
-    n_inputs = 8192
+    # Use a single input vector for testing d_max distribution
+    input_vec = jax.random.normal(jax.random.PRNGKey(0), shape=(768,))
+    input_vec = input_vec / jnp.linalg.norm(input_vec)
 
-    inputs = jax.random.normal(jax.random.PRNGKey(0), shape=(n_inputs, 768))
-    inputs = inputs / jnp.linalg.norm(inputs, axis=1, keepdims=True)
+    sample_cap_jv = jax.jit(
+        jax.vmap(
+            lambda rng: sample_cap(table, rng, input_vec, d_max_dist), in_axes=(0,)
+        )
+    )
 
-    sample_cap_j = jax.jit(lambda rng, v: sample_cap(table, rng, v, bias_d_max))
-
+    # Collect d_max samples in batches for efficiency
     rng = jax.random.PRNGKey(90210)
-    for v in inputs:
-        rng, gen_rng = jax.random.split(rng, 2)
-        new_pt, d_max = sample_cap_j(gen_rng, v)
-        assert jnp.all(jnp.isfinite(new_pt))
-        assert jnp.isfinite(d_max)
-        assert jnp.isclose(jnp.linalg.norm(new_pt), 1.0, atol=1e-5)
-        assert 0.0 <= d_max <= 2.0
-        dist = 1 - jnp.dot(v, new_pt)
-        assert dist <= d_max
+    batch_size = 1024
+    n_batches = 64
+    n_samples = batch_size * n_batches
+
+    all_new_pts = []
+    all_d_max_samples = []
+
+    for _ in range(n_batches):
+        rng, batch_rng = jax.random.split(rng)
+        batch_rngs = jax.random.split(batch_rng, batch_size)
+
+        new_pts, d_max_batch = sample_cap_jv(batch_rngs)
+
+        all_new_pts.append(new_pts)
+        all_d_max_samples.append(d_max_batch)
+
+    # Concatenate all batches
+    all_new_pts = jnp.concatenate(all_new_pts, axis=0)
+    all_d_max_samples = jnp.concatenate(all_d_max_samples, axis=0)
+
+    # Basic sanity checks on the vectorized results
+    assert jnp.all(jnp.isfinite(all_new_pts))
+    assert jnp.all(jnp.isfinite(all_d_max_samples))
+    assert jnp.allclose(jnp.linalg.norm(all_new_pts, axis=1), 1.0, atol=1e-5)
+    assert jnp.all(all_d_max_samples >= 0.0)
+    assert jnp.all(all_d_max_samples <= 2.0)
+    dists = 1 - jnp.dot(all_new_pts, input_vec)
+    assert jnp.all(dists <= all_d_max_samples)
+
+    d_max_samples = np.array(all_d_max_samples)
+
+    weights, range_starts, range_ends = process_d_max_dist(d_max_dist)
+
+    # Convert JAX arrays to numpy for the test
+    weights = np.array(weights)
+    range_starts = np.array(range_starts)
+    range_ends = np.array(range_ends)
+
+    # Test the distribution by checking proportions in each range
+    for i, (expected_weight, range_start, range_end) in enumerate(
+        zip(weights, range_starts, range_ends)
+    ):
+        # Count samples in this range
+        in_range = np.sum((d_max_samples >= range_start) & (d_max_samples < range_end))
+        observed_proportion = in_range / n_samples
+        expected_proportion = expected_weight
+
+        # Allow for some statistical variation (3 sigma test)
+        expected_std = np.sqrt(
+            expected_proportion * (1 - expected_proportion) / n_samples
+        )
+        tolerance = 3 * expected_std
+
+        np.testing.assert_allclose(
+            observed_proportion,
+            expected_proportion,
+            atol=tolerance,
+            rtol=0,
+            err_msg=f"Component {i}: expected {expected_proportion:.3f}, got {observed_proportion:.3f}",
+        )
+
+    # Also test that all samples are within the overall expected range
+    overall_max = np.max(range_ends)
+    assert np.all(d_max_samples >= 0.0)
+    assert np.all(d_max_samples <= overall_max)
+
+    # For uniform components, test that the distribution within each range is roughly uniform
+    for i, (expected_weight, range_start, range_end) in enumerate(
+        zip(weights, range_starts, range_ends)
+    ):
+        range_samples = d_max_samples[
+            (d_max_samples >= range_start) & (d_max_samples < range_end)
+        ]
+        if len(range_samples) > 100:  # Only test if we have enough samples
+            # Divide the range into bins and test uniformity
+            n_bins = 10
+            hist, bin_edges = np.histogram(
+                range_samples, bins=n_bins, range=(range_start, range_end)
+            )
+            expected_count_per_bin = len(range_samples) / n_bins
+
+            # Chi-square-like test for uniformity within the range
+            for bin_count in hist:
+                # Allow for reasonable statistical variation
+                expected_std = np.sqrt(expected_count_per_bin)
+                tolerance = 3 * expected_std
+                np.testing.assert_allclose(
+                    bin_count,
+                    expected_count_per_bin,
+                    atol=tolerance,
+                    err_msg=f"Component {i} uniformity test failed",
+                )
 
 
 def test_sample_from_cap():
