@@ -589,3 +589,20 @@ def test_sample_from_cap():
         )
         dists = 1 - jnp.dot(samples, vectors[i])
         assert jnp.all(dists <= max_cos_distances[i])
+
+
+def sphere_log_inverse_surface_area(d):
+    """Compute the log inverse surface area (density of a uniform distribution) of a sphere
+    embedded in d dimensions."""
+    # Surface area of unit sphere in d dimensions: A_d = 2 * π^(d/2) / Γ(d/2)
+    # Log probability density: log_p0 = -log(A_d) = -log(2) - (d/2)*log(π) + log(Γ(d/2))
+    return -(jnp.log(2.0) + (d / 2) * jnp.log(jnp.pi) - jax.lax.lgamma(d / 2))
+
+
+def test_sphere_log_inverse_surface_area_3d():
+    np.testing.assert_allclose(
+        sphere_log_inverse_surface_area(3),
+        jnp.log(1.0 / (4 * jnp.pi)),
+        atol=1e-5,
+        rtol=0,
+    )

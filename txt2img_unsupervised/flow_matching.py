@@ -68,7 +68,12 @@ from tqdm.contrib import tenumerate
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-from .cap_sampling import LogitsTable, sample_cap, sample_from_cap, process_d_max_dist
+from .cap_sampling import (
+    LogitsTable,
+    sample_cap,
+    sphere_log_inverse_surface_area,
+    process_d_max_dist,
+)
 
 
 class MLPBlock(nn.Module):
@@ -1507,6 +1512,131 @@ def test_train_vmf(domain_dim):
 
 
 @pytest.mark.parametrize("domain_dim", [3, 16])
+def test_train_uniform_zero_field(domain_dim):
+    """
+    Train a model with uniformly distributed data on the sphere and verify that the learned
+    vector field is approximately zero everywhere.
+
+    Since the uniform distribution is the stationary distribution (source equals target),
+    the optimal flow field should be zero everywhere.
+    """
+    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=4, d_model=256)
+
+    batch_size = 512
+    n_samples = 50000
+
+    # Generate uniformly distributed points on the sphere
+    rng = jax.random.PRNGKey(12345)
+    data_rng, eval_rng, params_rng = jax.random.split(rng, 3)
+
+    points = sample_sphere(data_rng, n_samples, domain_dim)
+    dsets = (
+        Dataset.from_dict({"point_vec": points})
+        .with_format("np")
+        .train_test_split(test_size=512)
+    )
+    train_dset = dsets["train"]
+    test_dset = dsets["test"]
+
+    # Set up test points for evaluation (same for pre- and post-training)
+    n_test_points = 1000
+    test_rng, eval_rng = jax.random.split(eval_rng)
+    test_points = sample_sphere(eval_rng, n_test_points, domain_dim)
+    test_times = jax.random.uniform(
+        test_rng, (n_test_points,)
+    )  # Random times in [0, 1]
+    test_cond_vecs = jnp.zeros((n_test_points, 0))
+
+    def compute_and_print_field_stats(params, label):
+        field_values = model.apply(params, test_points, test_times, test_cond_vecs)
+        field_magnitudes = jnp.linalg.norm(field_values, axis=1)
+        mean_magnitude = jnp.mean(field_magnitudes)
+        std_magnitude = jnp.std(field_magnitudes)
+        max_magnitude = jnp.max(field_magnitudes)
+
+        print(f"{label} vector field statistics:")
+        print(f"  Mean magnitude: {mean_magnitude:.6f}")
+        print(f"  Std magnitude: {std_magnitude:.6f}")
+        print(f"  Max magnitude: {max_magnitude:.6f}")
+
+        return (
+            field_values,
+            field_magnitudes,
+            mean_magnitude,
+            std_magnitude,
+            max_magnitude,
+        )
+
+    # Initialize model and evaluate pre-training vector field
+    pre_train_state = create_train_state(params_rng, model, 2e-4)
+
+    # Pre-training evaluation
+    (
+        pre_field_values,
+        pre_field_magnitudes,
+        pre_mean_magnitude,
+        pre_std_magnitude,
+        pre_max_magnitude,
+    ) = compute_and_print_field_stats(pre_train_state.params, "Pre-training")
+
+    # Train the model (note: _train_loop_for_tests creates its own training state)
+    state, train_loss, test_loss, test_nll = _train_loop_for_tests(
+        model, train_dset, batch_size, 2e-4, 8, test_dset
+    )
+
+    expected_nll = -sphere_log_inverse_surface_area(domain_dim)
+    print(
+        f"Final train loss: {train_loss:.6f}, final test loss: {test_loss:.6f}, final test nll: {test_nll:.6f}, expected nll: {expected_nll:.6f}"
+    )
+    np.testing.assert_allclose(test_nll, expected_nll, atol=1e-2, rtol=0)
+
+    # Post-training evaluation (same test points as pre-training)
+    (
+        post_field_values,
+        post_field_magnitudes,
+        post_mean_magnitude,
+        post_std_magnitude,
+        post_max_magnitude,
+    ) = compute_and_print_field_stats(state.params, "Post-training")
+    print(f"  Expected: ~0.0 (uniform distribution should have zero flow)")
+
+    # Compare pre- and post-training
+    fmt_delta = (
+        lambda label, pre, post: f"  {label} change: {pre:.6f} -> {post:.6f} (Δ = {post - pre:.6f})"
+    )
+    print(f"Training effect:")
+    print(fmt_delta("Mean magnitude", pre_mean_magnitude, post_mean_magnitude))
+    print(fmt_delta("Std magnitude", pre_std_magnitude, post_std_magnitude))
+    print(fmt_delta("Max magnitude", pre_max_magnitude, post_max_magnitude))
+
+    # Print some example field values
+    print(f"\nExample post-training field values at test points:")
+    for i in range(min(5, n_test_points)):
+        point = test_points[i]
+        field = post_field_values[i]
+        magnitude = post_field_magnitudes[i]
+
+        if domain_dim == 3:
+            point_str = f"[{point[0]:7.4f}, {point[1]:7.4f}, {point[2]:7.4f}]"
+            field_str = f"[{field[0]:7.4f}, {field[1]:7.4f}, {field[2]:7.4f}]"
+        else:
+            point_str = f"[{point[0]:7.4f}, {point[1]:7.4f}, {point[2]:7.4f}, ...]"
+            field_str = f"[{field[0]:7.4f}, {field[1]:7.4f}, {field[2]:7.4f}, ...]"
+
+        print(f"  Point: {point_str} -> Field: {field_str}, Magnitude: {magnitude:.6f}")
+
+    assert post_mean_magnitude < 0.1, (
+        f"Mean field magnitude {post_mean_magnitude:.6f} too large for uniform distribution "
+        f"(should be < 0.1)"
+    )
+
+    assert post_std_magnitude < 0.05, (
+        f"Std field magnitude {post_std_magnitude:.6f} too large for uniform distribution "
+        f"(should be < 0.05)"
+    )
+
+
+@pytest.mark.parametrize("domain_dim", [3, 16])
 def test_train_conditional_vmf(domain_dim):
     """
     Train a model with data from two different von Mises-Fisher distributions
@@ -2382,14 +2512,7 @@ def compute_log_probability(
     )
 
     # Density of the base distribution (uniform on unit sphere)
-    # Surface area of unit sphere in d dimensions: A_d = 2 * π^(d/2) / Γ(d/2)
-    # Log probability density: log_p0 = -log(A_d) = -log(2) - (d/2)*log(π) + log(Γ(d/2))
-    # Use logarithms throughout to avoid overflow for large dimensions
-    log_p0 = -(
-        jnp.log(2.0)
-        + (model.domain_dim / 2) * jnp.log(jnp.pi)
-        - jax.lax.lgamma(model.domain_dim / 2)
-    )
+    log_p0 = sphere_log_inverse_surface_area(model.domain_dim)
     log_p1 = log_p0 - div_sum
     return log_p1
 
