@@ -1890,11 +1890,11 @@ def spherical_rk4_step(f, x, t, dt, rng=None):
     k2 = f(x2, t + dt / 2, rng)
     k2_at_x = parallel_transport(k2, x2, x)
 
-    x3 = geodesic_step(x, k2, dt / 2)
+    x3 = geodesic_step(x, k2_at_x, dt / 2)
     k3 = f(x3, t + dt / 2, rng)
     k3_at_x = parallel_transport(k3, x3, x)
 
-    x4 = geodesic_step(x, k3, dt)
+    x4 = geodesic_step(x, k3_at_x, dt)
     k4 = f(x4, t + dt, rng)
     k4_at_x = parallel_transport(k4, x4, x)
 
