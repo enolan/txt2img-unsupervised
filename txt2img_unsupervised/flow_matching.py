@@ -1038,9 +1038,7 @@ def sample_sphere(rng, batch_size, dim):
 
 
 @partial(jax.jit, inline=True, static_argnames=("model", "capture_intermediates"))
-def compute_batch_loss(
-    model, params, batch, rng, capture_intermediates=False
-):
+def compute_batch_loss(model, params, batch, rng, capture_intermediates=False):
     """
     Compute the loss for a batch of data.
 
@@ -1597,7 +1595,6 @@ def test_train_uniform_zero_field(domain_dim):
     )
 
 
-
 @pytest.mark.parametrize("domain_dim", [3, 16])
 def test_train_conditional_vmf(domain_dim):
     """
@@ -2023,9 +2020,7 @@ def sample_loop(
         this_batch_size = min(batch_size, n_samples - samples_so_far)
 
         # Slice the conditioning vectors
-        batch_cond_vecs = cond_vecs[
-            i * batch_size : i * batch_size + this_batch_size
-        ]
+        batch_cond_vecs = cond_vecs[i * batch_size : i * batch_size + this_batch_size]
 
         samples.append(
             generate_samples(
@@ -2541,12 +2536,6 @@ def test_vector_field_evaluation():
 
     # Verify that vector field values are tangent to the sphere
     np.testing.assert_allclose(dot_products, 0.0, atol=1e-6)
-
-
-
-
-
-
 
 
 def test_vector_field_without_reference_directions():
