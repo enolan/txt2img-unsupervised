@@ -68,7 +68,7 @@ from tqdm.contrib import tenumerate
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-from .cap_sampling import sphere_log_inverse_surface_area
+from .cap_sampling import sphere_log_inverse_surface_area, sample_from_cap, LogitsTable
 
 
 def sinusoidal_scalar_encoding(s, dim: int):
@@ -2738,3 +2738,212 @@ def test_vector_field_output_magnitude_statistics(domain_dim):
     # Basic sanity check that magnitudes are non-negative and finite
     assert jnp.all(magnitudes >= 0), "All magnitudes should be non-negative"
     assert jnp.all(jnp.isfinite(magnitudes)), "All magnitudes should be finite"
+
+
+def generate_cap_constrained_samples(
+    model,
+    params,
+    rng,
+    cap_center,
+    cap_d_max,
+    table,
+    cond_vec,
+    n_proposal_samples,
+    n_output_samples,
+    n_steps=100,
+    n_projections=10,
+):
+    """
+    Generate samples from a trained model constrained to lie within a spherical cap using importance
+    sampling.
+
+    Args:
+        model: Trained VectorField model
+        params: Model parameters
+        rng: JAX random key
+        cap_center: Center of the spherical cap [domain_dim]
+        cap_d_max: Maximum cosine distance defining the cap size
+        table: LogitsTable for cap sampling
+        cond_vec: Conditioning vector shared across all samples [cond_dim]
+        n_proposal_samples: Number of samples to draw from uniform cap distribution
+        n_output_samples: Number of final samples to return after importance resampling
+        n_steps: Number of integration steps for compute_log_probability
+        n_projections: Number of projections for divergence estimation
+
+    Returns:
+        samples: Cap-constrained samples [n_output_samples, domain_dim]
+        ess: Effective sample size (measure of sampling efficiency)
+    """
+    assert cap_center.shape == (model.domain_dim,)
+    assert cond_vec.shape == (model.conditioning_dim,)
+
+    proposal_rng, prob_rng, resample_rng = jax.random.split(rng, 3)
+
+    # 1. Sample uniformly from the cap
+    proposal_keys = jax.random.split(proposal_rng, n_proposal_samples)
+    proposal_samples = jax.vmap(
+        lambda key: sample_from_cap(key, table, cap_center, cap_d_max)
+    )(proposal_keys)
+
+    # 2. Compute model log probabilities for all proposals
+    # Expand cond_vecs to match proposal sample count
+    proposal_cond_vecs = jnp.broadcast_to(
+        cond_vec[None, :], (n_proposal_samples, model.conditioning_dim)
+    )
+
+    model_log_probs = compute_log_probability(
+        model,
+        params,
+        proposal_samples,
+        proposal_cond_vecs,
+        n_steps=n_steps,
+        rng=prob_rng,
+        n_projections=n_projections,
+    )
+
+    # 3. Compute uniform cap log density. Fraction of the total sphere area that is inside the cap,
+    # times the total sphere area gets you the area of the cap, reciprocal of that is the density.
+    log_cap_size_frac = table.log_cap_size(cap_d_max)
+    sphere_log_area = -sphere_log_inverse_surface_area(model.domain_dim)
+    log_cap_area = log_cap_size_frac + sphere_log_area
+    uniform_cap_log_density = -log_cap_area
+
+    # 4. Compute importance weights: model_density / uniform_cap_density
+    # In log space: log_weight = model_log_prob - uniform_cap_log_density
+    log_weights = model_log_probs - uniform_cap_log_density
+
+    # Normalize weights for numerical stability
+    log_weights = log_weights - jnp.max(log_weights)
+    weights = jnp.exp(log_weights)
+    weights = weights / jnp.sum(weights)
+
+    # 5. Compute effective sample size
+    ess = jnp.sum(weights) ** 2 / jnp.sum(weights**2)
+
+    # 6. Resample according to importance weights
+    indices = jax.random.choice(
+        resample_rng,
+        n_proposal_samples,
+        shape=(n_output_samples,),
+        p=weights,
+    )
+    final_samples = proposal_samples[indices]
+
+    return final_samples, ess
+
+
+def test_generate_cap_constrained_samples_matches_rejection():
+    """
+    Train a 3D VectorField on a vMF distribution, then compare cap-constrained samples drawn via:
+    1) simple rejection sampling from the trained model, and
+    2) importance sampling using generate_cap_constrained_samples.
+
+    - Uses a fixed random cap center and d_max=0.25
+    - Reports proposal counts for both methods
+    - Verifies all samples are in-cap
+    - Compares statistics of both sets within tolerances
+    """
+
+    # Fixed RNGs
+    rng = jax.random.PRNGKey(20250713)
+    train_rng, cap_rng, rs_rng, imp_rng = jax.random.split(rng, 4)
+
+    # Train VectorField on a 3D vMF distribution
+    model = replace(_baseline_model, domain_dim=3, n_layers=2)
+
+    batch_size = 512
+    n_samples = 32768
+
+    mean_direction = np.zeros(3)
+    mean_direction[0] = 1.0
+    kappa = 2.0
+    vmf = stats.vonmises_fisher(mean_direction, kappa)
+    points = vmf.rvs(n_samples)
+
+    dset = Dataset.from_dict({"point_vec": points}).with_format("np")
+    state, train_loss = _train_loop_for_tests(model, dset, batch_size, 1e-3, 2)
+    params = state.params
+
+    # Cap setup: 2-sphere table for 3D vectors
+    table = LogitsTable(2, 8192)
+    cap_center = np.zeros(3)
+    cap_center[1] = 1.0
+    cap_center = jnp.asarray(cap_center)
+    d_max = jnp.float32(0.25)
+    threshold = 1.0 - d_max
+
+    target_n = 4096
+
+    # Rejection sampling from the trained model
+    rs_samples_chunks = []
+    total_rs_proposals = 0
+    proposal_batch = 256
+    while sum(chunk.shape[0] for chunk in rs_samples_chunks) < target_n:
+        rs_rng, sub = jax.random.split(rs_rng)
+        cond_vecs = jnp.zeros((proposal_batch, model.conditioning_dim))
+        batch = generate_samples(
+            model,
+            params,
+            sub,
+            proposal_batch,
+            cond_vecs=cond_vecs,
+            n_steps=16,
+            method="rk4",
+        )
+        cos = batch @ cap_center
+        mask = cos >= threshold
+        accepted = jnp.asarray(batch[mask])
+        if accepted.shape[0] > 0:
+            rs_samples_chunks.append(np.asarray(accepted))
+        total_rs_proposals += proposal_batch
+
+    rs_samples = jnp.asarray(np.concatenate(rs_samples_chunks, axis=0)[:target_n])
+
+    # Importance sampling using generate_cap_constrained_samples
+    n_proposal_samples = 8192
+    cond_vec = jnp.zeros((model.conditioning_dim,))
+    imp_samples, ess = generate_cap_constrained_samples(
+        model,
+        params,
+        imp_rng,
+        cap_center,
+        d_max,
+        table,
+        cond_vec,
+        n_proposal_samples=n_proposal_samples,
+        n_output_samples=target_n,
+        n_steps=16,
+        n_projections=10,
+    )
+
+    print(
+        f"Rejection proposals used: {total_rs_proposals} for {target_n} accepted samples ({(total_rs_proposals / target_n):.2f} per sample)"
+    )
+    print(
+        f"Importance proposals used: {n_proposal_samples}, ESS={float(ess):.2f} ({n_proposal_samples / ess:.2f} per effective sample)"
+    )
+
+    assert ess >= target_n, f"ESS={ess} < target_n={target_n}"
+
+    # Verify all samples are in-cap
+    for arr in [rs_samples, imp_samples]:
+        cos_vals = arr @ cap_center
+        assert jnp.all(cos_vals >= threshold)
+
+    # Compare statistics: per-coordinate mean and cosine-to-center moments
+    def summarize(arr, label):
+        means = jnp.mean(arr, axis=0)
+        cos_vals = arr @ cap_center
+        cos_mean = jnp.mean(cos_vals)
+        cos_std = jnp.std(cos_vals)
+        print(
+            f"{label} mean: {means}, cos_mean: {cos_mean:.2f}, cos_std: {cos_std:.2f}"
+        )
+        return means, cos_mean, cos_std
+
+    rs_means, rs_cos_mean, rs_cos_std = summarize(rs_samples, "rejection")
+    imp_means, imp_cos_mean, imp_cos_std = summarize(imp_samples, "importance")
+
+    np.testing.assert_allclose(rs_means, imp_means, atol=0.05, rtol=0)
+    np.testing.assert_allclose(rs_cos_mean, imp_cos_mean, atol=0.03, rtol=0)
+    np.testing.assert_allclose(rs_cos_std, imp_cos_std, atol=0.03, rtol=0)
