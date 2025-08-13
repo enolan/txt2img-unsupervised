@@ -68,13 +68,7 @@ from tqdm.contrib import tenumerate
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-from .cap_sampling import (
-    LogitsTable,
-    process_d_max_dist,
-    sample_cap,
-    sample_from_cap,
-    sphere_log_inverse_surface_area,
-)
+from .cap_sampling import sphere_log_inverse_surface_area
 
 
 def sinusoidal_scalar_encoding(s, dim: int):
@@ -936,8 +930,7 @@ def conditional_flow_matching_loss(
     x0,
     x1,
     t,
-    conds=None,
-    logits_table=None,
+    conds,
     rng=None,
     capture_intermediates=False,
 ):
@@ -946,14 +939,13 @@ def conditional_flow_matching_loss(
     OT field.
 
     Args:
-        model: Vector field model (VectorField or CapConditionedVectorField)
+        model: Vector field model (VectorField)
         params: Model parameters
         x0: Noise samples from p0 (batched) [batch_size, dim]
         x1: Target samples from p1 (batched) [batch_size, dim]
         t: Time parameters (batched) in [0, 1] [batch_size]
-        conds: Conditioning vectors (batched) [batch_size, cond_dim] (only for VectorField)
-        logits_table: LogitsTable for CapConditionedVectorField (required if model is CapConditionedVectorField)
-        caps_rng: JAX random key for cap sampling (required if model is CapConditionedVectorField)
+        conds: Conditioning vectors (batched) [batch_size, cond_dim]
+        rng: JAX random key (required if model uses dropout)
 
     Returns:
         CFM loss value (scalar)
@@ -964,55 +956,24 @@ def conditional_flow_matching_loss(
     assert x0.shape[1] == model.domain_dim
     assert t.shape == (batch_size,)
 
-    # Check if the model is a CapConditionedVectorField
-    is_cap_conditioned = isinstance(model, CapConditionedVectorField)
-
-    if is_cap_conditioned:
-        assert (
-            logits_table is not None
-        ), "LogitsTable is required for CapConditionedVectorField"
-        assert rng is not None, "rng is required for CapConditionedVectorField"
-        assert (
-            conds is None
-        ), "extra conditioning is not supported for CapConditionedVectorField"
-    else:
-        assert conds is not None, "conds is required for regular VectorField"
-        assert conds.shape == (batch_size, model.conditioning_dim)
-        if model.input_dropout_rate is not None or model.mlp_dropout_rate is not None:
-            assert rng is not None, "rng is required for VectorField with dropout"
+    assert conds.shape == (batch_size, model.conditioning_dim)
+    if model.input_dropout_rate is not None or model.mlp_dropout_rate is not None:
+        assert rng is not None, "rng is required for VectorField with dropout"
 
     # Compute target vector field (ground truth OT field) and current positions
     psi_ts, target_fields = jax.vmap(spherical_ot_field, in_axes=(0, 0, 0))(x0, x1, t)
     assert psi_ts.shape == x0.shape
     assert target_fields.shape == x0.shape
 
-    # Compute predicted vector field from our model (different for each model type)
-    if is_cap_conditioned:
-        rngs = jax.random.split(rng, batch_size + 1)
-
-        my_sample_cap = lambda rng, x: sample_cap(
-            logits_table, rng, x, model.d_max_dist
-        )
-        cap_centers, cap_d_maxes = jax.vmap(my_sample_cap)(rngs[:batch_size], x1)
-        apply_res = model.apply(
-            params,
-            psi_ts,
-            t,
-            cap_centers,
-            cap_d_maxes,
-            logits_table,
-            rngs={"dropout": rngs[-1]},
-            capture_intermediates=capture_intermediates,
-        )
-    else:
-        apply_res = model.apply(
-            params,
-            psi_ts,
-            t,
-            conds,
-            rngs={"dropout": rng},
-            capture_intermediates=capture_intermediates,
-        )
+    # Compute predicted vector field from our model
+    apply_res = model.apply(
+        params,
+        psi_ts,
+        t,
+        conds,
+        rngs={"dropout": rng},
+        capture_intermediates=capture_intermediates,
+    )
 
     if capture_intermediates:
         predicted_field, intermediates = apply_res
@@ -1078,17 +1039,17 @@ def sample_sphere(rng, batch_size, dim):
 
 @partial(jax.jit, inline=True, static_argnames=("model", "capture_intermediates"))
 def compute_batch_loss(
-    model, params, batch, rng, logits_table=None, capture_intermediates=False
+    model, params, batch, rng, capture_intermediates=False
 ):
     """
     Compute the loss for a batch of data.
 
     Args:
-        model: The vector field model (VectorField or CapConditionedVectorField)
+        model: The vector field model (VectorField)
         params: Model parameters
-        batch: Batch of data containing "point_vec" and "cond_vec" (cond_vec only needed for VectorField)
+        batch: Batch of data containing "point_vec" and "cond_vec"
         rng: JAX random key
-        logits_table: LogitsTable for CapConditionedVectorField (required if model is CapConditionedVectorField)
+        capture_intermediates: Whether to capture intermediate values
 
     Returns:
         loss: The computed loss value
@@ -1101,19 +1062,8 @@ def compute_batch_loss(
     x0_batch = sample_sphere(noise_rng, batch_size, model.domain_dim)
     t = jax.random.uniform(time_rng, (batch_size,))
 
-    is_cap_conditioned = isinstance(model, CapConditionedVectorField)
-
-    if is_cap_conditioned:
-        assert (
-            "cond_vec" not in batch
-        ), "cond_vec is not supported for CapConditionedVectorField"
-        assert (
-            logits_table is not None
-        ), "logits_table is required for CapConditionedVectorField"
-        conds = None
-    else:
-        conds = batch["cond_vec"]
-        assert conds.shape == (batch_size, model.conditioning_dim)
+    conds = batch["cond_vec"]
+    assert conds.shape == (batch_size, model.conditioning_dim)
 
     return conditional_flow_matching_loss(
         model,
@@ -1121,15 +1071,14 @@ def compute_batch_loss(
         x0_batch,
         x1_batch,
         t,
-        conds=conds,
-        logits_table=logits_table,
+        conds,
         rng=rng,
         capture_intermediates=capture_intermediates,
     )
 
 
 @partial(jax.jit, static_argnames=("model"), donate_argnames=("state", "rng"))
-def train_step(model, state, batch, rng, logits_table=None):
+def train_step(model, state, batch, rng):
     """
     Train for a single step.
 
@@ -1145,7 +1094,7 @@ def train_step(model, state, batch, rng, logits_table=None):
     rng, next_rng = jax.random.split(rng)
 
     def loss_fn(params):
-        loss = compute_batch_loss(model, params, batch, rng, logits_table)
+        loss = compute_batch_loss(model, params, batch, rng)
         return loss
 
     grad_fn = jax.value_and_grad(loss_fn)
@@ -1648,87 +1597,6 @@ def test_train_uniform_zero_field(domain_dim):
     )
 
 
-@pytest.mark.parametrize("domain_dim", [3, 8, 16, 64])
-@pytest.mark.parametrize("d_max", [1.0, 0.5, 0.25])
-def test_train_uniform_cap(domain_dim, d_max):
-    """
-    Train a model on data uniformly distributed within a single spherical cap and verify samples
-    from the trained model lie within that cap with high probability. This test passing is a logical
-    prerequisite for CapConditionedVectorFields working - if we can't learn a single cap we can't
-    learn to condition on arbitrary caps.
-
-    Steps:
-    - Choose a random cap center
-    - Generate a training dataset of points uniformly within the cap (center, d_max)
-    - Train an unconditioned model
-    - Sample from the trained model
-    - Check that >=99% of samples are inside the cap
-    """
-    # Model
-    model = VectorField(
-        activations_dtype=jnp.float32,
-        weights_dtype=jnp.float32,
-        domain_dim=domain_dim,
-        conditioning_dim=0,
-        time_dim=64,
-        reference_directions=96,
-        n_layers=8,
-        d_model=256,
-        mlp_expansion_factor=4,
-        input_dropout_rate=None,
-        mlp_dropout_rate=None,
-        use_pre_mlp_projection=True,
-    )
-
-    # Cap parameters and dataset
-    rng = jax.random.PRNGKey(20250811)
-    center_rng, dset_rng, sample_rng = jax.random.split(rng, 3)
-    cap_center = sample_sphere(center_rng, 1, domain_dim)[0]
-
-    table = LogitsTable(d=domain_dim - 1, n=8192)
-
-    # Generate training data inside the cap
-    n_train = 10_000
-    sample_cap_vmapped = jax.jit(
-        lambda key: jax.vmap(
-            lambda subkey: sample_from_cap(subkey, table, cap_center, d_max)
-        )(jax.random.split(key, n_train))
-    )
-    train_points = sample_cap_vmapped(dset_rng)
-
-    train_dset = Dataset.from_dict({"point_vec": train_points}).with_format("np")
-
-    # Train
-    batch_size = 256
-    epochs = 32
-    state, train_loss = _train_loop_for_tests(
-        model, train_dset, batch_size, learning_rate=1e-3, epochs=epochs
-    )
-    print(f"Final train loss: {float(train_loss):.6f}")
-
-    # Sample from trained model
-    n_eval = 1000
-    samples = generate_samples(
-        model,
-        state.params,
-        sample_rng,
-        n_eval,
-        cond_vecs=jnp.zeros((n_eval, 0)),
-        n_steps=1000,
-        method="rk4",
-    )
-
-    # Check cap membership: cos(sim) > 1 - d_max
-    cos_to_center = jnp.dot(samples, cap_center)
-    in_cap = cos_to_center > (1.0 - d_max)
-    fraction_in_cap = float(jnp.mean(in_cap))
-    print(
-        f"Cap center dim={domain_dim}, d_max={d_max}: in-cap fraction {fraction_in_cap:.4f}"
-    )
-    assert (
-        fraction_in_cap >= 0.99
-    ), f"Only {fraction_in_cap*100:.2f}% of samples are in the cap (required >= 99%)"
-
 
 @pytest.mark.parametrize("domain_dim", [3, 16])
 def test_train_conditional_vmf(domain_dim):
@@ -2004,10 +1872,7 @@ def spherical_rk4_step_with_model(
     x,
     t,
     dt,
-    cond_vecs=None,
-    cap_centers=None,
-    cap_d_maxes=None,
-    table=None,
+    cond_vecs,
     rng=None,
 ):
     vector_field_fn = lambda x, t, rng: _compute_vector_field_for_sampling(
@@ -2016,9 +1881,6 @@ def spherical_rk4_step_with_model(
         x,
         t,
         cond_vecs,
-        cap_centers,
-        cap_d_maxes,
-        table,
         rng,
     )
     return spherical_rk4_step(vector_field_fn, x, t, dt, rng)
@@ -2030,32 +1892,17 @@ def _compute_vector_field_for_sampling(
     params,
     x,
     t,
-    cond_vecs=None,
-    cap_centers=None,
-    cap_d_maxes=None,
-    table=None,
+    cond_vecs,
     rng=None,
 ):
     rngs_dict = {"dropout": rng} if rng is not None else {}
-    if isinstance(model, CapConditionedVectorField):
-        assert cond_vecs is None
-        return model.apply(
-            params,
-            x,
-            jnp.full((x.shape[0],), t),
-            cap_centers,
-            cap_d_maxes,
-            table,
-            rngs=rngs_dict,
-        )
-    else:
-        return model.apply(
-            params,
-            x,
-            jnp.full((x.shape[0],), t),
-            cond_vecs,
-            rngs=rngs_dict,
-        )
+    return model.apply(
+        params,
+        x,
+        jnp.full((x.shape[0],), t),
+        cond_vecs,
+        rngs=rngs_dict,
+    )
 
 
 def generate_samples(
@@ -2063,10 +1910,7 @@ def generate_samples(
     params,
     rng,
     batch_size,
-    cond_vecs=None,
-    cap_centers=None,
-    cap_d_maxes=None,
-    table=None,
+    cond_vecs,
     n_steps=100,
     method="rk4",
 ):
@@ -2085,23 +1929,14 @@ def generate_samples(
     Returns:
         Generated samples [batch_size, dim]
     """
-    if isinstance(model, CapConditionedVectorField):
-        assert cond_vecs is None
-        assert cap_centers is not None
-        assert cap_d_maxes is not None
-        assert cap_centers.shape == (batch_size, model.domain_dim)
-        assert cap_d_maxes.shape == (batch_size,)
-    else:
-        assert cond_vecs.shape == (batch_size, model.conditioning_dim)
-        assert cap_centers is None
-        assert cap_d_maxes is None
+    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
 
     x0_rng, *dropout_rngs = jax.random.split(rng, num=n_steps + 1)
     # Sample initial points uniformly from the sphere
     x0 = sample_sphere(x0_rng, batch_size, model.domain_dim)
 
     vector_field_fn = lambda x, t, rng: _compute_vector_field_for_sampling(
-        model, params, x, t, cond_vecs, cap_centers, cap_d_maxes, table, rng
+        model, params, x, t, cond_vecs, rng
     )
 
     # Solve ODE
@@ -2139,9 +1974,6 @@ def generate_samples(
                 t,
                 dt,
                 cond_vecs,
-                cap_centers,
-                cap_d_maxes,
-                table,
                 dropout_rngs[i],
             )
     else:
@@ -2159,10 +1991,7 @@ def sample_loop(
     n_samples,
     batch_size,
     rng,
-    cond_vecs=None,
-    cap_centers=None,
-    cap_d_maxes=None,
-    table=None,
+    cond_vecs,
     n_steps=100,
     method="rk4",
 ):
@@ -2176,9 +2005,7 @@ def sample_loop(
         n_samples: Total number of samples to generate
         batch_size: Size of each batch for generation
         rng: JAX random key
-        cond_vecs: Conditioning vectors [n_samples, cond_dim] or None
-        cap_centers: Cap centers [n_samples, domain_dim] or None
-        cap_d_maxes: Maximum cap distances [n_samples] or None
+        cond_vecs: Conditioning vectors [n_samples, cond_dim]
         n_steps: Number of integration steps
         method: ODE solver method ('euler', 'midpoint', or 'rk4')
 
@@ -2195,24 +2022,10 @@ def sample_loop(
         batch_rng, rng = jax.random.split(rng)
         this_batch_size = min(batch_size, n_samples - samples_so_far)
 
-        # Slice the conditioning vectors/cap parameters if provided
-        batch_cond_vecs = None
-        if cond_vecs is not None:
-            batch_cond_vecs = cond_vecs[
-                i * batch_size : i * batch_size + this_batch_size
-            ]
-
-        batch_cap_centers = None
-        if cap_centers is not None:
-            batch_cap_centers = cap_centers[
-                i * batch_size : i * batch_size + this_batch_size
-            ]
-
-        batch_cap_d_maxes = None
-        if cap_d_maxes is not None:
-            batch_cap_d_maxes = cap_d_maxes[
-                i * batch_size : i * batch_size + this_batch_size
-            ]
+        # Slice the conditioning vectors
+        batch_cond_vecs = cond_vecs[
+            i * batch_size : i * batch_size + this_batch_size
+        ]
 
         samples.append(
             generate_samples(
@@ -2221,9 +2034,6 @@ def sample_loop(
                 batch_rng,
                 this_batch_size,
                 cond_vecs=batch_cond_vecs,
-                cap_centers=batch_cap_centers,
-                cap_d_maxes=batch_cap_d_maxes,
-                table=table,
                 n_steps=n_steps,
                 method=method,
             )
@@ -2239,12 +2049,9 @@ def hutchinson_estimator(
     params,
     x,
     t,
-    cond_vecs=None,
-    cap_centers=None,
-    cap_d_maxes=None,
-    table=None,
-    step_rng=None,
-    n_projections=None,
+    cond_vecs,
+    step_rng,
+    n_projections,
 ):
     """
     Estimate the divergence of a vector field on a spherical manifold using Hutchinson's trace
@@ -2256,8 +2063,6 @@ def hutchinson_estimator(
         x: Current points on the sphere [batch_size, dim]
         t: Current time
         cond_vecs: Conditioning vectors [batch_size, cond_dim]
-        cap_centers: Cap centers [batch_size, domain_dim] (only for CapConditionedVectorField)
-        cap_d_maxes: Maximum cap distances [batch_size] (only for CapConditionedVectorField)
         step_rng: JAX random key for this step
         n_projections: Number of random projections to use
 
@@ -2267,41 +2072,21 @@ def hutchinson_estimator(
     batch_size, dim = x.shape
     assert dim == model.domain_dim
     assert isinstance(t, float) or (isinstance(t, jnp.ndarray) and t.shape == ())
-    assert step_rng is not None, "step_rng is required for Hutchinson estimator"
-    assert (
-        n_projections is not None and n_projections > 0
-    ), "n_projections must be positive"
+    assert n_projections > 0, "n_projections must be positive"
+    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
 
-    def hutchinson_single(x_i, rng_i, *args):
+    def hutchinson_single(x_i, rng_i, cond_i):
         """Compute Hutchinson divergence estimate for a single point."""
         dropout_rng, projection_rng = jax.random.split(rng_i)
 
-        # Create model function based on model type and args
-        if isinstance(model, CapConditionedVectorField):
-            center_i, cap_size_i = args
-
-            def f(x_single):
-                return model.apply(
-                    params,
-                    x_single[None, :],
-                    jnp.array([t]),
-                    center_i[None, :],
-                    cap_size_i[None],
-                    table,
-                    rngs={"dropout": dropout_rng},
-                )[0]
-
-        else:
-            (cond_i,) = args
-
-            def f(x_single):
-                return model.apply(
-                    params,
-                    x_single[None, :],
-                    jnp.array([t]),
-                    cond_i[None, :],
-                    rngs={"dropout": dropout_rng},
-                )[0]
+        def f(x_single):
+            return model.apply(
+                params,
+                x_single[None, :],
+                jnp.array([t]),
+                cond_i[None, :],
+                rngs={"dropout": dropout_rng},
+            )[0]
 
         # Generate random projection vectors (Rademacher distribution)
         projection_keys = jax.random.split(projection_rng, n_projections)
@@ -2327,26 +2112,7 @@ def hutchinson_estimator(
     # Split random keys for each batch element
     batch_keys = jax.random.split(step_rng, batch_size)
 
-    # Handle different model types with appropriate arguments
-    if isinstance(model, CapConditionedVectorField):
-        assert (
-            cond_vecs is None
-        ), "cond_vecs should be None for CapConditionedVectorField"
-        assert (
-            cap_centers is not None
-        ), "cap_centers is required for CapConditionedVectorField"
-        assert cap_centers.shape == (batch_size, model.domain_dim)
-
-        assert (
-            cap_d_maxes is not None
-        ), "cap_d_maxes is required for CapConditionedVectorField"
-        assert cap_d_maxes.shape == (batch_size,)
-        return jax.vmap(hutchinson_single)(x, batch_keys, cap_centers, cap_d_maxes)
-    else:
-        assert cond_vecs is not None, "cond_vecs is required for VectorField"
-        assert cond_vecs.shape == (batch_size, model.conditioning_dim)
-
-        return jax.vmap(hutchinson_single)(x, batch_keys, cond_vecs)
+    return jax.vmap(hutchinson_single)(x, batch_keys, cond_vecs)
 
 
 @partial(jax.jit, static_argnames=("model",))
@@ -2355,26 +2121,21 @@ def exact_divergence(
     params,
     x,
     t,
-    cond_vecs=None,
-    cap_centers=None,
-    cap_d_maxes=None,
-    table=None,
-    step_rng=None,
-    n_projections=None,
+    cond_vecs,
+    step_rng,
+    n_projections,
 ):
     """
     Compute the exact divergence of a vector field on a spherical manifold.
 
     Args:
-        model: Vector field model (VectorField or CapConditionedVectorField)
+        model: Vector field model
         params: Model parameters
         x: Current points on the sphere [batch_size, dim]
         t: Current time (scalar)
-        cond_vecs: Conditioning vectors [batch_size, cond_dim] (only for VectorField)
-        cap_centers: Cap centers [batch_size, domain_dim] (only for CapConditionedVectorField)
-        cap_d_maxes: Maximum cap distances [batch_size] (only for CapConditionedVectorField)
-        step_rng: JAX random key (unused, but kept for interface compatibility)
-        n_projections: Number of random projections (unused, but kept for interface compatibility)
+        cond_vecs: Conditioning vectors [batch_size, cond_dim]
+        step_rng: JAX random key (for dropout)
+        n_projections: Unused (kept for signature compatibility with hutchinson_estimator)
 
     Returns:
         Exact divergence [batch_size]
@@ -2382,56 +2143,23 @@ def exact_divergence(
     batch_size, dim = x.shape
     assert dim == model.domain_dim
     assert isinstance(t, float) or (isinstance(t, jnp.ndarray) and t.shape == ())
+    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
 
-    if isinstance(model, CapConditionedVectorField):
-        assert (
-            cond_vecs is None
-        ), "cond_vecs should be None for CapConditionedVectorField"
-        assert (
-            cap_centers is not None
-        ), "cap_centers is required for CapConditionedVectorField"
-        assert (
-            cap_d_maxes is not None
-        ), "cap_d_maxes is required for CapConditionedVectorField"
-        assert cap_centers.shape == (batch_size, model.domain_dim)
-        assert cap_d_maxes.shape == (batch_size,)
+    # Helper to compute divergence for regular vector field
+    def divergence_single(x_i, cond):
+        def f(x_single):
+            return model.apply(
+                params,
+                x_single[None, :],
+                jnp.array([t]),
+                cond[None, :],
+                rngs={"dropout": step_rng} if step_rng is not None else {},
+            )[0]
 
-        # Helper to compute divergence for cap-conditioned model
-        def divergence_single(x_i, center_i, d_max_i):
-            def f(x_single):
-                return model.apply(
-                    params,
-                    x_single[None, :],
-                    jnp.array([t]),
-                    center_i[None, :],
-                    d_max_i[None],
-                    table,
-                    rngs={"dropout": step_rng} if step_rng is not None else {},
-                )[0]
+        jac = jax.jacfwd(f)(x_i)
+        return jnp.trace(jac) - jnp.dot(x_i, jac @ x_i)
 
-            jac = jax.jacfwd(f)(x_i)
-            return jnp.trace(jac) - jnp.dot(x_i, jac @ x_i)
-
-        return jax.vmap(divergence_single)(x, cap_centers, cap_d_maxes)
-    else:
-        assert cond_vecs is not None, "cond_vecs is required for VectorField"
-        assert cond_vecs.shape == (batch_size, model.conditioning_dim)
-
-        # Helper to compute divergence for regular vector field
-        def divergence_single(x_i, cond):
-            def f(x_single):
-                return model.apply(
-                    params,
-                    x_single[None, :],
-                    jnp.array([t]),
-                    cond[None, :],
-                    rngs={"dropout": step_rng} if step_rng is not None else {},
-                )[0]
-
-            jac = jax.jacfwd(f)(x_i)
-            return jnp.trace(jac) - jnp.dot(x_i, jac @ x_i)
-
-        return jax.vmap(divergence_single)(x, cond_vecs)
+    return jax.vmap(divergence_single)(x, cond_vecs)
 
 
 @partial(jax.jit, static_argnames=("model", "n_steps", "n_projections"))
@@ -2439,24 +2167,19 @@ def _reverse_path_and_compute_divergence(
     model,
     params,
     samples,
-    cond_vecs=None,
-    cap_centers=None,
-    cap_d_maxes=None,
-    table=None,
-    n_steps=100,
-    rng=None,
+    cond_vecs,
+    n_steps,
+    rng,
     n_projections=10,
 ):
     """
     Compute the reverse path and integrate the divergence.
 
     Args:
-        model: Vector field model (VectorField or CapConditionedVectorField)
+        model: Vector field model
         params: Model parameters
         samples: Points on the sphere to evaluate [batch_size, dim]
-        cond_vecs: Conditioning vectors [batch_size, cond_dim] (only for VectorField)
-        cap_centers: Cap centers [batch_size, domain_dim] (only for CapConditionedVectorField)
-        cap_d_maxes: Maximum cap distances [batch_size] (only for CapConditionedVectorField)
+        cond_vecs: Conditioning vectors [batch_size, cond_dim]
         n_steps: Number of integration steps
         rng: JAX random key for stochastic estimation
         n_projections: Number of random projections to use for divergence estimation
@@ -2466,24 +2189,7 @@ def _reverse_path_and_compute_divergence(
     """
     batch_size = samples.shape[0]
     assert samples.shape == (batch_size, model.domain_dim)
-
-    if isinstance(model, CapConditionedVectorField):
-        assert (
-            cond_vecs is None
-        ), "cond_vecs should be None for CapConditionedVectorField"
-        assert (
-            cap_centers is not None
-        ), "cap_centers is required for CapConditionedVectorField"
-        assert (
-            cap_d_maxes is not None
-        ), "cap_d_maxes is required for CapConditionedVectorField"
-        assert cap_centers.shape == (batch_size, model.domain_dim)
-        assert cap_d_maxes.shape == (batch_size,)
-    else:
-        assert cond_vecs is not None, "cond_vecs is required for VectorField"
-        assert cond_vecs.shape == (batch_size, model.conditioning_dim)
-        assert cap_centers is None, "cap_centers should be None for VectorField"
-        assert cap_d_maxes is None, "cap_d_maxes should be None for VectorField"
+    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
 
     ts = jnp.linspace(1.0, 0.0, n_steps)
 
@@ -2505,9 +2211,6 @@ def _reverse_path_and_compute_divergence(
             x_t,
             t,
             cond_vecs,
-            cap_centers,
-            cap_d_maxes,
-            table,
             step_rng_div,
             n_projections,
         )
@@ -2521,9 +2224,6 @@ def _reverse_path_and_compute_divergence(
             t,
             -1.0 / n_steps,
             cond_vecs,
-            cap_centers,
-            cap_d_maxes,
-            table,
             step_rng_model,
         )
 
@@ -2542,10 +2242,7 @@ def compute_log_probability(
     model,
     params,
     samples,
-    cond_vecs=None,
-    cap_centers=None,
-    cap_d_maxes=None,
-    table=None,
+    cond_vecs,
     n_steps=100,
     rng=None,
     n_projections=10,
@@ -2554,12 +2251,10 @@ def compute_log_probability(
     Compute the log probability of samples under the flow-matching model.
 
     Args:
-        model: Vector field model (VectorField or CapConditionedVectorField)
+        model: Vector field model
         params: Model parameters
         samples: Points on the sphere to evaluate [batch_size, dim]
-        cond_vecs: Conditioning vectors [batch_size, cond_dim] (only for VectorField)
-        cap_centers: Cap centers [batch_size, domain_dim] (only for CapConditionedVectorField)
-        cap_d_maxes: Maximum cap distances [batch_size] (only for CapConditionedVectorField)
+        cond_vecs: Conditioning vectors [batch_size, cond_dim]
         n_steps: Number of integration steps
         rng: JAX random key for stochastic estimation (if None, uses deterministic keys)
         n_projections: Number of random projections to use for divergence estimation
@@ -2570,21 +2265,7 @@ def compute_log_probability(
     batch_size = samples.shape[0]
     assert samples.shape == (batch_size, model.domain_dim)
 
-    if isinstance(model, CapConditionedVectorField):
-        assert (
-            cond_vecs is None
-        ), "cond_vecs should be None for CapConditionedVectorField"
-        assert (
-            cap_centers is not None
-        ), "cap_centers is required for CapConditionedVectorField"
-        assert (
-            cap_d_maxes is not None
-        ), "cap_d_maxes is required for CapConditionedVectorField"
-        assert cap_centers.shape == (batch_size, model.domain_dim)
-        assert cap_d_maxes.shape == (batch_size,)
-    else:
-        assert cond_vecs is not None, "cond_vecs is required for VectorField"
-        assert cond_vecs.shape == (batch_size, model.conditioning_dim)
+    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
 
     if rng is None:
         rng = jax.random.PRNGKey(0)
@@ -2597,9 +2278,6 @@ def compute_log_probability(
         params,
         samples,
         cond_vecs=cond_vecs,
-        cap_centers=cap_centers,
-        cap_d_maxes=cap_d_maxes,
-        table=table,
         n_steps=n_steps,
         rng=rng,
         n_projections=n_projections,
@@ -2865,784 +2543,10 @@ def test_vector_field_evaluation():
     np.testing.assert_allclose(dot_products, 0.0, atol=1e-6)
 
 
-class CapConditionedVectorField(nn.Module):
-    """
-    Model of a vector field that learns a distribution on the unit sphere and can sample conditional
-    on the sample being within an arbitrary spherical cap.
-    """
 
-    # Parameters for the underlying VectorField
-    domain_dim: int
-    reference_directions: Optional[int]
-    time_dim: int
-    use_pre_mlp_projection: bool
-    n_layers: int
-    d_model: int
-    mlp_expansion_factor: int
-    mlp_dropout_rate: Optional[float]
-    input_dropout_rate: Optional[float]
-    activations_dtype: jnp.dtype = jnp.float32
-    weights_dtype: jnp.dtype = jnp.float32
-    d_model_base: int = 512
-    variance_base: float = 1 / 512
-    alpha_input: float = 1.0
-    alpha_output: float = 1.0
 
-    # Parameters for the cap conditioning
-    # Training distribution of maximum cosine distances, specified as a mixture of uniform
-    # distributions. Each tuple contains the weight of the mixture component and the upper d_max
-    # bound for that component.
-    d_max_dist: Tuple[Tuple[float, float], ...] = ((0.95, 1.0), (0.05, 2.0))
-    # If true, encode cap sizes as the fractional cap area in log scale, otherwise max cosine
-    # distance
-    use_cap_area: bool = False
-    # Minimum d_max allowed in cap conditioning. Required if use_cap_area is true, otherwise unused.
-    min_d_max: Optional[float] = None
-    # Dimension of the sinusoidal encoding for cap size (must be even). If None, use scalar.
-    cap_size_dim: Optional[int] = None
 
-    @nn.nowrap
-    def mk_vector_field(self):
-        # We need a VectorField object for various calculations, and some of them should happen
-        # outside of a flax init/apply, when setup() won't have run yet. So we define a function to
-        # create one. They're immutable and pure functions of the constructor params, so we can make
-        # as many as we feel like and they'll all be identical.
-        return VectorField(
-            domain_dim=self.domain_dim,
-            reference_directions=self.reference_directions,
-            conditioning_dim=self.conditioning_dim,
-            time_dim=self.time_dim,
-            use_pre_mlp_projection=self.use_pre_mlp_projection,
-            n_layers=self.n_layers,
-            d_model=self.d_model,
-            mlp_expansion_factor=self.mlp_expansion_factor,
-            mlp_dropout_rate=self.mlp_dropout_rate,
-            input_dropout_rate=self.input_dropout_rate,
-            activations_dtype=self.activations_dtype,
-            weights_dtype=self.weights_dtype,
-            d_model_base=self.d_model_base,
-            variance_base=self.variance_base,
-            alpha_input=self.alpha_input,
-            alpha_output=self.alpha_output,
-        )
 
-    def setup(self):
-        # Create the underlying VectorField. Needs to be an attribute set here so that the vector
-        # field paramters will get set up.
-        self.vector_field = self.mk_vector_field()
-
-        assert (
-            self.use_cap_area is False or self.min_d_max is not None
-        ), "min_d_max is required if use_cap_area is True"
-
-        assert (
-            self.min_d_max is None or self.min_d_max > 0
-        ), "min_d_max must be positive"
-
-        assert len(self.d_max_dist) > 0, "d_max_dist must be non-empty"
-        if self.cap_size_dim is not None:
-            assert self.cap_size_dim % 2 == 0, "cap_size_dim must be even"
-
-    @property
-    def conditioning_dim(self):
-        cap_center_dim = (
-            self.domain_dim
-            if self.reference_directions is None
-            else self.reference_directions
-        )
-        return cap_center_dim + (
-            self.cap_size_dim if self.cap_size_dim is not None else 1
-        )
-
-    @property
-    def d_model_scale_factor(self) -> float:
-        "m_d in muP."
-        return self.mk_vector_field().d_model_scale_factor
-
-    @nn.nowrap
-    def mk_partition_map(self, use_muon: bool):
-        """
-        Create a partition map for optimizer configuration with muP scaling.
-        Delegates to the underlying VectorField.
-        """
-        return {
-            "params": {
-                "vector_field": self.mk_vector_field().mk_partition_map(use_muon)[
-                    "params"
-                ]
-            }
-        }
-
-    @nn.nowrap
-    def scale_lr(self, lr: float) -> float:
-        "Scaled learning rate for hidden layers. Delegates to the underlying VectorField."
-        return self.mk_vector_field().scale_lr(lr)
-
-    def cap_size_encoding(self, s):
-        "Create a sinusoidal encoding for the cap size value with configurable dimension."
-        return sinusoidal_scalar_encoding(s, self.cap_size_dim)
-
-    def process_cap_inputs(self, cap_centers, cap_d_maxes, table=None):
-        """
-        Process the cap centers and size values, returning a vector for each cap with components
-        that have mean 0 and variance 1. This helper method is used for testing the distribution of
-        values.
-
-        Args:
-            cap_centers: Unit vectors defining cap centers [batch_size, domain_dim]
-            cap_d_maxes: Maximum cosine distances [batch_size]
-            table: LogitsTable for computing cap area fractions. Necessary if use_cap_area is True.
-
-        Returns:
-            Dictionary with:
-            - cap_centers_transformed: Transformed cap centers [batch_size, domain_dim or reference_directions if it's not None]
-            - cap_size_values_transformed: Transformed scalar size values with mean 0, var 1 [batch_size]
-            - cap_size_encoding: Encoded cap size for concatenation [batch_size, cap_size_dim] if cap_size_dim is not None, else [batch_size, 1]
-            - cap_info: Combined conditioning vector for the base model [batch_size, conditioning_dim]
-        """
-        batch_size = cap_centers.shape[0]
-        assert cap_centers.shape == (batch_size, self.domain_dim)
-        assert cap_d_maxes.shape == (batch_size,)
-
-        # Norm the input to have mean 0 variance 1
-        # Both unit vectors and cosine similarities have mean 0 standard deviation 1/sqrt(d)
-        if self.reference_directions is not None:
-            cap_centers_transformed = (
-                cap_centers @ self.vector_field.reference_vectors.T
-            ) * jnp.sqrt(self.domain_dim)
-        else:
-            cap_centers_transformed = cap_centers * jnp.sqrt(self.domain_dim)
-
-        if self.use_cap_area:
-            assert table is not None, "table is required if use_cap_area is True"
-            assert (
-                table.d == self.domain_dim - 1
-            ), "table must have the same dimension as the domain"
-
-            # Convert to log area fractions and normalize to expectation 0 variance 1:
-
-            # Calculate the log area fraction of the minimum size cap for normalization
-            min_log_area_fraction = table.log_cap_size(
-                self.min_d_max
-            )  # should be very negative
-
-            log_area_fractions = jax.vmap(lambda d_max: table.log_cap_size(d_max))(
-                cap_d_maxes
-            )
-            assert log_area_fractions.shape == (batch_size,)
-
-            log_area_fractions = jnp.clip(
-                log_area_fractions, min=min_log_area_fraction, max=0.0  # log(1) = 0
-            )
-
-            # Compute the expectation and variance of the training distribution of clipped logged
-            # cap area fractions. This is a fair amount of computation but very small in comparison
-            # to a forward/backward pass and maybe gets constant folded. If profiling shows it's a
-            # bottleneck then we'll precompute these stats separately.
-
-            weights, range_starts, range_ends = process_d_max_dist(self.d_max_dist)
-
-            # Make a uniformly spaced array of d_max values inside the range of the training
-            # distribution.
-            grid_size = 512
-            max_d = jnp.max(range_ends)
-            grid = jnp.linspace(0.0, max_d, grid_size)
-            assert grid.shape == (grid_size,)
-
-            # Find the density at each grid point.
-            # Mask indicating which grid points are in which mixture components.
-            comp_mask = (
-                (grid[None, :] >= range_starts[:, None])
-                & (grid[None, :] < range_ends[:, None])
-            ).astype(jnp.float32)
-            assert comp_mask.shape == (len(self.d_max_dist), grid_size)
-
-            comp_pdf = comp_mask * (
-                weights[:, None] / (range_ends - range_starts)[:, None]
-            )
-            pdf = jnp.sum(comp_pdf, axis=0)
-            pdf = pdf / jnp.sum(pdf)  # ensure normalisation (discrete approximation)
-
-            # Get the log area fractions for each grid point
-            grid_log_areas = jax.vmap(lambda d: table.log_cap_size(d))(grid)
-            grid_log_areas = jnp.clip(
-                grid_log_areas, min=min_log_area_fraction, max=0.0
-            )
-
-            # Compute the mean and variance over the distribution of log area fractions
-            mean_log_area = jnp.sum(pdf * grid_log_areas)
-            var_log_area = jnp.sum(pdf * (grid_log_areas - mean_log_area) ** 2)
-            std_log_area = jnp.sqrt(var_log_area)
-
-            # Shift and scale
-            cap_size_values_transformed = (
-                log_area_fractions - mean_log_area
-            ) / std_log_area
-        else:
-            # U[0, 2] has variance 1/3, mean 1. The actual training distribution may or may not be
-            # uniform, but it won't differ that much.
-            cap_size_values_transformed = (cap_d_maxes - 1) * np.sqrt(3)
-
-        # Encode the cap size value
-        if self.cap_size_dim is not None:
-            cap_size_encoding = jax.vmap(self.cap_size_encoding)(
-                cap_size_values_transformed
-            )
-            assert cap_size_encoding.shape == (batch_size, self.cap_size_dim)
-            cap_size_for_concat = cap_size_encoding
-        else:
-            cap_size_encoding = cap_size_values_transformed[:, None]
-            cap_size_for_concat = cap_size_encoding
-            assert cap_size_encoding.shape == (batch_size, 1)
-
-        # Convert the spherical cap info into a vector we can pass
-        cap_info = jnp.concatenate(
-            [cap_centers_transformed, cap_size_for_concat], axis=1
-        )
-        assert cap_info.shape == (batch_size, self.conditioning_dim)
-
-        return {
-            "cap_centers_transformed": cap_centers_transformed,
-            "cap_size_values_transformed": cap_size_values_transformed,
-            "cap_size_encoding": cap_size_encoding,
-            "cap_info": cap_info,
-        }
-
-    def dummy_inputs(self):
-        """Create dummy inputs for model initialization with the correct shapes.
-
-        Returns:
-            Tuple of (x, t, cap_centers, cap_d_maxes) with appropriate shapes for initialization.
-        """
-        x = jnp.ones((1, self.domain_dim))
-        t = jnp.ones((1,))
-        cap_centers = jnp.ones((1, self.domain_dim))
-        cap_d_maxes = jnp.ones((1,))
-        table = LogitsTable(d=self.domain_dim - 1, n=2) if self.use_cap_area else None
-        return x, t, cap_centers, cap_d_maxes, table
-
-    def __call__(self, x, t, cap_centers, cap_d_maxes, table=None):
-        assert len(x.shape) == 2
-        batch_size = x.shape[0]
-        assert x.shape == (batch_size, self.domain_dim)
-        assert t.shape == (batch_size,)
-        assert cap_centers.shape == (batch_size, self.domain_dim)
-        assert cap_d_maxes.shape == (batch_size,)
-
-        processed = self.process_cap_inputs(cap_centers, cap_d_maxes, table=table)
-        return self.vector_field(x, t, processed["cap_info"])
-
-
-@pytest.mark.parametrize("domain_dim", [3, 8, 16, 768])
-@pytest.mark.parametrize("reference_directions", [8, 16, None])
-@pytest.mark.parametrize("use_cap_area", [True, False])
-@pytest.mark.parametrize("cap_size_dim", [None])  # , 16])
-@pytest.mark.parametrize(
-    "d_max_dist",
-    [((0.95, 1.0), (0.05, 2.0)), ((1.0, 2.0),), ((0.4, 0.8), (0.4, 1.2), (0.2, 2.0))],
-)
-def test_cap_conditioned_vector_field_normalization(
-    domain_dim, reference_directions, use_cap_area, cap_size_dim, d_max_dist
-):
-    """
-    Test that CapConditionedVectorField properly normalizes the inputs passed to the superclass.
-    This verifies that the cap centers and max distances are properly transformed to have the
-    statistical properties expected by the base VectorField class.
-
-    The test checks:
-    1. That cap centers are scaled to have variance 1 per dimension
-    2. That cap distances are transformed to have mean 0 and variance 1
-    3. That the combined conditioning vector has appropriate statistics
-    """
-    rng = jax.random.PRNGKey(42)
-    time_dim = 16
-
-    # Create the model
-    model = CapConditionedVectorField(
-        activations_dtype=jnp.float32,
-        weights_dtype=jnp.float32,
-        domain_dim=domain_dim,
-        reference_directions=reference_directions,
-        n_layers=1,
-        d_model=128,
-        time_dim=time_dim,
-        mlp_expansion_factor=1,
-        input_dropout_rate=None,
-        mlp_dropout_rate=None,
-        use_pre_mlp_projection=True,
-        d_max_dist=d_max_dist,
-        use_cap_area=use_cap_area,
-        min_d_max=0.05 if use_cap_area else None,
-        cap_size_dim=cap_size_dim,
-    )
-    table = LogitsTable(d=domain_dim - 1, n=8192) if use_cap_area else None
-
-    params_rng, sample_rng = jax.random.split(rng)
-    state = create_train_state(params_rng, model, 1e-3)
-
-    # Generate test inputs
-    n_samples = 50_000
-    cap_center_rng, cap_size_rng = jax.random.split(sample_rng, 2)
-
-    cap_centers = sample_sphere(cap_center_rng, n_samples, domain_dim)
-    if use_cap_area:
-        weights, range_starts, range_ends = process_d_max_dist(d_max_dist)
-        components_rng, d_max_rng = jax.random.split(cap_size_rng, 2)
-        component_idxs = jax.random.categorical(
-            components_rng, jnp.log(weights), shape=(n_samples,)
-        )
-        cap_d_maxes = jax.vmap(
-            lambda k, i: jax.random.uniform(
-                k, minval=range_starts[i], maxval=range_ends[i]
-            )
-        )(jax.random.split(d_max_rng, n_samples), component_idxs)
-    else:
-        cap_d_maxes = jax.random.uniform(
-            cap_size_rng, shape=(n_samples,), minval=0.0, maxval=2.0
-        )
-    assert cap_d_maxes.shape == (n_samples,)
-
-    # Get the processed conditioning data using the model's helper method
-    processed = model.apply(
-        state.params,
-        cap_centers,
-        cap_d_maxes,
-        table=table,
-        method=model.process_cap_inputs,
-    )
-
-    cap_centers_transformed = processed["cap_centers_transformed"]
-    cap_size_values_transformed = processed["cap_size_values_transformed"]
-    cap_info = processed["cap_info"]
-    cap_size_encoding = processed["cap_size_encoding"]
-
-    cap_center_dim = (
-        model.reference_directions
-        if model.reference_directions is not None
-        else model.domain_dim
-    )
-    assert cap_centers_transformed.shape == (
-        n_samples,
-        cap_center_dim,
-    )
-    assert cap_size_values_transformed.shape == (n_samples,)
-    assert cap_info.shape == (n_samples, model.conditioning_dim)
-    # Check cap size encoding shape based on configuration
-    expected_cap_size_channels = 1 if cap_size_dim is None else cap_size_dim
-    assert cap_size_encoding.shape == (n_samples, expected_cap_size_channels)
-
-    # Check statistics of transformed values
-    cap_centers_mean = jnp.mean(cap_centers_transformed, axis=0)
-    cap_centers_var = jnp.var(cap_centers_transformed, axis=0)
-    cap_size_values_mean = jnp.mean(cap_size_values_transformed)
-    cap_size_values_var = jnp.var(cap_size_values_transformed)
-
-    print(
-        f"\nTesting CapConditionedVectorField normalization with domain_dim={domain_dim}, reference_directions={reference_directions}, cap_size_dim={cap_size_dim}"
-    )
-    print(f"Cap centers - Mean: {jnp.mean(cap_centers_mean):.6f}, Expected: ~0.0")
-    print(f"Cap centers - Variance: {jnp.mean(cap_centers_var):.6f}, Expected: ~1.0")
-    print(f"Cap distances - Mean: {cap_size_values_mean:.6f}, Expected: ~0.0")
-    print(f"Cap distances - Variance: {cap_size_values_var:.6f}, Expected: ~1.0")
-
-    assert jnp.all(
-        jnp.abs(cap_centers_mean) < 0.05
-    ), f"Cap center mean should be close to 0, got {cap_centers_mean}"
-    assert jnp.all(
-        jnp.abs(cap_centers_var - 1.0) < 0.05
-    ), f"Cap center variance should be close to 1, got {cap_centers_var}"
-    assert (
-        jnp.abs(cap_size_values_mean) < 0.05
-    ), f"Cap distances mean should be close to 0, got {cap_size_values_mean}"
-    assert (
-        jnp.abs(cap_size_values_var - 1.0) < 0.05
-    ), f"Cap distances variance should be close to 1, got {cap_size_values_var}"
-
-    # Check statistics of the cap size encoding channels
-    cap_size_enc_means = jnp.mean(cap_size_encoding, axis=0)
-    cap_size_enc_vars = jnp.var(cap_size_encoding, axis=0)
-    print(
-        f"Cap size encoding - Mean (avg over channels): {jnp.mean(cap_size_enc_means):.6f}, Expected: ~0.0"
-    )
-    print(
-        f"Cap size encoding - Variance (avg over channels): {jnp.mean(cap_size_enc_vars):.6f}, Expected: ~1.0"
-    )
-    frac_mean_within_tolerance = (jnp.abs(cap_size_enc_means) < 0.1).mean()
-    frac_var_within_tolerance = (jnp.abs(cap_size_enc_vars - 1.0) < 0.1).mean()
-    assert (
-        frac_mean_within_tolerance > 0.9
-    ), f"Cap size encoding per-channel means should be close to 0, got {cap_size_enc_means}"
-    assert (
-        frac_var_within_tolerance > 0.95
-    ), f"Cap size encoding per-channel variances should be close to 1, got {cap_size_enc_vars}"
-
-
-@pytest.mark.parametrize("domain_dim", [3, 8, 64])
-def test_train_cap_conditioned_uniform_data(domain_dim):
-    """
-    Minimal test of cap conditioning with a uniform data distribution.
-
-    Tests:
-    1. Model isn't overfit.
-    2. Generated samples respect cap constraints for various cap sizes and centers
-    3. When d_max=2.0, the vector field is invariant to cap center (cap center should have no influence)
-    """
-
-    model = CapConditionedVectorField(
-        domain_dim=domain_dim,
-        reference_directions=96,
-        n_layers=16,
-        d_model=256,
-        time_dim=64,
-        cap_size_dim=64,
-        mlp_expansion_factor=4,
-        activations_dtype=jnp.float32,
-        weights_dtype=jnp.float32,
-        input_dropout_rate=None,
-        mlp_dropout_rate=None,
-        use_pre_mlp_projection=True,
-        use_cap_area=False,
-        min_d_max=None,
-        d_max_dist=((1.0, 2.0),),
-    )
-
-    data_rng, params_rng, train_rng, test_rng = jax.random.split(
-        jax.random.PRNGKey(42), 4
-    )
-
-    # Generate uniform dataset
-    dset_size = 10000
-    uniform_points = sample_sphere(data_rng, dset_size, domain_dim)
-
-    # Split into train/test
-    train_size = int(0.8 * dset_size)
-    train_points = uniform_points[:train_size]
-    test_points = uniform_points[train_size:]
-
-    train_dset = Dataset.from_dict({"point_vec": train_points}).with_format("np")
-    test_dset = Dataset.from_dict({"point_vec": test_points}).with_format("np")
-
-    # Train model
-    logits_table = LogitsTable(d=model.domain_dim - 1, n=8192)
-    batch_size = 256
-    epochs = 200
-    batches_per_epoch = len(train_dset) // batch_size
-    total_steps = epochs * batches_per_epoch
-
-    lr_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=1e-4,
-        warmup_steps=total_steps // 10,
-        decay_steps=total_steps,
-    )
-    train_state = create_train_state(
-        params_rng, model, learning_rate_or_schedule=3e-4, gradient_clipping=10.0
-    )
-
-    # Training loop
-    print("")  # Make sure progress bars don't delete the test name in console output
-    for epoch in tqdm(range(epochs), desc="Training"):
-        with tqdm(total=batches_per_epoch, desc=f"Epoch {epoch}", leave=False) as pbar:
-            for batch in train_dset.iter(batch_size, drop_last_batch=True):
-                train_state, loss, grad_norm, train_rng = train_step(
-                    model, train_state, batch, train_rng, logits_table
-                )
-                pbar.set_postfix(loss=f"{loss:.4f}", grad_norm=f"{grad_norm:.4f}")
-                pbar.update(1)
-        tqdm.write(f"Epoch {epoch} train loss: {loss:.4f}")
-
-    # Compute final train/test losses
-    train_losses = []
-    for batch in tqdm(
-        train_dset.iter(batch_size, drop_last_batch=True),
-        total=len(train_dset) // batch_size,
-        desc="Computing train loss",
-        leave=False,
-    ):
-        train_losses.append(
-            compute_batch_loss(
-                model, train_state.params, batch, train_rng, logits_table
-            )
-        )
-    train_loss = jnp.mean(jnp.array(train_losses))
-
-    test_losses = []
-    for batch in tqdm(
-        test_dset.iter(batch_size, drop_last_batch=True),
-        total=len(test_dset) // batch_size,
-        desc="Computing test loss",
-        leave=False,
-    ):
-        test_losses.append(
-            compute_batch_loss(model, train_state.params, batch, test_rng, logits_table)
-        )
-    test_loss = jnp.mean(jnp.array(test_losses))
-
-    tqdm.write(f"Train loss: {train_loss:.4f}, Test loss: {test_loss:.4f}")
-
-    assert test_loss - train_loss < 0.1, "Test loss exceeds train loss by more than 0.1"
-
-    # Cap constraint tests
-    n_samples = 500
-
-    # Test 1: Samples within caps for various cap sizes
-    cap_sizes = [1.5, 1.0, 0.5]
-    for d_max in tqdm(
-        cap_sizes, desc="Testing cap constraint satisfaction", leave=False
-    ):
-        cap_rng, sample_rng, test_rng = jax.random.split(test_rng, 3)
-
-        # Random cap centers
-        cap_centers = sample_sphere(cap_rng, n_samples, domain_dim)
-        cap_d_maxes = jnp.full((n_samples,), d_max)
-
-        samples = generate_samples(
-            model,
-            train_state.params,
-            sample_rng,
-            n_samples,
-            cap_centers=cap_centers,
-            cap_d_maxes=cap_d_maxes,
-            table=logits_table,
-            n_steps=100,
-            method="rk4",
-        )
-
-        assert cap_centers.shape == (n_samples, domain_dim)
-        assert samples.shape == (n_samples, domain_dim)
-        # Check samples are within caps
-        cos_similarities = jnp.sum(samples * cap_centers, axis=1)
-        assert cos_similarities.shape == (n_samples,)
-        constraint_satisfied = cos_similarities > (1 - d_max)
-        satisfaction_rate = constraint_satisfied.mean()
-        tqdm.write(f"d_max={d_max} satisfaction rate: {satisfaction_rate:.2%}")
-
-        assert (
-            satisfaction_rate >= 0.95
-        ), f"Only {satisfaction_rate:.2%} of samples satisfy cap constraint for d_max={d_max} (required >= 95%)"
-
-    # Test 2: d_max=2.0 invariance to cap center (full sphere coverage)
-    invariance_rng, test_rng = jax.random.split(test_rng)
-
-    # Generate two different cap centers
-    centers_rng, input_rng, invariance_rng = jax.random.split(invariance_rng, 3)
-    centers = sample_sphere(centers_rng, 2, domain_dim)
-    center1, center2 = centers
-
-    # Test inputs
-    test_inputs = sample_sphere(input_rng, 100, domain_dim)
-    test_times = jnp.linspace(0.0, 1.0, 100)
-
-    assert center1.shape == center2.shape == (domain_dim,)
-    assert test_inputs.shape == (100, domain_dim)
-    assert test_times.shape == (100,)
-
-    # Compute vector fields for both centers
-    cap_centers_1 = jnp.repeat(center1[None, :], 100, axis=0)
-    cap_d_maxes = jnp.full((100,), 2.0)
-    field1 = model.apply(
-        train_state.params,
-        test_inputs,
-        test_times,
-        cap_centers_1,
-        cap_d_maxes,
-        table=logits_table,
-    )
-
-    cap_centers_2 = jnp.repeat(center2[None, :], 100, axis=0)
-    field2 = model.apply(
-        train_state.params,
-        test_inputs,
-        test_times,
-        cap_centers_2,
-        cap_d_maxes,
-        table=logits_table,
-    )
-
-    assert field1.shape == field2.shape == (100, domain_dim)
-
-    # When d_max=2.0, cap center should be irrelevant since cap covers entire sphere
-    diffs = jnp.linalg.norm(field1 - field2, axis=1)
-    mean_diff = jnp.mean(diffs)
-    std_diff = jnp.std(diffs)
-    max_diff = jnp.max(diffs)
-    print(f"Mean difference between vector fields: {mean_diff:.4f}")
-    print(f"Std difference between vector fields: {std_diff:.4f}")
-    print(f"Max difference between vector fields: {max_diff:.4f}")
-    assert (
-        mean_diff < 0.05
-    ), f"Vector field mean difference is {mean_diff:.4f} for d_max=2.0 with different cap centers (should be <0.05)"
-
-
-@pytest.mark.parametrize("domain_dim,epochs", [(3, 10), (16, 30)])
-@pytest.mark.parametrize("use_cap_area", [True, False])
-def test_train_cap_conditioned_model(domain_dim, epochs, use_cap_area):
-    """
-    Train a cap conditioned model on a simple 3d training distribution and check the samples are
-    inside the input caps and correctly distributed.
-
-    Tests three cases:
-    1. Full sphere (d_max=2.0)
-    2. Hemisphere (d_max=1.0)
-    3. Quarter-sphere (d_max=0.5)
-
-    In each case, we check that the samples respect the cap boundaries and come from the learned
-    distribution.
-    """
-
-    model = CapConditionedVectorField(
-        domain_dim=domain_dim,
-        reference_directions=128,
-        n_layers=6,
-        d_model=512,
-        time_dim=128,
-        mlp_expansion_factor=4,
-        activations_dtype=jnp.float32,
-        weights_dtype=jnp.float32,
-        input_dropout_rate=None,
-        mlp_dropout_rate=None,
-        use_pre_mlp_projection=True,
-        use_cap_area=use_cap_area,
-        min_d_max=0.05 if use_cap_area else None,
-    )
-
-    distribution_rng, shuffle_rng, params_rng, train_rng, sample_rng = jax.random.split(
-        jax.random.PRNGKey(0), 5
-    )
-
-    logits_table = LogitsTable(d=model.domain_dim - 1, n=8192)
-
-    # Generate a training set from a discrete uniform distribution of 5 fixed random points on the
-    # sphere.
-    n_distribution_points = 20
-    distribution_points = sample_sphere(
-        distribution_rng, n_distribution_points, domain_dim
-    )
-    dset_size = 200_000
-    assert dset_size % n_distribution_points == 0
-    training_points = jnp.repeat(
-        distribution_points, dset_size // n_distribution_points, axis=0
-    )
-    assert training_points.shape == (dset_size, domain_dim)
-    shuffle_indices = jax.random.permutation(
-        shuffle_rng, jnp.arange(training_points.shape[0])
-    )
-    training_points = training_points[shuffle_indices]
-
-    train_set_size = floor(training_points.shape[0] * 0.9)
-    dset = Dataset.from_dict({"point_vec": training_points}).with_format("np")
-    train_dset = dset.select(range(train_set_size))
-    test_dset = dset.select(range(train_set_size, training_points.shape[0]))
-
-    # Train a model
-    batch_size = 256
-    batches_per_epoch = len(train_dset) // batch_size
-    total_steps = epochs * batches_per_epoch
-
-    cosine_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=1e-3,
-        warmup_steps=floor(total_steps * 0.1),
-        decay_steps=total_steps,
-    )
-    train_state = create_train_state(
-        params_rng, model, learning_rate_or_schedule=cosine_schedule
-    )
-
-    print("")  # Make sure progress bars don't delete the test name in console output
-    for epoch in tqdm(range(epochs), desc="Epochs"):
-        with tqdm(total=batches_per_epoch, desc=f"Epoch {epoch}") as pbar:
-            for i, batch in enumerate(
-                train_dset.iter(batch_size, drop_last_batch=True)
-            ):
-                train_state, loss, grad_norm, train_rng = train_step(
-                    model, train_state, batch, train_rng, logits_table
-                )
-                pbar.set_postfix(loss=loss, grad_norm=grad_norm)
-                pbar.update(1)
-
-            test_losses = []
-            for batch in tqdm(
-                test_dset.iter(batch_size, drop_last_batch=True),
-                total=len(test_dset) // batch_size,
-                desc="Testing",
-            ):
-                test_losses.append(
-                    compute_batch_loss(
-                        model,
-                        train_state.params,
-                        batch,
-                        train_rng,
-                        logits_table,
-                    )
-                )
-            test_loss = jnp.mean(jnp.array(test_losses))
-            tqdm.write(f"Test loss: {test_loss}")
-
-    n_samples = 100
-
-    test_cases = [
-        {"name": "full sphere", "d_max": 2.0},
-        {"name": "hemisphere", "d_max": 1.0},
-        # cap area, holding d_max fixed, shrinks as dimension increases. 0.82 is approximately 1/4
-        # of a 15-sphere.
-        {"name": "quarter-sphere", "d_max": 0.5 if domain_dim == 3 else 0.82},
-    ]
-
-    for test_case in test_cases:
-        test_name = test_case["name"]
-        d_max = test_case["d_max"]
-
-        # For each test case, sample from a cap centered on the first distribution point
-        print(f"\nSampling from {test_name} (d_max={d_max})...")
-        cap_sample_rng, pt_sample_rng, sample_rng = jax.random.split(sample_rng, 3)
-
-        center = sample_sphere(cap_sample_rng, 1, domain_dim)[0]
-        centers = jnp.repeat(center[None, :], n_samples, axis=0)
-        d_maxes = jnp.full((n_samples,), d_max)
-
-        # Generate samples with increased accuracy settings
-        # Higher number of steps and RK4 method dramatically improves cap constraint satisfaction
-        cap_samples = generate_samples(
-            model,
-            train_state.params,
-            pt_sample_rng,
-            n_samples,
-            cap_centers=centers,
-            cap_d_maxes=d_maxes,
-            table=logits_table,
-            n_steps=1000,
-            method="rk4",
-        )
-
-        cos_similarity_targets = jnp.concatenate(
-            [center[None, :], distribution_points], axis=0
-        )
-        assert cos_similarity_targets.shape == (n_distribution_points + 1, domain_dim)
-
-        # Calculate similarities to center and distribution points
-        cos_similarities = jnp.dot(cap_samples, cos_similarity_targets.T)
-        cos_to_center = cos_similarities[:, 0]
-
-        # Print stats
-        print(
-            f"Cosine similarities to cap center - min: {cos_to_center.min():.4f}, max: {cos_to_center.max():.4f}"
-        )
-
-        constraint_results = cos_to_center > (1 - d_max)
-        constraint_fraction = constraint_results.mean()
-        print(
-            f"Fraction of points satisfying constraint: {constraint_fraction * 100:.2f}%"
-        )
-        assert (
-            constraint_fraction >= 0.90
-        ), f"Only {constraint_fraction * 100:.2f}% of samples satisfy the {test_name} constraint (required >= 90%)"
-
-        # Check which distribution points the samples are closest to
-        distribution_similarities = cos_similarities[:, 1:]
-        closest_points = jnp.argmax(distribution_similarities, axis=1)
-        counts = np.bincount(np.array(closest_points), minlength=n_distribution_points)
-        print(f"Distribution of closest points: {counts}")
 
 
 def test_vector_field_without_reference_directions():
