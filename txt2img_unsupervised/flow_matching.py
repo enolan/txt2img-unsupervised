@@ -70,10 +70,35 @@ import matplotlib.ticker as ticker
 
 from .cap_sampling import (
     LogitsTable,
-    sample_cap,
-    sphere_log_inverse_surface_area,
     process_d_max_dist,
+    sample_cap,
+    sample_from_cap,
+    sphere_log_inverse_surface_area,
 )
+
+
+def sinusoidal_scalar_encoding(s, dim: int):
+    """Sinusoidal encoding for a scalar in [0, 1] with configurable dimension (even)."""
+    assert dim % 2 == 0
+    half_d = dim // 2
+
+    min_freq = 1.0
+    max_freq = 1000.0
+    freqs = jnp.exp(jnp.linspace(jnp.log(min_freq), jnp.log(max_freq), half_d))
+
+    sin_components = jnp.sin(2 * jnp.pi * freqs * s)
+    cos_components = jnp.cos(2 * jnp.pi * freqs * s)
+
+    sin_means = -(jnp.cos(2 * jnp.pi * freqs) - 1.0) / (2 * jnp.pi * freqs)
+    cos_means = jnp.sin(2 * jnp.pi * freqs) / (2 * jnp.pi * freqs)
+
+    sin_components = sin_components - sin_means
+    cos_components = cos_components - cos_means
+
+    encoding = jnp.concatenate([sin_components, cos_components])
+    encoding = encoding * jnp.sqrt(2)
+    assert encoding.shape == (dim,)
+    return encoding
 
 
 class MLPBlock(nn.Module):
@@ -365,32 +390,7 @@ class VectorField(nn.Module):
 
     def time_encoding(self, t):
         "Create a sinusoidal encoding for the time parameter with configurable dimension."
-        # Equal number of sine and cosine components
-        half_d = self.time_dim // 2
-
-        # Generate logarithmically spaced frequencies
-        min_freq = 1.0
-        max_freq = 1000.0
-        freqs = jnp.exp(jnp.linspace(jnp.log(min_freq), jnp.log(max_freq), half_d))
-
-        sin_components = jnp.sin(2 * jnp.pi * freqs * t)
-        cos_components = jnp.cos(2 * jnp.pi * freqs * t)
-
-        # Compute the means of the sine and cosine components
-        # This might be faster with an explicit lookup table, but maybe it'll get constant folded
-        # who knows.
-        sin_means = -(jnp.cos(2 * jnp.pi * freqs) - 1.0) / (2 * jnp.pi * freqs)
-        cos_means = jnp.sin(2 * jnp.pi * freqs) / (2 * jnp.pi * freqs)
-
-        sin_components = sin_components - sin_means
-        cos_components = cos_components - cos_means
-
-        encoding = jnp.concatenate([sin_components, cos_components])
-        # Try and normalize to variance 1. The standard deviation of a sine over [0, 1] is
-        # 1 / sqrt(2), but the scaling above makes this a little off.
-        encoding = encoding * jnp.sqrt(2)
-        assert encoding.shape == (self.time_dim,)
-        return encoding
+        return sinusoidal_scalar_encoding(t, self.time_dim)
 
     def process_inputs(self, x, t, cond_vec):
         """
@@ -1028,8 +1028,8 @@ def conditional_flow_matching_loss(
         return loss
 
 
-def create_train_state(rng, model, learning_rate_or_schedule):
-    """Create initial training state."""
+def create_train_state(rng, model, learning_rate_or_schedule, gradient_clipping=None):
+    """Create initial training state for a test. See checkpoint.py for the real one."""
     dummy_inputs = model.dummy_inputs()
     params = model.init(rng, *dummy_inputs)
     if callable(learning_rate_or_schedule):
@@ -1038,8 +1038,20 @@ def create_train_state(rng, model, learning_rate_or_schedule):
         )
     else:
         scaled_lr_or_schedule = model.scale_lr(learning_rate_or_schedule)
-    opt_fixed_lr = optax.adamw(learning_rate_or_schedule, weight_decay=0.001)
-    opt_scaled_lr = optax.adamw(scaled_lr_or_schedule, weight_decay=0.001)
+
+    if gradient_clipping is not None:
+        opt_fixed_lr = optax.chain(
+            optax.clip_by_global_norm(gradient_clipping),
+            optax.adamw(learning_rate_or_schedule, weight_decay=0.001),
+        )
+        opt_scaled_lr = optax.chain(
+            optax.clip_by_global_norm(gradient_clipping),
+            optax.adamw(scaled_lr_or_schedule, weight_decay=0.001),
+        )
+    else:
+        opt_fixed_lr = optax.adamw(learning_rate_or_schedule, weight_decay=0.001)
+        opt_scaled_lr = optax.adamw(scaled_lr_or_schedule, weight_decay=0.001)
+
     opt = optax.transforms.partition(
         {"fixed_lr": opt_fixed_lr, "scaled_lr": opt_scaled_lr},
         model.mk_partition_map(use_muon=False),
@@ -1634,6 +1646,88 @@ def test_train_uniform_zero_field(domain_dim):
         f"Std field magnitude {post_std_magnitude:.6f} too large for uniform distribution "
         f"(should be < 0.05)"
     )
+
+
+@pytest.mark.parametrize("domain_dim", [3, 8, 16, 64])
+@pytest.mark.parametrize("d_max", [1.0, 0.5, 0.25])
+def test_train_uniform_cap(domain_dim, d_max):
+    """
+    Train a model on data uniformly distributed within a single spherical cap and verify samples
+    from the trained model lie within that cap with high probability. This test passing is a logical
+    prerequisite for CapConditionedVectorFields working - if we can't learn a single cap we can't
+    learn to condition on arbitrary caps.
+
+    Steps:
+    - Choose a random cap center
+    - Generate a training dataset of points uniformly within the cap (center, d_max)
+    - Train an unconditioned model
+    - Sample from the trained model
+    - Check that >=99% of samples are inside the cap
+    """
+    # Model
+    model = VectorField(
+        activations_dtype=jnp.float32,
+        weights_dtype=jnp.float32,
+        domain_dim=domain_dim,
+        conditioning_dim=0,
+        time_dim=64,
+        reference_directions=96,
+        n_layers=8,
+        d_model=256,
+        mlp_expansion_factor=4,
+        input_dropout_rate=None,
+        mlp_dropout_rate=None,
+        use_pre_mlp_projection=True,
+    )
+
+    # Cap parameters and dataset
+    rng = jax.random.PRNGKey(20250811)
+    center_rng, dset_rng, sample_rng = jax.random.split(rng, 3)
+    cap_center = sample_sphere(center_rng, 1, domain_dim)[0]
+
+    table = LogitsTable(d=domain_dim - 1, n=8192)
+
+    # Generate training data inside the cap
+    n_train = 10_000
+    sample_cap_vmapped = jax.jit(
+        lambda key: jax.vmap(
+            lambda subkey: sample_from_cap(subkey, table, cap_center, d_max)
+        )(jax.random.split(key, n_train))
+    )
+    train_points = sample_cap_vmapped(dset_rng)
+
+    train_dset = Dataset.from_dict({"point_vec": train_points}).with_format("np")
+
+    # Train
+    batch_size = 256
+    epochs = 32
+    state, train_loss = _train_loop_for_tests(
+        model, train_dset, batch_size, learning_rate=1e-3, epochs=epochs
+    )
+    print(f"Final train loss: {float(train_loss):.6f}")
+
+    # Sample from trained model
+    n_eval = 1000
+    samples = generate_samples(
+        model,
+        state.params,
+        sample_rng,
+        n_eval,
+        cond_vecs=jnp.zeros((n_eval, 0)),
+        n_steps=1000,
+        method="rk4",
+    )
+
+    # Check cap membership: cos(sim) > 1 - d_max
+    cos_to_center = jnp.dot(samples, cap_center)
+    in_cap = cos_to_center > (1.0 - d_max)
+    fraction_in_cap = float(jnp.mean(in_cap))
+    print(
+        f"Cap center dim={domain_dim}, d_max={d_max}: in-cap fraction {fraction_in_cap:.4f}"
+    )
+    assert (
+        fraction_in_cap >= 0.99
+    ), f"Only {fraction_in_cap*100:.2f}% of samples are in the cap (required >= 99%)"
 
 
 @pytest.mark.parametrize("domain_dim", [3, 16])
@@ -2804,6 +2898,8 @@ class CapConditionedVectorField(nn.Module):
     use_cap_area: bool = False
     # Minimum d_max allowed in cap conditioning. Required if use_cap_area is true, otherwise unused.
     min_d_max: Optional[float] = None
+    # Dimension of the sinusoidal encoding for cap size (must be even). If None, use scalar.
+    cap_size_dim: Optional[int] = None
 
     @nn.nowrap
     def mk_vector_field(self):
@@ -2844,6 +2940,8 @@ class CapConditionedVectorField(nn.Module):
         ), "min_d_max must be positive"
 
         assert len(self.d_max_dist) > 0, "d_max_dist must be non-empty"
+        if self.cap_size_dim is not None:
+            assert self.cap_size_dim % 2 == 0, "cap_size_dim must be even"
 
     @property
     def conditioning_dim(self):
@@ -2852,7 +2950,9 @@ class CapConditionedVectorField(nn.Module):
             if self.reference_directions is None
             else self.reference_directions
         )
-        return cap_center_dim + 1
+        return cap_center_dim + (
+            self.cap_size_dim if self.cap_size_dim is not None else 1
+        )
 
     @property
     def d_model_scale_factor(self) -> float:
@@ -2878,6 +2978,10 @@ class CapConditionedVectorField(nn.Module):
         "Scaled learning rate for hidden layers. Delegates to the underlying VectorField."
         return self.mk_vector_field().scale_lr(lr)
 
+    def cap_size_encoding(self, s):
+        "Create a sinusoidal encoding for the cap size value with configurable dimension."
+        return sinusoidal_scalar_encoding(s, self.cap_size_dim)
+
     def process_cap_inputs(self, cap_centers, cap_d_maxes, table=None):
         """
         Process the cap centers and size values, returning a vector for each cap with components
@@ -2892,7 +2996,8 @@ class CapConditionedVectorField(nn.Module):
         Returns:
             Dictionary with:
             - cap_centers_transformed: Transformed cap centers [batch_size, domain_dim or reference_directions if it's not None]
-            - cap_d_maxes_transformed: Transformed size values [batch_size]
+            - cap_size_values_transformed: Transformed scalar size values with mean 0, var 1 [batch_size]
+            - cap_size_encoding: Encoded cap size for concatenation [batch_size, cap_size_dim] if cap_size_dim is not None, else [batch_size, 1]
             - cap_info: Combined conditioning vector for the base model [batch_size, conditioning_dim]
         """
         batch_size = cap_centers.shape[0]
@@ -2977,15 +3082,29 @@ class CapConditionedVectorField(nn.Module):
             # U[0, 2] has variance 1/3, mean 1. The actual training distribution may or may not be
             # uniform, but it won't differ that much.
             cap_size_values_transformed = (cap_d_maxes - 1) * np.sqrt(3)
+
+        # Encode the cap size value
+        if self.cap_size_dim is not None:
+            cap_size_encoding = jax.vmap(self.cap_size_encoding)(
+                cap_size_values_transformed
+            )
+            assert cap_size_encoding.shape == (batch_size, self.cap_size_dim)
+            cap_size_for_concat = cap_size_encoding
+        else:
+            cap_size_encoding = cap_size_values_transformed[:, None]
+            cap_size_for_concat = cap_size_encoding
+            assert cap_size_encoding.shape == (batch_size, 1)
+
         # Convert the spherical cap info into a vector we can pass
         cap_info = jnp.concatenate(
-            [cap_centers_transformed, cap_size_values_transformed[:, None]], axis=1
+            [cap_centers_transformed, cap_size_for_concat], axis=1
         )
         assert cap_info.shape == (batch_size, self.conditioning_dim)
 
         return {
             "cap_centers_transformed": cap_centers_transformed,
             "cap_size_values_transformed": cap_size_values_transformed,
+            "cap_size_encoding": cap_size_encoding,
             "cap_info": cap_info,
         }
 
@@ -3017,12 +3136,13 @@ class CapConditionedVectorField(nn.Module):
 @pytest.mark.parametrize("domain_dim", [3, 8, 16, 768])
 @pytest.mark.parametrize("reference_directions", [8, 16, None])
 @pytest.mark.parametrize("use_cap_area", [True, False])
+@pytest.mark.parametrize("cap_size_dim", [None])  # , 16])
 @pytest.mark.parametrize(
     "d_max_dist",
     [((0.95, 1.0), (0.05, 2.0)), ((1.0, 2.0),), ((0.4, 0.8), (0.4, 1.2), (0.2, 2.0))],
 )
 def test_cap_conditioned_vector_field_normalization(
-    domain_dim, reference_directions, use_cap_area, d_max_dist
+    domain_dim, reference_directions, use_cap_area, cap_size_dim, d_max_dist
 ):
     """
     Test that CapConditionedVectorField properly normalizes the inputs passed to the superclass.
@@ -3053,6 +3173,7 @@ def test_cap_conditioned_vector_field_normalization(
         d_max_dist=d_max_dist,
         use_cap_area=use_cap_area,
         min_d_max=0.05 if use_cap_area else None,
+        cap_size_dim=cap_size_dim,
     )
     table = LogitsTable(d=domain_dim - 1, n=8192) if use_cap_area else None
 
@@ -3093,6 +3214,7 @@ def test_cap_conditioned_vector_field_normalization(
     cap_centers_transformed = processed["cap_centers_transformed"]
     cap_size_values_transformed = processed["cap_size_values_transformed"]
     cap_info = processed["cap_info"]
+    cap_size_encoding = processed["cap_size_encoding"]
 
     cap_center_dim = (
         model.reference_directions
@@ -3105,6 +3227,9 @@ def test_cap_conditioned_vector_field_normalization(
     )
     assert cap_size_values_transformed.shape == (n_samples,)
     assert cap_info.shape == (n_samples, model.conditioning_dim)
+    # Check cap size encoding shape based on configuration
+    expected_cap_size_channels = 1 if cap_size_dim is None else cap_size_dim
+    assert cap_size_encoding.shape == (n_samples, expected_cap_size_channels)
 
     # Check statistics of transformed values
     cap_centers_mean = jnp.mean(cap_centers_transformed, axis=0)
@@ -3113,7 +3238,7 @@ def test_cap_conditioned_vector_field_normalization(
     cap_size_values_var = jnp.var(cap_size_values_transformed)
 
     print(
-        f"\nTesting CapConditionedVectorField normalization with domain_dim={domain_dim}, reference_directions={reference_directions}"
+        f"\nTesting CapConditionedVectorField normalization with domain_dim={domain_dim}, reference_directions={reference_directions}, cap_size_dim={cap_size_dim}"
     )
     print(f"Cap centers - Mean: {jnp.mean(cap_centers_mean):.6f}, Expected: ~0.0")
     print(f"Cap centers - Variance: {jnp.mean(cap_centers_var):.6f}, Expected: ~1.0")
@@ -3132,6 +3257,221 @@ def test_cap_conditioned_vector_field_normalization(
     assert (
         jnp.abs(cap_size_values_var - 1.0) < 0.05
     ), f"Cap distances variance should be close to 1, got {cap_size_values_var}"
+
+    # Check statistics of the cap size encoding channels
+    cap_size_enc_means = jnp.mean(cap_size_encoding, axis=0)
+    cap_size_enc_vars = jnp.var(cap_size_encoding, axis=0)
+    print(
+        f"Cap size encoding - Mean (avg over channels): {jnp.mean(cap_size_enc_means):.6f}, Expected: ~0.0"
+    )
+    print(
+        f"Cap size encoding - Variance (avg over channels): {jnp.mean(cap_size_enc_vars):.6f}, Expected: ~1.0"
+    )
+    frac_mean_within_tolerance = (jnp.abs(cap_size_enc_means) < 0.1).mean()
+    frac_var_within_tolerance = (jnp.abs(cap_size_enc_vars - 1.0) < 0.1).mean()
+    assert (
+        frac_mean_within_tolerance > 0.9
+    ), f"Cap size encoding per-channel means should be close to 0, got {cap_size_enc_means}"
+    assert (
+        frac_var_within_tolerance > 0.95
+    ), f"Cap size encoding per-channel variances should be close to 1, got {cap_size_enc_vars}"
+
+
+@pytest.mark.parametrize("domain_dim", [3, 8, 64])
+def test_train_cap_conditioned_uniform_data(domain_dim):
+    """
+    Minimal test of cap conditioning with a uniform data distribution.
+
+    Tests:
+    1. Model isn't overfit.
+    2. Generated samples respect cap constraints for various cap sizes and centers
+    3. When d_max=2.0, the vector field is invariant to cap center (cap center should have no influence)
+    """
+
+    model = CapConditionedVectorField(
+        domain_dim=domain_dim,
+        reference_directions=96,
+        n_layers=16,
+        d_model=256,
+        time_dim=64,
+        cap_size_dim=64,
+        mlp_expansion_factor=4,
+        activations_dtype=jnp.float32,
+        weights_dtype=jnp.float32,
+        input_dropout_rate=None,
+        mlp_dropout_rate=None,
+        use_pre_mlp_projection=True,
+        use_cap_area=False,
+        min_d_max=None,
+        d_max_dist=((1.0, 2.0),),
+    )
+
+    data_rng, params_rng, train_rng, test_rng = jax.random.split(
+        jax.random.PRNGKey(42), 4
+    )
+
+    # Generate uniform dataset
+    dset_size = 10000
+    uniform_points = sample_sphere(data_rng, dset_size, domain_dim)
+
+    # Split into train/test
+    train_size = int(0.8 * dset_size)
+    train_points = uniform_points[:train_size]
+    test_points = uniform_points[train_size:]
+
+    train_dset = Dataset.from_dict({"point_vec": train_points}).with_format("np")
+    test_dset = Dataset.from_dict({"point_vec": test_points}).with_format("np")
+
+    # Train model
+    logits_table = LogitsTable(d=model.domain_dim - 1, n=8192)
+    batch_size = 256
+    epochs = 200
+    batches_per_epoch = len(train_dset) // batch_size
+    total_steps = epochs * batches_per_epoch
+
+    lr_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=1e-4,
+        warmup_steps=total_steps // 10,
+        decay_steps=total_steps,
+    )
+    train_state = create_train_state(
+        params_rng, model, learning_rate_or_schedule=3e-4, gradient_clipping=10.0
+    )
+
+    # Training loop
+    print("")  # Make sure progress bars don't delete the test name in console output
+    for epoch in tqdm(range(epochs), desc="Training"):
+        with tqdm(total=batches_per_epoch, desc=f"Epoch {epoch}", leave=False) as pbar:
+            for batch in train_dset.iter(batch_size, drop_last_batch=True):
+                train_state, loss, grad_norm, train_rng = train_step(
+                    model, train_state, batch, train_rng, logits_table
+                )
+                pbar.set_postfix(loss=f"{loss:.4f}", grad_norm=f"{grad_norm:.4f}")
+                pbar.update(1)
+        tqdm.write(f"Epoch {epoch} train loss: {loss:.4f}")
+
+    # Compute final train/test losses
+    train_losses = []
+    for batch in tqdm(
+        train_dset.iter(batch_size, drop_last_batch=True),
+        total=len(train_dset) // batch_size,
+        desc="Computing train loss",
+        leave=False,
+    ):
+        train_losses.append(
+            compute_batch_loss(
+                model, train_state.params, batch, train_rng, logits_table
+            )
+        )
+    train_loss = jnp.mean(jnp.array(train_losses))
+
+    test_losses = []
+    for batch in tqdm(
+        test_dset.iter(batch_size, drop_last_batch=True),
+        total=len(test_dset) // batch_size,
+        desc="Computing test loss",
+        leave=False,
+    ):
+        test_losses.append(
+            compute_batch_loss(model, train_state.params, batch, test_rng, logits_table)
+        )
+    test_loss = jnp.mean(jnp.array(test_losses))
+
+    tqdm.write(f"Train loss: {train_loss:.4f}, Test loss: {test_loss:.4f}")
+
+    assert test_loss - train_loss < 0.1, "Test loss exceeds train loss by more than 0.1"
+
+    # Cap constraint tests
+    n_samples = 500
+
+    # Test 1: Samples within caps for various cap sizes
+    cap_sizes = [1.5, 1.0, 0.5]
+    for d_max in tqdm(
+        cap_sizes, desc="Testing cap constraint satisfaction", leave=False
+    ):
+        cap_rng, sample_rng, test_rng = jax.random.split(test_rng, 3)
+
+        # Random cap centers
+        cap_centers = sample_sphere(cap_rng, n_samples, domain_dim)
+        cap_d_maxes = jnp.full((n_samples,), d_max)
+
+        samples = generate_samples(
+            model,
+            train_state.params,
+            sample_rng,
+            n_samples,
+            cap_centers=cap_centers,
+            cap_d_maxes=cap_d_maxes,
+            table=logits_table,
+            n_steps=100,
+            method="rk4",
+        )
+
+        assert cap_centers.shape == (n_samples, domain_dim)
+        assert samples.shape == (n_samples, domain_dim)
+        # Check samples are within caps
+        cos_similarities = jnp.sum(samples * cap_centers, axis=1)
+        assert cos_similarities.shape == (n_samples,)
+        constraint_satisfied = cos_similarities > (1 - d_max)
+        satisfaction_rate = constraint_satisfied.mean()
+        tqdm.write(f"d_max={d_max} satisfaction rate: {satisfaction_rate:.2%}")
+
+        assert (
+            satisfaction_rate >= 0.95
+        ), f"Only {satisfaction_rate:.2%} of samples satisfy cap constraint for d_max={d_max} (required >= 95%)"
+
+    # Test 2: d_max=2.0 invariance to cap center (full sphere coverage)
+    invariance_rng, test_rng = jax.random.split(test_rng)
+
+    # Generate two different cap centers
+    centers_rng, input_rng, invariance_rng = jax.random.split(invariance_rng, 3)
+    centers = sample_sphere(centers_rng, 2, domain_dim)
+    center1, center2 = centers
+
+    # Test inputs
+    test_inputs = sample_sphere(input_rng, 100, domain_dim)
+    test_times = jnp.linspace(0.0, 1.0, 100)
+
+    assert center1.shape == center2.shape == (domain_dim,)
+    assert test_inputs.shape == (100, domain_dim)
+    assert test_times.shape == (100,)
+
+    # Compute vector fields for both centers
+    cap_centers_1 = jnp.repeat(center1[None, :], 100, axis=0)
+    cap_d_maxes = jnp.full((100,), 2.0)
+    field1 = model.apply(
+        train_state.params,
+        test_inputs,
+        test_times,
+        cap_centers_1,
+        cap_d_maxes,
+        table=logits_table,
+    )
+
+    cap_centers_2 = jnp.repeat(center2[None, :], 100, axis=0)
+    field2 = model.apply(
+        train_state.params,
+        test_inputs,
+        test_times,
+        cap_centers_2,
+        cap_d_maxes,
+        table=logits_table,
+    )
+
+    assert field1.shape == field2.shape == (100, domain_dim)
+
+    # When d_max=2.0, cap center should be irrelevant since cap covers entire sphere
+    diffs = jnp.linalg.norm(field1 - field2, axis=1)
+    mean_diff = jnp.mean(diffs)
+    std_diff = jnp.std(diffs)
+    max_diff = jnp.max(diffs)
+    print(f"Mean difference between vector fields: {mean_diff:.4f}")
+    print(f"Std difference between vector fields: {std_diff:.4f}")
+    print(f"Max difference between vector fields: {max_diff:.4f}")
+    assert (
+        mean_diff < 0.05
+    ), f"Vector field mean difference is {mean_diff:.4f} for d_max=2.0 with different cap centers (should be <0.05)"
 
 
 @pytest.mark.parametrize("domain_dim,epochs", [(3, 10), (16, 30)])
