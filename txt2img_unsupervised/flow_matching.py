@@ -56,6 +56,7 @@ from flax.training import train_state
 from functools import partial
 from math import floor, ceil
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
+from enum import Enum
 import jax
 import jax.lax
 import jax.numpy as jnp
@@ -2740,7 +2741,40 @@ def test_vector_field_output_magnitude_statistics(domain_dim):
     assert jnp.all(jnp.isfinite(magnitudes)), "All magnitudes should be finite"
 
 
-def generate_cap_constrained_samples(
+class SamplingAlgorithm(Enum):
+    """Enum for selecting cap-constrained sampling algorithms."""
+
+    SIR = "sir"
+    REJECTION = "rejection"
+
+
+@dataclass
+class SIRParams:
+    """Parameters specific to Sampling-Importance-Resampling (SIR) algorithm."""
+
+    n_proposal_samples: int
+    n_steps: int = 100
+    n_projections: int = 10
+    batch_size: int = 512
+
+
+@dataclass
+class RejectionParams:
+    """Parameters specific to rejection sampling algorithm."""
+
+    proposal_batch_size: int = 256
+    n_steps: int = 100
+
+
+@dataclass
+class SamplingDebugInfo:
+    """Debug information about sampling performance."""
+
+    n_model_samples_drawn: int
+    n_model_probabilities_calculated: int
+
+
+def _generate_cap_constrained_samples_rejection(
     model,
     params,
     rng,
@@ -2748,15 +2782,98 @@ def generate_cap_constrained_samples(
     cap_d_max,
     table,
     cond_vec,
-    n_proposal_samples,
     n_output_samples,
-    n_steps=100,
-    n_projections=10,
-    batch_size=512,
+    rejection_params: RejectionParams,
 ):
     """
-    Generate samples from a trained model constrained to lie within a spherical cap using importance
-    sampling.
+    Generate samples from a trained model constrained to lie within a spherical cap using
+    rejection sampling.
+
+    Args:
+        model: Trained VectorField model
+        params: Model parameters
+        rng: JAX random key
+        cap_center: Center of the spherical cap [domain_dim]
+        cap_d_max: Maximum cosine distance defining the cap size
+        table: LogitsTable for cap sampling (unused in rejection sampling)
+        cond_vec: Conditioning vector shared across all samples [cond_dim]
+        n_output_samples: Number of final samples to return
+        rejection_params: Rejection sampling specific parameters
+
+    Returns:
+        samples: Cap-constrained samples [n_output_samples, domain_dim]
+        ess: Effective sample size (always equals n_output_samples for rejection sampling)
+        debug_info: Performance debugging information
+    """
+    assert cap_center.shape == (model.domain_dim,)
+    assert cond_vec.shape == (model.conditioning_dim,)
+
+    threshold = 1.0 - cap_d_max
+    samples_chunks = []
+    total_proposals = 0
+
+    with tqdm(
+        desc="rejection sampling", unit="accepted samples", total=n_output_samples
+    ) as pbar:
+        while sum(chunk.shape[0] for chunk in samples_chunks) < n_output_samples:
+            rng, sub_rng = jax.random.split(rng)
+
+            # Generate batch of conditioning vectors
+            batch_cond_vecs = jnp.broadcast_to(
+                cond_vec[None, :],
+                (rejection_params.proposal_batch_size, model.conditioning_dim),
+            )
+
+            # Generate samples from the trained model
+            batch_samples = generate_samples(
+                model,
+                params,
+                sub_rng,
+                rejection_params.proposal_batch_size,
+                cond_vecs=batch_cond_vecs,
+                n_steps=rejection_params.n_steps,
+                method="rk4",
+            )
+
+            # Check which samples are in the cap
+            cos_similarities = batch_samples @ cap_center
+            mask = cos_similarities >= threshold
+            accepted = batch_samples[mask]
+
+            if accepted.shape[0] > 0:
+                samples_chunks.append(accepted)
+                pbar.update(accepted.shape[0])
+
+            total_proposals += rejection_params.proposal_batch_size
+
+    # Concatenate and trim to exact number requested
+    all_samples = jnp.concatenate(samples_chunks, axis=0)
+    final_samples = all_samples[:n_output_samples]
+
+    # For rejection sampling, ESS equals the number of output samples
+    ess = float(n_output_samples)
+
+    debug_info = SamplingDebugInfo(
+        n_model_samples_drawn=total_proposals, n_model_probabilities_calculated=0
+    )
+
+    return final_samples, ess, debug_info
+
+
+def _generate_cap_constrained_samples_sir(
+    model,
+    params,
+    rng,
+    cap_center,
+    cap_d_max,
+    table,
+    cond_vec,
+    n_output_samples,
+    sir_params: SIRParams,
+):
+    """
+    Generate samples from a trained model constrained to lie within a spherical cap using
+    Sampling-Importance-Resampling (SIR).
 
     Args:
         model: Trained VectorField model
@@ -2766,15 +2883,13 @@ def generate_cap_constrained_samples(
         cap_d_max: Maximum cosine distance defining the cap size
         table: LogitsTable for cap sampling
         cond_vec: Conditioning vector shared across all samples [cond_dim]
-        n_proposal_samples: Number of samples to draw from uniform cap distribution
         n_output_samples: Number of final samples to return after importance resampling
-        n_steps: Number of integration steps for compute_log_probability
-        n_projections: Number of projections for divergence estimation
-        batch_size: Batch size for computing model probabilities (default: 512)
+        sir_params: SIR-specific parameters
 
     Returns:
         samples: Cap-constrained samples [n_output_samples, domain_dim]
         ess: Effective sample size (measure of sampling efficiency)
+        debug_info: Performance debugging information
     """
     assert cap_center.shape == (model.domain_dim,)
     assert cond_vec.shape == (model.conditioning_dim,)
@@ -2782,24 +2897,28 @@ def generate_cap_constrained_samples(
     proposal_rng, prob_rng, resample_rng = jax.random.split(rng, 3)
 
     # 1. Sample uniformly from the cap
-    proposal_keys = jax.random.split(proposal_rng, n_proposal_samples)
+    proposal_keys = jax.random.split(proposal_rng, sir_params.n_proposal_samples)
     proposal_samples = jax.vmap(
         lambda key: sample_from_cap(key, table, cap_center, cap_d_max)
     )(proposal_keys)
 
     # 2. Compute model log probabilities for all proposals in batches
-    n_batches = ceil(n_proposal_samples / batch_size)
+    n_batches = ceil(sir_params.n_proposal_samples / sir_params.batch_size)
     model_log_probs_list = []
 
     # Split RNG for each batch
     batch_rngs = jax.random.split(prob_rng, n_batches)
 
     with tqdm(
-        total=n_proposal_samples, desc="computing model probabilities", unit="sample"
+        total=sir_params.n_proposal_samples,
+        desc="computing model probabilities",
+        unit="sample",
     ) as pbar:
         for batch_idx in range(n_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min((batch_idx + 1) * batch_size, n_proposal_samples)
+            start_idx = batch_idx * sir_params.batch_size
+            end_idx = min(
+                (batch_idx + 1) * sir_params.batch_size, sir_params.n_proposal_samples
+            )
             actual_batch_size = end_idx - start_idx
 
             # Extract batch of samples
@@ -2816,9 +2935,9 @@ def generate_cap_constrained_samples(
                 params,
                 batch_samples,
                 batch_cond_vecs,
-                n_steps=n_steps,
+                n_steps=sir_params.n_steps,
                 rng=batch_rngs[batch_idx],
-                n_projections=n_projections,
+                n_projections=sir_params.n_projections,
             )
 
             model_log_probs_list.append(batch_log_probs)
@@ -2850,20 +2969,93 @@ def generate_cap_constrained_samples(
     # 6. Resample according to importance weights
     indices = jax.random.choice(
         resample_rng,
-        n_proposal_samples,
+        sir_params.n_proposal_samples,
         shape=(n_output_samples,),
         p=weights,
     )
     final_samples = proposal_samples[indices]
 
-    return final_samples, ess
+    debug_info = SamplingDebugInfo(
+        n_model_samples_drawn=0,
+        n_model_probabilities_calculated=sir_params.n_proposal_samples,
+    )
+
+    return final_samples, ess, debug_info
+
+
+def generate_cap_constrained_samples(
+    model,
+    params,
+    rng,
+    cap_center,
+    cap_d_max,
+    table,
+    cond_vec,
+    n_output_samples,
+    algorithm: SamplingAlgorithm,
+    algorithm_params,
+):
+    """
+    Generate samples from a trained model constrained to lie within a spherical cap.
+
+    Args:
+        model: Trained VectorField model
+        params: Model parameters
+        rng: JAX random key
+        cap_center: Center of the spherical cap [domain_dim]
+        cap_d_max: Maximum cosine distance defining the cap size
+        table: LogitsTable for cap sampling
+        cond_vec: Conditioning vector shared across all samples [cond_dim]
+        n_output_samples: Number of final samples to return
+        algorithm: Which sampling algorithm to use
+        algorithm_params: Parameters specific to the chosen algorithm
+
+    Returns:
+        samples: Cap-constrained samples [n_output_samples, domain_dim]
+        ess: Effective sample size (measure of sampling efficiency)
+        debug_info: Performance debugging information
+    """
+    if algorithm == SamplingAlgorithm.SIR:
+        if not isinstance(algorithm_params, SIRParams):
+            raise TypeError(
+                f"Expected SIRParams for SIR algorithm, got {type(algorithm_params)}"
+            )
+        return _generate_cap_constrained_samples_sir(
+            model,
+            params,
+            rng,
+            cap_center,
+            cap_d_max,
+            table,
+            cond_vec,
+            n_output_samples,
+            algorithm_params,
+        )
+    elif algorithm == SamplingAlgorithm.REJECTION:
+        if not isinstance(algorithm_params, RejectionParams):
+            raise TypeError(
+                f"Expected RejectionParams for REJECTION algorithm, got {type(algorithm_params)}"
+            )
+        return _generate_cap_constrained_samples_rejection(
+            model,
+            params,
+            rng,
+            cap_center,
+            cap_d_max,
+            table,
+            cond_vec,
+            n_output_samples,
+            algorithm_params,
+        )
+    else:
+        raise ValueError(f"Unknown sampling algorithm: {algorithm}")
 
 
 def test_generate_cap_constrained_samples_matches_rejection():
     """
     Train a 3D VectorField on a vMF distribution, then compare cap-constrained samples drawn via:
-    1) simple rejection sampling from the trained model, and
-    2) importance sampling using generate_cap_constrained_samples.
+    1) rejection sampling using generate_cap_constrained_samples, and
+    2) importance sampling (SIR) using generate_cap_constrained_samples.
 
     - Uses a fixed random cap center and d_max=0.25
     - Reports proposal counts for both methods
@@ -2901,35 +3093,34 @@ def test_generate_cap_constrained_samples_matches_rejection():
 
     target_n = 4096
 
-    # Rejection sampling from the trained model
-    rs_samples_chunks = []
-    total_rs_proposals = 0
-    proposal_batch = 256
-    while sum(chunk.shape[0] for chunk in rs_samples_chunks) < target_n:
-        rs_rng, sub = jax.random.split(rs_rng)
-        cond_vecs = jnp.zeros((proposal_batch, model.conditioning_dim))
-        batch = generate_samples(
-            model,
-            params,
-            sub,
-            proposal_batch,
-            cond_vecs=cond_vecs,
-            n_steps=16,
-            method="rk4",
-        )
-        cos = batch @ cap_center
-        mask = cos >= threshold
-        accepted = jnp.asarray(batch[mask])
-        if accepted.shape[0] > 0:
-            rs_samples_chunks.append(np.asarray(accepted))
-        total_rs_proposals += proposal_batch
-
-    rs_samples = jnp.asarray(np.concatenate(rs_samples_chunks, axis=0)[:target_n])
-
-    # Importance sampling using generate_cap_constrained_samples
-    n_proposal_samples = 8192
+    # Rejection sampling
     cond_vec = jnp.zeros((model.conditioning_dim,))
-    imp_samples, ess = generate_cap_constrained_samples(
+    rejection_params = RejectionParams(
+        proposal_batch_size=256,
+        n_steps=16,
+    )
+    rs_samples, rs_ess, rs_debug = generate_cap_constrained_samples(
+        model,
+        params,
+        rs_rng,
+        cap_center,
+        d_max,
+        table,
+        cond_vec,
+        target_n,
+        SamplingAlgorithm.REJECTION,
+        rejection_params,
+    )
+
+    # Importance sampling
+    n_proposal_samples = 16384
+    cond_vec = jnp.zeros((model.conditioning_dim,))
+    sir_params = SIRParams(
+        n_proposal_samples=n_proposal_samples,
+        n_steps=16,
+        n_projections=10,
+    )
+    imp_samples, ess, sir_debug = generate_cap_constrained_samples(
         model,
         params,
         imp_rng,
@@ -2937,20 +3128,21 @@ def test_generate_cap_constrained_samples_matches_rejection():
         d_max,
         table,
         cond_vec,
-        n_proposal_samples=n_proposal_samples,
-        n_output_samples=target_n,
-        n_steps=16,
-        n_projections=10,
-    )
-
-    print(
-        f"Rejection proposals used: {total_rs_proposals} for {target_n} accepted samples ({(total_rs_proposals / target_n):.2f} per sample)"
+        target_n,
+        SamplingAlgorithm.SIR,
+        sir_params,
     )
     print(
-        f"Importance proposals used: {n_proposal_samples}, ESS={float(ess):.2f} ({n_proposal_samples / ess:.2f} per effective sample)"
+        f"Rejection proposals used: {rs_debug.n_model_samples_drawn} for {target_n} accepted samples ({(rs_debug.n_model_samples_drawn / target_n):.2f} per sample)"
+    )
+    print(
+        f"Importance sampling (SIR): {n_proposal_samples} proposals, ESS={float(ess):.2f} ({n_proposal_samples / ess:.2f} per effective sample)"
     )
 
-    assert ess >= target_n, f"ESS={ess} < target_n={target_n}"
+    assert ess >= target_n, f"SIR ESS={ess} < target_n={target_n}"
+    assert (
+        rs_ess == target_n
+    ), f"Rejection ESS should equal output samples, got {rs_ess}"
 
     # Verify all samples are in-cap
     for arr in [rs_samples, imp_samples]:
