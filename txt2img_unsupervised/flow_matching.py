@@ -2752,6 +2752,7 @@ def generate_cap_constrained_samples(
     n_output_samples,
     n_steps=100,
     n_projections=10,
+    batch_size=512,
 ):
     """
     Generate samples from a trained model constrained to lie within a spherical cap using importance
@@ -2769,6 +2770,7 @@ def generate_cap_constrained_samples(
         n_output_samples: Number of final samples to return after importance resampling
         n_steps: Number of integration steps for compute_log_probability
         n_projections: Number of projections for divergence estimation
+        batch_size: Batch size for computing model probabilities (default: 512)
 
     Returns:
         samples: Cap-constrained samples [n_output_samples, domain_dim]
@@ -2785,21 +2787,46 @@ def generate_cap_constrained_samples(
         lambda key: sample_from_cap(key, table, cap_center, cap_d_max)
     )(proposal_keys)
 
-    # 2. Compute model log probabilities for all proposals
-    # Expand cond_vecs to match proposal sample count
-    proposal_cond_vecs = jnp.broadcast_to(
-        cond_vec[None, :], (n_proposal_samples, model.conditioning_dim)
-    )
+    # 2. Compute model log probabilities for all proposals in batches
+    n_batches = ceil(n_proposal_samples / batch_size)
+    model_log_probs_list = []
 
-    model_log_probs = compute_log_probability(
-        model,
-        params,
-        proposal_samples,
-        proposal_cond_vecs,
-        n_steps=n_steps,
-        rng=prob_rng,
-        n_projections=n_projections,
-    )
+    # Split RNG for each batch
+    batch_rngs = jax.random.split(prob_rng, n_batches)
+
+    with tqdm(
+        total=n_proposal_samples, desc="computing model probabilities", unit="sample"
+    ) as pbar:
+        for batch_idx in range(n_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min((batch_idx + 1) * batch_size, n_proposal_samples)
+            actual_batch_size = end_idx - start_idx
+
+            # Extract batch of samples
+            batch_samples = proposal_samples[start_idx:end_idx]
+
+            # Expand cond_vecs to match batch size
+            batch_cond_vecs = jnp.broadcast_to(
+                cond_vec[None, :], (actual_batch_size, model.conditioning_dim)
+            )
+
+            # Compute log probabilities for this batch
+            batch_log_probs = compute_log_probability(
+                model,
+                params,
+                batch_samples,
+                batch_cond_vecs,
+                n_steps=n_steps,
+                rng=batch_rngs[batch_idx],
+                n_projections=n_projections,
+            )
+
+            model_log_probs_list.append(batch_log_probs)
+            pbar.update(actual_batch_size)
+
+    # Concatenate all batch results
+    model_log_probs = jnp.concatenate(model_log_probs_list, axis=0)
+    del model_log_probs_list
 
     # 3. Compute uniform cap log density. Fraction of the total sphere area that is inside the cap,
     # times the total sphere area gets you the area of the cap, reciprocal of that is the density.

@@ -552,52 +552,68 @@ def two_stage_sample_loop(
 
     # Sample CLIP embeddings from flow model via cap-constrained importance sampling
     flow_rng, rng = jax.random.split(rng)
-    generated_clip_embeddings = []
 
-    batches = batches_split(batch_size, n_imgs)
-    ess_all = []
-    with tqdm(total=n_imgs, desc="flow sampling", unit="embed") as pbar:
-        ctr = 0
-        for batch in batches:
-            batch_cap_centers = cap_centers[ctr : ctr + batch]
-            batch_max_cos_distances = max_cos_distances[ctr : ctr + batch]
+    # Group all images by identical cap constraints to pool proposal samples
+    cap_specs = [
+        (tuple(center), float(d_max))
+        for center, d_max in zip(cap_centers, max_cos_distances)
+    ]
 
-            batch_rng, flow_rng = jax.random.split(flow_rng)
+    # Find unique cap specifications and which image indices want each one
+    unique_caps = {}
+    for img_idx, cap_spec in enumerate(cap_specs):
+        if cap_spec not in unique_caps:
+            unique_caps[cap_spec] = []
+        unique_caps[cap_spec].append(img_idx)
 
-            # Generate embeddings for this batch using importance sampling per item
-            per_item_keys = jax.random.split(batch_rng, batch)
+    print(f"Grouped {n_imgs} images into {len(unique_caps)} unique caps")
 
-            def _sample_one(key, center, d_max):
-                samples, ess = flow_matching.generate_cap_constrained_samples(
-                    flow_mdl,
-                    flow_params_gpu,
-                    key,
-                    center,
-                    d_max,
-                    table,
-                    cond_vec,
-                    n_proposal_samples=n_flow_proposals,
-                    n_output_samples=1,
-                    n_steps=n_flow_steps,
-                    n_projections=10,
-                )
-                return samples[0], ess
+    # Initialize results array
+    generated_clip_embeddings = np.zeros((n_imgs, 768), dtype=np.float32)
 
-            batch_embeddings, batch_ess = jax.vmap(_sample_one)(
-                per_item_keys, batch_cap_centers, batch_max_cos_distances
+    # Generate random keys for each unique cap
+    cap_keys = jax.random.split(flow_rng, len(unique_caps))
+
+    # Sample embeddings per unique cap
+    with tqdm(total=len(unique_caps), desc="flow sampling", unit="cap") as pbar:
+        for cap_idx, ((center_tuple, d_max), img_indices) in enumerate(
+            unique_caps.items()
+        ):
+            center = jnp.array(center_tuple)
+            n_samples_for_cap = len(img_indices)
+
+            # Use more proposals when sampling for multiple images with same cap
+            # This improves importance sampling statistics
+            total_proposals = n_flow_proposals * max(1, n_samples_for_cap // 4)
+
+            samples, ess = flow_matching.generate_cap_constrained_samples(
+                flow_mdl,
+                flow_params_gpu,
+                cap_keys[cap_idx],
+                center,
+                d_max,
+                table,
+                cond_vec,
+                n_proposal_samples=total_proposals,
+                n_output_samples=n_samples_for_cap,
+                n_steps=n_flow_steps,
+                n_projections=10,
             )
-            ess_all.append(jax.device_get(batch_ess))
-            tqdm.write(f"{batch_ess=}")
-            tqdm.write(
-                f"ESS stats (n_proposals={n_flow_proposals}): mean={float(jnp.mean(batch_ess)):.1f}, min={float(jnp.min(batch_ess)):.1f}, max={float(jnp.max(batch_ess)):.1f}"
+
+            # Distribute results back to original image indices
+            for i, img_idx in enumerate(img_indices):
+                generated_clip_embeddings[img_idx] = jax.device_get(samples[i])
+
+            tqdm.write(f"Cap {cap_idx} ESS: {ess}")
+            pbar.set_postfix(
+                {
+                    "n_imgs": n_samples_for_cap,
+                    "ESS": f"{float(ess):.1f}",
+                    "proposals": total_proposals,
+                }
             )
+            pbar.update(1)
 
-            generated_clip_embeddings.append(jax.device_get(batch_embeddings))
-            pbar.update(batch)
-            ctr += batch
-
-    generated_clip_embeddings = np.concatenate(generated_clip_embeddings, axis=0)
-    assert generated_clip_embeddings.shape == (n_imgs, 768)
     cos_distances = 1 - np.sum(generated_clip_embeddings * cap_centers, axis=1)
     assert cos_distances.shape == (n_imgs,)
     print(f"Cosine distances to cap centers: {cos_distances}")
@@ -607,6 +623,8 @@ def two_stage_sample_loop(
 
     # Stage 2: Generate image codes using transformer model
     print("Stage 2: Generating image codes with transformer model...")
+
+    batches = batches_split(batch_size, n_imgs)
 
     # Put image model parameters on GPU
     im_params_gpu = jax.device_put(im_params, NamedSharding(mesh, PartitionSpec(None)))
