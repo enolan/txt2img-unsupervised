@@ -170,10 +170,6 @@ class FlowMatchingModelConfig(BaseModelConfig):
     variance_base: float = 1 / 512
     alpha_input: float = 1.0
     alpha_output: float = 1.0
-    d_max_dist: List[Tuple[float, float]] = field(
-        default_factory=lambda: [(0.95, 1.0), (0.05, 2.0)]
-    )
-    use_cap_area: bool = False
 
     # Class variable to store the model type
     model_type: ClassVar[str] = "flow_matching"

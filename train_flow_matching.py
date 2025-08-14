@@ -29,10 +29,8 @@ from txt2img_unsupervised.config import (
 from txt2img_unsupervised.flow_matching import (
     compute_batch_loss,
     compute_log_probability,
-    CapConditionedVectorField,
     LogitsTable,
     sample_loop,
-    sample_cap,
     create_mollweide_projection_figure,
     generate_samples,
 )
@@ -201,23 +199,16 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_ste
     if mdl.domain_dim != 3:
         return
 
-    # Generate random unit vectors as cap centers for unconditioned sampling
-    centers_rng, samples_rng = jax.random.split(rng)
-
-    cap_centers = jax.random.normal(centers_rng, (n_samples, mdl.domain_dim))
-    cap_centers = cap_centers / jnp.linalg.norm(cap_centers, axis=1, keepdims=True)
-
-    # Use maximum cap size (2.0) for unconditioned sampling
-    cap_d_maxes = jnp.full((n_samples,), 2.0)
+    # Create empty conditioning vectors
+    cond_vecs = jnp.zeros((n_samples, mdl.conditioning_dim))
 
     samples = sample_loop(
         mdl,
         params,
         n_samples,
         batch_size,
-        samples_rng,
-        cap_centers=cap_centers,
-        cap_d_maxes=cap_d_maxes,
+        rng,
+        cond_vecs,
         n_steps=n_steps,
     )
 
@@ -294,13 +285,17 @@ def save_checkpoint_and_evaluate(
             sharding=examples_sharding,
         )
 
-        test_batch = {"point_vec": batch[vector_column]}
+        test_batch = {
+            "point_vec": batch[vector_column],
+            "cond_vec": jnp.zeros(
+                (batch[vector_column].shape[0], 0), dtype=jnp.float32
+            ),
+        }
         loss = compute_batch_loss(
             mdl,
             eval_params,
             test_batch,
             batch_rng,
-            logits_table,
         )
         losses.append(loss)
 
@@ -311,88 +306,20 @@ def save_checkpoint_and_evaluate(
     ):
         test_rng, batch_rng, nll_batch_rng = jax.random.split(test_rng, 3)
 
-        # Compute NLL using full caps. It's non-obvious what the correct way to test NLL with
-        # conditioning is, and the stat without conditioning is clearly useful.
         batch_size = test_batch["point_vec"].shape[0]
-        cap_centers = jax.random.normal(nll_batch_rng, (batch_size, mdl.domain_dim))
-        cap_centers = cap_centers / jnp.linalg.norm(cap_centers, axis=1, keepdims=True)
-
-        cap_d_maxes = jnp.full((batch_size,), 2.0)
+        cond_vecs = jnp.zeros((batch_size, mdl.conditioning_dim))
 
         log_prob = compute_log_probability(
             mdl,
             eval_params,
             test_batch["point_vec"],
-            cond_vecs=None,
+            cond_vecs,
             n_steps=integration_steps,
             rng=nll_batch_rng,
             n_projections=nll_n_projections,
-            cap_centers=cap_centers,
-            cap_d_maxes=cap_d_maxes,
         )
         nll = -jnp.mean(log_prob)
         nlls.append(nll)
-
-    # Evaluate cap conditioning performance by sampling conditioned on caps centered on test
-    # examples
-    cap_metrics = {}
-    cap_rng = jax.random.PRNGKey(42 + global_step)  # Reproducible but unique per step
-
-    for d_max in tqdm([1.0, 0.5], unit="d_max", desc="cap conditioning eval"):
-        cap_distances = []
-        within_cap_counts = []
-        total_samples = 0
-
-        for batch_idx in trange(
-            ceil(min(1000, len(test_dataset)) / training_cfg.batch_size),
-            desc=f"cap conditioning eval (d_max={d_max})",
-        ):
-            cap_rng, batch_cap_rng = jax.random.split(cap_rng)
-
-            batch = get_batch(
-                test_dataset,
-                training_cfg.batch_size,
-                batch_idx,
-                fields=[vector_column],
-                sharding=examples_sharding,
-            )
-
-            cap_centers = batch[vector_column]
-            batch_size = cap_centers.shape[0]
-            cap_d_maxes = jnp.full((batch_size,), d_max)
-
-            samples = generate_samples(
-                mdl,
-                eval_params,
-                batch_cap_rng,
-                batch_size,
-                cap_centers=cap_centers,
-                cap_d_maxes=cap_d_maxes,
-                n_steps=integration_steps,
-            )
-
-            cosine_similarities = jnp.sum(samples * cap_centers, axis=1)
-            cosine_distances = 1.0 - cosine_similarities
-
-            within_cap = cosine_distances <= d_max
-
-            cap_distances.append(cosine_distances)
-            within_cap_counts.append(jnp.sum(within_cap))
-            total_samples += batch_size
-
-        # Compute aggregate metrics
-        all_distances = jnp.concatenate(cap_distances)
-        total_within_cap = jnp.sum(jnp.stack(within_cap_counts))
-
-        mean_distance = jnp.mean(all_distances)
-        fraction_within_cap = total_within_cap / total_samples
-
-        cap_metrics[
-            f"test/cap_conditioning/d_max_{d_max}/mean_cosine_distance"
-        ] = mean_distance
-        cap_metrics[
-            f"test/cap_conditioning/d_max_{d_max}/fraction_within_cap"
-        ] = fraction_within_cap
 
     test_loss = jnp.mean(jnp.stack(losses))
     test_nll = jnp.mean(jnp.stack(nlls))
@@ -402,7 +329,6 @@ def save_checkpoint_and_evaluate(
             "global_step": global_step,
             "test/loss": test_loss,
             "test/nll": test_nll,
-            **cap_metrics,
         }
     )
     tqdm.write(
@@ -594,8 +520,12 @@ if __name__ == "__main__":
     @partial(jax.jit, static_argnames=("mdl"))
     def loss_fn(params, batch, rng, mdl=None, logits_table=None):
         # The loss function expects a batch with 'point_vec' key
-        flow_batch = {"point_vec": batch[args.vector_column]}
-        return compute_batch_loss(mdl, params, flow_batch, rng, logits_table)
+        vecs = batch[args.vector_column]
+        flow_batch = {
+            "point_vec": vecs,
+            "cond_vec": jnp.zeros((vecs.shape[0], 0), dtype=jnp.float32),
+        }
+        return compute_batch_loss(mdl, params, flow_batch, rng)
 
     train_state, global_step = train_loop(
         steps_per_epoch=steps_per_epoch,

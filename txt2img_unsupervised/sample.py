@@ -492,15 +492,17 @@ def two_stage_sample_loop(
     temperature=1.0,
     force_f32=True,
     n_flow_steps=100,
+    n_flow_proposals=128,
 ):
-    """Two-stage sampling pipeline that uses a flow model to generate CLIP embeddings,
-    then uses an image model to generate codes, then decodes with an autoencoder.
+    """Two-stage sampling pipeline that uses a flow model to generate CLIP embeddings constrained to
+    caps with importance sampling, then uses an image model to generate codes, then decodes with an
+    autoencoder.
 
     Args:
         im_mdl: ImageModel instance
         im_params: Parameters for the ImageModel (on CPU)
-        flow_mdl: CapConditionedVectorField instance
-        flow_params: Parameters for the CapConditionedVectorField (on CPU)
+        flow_mdl: VectorField instance
+        flow_params: Parameters for the VectorField (on CPU)
         ae_mdl: LDMAutoencoder instance
         ae_params: Parameters for the LDMAutoencoder (on CPU)
         batch_size: Batch size for processing
@@ -544,11 +546,16 @@ def two_stage_sample_loop(
         flow_params, NamedSharding(mesh, PartitionSpec(None))
     )
 
-    # Sample CLIP embeddings from flow model
+    # Prepare importance sampler utilities
+    table = flow_matching.LogitsTable(d=flow_mdl.domain_dim - 1, n=16384)
+    cond_vec = jnp.zeros((flow_mdl.conditioning_dim,), dtype=jnp.float32)
+
+    # Sample CLIP embeddings from flow model via cap-constrained importance sampling
     flow_rng, rng = jax.random.split(rng)
     generated_clip_embeddings = []
 
     batches = batches_split(batch_size, n_imgs)
+    ess_all = []
     with tqdm(total=n_imgs, desc="flow sampling", unit="embed") as pbar:
         ctr = 0
         for batch in batches:
@@ -557,16 +564,32 @@ def two_stage_sample_loop(
 
             batch_rng, flow_rng = jax.random.split(flow_rng)
 
-            # Generate embeddings for this batch
-            print(f"{batch_max_cos_distances=}")
-            batch_embeddings = flow_matching.generate_samples(
-                flow_mdl,
-                flow_params_gpu,
-                batch_rng,
-                batch,
-                cap_centers=batch_cap_centers,
-                cap_d_maxes=batch_max_cos_distances,
-                n_steps=n_flow_steps,
+            # Generate embeddings for this batch using importance sampling per item
+            per_item_keys = jax.random.split(batch_rng, batch)
+
+            def _sample_one(key, center, d_max):
+                samples, ess = flow_matching.generate_cap_constrained_samples(
+                    flow_mdl,
+                    flow_params_gpu,
+                    key,
+                    center,
+                    d_max,
+                    table,
+                    cond_vec,
+                    n_proposal_samples=n_flow_proposals,
+                    n_output_samples=1,
+                    n_steps=n_flow_steps,
+                    n_projections=10,
+                )
+                return samples[0], ess
+
+            batch_embeddings, batch_ess = jax.vmap(_sample_one)(
+                per_item_keys, batch_cap_centers, batch_max_cos_distances
+            )
+            ess_all.append(jax.device_get(batch_ess))
+            tqdm.write(f"{batch_ess=}")
+            tqdm.write(
+                f"ESS stats (n_proposals={n_flow_proposals}): mean={float(jnp.mean(batch_ess)):.1f}, min={float(jnp.min(batch_ess)):.1f}, max={float(jnp.max(batch_ess)):.1f}"
             )
 
             generated_clip_embeddings.append(jax.device_get(batch_embeddings))
@@ -578,7 +601,6 @@ def two_stage_sample_loop(
     cos_distances = 1 - np.sum(generated_clip_embeddings * cap_centers, axis=1)
     assert cos_distances.shape == (n_imgs,)
     print(f"Cosine distances to cap centers: {cos_distances}")
-
     # Free GPU memory used by flow model
     del flow_params_gpu
     gc.collect()
@@ -704,6 +726,12 @@ def main():
         type=int,
         default=100,
         help="Number of ODE integration steps for flow model",
+    )
+    parser.add_argument(
+        "--n-flow-proposals",
+        type=int,
+        default=128,
+        help="Number of proposal samples for cap-constrained importance sampling",
     )
     parser.add_argument("transformer_checkpoint_dir", type=Path)
     parser.add_argument("autoencoder_checkpoint", type=Path)
@@ -899,10 +927,8 @@ def main():
         print(f"Loaded flow model step {flow_step}")
 
         # Validate flow model compatibility
-        if not isinstance(flow_mdl, flow_matching.CapConditionedVectorField):
-            raise ValueError(
-                f"Flow model must be a CapConditionedVectorField, got {type(flow_mdl)}"
-            )
+        if not isinstance(flow_mdl, flow_matching.VectorField):
+            raise ValueError(f"Flow model must be a VectorField, got {type(flow_mdl)}")
         if flow_mdl.domain_dim != 768:
             raise ValueError(
                 f"Flow model domain_dim must be 768 (CLIP embedding size), got {flow_mdl.domain_dim}"
@@ -926,6 +952,7 @@ def main():
             temperature=args.temperature,
             force_f32=args.force_fp32,
             n_flow_steps=args.n_flow_steps,
+            n_flow_proposals=args.n_flow_proposals,
         )
     else:
         imgs = sample_loop(

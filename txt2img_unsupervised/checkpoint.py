@@ -11,6 +11,7 @@ import time
 import subprocess
 
 from contextlib import nullcontext
+from copy import copy
 from flax.training import train_state
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -26,7 +27,7 @@ from .config import (
     TrainingConfig,
     TransformerModelConfig,
 )
-from .flow_matching import CapConditionedVectorField
+from .flow_matching import VectorField
 from .muon import muon
 from .transformer_model import ImageModel
 from .triangle_schedule import triangle_schedule
@@ -443,7 +444,9 @@ class FlowMatchingTrainState(BaseTrainState):
         """Create a flow matching model instance from configuration."""
         if not isinstance(model_cfg, FlowMatchingModelConfig):
             raise ValueError(f"Expected FlowMatchingModelConfig, got {type(model_cfg)}")
-        return CapConditionedVectorField(**model_cfg.__dict__)
+        cfg_dict = copy(model_cfg.__dict__)
+        cfg_dict["conditioning_dim"] = 0
+        return VectorField(**cfg_dict)
 
 
 def mk_checkpoint_manager(
