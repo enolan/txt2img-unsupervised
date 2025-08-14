@@ -493,6 +493,8 @@ def two_stage_sample_loop(
     force_f32=True,
     n_flow_steps=100,
     n_flow_proposals=128,
+    flow_algorithm=None,
+    algorithm_params=None,
 ):
     """Two-stage sampling pipeline that uses a flow model to generate CLIP embeddings constrained to
     caps with importance sampling, then uses an image model to generate codes, then decodes with an
@@ -586,7 +588,40 @@ def two_stage_sample_loop(
             # This improves importance sampling statistics
             total_proposals = n_flow_proposals * max(1, n_samples_for_cap // 4)
 
-            samples, ess = flow_matching.generate_cap_constrained_samples(
+            # Build per-cap algorithm params
+            algo = (
+                flow_algorithm
+                if flow_algorithm is not None
+                else flow_matching.SamplingAlgorithm.SIR
+            )
+            if algo == flow_matching.SamplingAlgorithm.SIR:
+                # Derive per-cap SIR params from base, adjust n_proposal_samples
+                base = algorithm_params or flow_matching.SIRParams(
+                    n_proposal_samples=total_proposals,
+                    n_projections=10,
+                    batch_size=512,
+                )
+                sir_params = flow_matching.SIRParams(
+                    n_proposal_samples=total_proposals,
+                    n_projections=base.n_projections,
+                    batch_size=base.batch_size,
+                )
+                algo_params_for_cap = sir_params
+            elif algo == flow_matching.SamplingAlgorithm.REJECTION:
+                algo_params_for_cap = algorithm_params or flow_matching.RejectionParams(
+                    proposal_batch_size=256
+                )
+            elif algo == flow_matching.SamplingAlgorithm.MCMC:
+                algo_params_for_cap = algorithm_params or flow_matching.MCMCParams(
+                    n_chains=512,
+                    n_steps_per_chain=128,
+                    step_scale=1 / 3,
+                    burnin_steps=16,
+                )
+            else:
+                raise ValueError(f"Unsupported flow sampling algorithm: {algo}")
+
+            samples, ess, _ = flow_matching.generate_cap_constrained_samples(
                 flow_mdl,
                 flow_params_gpu,
                 cap_keys[cap_idx],
@@ -594,10 +629,10 @@ def two_stage_sample_loop(
                 d_max,
                 table,
                 cond_vec,
-                n_proposal_samples=total_proposals,
                 n_output_samples=n_samples_for_cap,
-                n_steps=n_flow_steps,
-                n_projections=10,
+                flow_n_steps=n_flow_steps,
+                algorithm=algo,
+                algorithm_params=algo_params_for_cap,
             )
 
             # Distribute results back to original image indices
@@ -605,13 +640,13 @@ def two_stage_sample_loop(
                 generated_clip_embeddings[img_idx] = jax.device_get(samples[i])
 
             tqdm.write(f"Cap {cap_idx} ESS: {ess}")
-            pbar.set_postfix(
-                {
-                    "n_imgs": n_samples_for_cap,
-                    "ESS": f"{float(ess):.1f}",
-                    "proposals": total_proposals,
-                }
-            )
+            postfix = {
+                "n_imgs": n_samples_for_cap,
+                "ESS": f"{float(ess):.1f}",
+            }
+            if algo == flow_matching.SamplingAlgorithm.SIR:
+                postfix["proposals"] = total_proposals
+            pbar.set_postfix(postfix)
             pbar.update(1)
 
     cos_distances = 1 - np.sum(generated_clip_embeddings * cap_centers, axis=1)
@@ -744,6 +779,58 @@ def main():
         type=int,
         default=100,
         help="Number of ODE integration steps for flow model",
+    )
+    parser.add_argument(
+        "--flow-algorithm",
+        type=str,
+        choices=["sir", "rejection", "mcmc"],
+        default="sir",
+        help="Flow sampling algorithm to use",
+    )
+    # SIR params
+    parser.add_argument(
+        "--sir-n-projections",
+        type=int,
+        default=10,
+        help="Number of random projections for log-probability estimation (SIR)",
+    )
+    parser.add_argument(
+        "--sir-batch-size",
+        type=int,
+        default=512,
+        help="Batch size for probability evaluation (SIR)",
+    )
+    # Rejection params
+    parser.add_argument(
+        "--rejection-proposal-batch-size",
+        type=int,
+        default=256,
+        help="Batch size of proposals for rejection sampling",
+    )
+    # MCMC params
+    parser.add_argument(
+        "--mcmc-n-chains",
+        type=int,
+        default=512,
+        help="Number of MCMC chains",
+    )
+    parser.add_argument(
+        "--mcmc-steps-per-chain",
+        type=int,
+        default=128,
+        help="Number of MCMC steps per chain",
+    )
+    parser.add_argument(
+        "--mcmc-step-scale",
+        type=float,
+        default=1.0 / 3.0,
+        help="Step scale as a fraction of cap radius (std dev of geodesic distance)",
+    )
+    parser.add_argument(
+        "--mcmc-burnin-steps",
+        type=int,
+        default=16,
+        help="Number of burn-in steps to discard for MCMC",
     )
     parser.add_argument(
         "--n-flow-proposals",
@@ -954,6 +1041,26 @@ def main():
 
     # Choose sampling method based on whether flow model is provided
     if args.flow_model is not None:
+        # Map CLI choice to SamplingAlgorithm via Enum value
+        flow_algorithm = flow_matching.SamplingAlgorithm(args.flow_algorithm)
+        # Base algorithm params from CLI
+        if flow_algorithm == flow_matching.SamplingAlgorithm.SIR:
+            algorithm_params = flow_matching.SIRParams(
+                n_proposal_samples=args.n_flow_proposals,
+                n_projections=args.sir_n_projections,
+                batch_size=args.sir_batch_size,
+            )
+        elif flow_algorithm == flow_matching.SamplingAlgorithm.REJECTION:
+            algorithm_params = flow_matching.RejectionParams(
+                proposal_batch_size=args.rejection_proposal_batch_size
+            )
+        else:
+            algorithm_params = flow_matching.MCMCParams(
+                n_chains=args.mcmc_n_chains,
+                n_steps_per_chain=args.mcmc_steps_per_chain,
+                step_scale=args.mcmc_step_scale,
+                burnin_steps=args.mcmc_burnin_steps,
+            )
         imgs = two_stage_sample_loop(
             im_mdl=im_mdl,
             im_params=im_params,
@@ -971,6 +1078,8 @@ def main():
             force_f32=args.force_fp32,
             n_flow_steps=args.n_flow_steps,
             n_flow_proposals=args.n_flow_proposals,
+            flow_algorithm=flow_algorithm,
+            algorithm_params=algorithm_params,
         )
     else:
         imgs = sample_loop(

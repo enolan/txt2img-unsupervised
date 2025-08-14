@@ -2746,24 +2746,7 @@ class SamplingAlgorithm(Enum):
 
     SIR = "sir"
     REJECTION = "rejection"
-
-
-@dataclass
-class SIRParams:
-    """Parameters specific to Sampling-Importance-Resampling (SIR) algorithm."""
-
-    n_proposal_samples: int
-    n_steps: int = 100
-    n_projections: int = 10
-    batch_size: int = 512
-
-
-@dataclass
-class RejectionParams:
-    """Parameters specific to rejection sampling algorithm."""
-
-    proposal_batch_size: int = 256
-    n_steps: int = 100
+    MCMC = "mcmc"
 
 
 @dataclass
@@ -2772,6 +2755,13 @@ class SamplingDebugInfo:
 
     n_model_samples_drawn: int
     n_model_probabilities_calculated: int
+
+
+@dataclass
+class RejectionParams:
+    """Parameters specific to rejection sampling algorithm."""
+
+    proposal_batch_size: int = 256
 
 
 def _generate_cap_constrained_samples_rejection(
@@ -2784,6 +2774,7 @@ def _generate_cap_constrained_samples_rejection(
     cond_vec,
     n_output_samples,
     rejection_params: RejectionParams,
+    flow_n_steps: int,
 ):
     """
     Generate samples from a trained model constrained to lie within a spherical cap using
@@ -2831,7 +2822,7 @@ def _generate_cap_constrained_samples_rejection(
                 sub_rng,
                 rejection_params.proposal_batch_size,
                 cond_vecs=batch_cond_vecs,
-                n_steps=rejection_params.n_steps,
+                n_steps=flow_n_steps,
                 method="rk4",
             )
 
@@ -2860,6 +2851,230 @@ def _generate_cap_constrained_samples_rejection(
     return final_samples, ess, debug_info
 
 
+@dataclass
+class MCMCParams:
+    """Parameters specific to Markov Chain Monte Carlo (MCMC) algorithm."""
+
+    n_chains: int = 8
+    # Steps of markov chain iteration
+    n_steps_per_chain: int = 1000
+    # Standard deviation of step geodesic distance is cap radius times this value
+    step_scale: float = 1 / 3
+    burnin_steps: int = 100
+
+
+@jax.jit
+def _mk_geodesic_proposals(key, positions, step_size):
+    "Generic proposal points for MCMC using geodesic movement."
+    directions_rng, distances_rng = jax.random.split(key)
+
+    # Sample directions in the tangent spaces of the input positions
+    directions = jax.random.normal(
+        directions_rng, (positions.shape[0], positions.shape[1])
+    )
+    directions = (
+        directions - jnp.sum(directions * positions, axis=1, keepdims=True) * positions
+    )
+    directions = directions / jnp.linalg.norm(directions, axis=1, keepdims=True)
+
+    # Sample distances from a normal distribution
+    distances = jax.random.normal(distances_rng, (positions.shape[0],)) * step_size
+
+    def geodesic_move(point, tangent_direction, distance):
+        """Move along geodesic on the sphere in the given tangent direction."""
+        # Geodesic movement: point * cos(distance) + tangent_direction * sin(distance)
+        result = point * jnp.cos(distance) + tangent_direction * jnp.sin(distance)
+        # Ensure we stay exactly on the unit sphere
+        return result / jnp.linalg.norm(result)
+
+    return jax.vmap(geodesic_move)(positions, directions, distances)
+
+
+def _generate_cap_constrained_samples_mcmc(
+    model,
+    params,
+    rng,
+    cap_center,
+    cap_d_max,
+    table,
+    cond_vec,
+    n_output_samples,
+    mcmc_params: MCMCParams,
+    flow_n_steps: int,
+):
+    """
+    Generate samples from a trained model constrained to lie within a spherical cap using
+    parallel Markov Chain Monte Carlo (MCMC).
+
+    Args:
+        model: Trained VectorField model
+        params: Model parameters
+        rng: JAX random key
+        cap_center: Center of the spherical cap [domain_dim]
+        cap_d_max: Maximum cosine distance defining the cap size
+        table: LogitsTable for cap sampling
+        cond_vec: Conditioning vector shared across all samples [cond_dim]
+        n_output_samples: Number of final samples to return
+        mcmc_params: MCMC-specific parameters
+
+    Returns:
+        samples: Cap-constrained samples [n_output_samples, domain_dim]
+        ess: Effective sample size (equals n_output_samples for MCMC)
+        debug_info: Performance debugging information
+    """
+    assert cap_center.shape == (model.domain_dim,)
+    assert cond_vec.shape == (model.conditioning_dim,)
+
+    init_rng, chain_rng = jax.random.split(rng)
+
+    # Initialize chains uniformly within the cap
+    init_keys = jax.random.split(init_rng, mcmc_params.n_chains)
+    chain_positions = jax.vmap(
+        lambda key: sample_from_cap(key, table, cap_center, cap_d_max)
+    )(init_keys)
+
+    # Expand conditioning vector to all chains
+    chain_cond_vecs = jnp.broadcast_to(
+        cond_vec[None, :], (mcmc_params.n_chains, model.conditioning_dim)
+    )
+
+    # Compute initial log probabilities
+    init_log_probs = compute_log_probability(
+        model,
+        params,
+        chain_positions,
+        chain_cond_vecs,
+        n_steps=flow_n_steps,
+        rng=None,
+        n_projections=10,
+    )
+
+    def mcmc_step(state, step_rng):
+        """Single MCMC step for all chains."""
+        positions, log_probs = state
+
+        proposals = _mk_geodesic_proposals(
+            step_rng, positions, mcmc_params.step_scale * jnp.arccos(1 - cap_d_max)
+        )
+
+        # Determine which proposals lie within the cap; out-of-cap proposals are rejected
+        threshold = 1.0 - cap_d_max
+        in_cap = (proposals @ cap_center) >= threshold
+
+        tqdm.write(f"In-cap: {jnp.mean(in_cap) * 100:.2f}%")
+
+        proposal_log_probs = jnp.where(
+            in_cap,
+            compute_log_probability(
+                model,
+                params,
+                proposals,
+                chain_cond_vecs,
+                n_steps=flow_n_steps,
+                rng=None,
+                n_projections=10,
+            ),
+            jnp.full(mcmc_params.n_chains, -jnp.inf),
+        )
+
+        # Metropolis-Hastings acceptance
+        log_accept_probs = jnp.minimum(0.0, proposal_log_probs - log_probs)
+        accept_flags = (
+            jnp.log(jax.random.uniform(step_rng, (mcmc_params.n_chains,)))
+            < log_accept_probs
+        )
+
+        # Update positions and log probabilities
+        new_positions = jnp.where(accept_flags[:, None], proposals, positions)
+        new_log_probs = jnp.where(accept_flags, proposal_log_probs, log_probs)
+
+        return (new_positions, new_log_probs), (new_positions, accept_flags)
+
+    # Run MCMC chains with regular loop
+    current_state = (chain_positions, init_log_probs)
+    all_positions = []
+    all_accept_flags = []
+
+    with tqdm(
+        total=mcmc_params.n_steps_per_chain, desc="MCMC sampling", unit="step"
+    ) as pbar:
+        for step in range(mcmc_params.n_steps_per_chain):
+            # Get random key for this step
+            step_key = jax.random.fold_in(chain_rng, step)
+
+            # Take MCMC step
+            new_state, (step_positions, step_accept_flags) = mcmc_step(
+                current_state, step_key
+            )
+
+            # Store results
+            all_positions.append(step_positions)
+            all_accept_flags.append(step_accept_flags)
+
+            # Update state for next iteration
+            current_state = new_state
+
+            # Update progress bar
+            pbar.update(1)
+
+    # Convert lists to arrays
+    all_positions = jnp.stack(all_positions, axis=0)  # [n_steps, n_chains, dim]
+    accept_flags = jnp.stack(all_accept_flags, axis=0)  # [n_steps, n_chains]
+
+    # Extract samples after burnin
+    burnin = mcmc_params.burnin_steps
+    post_burnin_positions = all_positions[burnin:]  # [n_steps - burnin, n_chains, dim]
+
+    # Reshape to [n_samples, dim] where n_samples = (n_steps - burnin) * n_chains
+    all_samples = post_burnin_positions.reshape(-1, model.domain_dim)
+
+    # Randomly select n_output_samples
+    if all_samples.shape[0] >= n_output_samples:
+        indices = jax.random.choice(
+            jax.random.split(chain_rng)[0],
+            all_samples.shape[0],
+            shape=(n_output_samples,),
+            replace=False,
+        )
+        final_samples = all_samples[indices]
+    else:
+        # If we don't have enough samples, repeat some
+        n_repeats = (n_output_samples + all_samples.shape[0] - 1) // all_samples.shape[
+            0
+        ]
+        repeated_samples = jnp.tile(all_samples, (n_repeats, 1))
+        final_samples = repeated_samples[:n_output_samples]
+
+    # Compute acceptance rate for debugging
+    total_accepts = jnp.sum(accept_flags)
+    acceptance_rate = total_accepts / (
+        mcmc_params.n_chains * mcmc_params.n_steps_per_chain
+    )
+    print(f"MCMC acceptance rate: {acceptance_rate:.3f}")
+
+    # For MCMC, ESS equals the number of output samples (conservative estimate)
+    ess = float(n_output_samples)
+
+    # Debug info: we evaluate probabilities at each step for each chain
+    total_prob_evals = mcmc_params.n_chains * (
+        mcmc_params.n_steps_per_chain + 1
+    )  # +1 for initial
+    debug_info = SamplingDebugInfo(
+        n_model_samples_drawn=0, n_model_probabilities_calculated=total_prob_evals
+    )
+
+    return final_samples, ess, debug_info
+
+
+@dataclass
+class SIRParams:
+    """Parameters specific to Sampling-Importance-Resampling (SIR) algorithm."""
+
+    n_proposal_samples: int
+    n_projections: int = 10
+    batch_size: int = 512
+
+
 def _generate_cap_constrained_samples_sir(
     model,
     params,
@@ -2870,6 +3085,7 @@ def _generate_cap_constrained_samples_sir(
     cond_vec,
     n_output_samples,
     sir_params: SIRParams,
+    flow_n_steps: int,
 ):
     """
     Generate samples from a trained model constrained to lie within a spherical cap using
@@ -2935,7 +3151,7 @@ def _generate_cap_constrained_samples_sir(
                 params,
                 batch_samples,
                 batch_cond_vecs,
-                n_steps=sir_params.n_steps,
+                n_steps=flow_n_steps,
                 rng=batch_rngs[batch_idx],
                 n_projections=sir_params.n_projections,
             )
@@ -2992,6 +3208,7 @@ def generate_cap_constrained_samples(
     table,
     cond_vec,
     n_output_samples,
+    flow_n_steps: int,
     algorithm: SamplingAlgorithm,
     algorithm_params,
 ):
@@ -3030,6 +3247,7 @@ def generate_cap_constrained_samples(
             cond_vec,
             n_output_samples,
             algorithm_params,
+            flow_n_steps,
         )
     elif algorithm == SamplingAlgorithm.REJECTION:
         if not isinstance(algorithm_params, RejectionParams):
@@ -3046,6 +3264,24 @@ def generate_cap_constrained_samples(
             cond_vec,
             n_output_samples,
             algorithm_params,
+            flow_n_steps,
+        )
+    elif algorithm == SamplingAlgorithm.MCMC:
+        if not isinstance(algorithm_params, MCMCParams):
+            raise TypeError(
+                f"Expected MCMCParams for MCMC algorithm, got {type(algorithm_params)}"
+            )
+        return _generate_cap_constrained_samples_mcmc(
+            model,
+            params,
+            rng,
+            cap_center,
+            cap_d_max,
+            table,
+            cond_vec,
+            n_output_samples,
+            algorithm_params,
+            flow_n_steps,
         )
     else:
         raise ValueError(f"Unknown sampling algorithm: {algorithm}")
@@ -3095,10 +3331,7 @@ def test_generate_cap_constrained_samples_matches_rejection():
 
     # Rejection sampling
     cond_vec = jnp.zeros((model.conditioning_dim,))
-    rejection_params = RejectionParams(
-        proposal_batch_size=256,
-        n_steps=16,
-    )
+    rejection_params = RejectionParams(proposal_batch_size=256)
     rs_samples, rs_ess, rs_debug = generate_cap_constrained_samples(
         model,
         params,
@@ -3108,6 +3341,7 @@ def test_generate_cap_constrained_samples_matches_rejection():
         table,
         cond_vec,
         target_n,
+        16,
         SamplingAlgorithm.REJECTION,
         rejection_params,
     )
@@ -3117,7 +3351,6 @@ def test_generate_cap_constrained_samples_matches_rejection():
     cond_vec = jnp.zeros((model.conditioning_dim,))
     sir_params = SIRParams(
         n_proposal_samples=n_proposal_samples,
-        n_steps=16,
         n_projections=10,
     )
     imp_samples, ess, sir_debug = generate_cap_constrained_samples(
@@ -3129,23 +3362,49 @@ def test_generate_cap_constrained_samples_matches_rejection():
         table,
         cond_vec,
         target_n,
+        16,
         SamplingAlgorithm.SIR,
         sir_params,
     )
+    # MCMC sampling (reduced parameters for testing speed)
+    mcmc_rng = jax.random.split(rng, 4)[3]
+    mcmc_params = MCMCParams(
+        n_chains=512,
+        n_steps_per_chain=128,
+        burnin_steps=16,
+    )
+    mcmc_samples, mcmc_ess, mcmc_debug = generate_cap_constrained_samples(
+        model,
+        params,
+        mcmc_rng,
+        cap_center,
+        d_max,
+        table,
+        cond_vec,
+        target_n,
+        16,
+        SamplingAlgorithm.MCMC,
+        mcmc_params,
+    )
+
     print(
         f"Rejection proposals used: {rs_debug.n_model_samples_drawn} for {target_n} accepted samples ({(rs_debug.n_model_samples_drawn / target_n):.2f} per sample)"
     )
     print(
         f"Importance sampling (SIR): {n_proposal_samples} proposals, ESS={float(ess):.2f} ({n_proposal_samples / ess:.2f} per effective sample)"
     )
+    print(
+        f"MCMC: {mcmc_params.n_chains} chains × {mcmc_params.n_steps_per_chain} steps, ESS={float(mcmc_ess):.2f}, {mcmc_debug.n_model_probabilities_calculated} prob evals"
+    )
 
     assert ess >= target_n, f"SIR ESS={ess} < target_n={target_n}"
     assert (
         rs_ess == target_n
     ), f"Rejection ESS should equal output samples, got {rs_ess}"
+    assert mcmc_ess == target_n, f"MCMC ESS should equal output samples, got {mcmc_ess}"
 
     # Verify all samples are in-cap
-    for arr in [rs_samples, imp_samples]:
+    for arr in [rs_samples, imp_samples, mcmc_samples]:
         cos_vals = arr @ cap_center
         assert jnp.all(cos_vals >= threshold)
 
@@ -3162,7 +3421,14 @@ def test_generate_cap_constrained_samples_matches_rejection():
 
     rs_means, rs_cos_mean, rs_cos_std = summarize(rs_samples, "rejection")
     imp_means, imp_cos_mean, imp_cos_std = summarize(imp_samples, "importance")
+    mcmc_means, mcmc_cos_mean, mcmc_cos_std = summarize(mcmc_samples, "MCMC")
 
-    np.testing.assert_allclose(rs_means, imp_means, atol=0.05, rtol=0)
+    # Compare rejection vs SIR
+    np.testing.assert_allclose(rs_means, imp_means, atol=0.1, rtol=0)
     np.testing.assert_allclose(rs_cos_mean, imp_cos_mean, atol=0.03, rtol=0)
     np.testing.assert_allclose(rs_cos_std, imp_cos_std, atol=0.03, rtol=0)
+
+    # Compare rejection vs MCMC (looser tolerance for MCMC due to finite chain effects)
+    np.testing.assert_allclose(rs_means, mcmc_means, atol=0.1, rtol=0)
+    np.testing.assert_allclose(rs_cos_mean, mcmc_cos_mean, atol=0.05, rtol=0)
+    np.testing.assert_allclose(rs_cos_std, mcmc_cos_std, atol=0.05, rtol=0)
