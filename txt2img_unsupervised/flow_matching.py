@@ -2851,6 +2851,140 @@ def _generate_cap_constrained_samples_rejection(
     return final_samples, ess, debug_info
 
 
+def calculate_autocorrelation(chain_samples, max_lag=None):
+    """
+    Calculate autocorrelation function for a single MCMC chain using FFT for efficiency.
+
+    Args:
+        chain_samples: Array of shape [n_steps, dim] for a single chain
+        max_lag: Maximum lag to compute autocorrelation for. If None, uses n_steps // 4
+
+    Returns:
+        autocorrelations: Array of autocorrelation values [max_lag + 1]
+    """
+    n_steps, dim = chain_samples.shape
+
+    if max_lag is None:
+        max_lag = n_steps // 4
+    max_lag = min(max_lag, n_steps - 1)
+
+    # Center the data by subtracting the mean
+    centered = chain_samples - jnp.mean(chain_samples, axis=0, keepdims=True)
+
+    # For multivariate case, we'll compute autocorrelation of the scalar quantity
+    # representing the "position" - we'll use the norm of the centered samples
+    # This gives us a single autocorrelation function that captures the overall
+    # chain mixing behavior
+    scalar_series = jnp.linalg.norm(centered, axis=1)
+
+    # Compute autocorrelation using FFT for efficiency
+    n = len(scalar_series)
+    # Pad to next power of 2 for efficient FFT
+    n_fft = 1 << (n - 1).bit_length() + 1
+
+    # Mean-center the scalar series
+    scalar_centered = scalar_series - jnp.mean(scalar_series)
+
+    # Compute autocorrelation via FFT
+    f_transform = jnp.fft.fft(scalar_centered, n_fft)
+    autocorr_fft = jnp.fft.ifft(f_transform * jnp.conj(f_transform)).real
+
+    # Extract the positive lags and normalize
+    autocorr = autocorr_fft[: max_lag + 1]
+    autocorr = autocorr / autocorr[0]  # Normalize so lag 0 = 1
+
+    return autocorr
+
+
+def calculate_integrated_autocorr_time(autocorrelations, c=5):
+    """
+    Calculate integrated autocorrelation time using automatic windowing.
+
+    Args:
+        autocorrelations: Array of autocorrelation values
+        c: Windowing constant (typically 5-10)
+
+    Returns:
+        tau_int: Integrated autocorrelation time
+    """
+    # Find the cutoff where autocorrelation becomes small
+    # We use automatic windowing: stop when W >= c * tau_int
+    max_len = len(autocorrelations)
+
+    # Start with a reasonable initial window
+    tau_int = 1.0
+    for W in range(1, max_len):
+        # Calculate integrated autocorrelation time up to window W
+        if W < len(autocorrelations):
+            tau_int = 1.0 + 2.0 * jnp.sum(autocorrelations[1 : W + 1])
+        else:
+            tau_int = 1.0 + 2.0 * jnp.sum(autocorrelations[1:])
+
+        # Check windowing condition
+        if W >= c * tau_int:
+            break
+
+    return tau_int
+
+
+def calculate_effective_sample_size_single_chain(chain_samples):
+    """
+    Calculate effective sample size for a single MCMC chain.
+
+    Args:
+        chain_samples: Array of shape [n_steps, dim] for a single chain
+
+    Returns:
+        ess: Effective sample size for this chain
+    """
+    n_steps = chain_samples.shape[0]
+
+    if n_steps < 4:
+        # Too few samples to calculate meaningful autocorrelation
+        return float(n_steps)
+
+    # Calculate autocorrelation
+    autocorr = calculate_autocorrelation(chain_samples)
+
+    # Calculate integrated autocorrelation time
+    tau_int = calculate_integrated_autocorr_time(autocorr)
+
+    # ESS = N / (2 * tau_int)
+    # The factor of 2 comes from the relationship between integrated autocorr time
+    # and the variance of the sample mean
+    ess = n_steps / tau_int
+
+    # Ensure ESS doesn't exceed the number of samples
+    ess = jnp.minimum(ess, float(n_steps))
+
+    return float(ess)
+
+
+def calculate_total_effective_sample_size(all_chain_samples):
+    """
+    Calculate total effective sample size across multiple MCMC chains.
+
+    Args:
+        all_chain_samples: Array of shape [n_steps, n_chains, dim]
+
+    Returns:
+        total_ess: Total effective sample size across all chains
+    """
+    n_steps, n_chains, dim = all_chain_samples.shape
+
+    # Calculate ESS for each chain individually
+    ess_per_chain = []
+    for chain_idx in range(n_chains):
+        chain_samples = all_chain_samples[:, chain_idx, :]
+        chain_ess = calculate_effective_sample_size_single_chain(chain_samples)
+        ess_per_chain.append(chain_ess)
+
+    # Total ESS is the sum of individual chain ESS values
+    total_ess = sum(ess_per_chain)
+
+    return total_ess, ess_per_chain
+
+
 @dataclass
 class MCMCParams:
     """Parameters specific to Markov Chain Monte Carlo (MCMC) algorithm."""
@@ -3052,8 +3186,19 @@ def _generate_cap_constrained_samples_mcmc(
     )
     print(f"MCMC acceptance rate: {acceptance_rate:.3f}")
 
-    # For MCMC, ESS equals the number of output samples (conservative estimate)
-    ess = float(n_output_samples)
+    # Calculate effective sample size using autocorrelation analysis
+    # NOTE: this is a dubious method for high dimensions.
+    total_ess, ess_per_chain = calculate_total_effective_sample_size(
+        post_burnin_positions
+    )
+
+    # Report ESS statistics
+    print(f"Total ESS: {total_ess:.1f}")
+    print(
+        f"ESS per chain: min={min(ess_per_chain):.1f}, max={max(ess_per_chain):.1f}, mean={sum(ess_per_chain)/len(ess_per_chain):.1f}"
+    )
+
+    ess = total_ess
 
     # Debug info: we evaluate probabilities at each step for each chain
     total_prob_evals = mcmc_params.n_chains * (
@@ -3401,7 +3546,10 @@ def test_generate_cap_constrained_samples_matches_rejection():
     assert (
         rs_ess == target_n
     ), f"Rejection ESS should equal output samples, got {rs_ess}"
-    assert mcmc_ess == target_n, f"MCMC ESS should equal output samples, got {mcmc_ess}"
+    # MCMC ESS should be at least 10% of target samples (accounting for autocorrelation)
+    assert (
+        mcmc_ess >= target_n * 0.1
+    ), f"MCMC ESS {mcmc_ess} too low compared to target {target_n}"
 
     # Verify all samples are in-cap
     for arr in [rs_samples, imp_samples, mcmc_samples]:
