@@ -3142,6 +3142,9 @@ def _generate_cap_constrained_samples_mcmc(
             )
 
             # Store results
+            step_positions, step_accept_flags = jax.device_get(
+                (step_positions, step_accept_flags)
+            )
             all_positions.append(step_positions)
             all_accept_flags.append(step_accept_flags)
 
@@ -3152,8 +3155,8 @@ def _generate_cap_constrained_samples_mcmc(
             pbar.update(1)
 
     # Convert lists to arrays
-    all_positions = jnp.stack(all_positions, axis=0)  # [n_steps, n_chains, dim]
-    accept_flags = jnp.stack(all_accept_flags, axis=0)  # [n_steps, n_chains]
+    all_positions = np.stack(all_positions, axis=0)  # [n_steps, n_chains, dim]
+    accept_flags = np.stack(all_accept_flags, axis=0)  # [n_steps, n_chains]
 
     # Extract samples after burnin
     burnin = mcmc_params.burnin_steps
@@ -3163,21 +3166,13 @@ def _generate_cap_constrained_samples_mcmc(
     all_samples = post_burnin_positions.reshape(-1, model.domain_dim)
 
     # Randomly select n_output_samples
-    if all_samples.shape[0] >= n_output_samples:
-        indices = jax.random.choice(
-            jax.random.split(chain_rng)[0],
-            all_samples.shape[0],
-            shape=(n_output_samples,),
-            replace=False,
-        )
-        final_samples = all_samples[indices]
-    else:
-        # If we don't have enough samples, repeat some
-        n_repeats = (n_output_samples + all_samples.shape[0] - 1) // all_samples.shape[
-            0
-        ]
-        repeated_samples = jnp.tile(all_samples, (n_repeats, 1))
-        final_samples = repeated_samples[:n_output_samples]
+    indices = jax.random.choice(
+        jax.random.split(chain_rng)[0],
+        all_samples.shape[0],
+        shape=(n_output_samples,),
+        replace=True,
+    )
+    final_samples = jax.device_put(all_samples[indices])
 
     # Compute acceptance rate for debugging
     total_accepts = jnp.sum(accept_flags)
