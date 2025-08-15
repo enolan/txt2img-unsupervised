@@ -651,7 +651,11 @@ def two_stage_sample_loop(
 
     cos_distances = 1 - np.sum(generated_clip_embeddings * cap_centers, axis=1)
     assert cos_distances.shape == (n_imgs,)
-    print(f"Cosine distances to cap centers: {cos_distances}")
+    print(f"Cosine distances to cap centers: {np.sort(cos_distances)}")
+
+    unique_embeddings = np.unique(generated_clip_embeddings, axis=0)
+    print(f"Total unique CLIP embeddings generated: {len(unique_embeddings)}/{n_imgs}")
+
     # Free GPU memory used by flow model
     del flow_params_gpu
     gc.collect()
