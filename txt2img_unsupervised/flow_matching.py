@@ -2998,8 +2998,12 @@ class MCMCParams:
 
 
 @jax.jit
-def _mk_geodesic_proposals(key, positions, step_size):
-    "Generic proposal points for MCMC using geodesic movement."
+def _mk_geodesic_proposals_reflected(key, positions, step_size, cap_center, cap_d_max):
+    """Geodesic proposals with specular reflection at the spherical-cap boundary.
+
+    Ensures all proposed positions remain inside the cap defined by
+    x·cap_center >= 1 - cap_d_max, while preserving proposal symmetry.
+    """
     directions_rng, distances_rng = jax.random.split(key)
 
     # Sample directions in the tangent spaces of the input positions
@@ -3011,17 +3015,60 @@ def _mk_geodesic_proposals(key, positions, step_size):
     )
     directions = directions / jnp.linalg.norm(directions, axis=1, keepdims=True)
 
-    # Sample distances from a normal distribution
+    # Sample distances from a normal distribution (symmetric around 0)
     distances = jax.random.normal(distances_rng, (positions.shape[0],)) * step_size
 
-    def geodesic_move(point, tangent_direction, distance):
-        """Move along geodesic on the sphere in the given tangent direction."""
-        # Geodesic movement: point * cos(distance) + tangent_direction * sin(distance)
-        result = point * jnp.cos(distance) + tangent_direction * jnp.sin(distance)
-        # Ensure we stay exactly on the unit sphere
+    threshold = 1.0 - cap_d_max
+    two_pi = 2.0 * jnp.pi
+    eps = 1e-12
+
+    def reflect_along_geodesic(point, tangent_direction, distance):
+        # Compute forward/backward distances to the cap boundary along this geodesic
+        a = jnp.dot(point, cap_center)
+        b = jnp.dot(tangent_direction, cap_center)
+        r = jnp.sqrt(jnp.maximum(a * a + b * b, eps))
+
+        # If the entire great circle stays inside the cap, skip reflection
+        always_inside = threshold <= -r + eps
+        # Clip for numerical stability
+        val = jnp.clip(threshold / r, -1.0, 1.0)
+        delta = jnp.arccos(val)
+        phi = jnp.arctan2(b, a)
+
+        t1_mod = jnp.mod(phi - delta, two_pi)
+        t2_mod = jnp.mod(phi + delta, two_pi)
+
+        # Forward distance to nearest boundary crossing (smallest nonnegative)
+        L_plus = jnp.minimum(t1_mod, t2_mod)
+
+        # Backward distance to nearest boundary crossing (treat boundary at 0 as distance 0)
+        any_zero = jnp.logical_or(t1_mod < eps, t2_mod < eps)
+        L_minus_raw = jnp.minimum(two_pi - t1_mod, two_pi - t2_mod)
+        L_minus = jnp.where(any_zero, 0.0, L_minus_raw)
+
+        # Reflect distance into the interval [-L_minus, L_plus]
+        a_int = -L_minus
+        b_int = L_plus
+        width = b_int - a_int
+
+        def reflect_scalar(s):
+            t = s - a_int
+            two_w = 2.0 * width
+            t_mod = jnp.mod(t, two_w)
+            return jnp.where(
+                t_mod <= width,
+                a_int + t_mod,
+                b_int - (t_mod - width),
+            )
+
+        s_unfolded = jnp.where(width > eps, reflect_scalar(distance), 0.0)
+        s_reflected = jnp.where(always_inside, distance, s_unfolded)
+
+        # Move along geodesic with reflected distance
+        result = point * jnp.cos(s_reflected) + tangent_direction * jnp.sin(s_reflected)
         return result / jnp.linalg.norm(result)
 
-    return jax.vmap(geodesic_move)(positions, directions, distances)
+    return jax.vmap(reflect_along_geodesic)(positions, directions, distances)
 
 
 def _generate_cap_constrained_samples_mcmc(
@@ -3087,28 +3134,27 @@ def _generate_cap_constrained_samples_mcmc(
         """Single MCMC step for all chains."""
         positions, log_probs = state
 
-        proposals = _mk_geodesic_proposals(
-            step_rng, positions, mcmc_params.step_scale * jnp.arccos(1 - cap_d_max)
+        proposals = _mk_geodesic_proposals_reflected(
+            step_rng,
+            positions,
+            mcmc_params.step_scale * jnp.arccos(1 - cap_d_max),
+            cap_center,
+            cap_d_max,
         )
 
-        # Determine which proposals lie within the cap; out-of-cap proposals are rejected
+        # All proposals are in-cap by construction; assert and report for debugging
         threshold = 1.0 - cap_d_max
         in_cap = (proposals @ cap_center) >= threshold
+        assert np.all(in_cap)
 
-        tqdm.write(f"In-cap: {jnp.mean(in_cap) * 100:.2f}%")
-
-        proposal_log_probs = jnp.where(
-            in_cap,
-            compute_log_probability(
-                model,
-                params,
-                proposals,
-                chain_cond_vecs,
-                n_steps=flow_n_steps,
-                rng=None,
-                n_projections=10,
-            ),
-            jnp.full(mcmc_params.n_chains, -jnp.inf),
+        proposal_log_probs = compute_log_probability(
+            model,
+            params,
+            proposals,
+            chain_cond_vecs,
+            n_steps=flow_n_steps,
+            rng=None,
+            n_projections=10,
         )
 
         # Metropolis-Hastings acceptance
