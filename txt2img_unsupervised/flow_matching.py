@@ -2998,6 +2998,179 @@ class MCMCParams:
 
 
 @jax.jit
+def reflect_geodesic_step_into_cap(
+    point, tangent_direction, distance, cap_center, cap_d_max
+):
+    """Reflect a geodesic step at the spherical-cap boundary.
+
+    Given a starting `point` on the unit sphere, a unit `tangent_direction` in its tangent space,
+    and a geodesic `distance` (can be any real number), returns the new point after moving along
+    the great-circle and applying specular reflections at the boundary of the spherical cap
+    defined by x·cap_center >= 1 - cap_d_max.
+
+    The mapping preserves proposal symmetry (detailed balance) when distances are sampled from a
+    symmetric distribution and tangent directions are sampled symmetrically.
+    """
+    threshold = 1.0 - cap_d_max
+    two_pi = 2.0 * jnp.pi
+    eps = 1e-12
+
+    # Compute forward/backward distances to the cap boundary along this geodesic
+    a = jnp.dot(point, cap_center)
+    b = jnp.dot(tangent_direction, cap_center)
+    r = jnp.sqrt(jnp.maximum(a * a + b * b, eps))
+
+    # If the entire great circle stays inside the cap, skip reflection
+    always_inside = threshold <= -r + eps
+    # Clip for numerical stability
+    val = jnp.clip(threshold / r, -1.0, 1.0)
+    delta = jnp.arccos(val)
+    phi = jnp.arctan2(b, a)
+
+    t1_mod = jnp.mod(phi - delta, two_pi)
+    t2_mod = jnp.mod(phi + delta, two_pi)
+
+    # Forward distance to nearest boundary crossing (smallest nonnegative)
+    L_plus = jnp.minimum(t1_mod, t2_mod)
+
+    # Backward distance to nearest boundary crossing (treat boundary at 0 as distance 0)
+    any_zero = jnp.logical_or(t1_mod < eps, t2_mod < eps)
+    L_minus_raw = jnp.minimum(two_pi - t1_mod, two_pi - t2_mod)
+    L_minus = jnp.where(any_zero, 0.0, L_minus_raw)
+
+    # Reflect distance into the interval [-L_minus, L_plus]
+    a_int = -L_minus
+    b_int = L_plus
+    width = b_int - a_int
+
+    def reflect_scalar(s):
+        t = s - a_int
+        two_w = 2.0 * width
+        t_mod = jnp.mod(t, two_w)
+        return jnp.where(
+            t_mod <= width,
+            a_int + t_mod,
+            b_int - (t_mod - width),
+        )
+
+    s_unfolded = jnp.where(width > eps, reflect_scalar(distance), 0.0)
+    s_reflected = jnp.where(always_inside, distance, s_unfolded)
+
+    # Move along geodesic with reflected distance and re-normalize to unit sphere
+    result = point * jnp.cos(s_reflected) + tangent_direction * jnp.sin(s_reflected)
+    return result / jnp.linalg.norm(result)
+
+
+def test_reflected_moves_stay_in_cap_and_on_unit_sphere():
+    """
+    Reflected geodesic moves should remain inside the cap and on the unit sphere.
+    """
+    rng = jax.random.PRNGKey(0)
+    dim = 8
+    n = 512
+
+    cap_center = jnp.zeros((dim,))
+    cap_center = cap_center.at[0].set(1.0)
+    cap_d_max = 0.5  # threshold = 0.5
+
+    def _normalize(v, axis=-1, eps=1e-12):
+        norm = jnp.linalg.norm(v, axis=axis, keepdims=True)
+        norm = jnp.maximum(norm, eps)
+        return v / norm
+
+    # Sample points inside the cap by rotating the cap center along random tangent directions
+    rng, r1, r2, r3 = jax.random.split(rng, 4)
+    table = LogitsTable(dim - 1, 8192)
+    keys = jax.random.split(r1, n)
+    points = jax.vmap(lambda k: sample_from_cap(k, table, cap_center, cap_d_max))(keys)
+
+    # Sample unit tangent directions at each point
+    noise2 = jax.random.normal(r3, (n, dim))
+    tangents = noise2 - jnp.sum(noise2 * points, axis=1, keepdims=True) * points
+    tangents = _normalize(tangents, axis=1)
+
+    # Sample step distances
+    distances = jax.random.normal(r3, (n,)) * 0.8
+
+    reflected = jax.vmap(
+        lambda p, t, s: reflect_geodesic_step_into_cap(p, t, s, cap_center, cap_d_max)
+    )(points, tangents, distances)
+
+    # Unit sphere constraint
+    norms = jnp.linalg.norm(reflected, axis=1)
+    assert jnp.allclose(norms, jnp.ones_like(norms), atol=1e-6, rtol=0)
+
+    # Cap constraint
+    threshold = 1.0 - cap_d_max
+    dots = reflected @ cap_center
+    assert bool(jnp.all(dots >= threshold - 1e-7))
+
+
+def test_reflection_reversibility_round_trip():
+    """
+    For MCMC to be mathematically well founded, the proposal distribution must be symmetric. In
+    other words, the probability of proposing point p from point q must equal the probability of
+    proposing point q from point p. In order for reflections to preserve this symmetry, if a move
+    from p to q of distance d is reflected, there must be a move from q to p of distance d in the
+    reflected direction. Without reflection, this is the case and the reverse move is simply the
+    opposite direction. With reflection, the reverse move is the opposite direction *along the
+    reflected geodesic*, not the opposite direction of the original move. This test verifies that
+    this is the case.
+    """
+    rng = jax.random.PRNGKey(1)
+    dim = 8
+    n = 512
+
+    cap_center = jnp.zeros((dim,))
+    cap_center = cap_center.at[0].set(1.0)
+    cap_d_max = 0.5  # threshold = 0.5
+
+    def _normalize(v, axis=-1, eps=1e-12):
+        norm = jnp.linalg.norm(v, axis=axis, keepdims=True)
+        norm = jnp.maximum(norm, eps)
+        return v / norm
+
+    # Sample points inside the cap
+    rng, r1, r2, r3 = jax.random.split(rng, 4)
+    table = LogitsTable(dim - 1, 8192)
+    keys = jax.random.split(r1, n)
+    points = jax.vmap(lambda k: sample_from_cap(k, table, cap_center, cap_d_max))(keys)
+
+    # Sample unit tangent directions at each point
+    noise = jax.random.normal(r2, (n, dim))
+    tangents = noise - jnp.sum(noise * points, axis=1, keepdims=True) * points
+    tangents = _normalize(tangents, axis=1)
+
+    # Sample step distances; use a wide spread to induce multiple reflections
+    distances = jax.random.normal(r3, (n,)) * 8.0
+
+    # Forward reflected step: p -> q
+    q = jax.vmap(
+        lambda p, t, s: reflect_geodesic_step_into_cap(p, t, s, cap_center, cap_d_max)
+    )(points, tangents, distances)
+
+    # Recover effective angle along the (p, t) great circle that produced q
+    cos_comp = jnp.sum(q * points, axis=1)
+    sin_comp = jnp.sum(q * tangents, axis=1)
+    s_eff = jnp.arctan2(sin_comp, cos_comp)
+
+    # Build the reverse tangent at q along the same great circle, pointing back toward p
+    # t_rev = sin(s_eff) * p - cos(s_eff) * t
+    t_rev = jnp.sin(s_eff)[:, None] * points - jnp.cos(s_eff)[:, None] * tangents
+    t_rev = _normalize(t_rev, axis=1)
+
+    # Reverse reflected step with the effective reflected distance along the same geodesic: q -> p_back
+    p_back = jax.vmap(
+        lambda qq, tt, s: reflect_geodesic_step_into_cap(
+            qq, tt, s, cap_center, cap_d_max
+        )
+    )(q, t_rev, s_eff)
+
+    # Check round trip accuracy
+    assert jnp.allclose(p_back, points, atol=1e-6, rtol=0)
+
+
+@jax.jit
 def _mk_geodesic_proposals_reflected(key, positions, step_size, cap_center, cap_d_max):
     """Geodesic proposals with specular reflection at the spherical-cap boundary.
 
@@ -3018,57 +3191,9 @@ def _mk_geodesic_proposals_reflected(key, positions, step_size, cap_center, cap_
     # Sample distances from a normal distribution (symmetric around 0)
     distances = jax.random.normal(distances_rng, (positions.shape[0],)) * step_size
 
-    threshold = 1.0 - cap_d_max
-    two_pi = 2.0 * jnp.pi
-    eps = 1e-12
-
-    def reflect_along_geodesic(point, tangent_direction, distance):
-        # Compute forward/backward distances to the cap boundary along this geodesic
-        a = jnp.dot(point, cap_center)
-        b = jnp.dot(tangent_direction, cap_center)
-        r = jnp.sqrt(jnp.maximum(a * a + b * b, eps))
-
-        # If the entire great circle stays inside the cap, skip reflection
-        always_inside = threshold <= -r + eps
-        # Clip for numerical stability
-        val = jnp.clip(threshold / r, -1.0, 1.0)
-        delta = jnp.arccos(val)
-        phi = jnp.arctan2(b, a)
-
-        t1_mod = jnp.mod(phi - delta, two_pi)
-        t2_mod = jnp.mod(phi + delta, two_pi)
-
-        # Forward distance to nearest boundary crossing (smallest nonnegative)
-        L_plus = jnp.minimum(t1_mod, t2_mod)
-
-        # Backward distance to nearest boundary crossing (treat boundary at 0 as distance 0)
-        any_zero = jnp.logical_or(t1_mod < eps, t2_mod < eps)
-        L_minus_raw = jnp.minimum(two_pi - t1_mod, two_pi - t2_mod)
-        L_minus = jnp.where(any_zero, 0.0, L_minus_raw)
-
-        # Reflect distance into the interval [-L_minus, L_plus]
-        a_int = -L_minus
-        b_int = L_plus
-        width = b_int - a_int
-
-        def reflect_scalar(s):
-            t = s - a_int
-            two_w = 2.0 * width
-            t_mod = jnp.mod(t, two_w)
-            return jnp.where(
-                t_mod <= width,
-                a_int + t_mod,
-                b_int - (t_mod - width),
-            )
-
-        s_unfolded = jnp.where(width > eps, reflect_scalar(distance), 0.0)
-        s_reflected = jnp.where(always_inside, distance, s_unfolded)
-
-        # Move along geodesic with reflected distance
-        result = point * jnp.cos(s_reflected) + tangent_direction * jnp.sin(s_reflected)
-        return result / jnp.linalg.norm(result)
-
-    return jax.vmap(reflect_along_geodesic)(positions, directions, distances)
+    return jax.vmap(
+        lambda p, t, s: reflect_geodesic_step_into_cap(p, t, s, cap_center, cap_d_max)
+    )(positions, directions, distances)
 
 
 def _generate_cap_constrained_samples_mcmc(
