@@ -2793,6 +2793,7 @@ def _generate_cap_constrained_samples_rejection(
 
     Returns:
         samples: Cap-constrained samples [n_output_samples, domain_dim]
+        log_probs: Model log densities for returned samples [n_output_samples]
         ess: Effective sample size (always equals n_output_samples for rejection sampling)
         debug_info: Performance debugging information
     """
@@ -2841,6 +2842,20 @@ def _generate_cap_constrained_samples_rejection(
     all_samples = jnp.concatenate(samples_chunks, axis=0)
     final_samples = all_samples[:n_output_samples]
 
+    # Compute probabilities for the returned samples
+    batch_cond_vecs = jnp.broadcast_to(
+        cond_vec[None, :], (final_samples.shape[0], model.conditioning_dim)
+    )
+    log_probs = compute_log_probability(
+        model,
+        params,
+        final_samples,
+        batch_cond_vecs,
+        n_steps=flow_n_steps,
+        rng=None,
+        n_projections=10,
+    )
+
     # For rejection sampling, ESS equals the number of output samples
     ess = float(n_output_samples)
 
@@ -2848,7 +2863,7 @@ def _generate_cap_constrained_samples_rejection(
         n_model_samples_drawn=total_proposals, n_model_probabilities_calculated=0
     )
 
-    return final_samples, ess, debug_info
+    return final_samples, log_probs, ess, debug_info
 
 
 def calculate_autocorrelation(chain_samples, max_lag=None):
@@ -3225,6 +3240,7 @@ def _generate_cap_constrained_samples_mcmc(
 
     Returns:
         samples: Cap-constrained samples [n_output_samples, domain_dim]
+        log_probs: Model log densities for returned samples [n_output_samples]
         ess: Effective sample size (equals n_output_samples for MCMC)
         debug_info: Performance debugging information
     """
@@ -3345,6 +3361,20 @@ def _generate_cap_constrained_samples_mcmc(
     )
     final_samples = jax.device_put(all_samples[indices])
 
+    # Compute probabilities for the returned samples
+    final_batch_cond_vecs = jnp.broadcast_to(
+        cond_vec[None, :], (final_samples.shape[0], model.conditioning_dim)
+    )
+    final_log_probs = compute_log_probability(
+        model,
+        params,
+        final_samples,
+        final_batch_cond_vecs,
+        n_steps=flow_n_steps,
+        rng=None,
+        n_projections=10,
+    )
+
     # Compute acceptance rate for debugging
     total_accepts = jnp.sum(accept_flags)
     acceptance_rate = total_accepts / (
@@ -3374,7 +3404,7 @@ def _generate_cap_constrained_samples_mcmc(
         n_model_samples_drawn=0, n_model_probabilities_calculated=total_prob_evals
     )
 
-    return final_samples, ess, debug_info
+    return final_samples, final_log_probs, ess, debug_info
 
 
 @dataclass
@@ -3415,6 +3445,7 @@ def _generate_cap_constrained_samples_sir(
 
     Returns:
         samples: Cap-constrained samples [n_output_samples, domain_dim]
+        log_probs: Model log densities for returned samples [n_output_samples]
         ess: Effective sample size (measure of sampling efficiency)
         debug_info: Performance debugging information
     """
@@ -3502,12 +3533,15 @@ def _generate_cap_constrained_samples_sir(
     )
     final_samples = proposal_samples[indices]
 
+    # Log-densities for returned samples from precomputed log-probs
+    selected_log_probs = model_log_probs[indices]
+
     debug_info = SamplingDebugInfo(
         n_model_samples_drawn=0,
         n_model_probabilities_calculated=sir_params.n_proposal_samples,
     )
 
-    return final_samples, ess, debug_info
+    return final_samples, selected_log_probs, ess, debug_info
 
 
 def generate_cap_constrained_samples(
@@ -3540,6 +3574,7 @@ def generate_cap_constrained_samples(
 
     Returns:
         samples: Cap-constrained samples [n_output_samples, domain_dim]
+        log_probs: Model log densities for returned samples [n_output_samples]
         ess: Effective sample size (measure of sampling efficiency)
         debug_info: Performance debugging information
     """
@@ -3643,7 +3678,7 @@ def test_generate_cap_constrained_samples_matches_rejection():
     # Rejection sampling
     cond_vec = jnp.zeros((model.conditioning_dim,))
     rejection_params = RejectionParams(proposal_batch_size=256)
-    rs_samples, rs_ess, rs_debug = generate_cap_constrained_samples(
+    rs_samples, _rs_probs, rs_ess, rs_debug = generate_cap_constrained_samples(
         model,
         params,
         rs_rng,
@@ -3664,7 +3699,7 @@ def test_generate_cap_constrained_samples_matches_rejection():
         n_proposal_samples=n_proposal_samples,
         n_projections=10,
     )
-    imp_samples, ess, sir_debug = generate_cap_constrained_samples(
+    imp_samples, _imp_probs, ess, sir_debug = generate_cap_constrained_samples(
         model,
         params,
         imp_rng,
@@ -3684,7 +3719,7 @@ def test_generate_cap_constrained_samples_matches_rejection():
         n_steps_per_chain=128,
         burnin_steps=16,
     )
-    mcmc_samples, mcmc_ess, mcmc_debug = generate_cap_constrained_samples(
+    mcmc_samples, _mcmc_probs, mcmc_ess, mcmc_debug = generate_cap_constrained_samples(
         model,
         params,
         mcmc_rng,
