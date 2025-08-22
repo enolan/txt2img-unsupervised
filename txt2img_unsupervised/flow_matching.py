@@ -3978,9 +3978,20 @@ class WeightedFlowModel(nn.Module):
         """
         x = jnp.ones((1, self.domain_dim))
         t = jnp.ones((1,))
-        cap_centers = jnp.ones((1, self.domain_dim))
-        cap_d_maxes = jnp.ones((1,))
-        return x, t, cap_centers, cap_d_maxes
+        if self.weighting_function == WeightingFunction.CONSTANT:
+            weighting_function_params = None
+        elif self.weighting_function in [
+            WeightingFunction.CAP_INDICATOR,
+            WeightingFunction.SMOOTHED_CAP_INDICATOR,
+        ]:
+            weighting_function_params = (jnp.ones((1, self.domain_dim)), jnp.ones((1,)))
+        elif self.weighting_function == WeightingFunction.VMF_DENSITY:
+            raise NotImplementedError(
+                "VMF density weighting function not implemented yet."
+            )
+        else:
+            raise ValueError(f"Unknown weighting function: {self.weighting_function}")
+        return x, t, weighting_function_params
 
     @property
     def d_model_scale_factor(self) -> float:
@@ -4031,6 +4042,10 @@ class WeightedFlowModel(nn.Module):
         assert cond_scalars.shape == (
             batch_size,
         ), f"cond_scalars.shape: {cond_scalars.shape}"
+        assert self.weighting_function in [
+            WeightingFunction.CAP_INDICATOR,
+            WeightingFunction.SMOOTHED_CAP_INDICATOR,
+        ], f"process_weighting_function_params called with unsupported weighting function: {self.weighting_function}"
 
         # Encode the direction parameter to match how inputs are encoded, then scale to unit variance.
         # - If using reference directions, project onto them and scale by sqrt(domain_dim) so that
@@ -4072,7 +4087,7 @@ class WeightedFlowModel(nn.Module):
     def __call__(self, x, t, weighting_function_params):
         if self.weighting_function == WeightingFunction.CONSTANT:
             assert weighting_function_params is None
-            cond_vecs_for_inner_model = jax.zeros((x.shape[0], 0))
+            cond_vecs_for_inner_model = jnp.zeros((x.shape[0], 0))
         elif (
             self.weighting_function == WeightingFunction.CAP_INDICATOR
             or self.weighting_function == WeightingFunction.SMOOTHED_CAP_INDICATOR
@@ -4341,6 +4356,7 @@ def test_process_weighting_function_params(
         mlp_expansion_factor=4,
         mlp_dropout_rate=None,
         input_dropout_rate=None,
+        weighting_function=WeightingFunction.CAP_INDICATOR,
         weighting_function_extra_params=extra_params,
     )
 
