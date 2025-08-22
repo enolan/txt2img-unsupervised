@@ -3871,6 +3871,29 @@ class WeightedFlowModel(nn.Module):
     fully specifying the weighting function.
     """
 
+    # Some notes for the paper:
+
+    # Weighted generative models are a superset of class conditional generative models:
+    # We can recover class-conditional generative models with a very simple extension of this. For
+    # concreteness, imagine a model that generates pictures of cats or dogs. And we have a labeled
+    # dataset. If we think of the label as part of the example we're generating, then our weighting
+    # function can consider it. We augment each cat/dog picture with a one hot vector that says what
+    # kind of animal it's a picture of, and use a weighting function that's an indicator of which
+    # value in the one-hot is hot. Very roundabout, but shows that regular class conditional
+    # generative models are a special case of this. And, just because we're "considering" the class
+    # as part of the example doesn't mean our model needs to actually output classes again at
+    # sampling time. Each example can be split into a) the item of the domain we're generating and
+    # b) arbitrary data that the weighting function may consider. b would be used to generate
+    # conditioning data during training, but not be reproduced.
+
+    # Requirements for the weighting function:
+    # 1. With the obviously implementation, there must be at least one set of weighting function
+    #    parameters that produces positive weight for every point in the domain. But you can drop
+    #    this requirement if you simply ignore training examples that cannot have positive weight.
+    #    This would be kinda dumb but nevertheless.
+    # 2. Weights must be nonnegative & finite everywhere.
+    # 3. ??? idk, in general the reversed distribution must be valid.
+
     # Hyperparameters for the underlying VectorField
     domain_dim: int
     reference_directions: Optional[int]
