@@ -1304,7 +1304,6 @@ def test_train_trivial(domain_dim, epochs):
         model,
         state.params,
         jax.random.PRNGKey(0),
-        20,
         cond_vecs=jnp.zeros((20, 0)),
         n_steps=1000,
         method="rk4",
@@ -1440,7 +1439,6 @@ def test_train_vmf(domain_dim):
         model,
         state.params,
         jax.random.PRNGKey(42),
-        n_test_samples,
         cond_vecs=jnp.zeros((n_test_samples, 0)),
         n_steps=1000,
         method="rk4",
@@ -1675,7 +1673,6 @@ def test_train_conditional_vmf(domain_dim):
         model,
         state.params,
         seed1,
-        n_eval_samples,
         cond_vecs=cond_vec_0,
         n_steps=500,
         method="rk4",
@@ -1684,7 +1681,6 @@ def test_train_conditional_vmf(domain_dim):
         model,
         state.params,
         seed2,
-        n_eval_samples,
         cond_vecs=cond_vec_1,
         n_steps=500,
         method="rk4",
@@ -1835,7 +1831,10 @@ def parallel_transport(v, from_point, to_point):
     return result - dot_with_to * to_point
 
 
-def spherical_rk4_step(f, x, t, dt, rng=None):
+@partial(jax.jit, inline=True, static_argnames=("f", "f_fixed_static_params"))
+def spherical_rk4_step(
+    f, f_fixed_static_params, f_fixed_params, f_per_sample_params, x, t, dt, rng=None
+):
     """
     Runge-Kutta 4th order step adapted for spherical manifold with correct parallel transport.
 
@@ -1850,18 +1849,22 @@ def spherical_rk4_step(f, x, t, dt, rng=None):
     """
     # Each result from f is in the tangent space of f's input point, when we combine them we need to
     # parallel transport them all into the tangent space of x.
-    k1 = f(x, t, rng)
+    k1 = f(f_fixed_static_params, f_fixed_params, f_per_sample_params, x, t, rng)
 
     x2 = geodesic_step(x, k1, dt / 2)
-    k2 = f(x2, t + dt / 2, rng)
+    k2 = f(
+        f_fixed_static_params, f_fixed_params, f_per_sample_params, x2, t + dt / 2, rng
+    )
     k2_at_x = parallel_transport(k2, x2, x)
 
     x3 = geodesic_step(x, k2_at_x, dt / 2)
-    k3 = f(x3, t + dt / 2, rng)
+    k3 = f(
+        f_fixed_static_params, f_fixed_params, f_per_sample_params, x3, t + dt / 2, rng
+    )
     k3_at_x = parallel_transport(k3, x3, x)
 
     x4 = geodesic_step(x, k3_at_x, dt)
-    k4 = f(x4, t + dt, rng)
+    k4 = f(f_fixed_static_params, f_fixed_params, f_per_sample_params, x4, t + dt, rng)
     k4_at_x = parallel_transport(k4, x4, x)
 
     combined_direction = (k1 + 2 * k2_at_x + 2 * k3_at_x + k4_at_x) / 6
@@ -1870,33 +1873,12 @@ def spherical_rk4_step(f, x, t, dt, rng=None):
 
 
 @partial(jax.jit, static_argnames=("model",), inline=True)
-def spherical_rk4_step_with_model(
-    model,
-    params,
-    x,
-    t,
-    dt,
-    cond_vecs,
-    rng=None,
-):
-    vector_field_fn = lambda x, t, rng: _compute_vector_field_for_sampling(
-        model,
-        params,
-        x,
-        t,
-        cond_vecs,
-        rng,
-    )
-    return spherical_rk4_step(vector_field_fn, x, t, dt, rng)
-
-
-@partial(jax.jit, static_argnames=("model",), inline=True)
 def _compute_vector_field_for_sampling(
     model,
     params,
+    cond_vecs,
     x,
     t,
-    cond_vecs,
     rng=None,
 ):
     rngs_dict = {"dropout": rng} if rng is not None else {}
@@ -1913,35 +1895,76 @@ def generate_samples(
     model,
     params,
     rng,
-    batch_size,
     cond_vecs,
     n_steps=100,
     method="rk4",
 ):
     """
-    Generate samples from the flow matching model by solving the ODE.
+    Generate samples from a VectorField flow matching model by solving the ODE.
 
     Args:
         model: Vector field model
         params: Model parameters
         rng: JAX random key
-        batch_size: Number of samples to generate
         cond_vecs: Conditioning vectors [batch_size, cond_dim]
         n_steps: Number of integration steps
         method: ODE solver method ('euler', 'midpoint', or 'rk4')
 
     Returns:
+        Generated samples [batch_size, domain_dim]
+    """
+
+    assert len(cond_vecs.shape) == 2
+    batch_size = cond_vecs.shape[0]
+    return generate_samples_inner(
+        rng,
+        n_steps,
+        batch_size,
+        method,
+        _compute_vector_field_for_sampling,
+        model,
+        params,
+        cond_vecs,
+        model.domain_dim,
+    )
+
+
+def generate_samples_inner(
+    rng,
+    n_steps,
+    batch_size,
+    method,
+    vector_field_fn,
+    vector_field_fn_fixed_static_params,
+    vector_field_fn_fixed_params,
+    vector_field_fn_per_sample_params,
+    domain_dim,
+):
+    """
+    Generate samples from a flow matching model by solving the ODE, generic over the method of
+    computing the vector field.
+
+    Args:
+        rng: JAX random key
+        n_steps: Number of integration steps
+        batch_size: Number of samples to generate
+        method: ODE solver method ('euler', 'midpoint', or 'rk4')
+        vector_field_fn: Function that computes the tangent vector field
+        vector_field_fn_fixed_static_params: Parameters to pass to vector_field_fn that are constant
+            across all samples and may be marked static to jax.jit. (separate parameter so
+            static_argnums will work.)
+        vector_field_fn_fixed_params: Parameters to pass to vector_field_fn that are constant across
+            all samples
+        vector_field_fn_per_sample_params: PyTree of per-sample parameters with leading dim
+            batch_size.
+        domain_dim: Dimension of the domain
+
+    Returns:
         Generated samples [batch_size, dim]
     """
-    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
-
     x0_rng, *dropout_rngs = jax.random.split(rng, num=n_steps + 1)
     # Sample initial points uniformly from the sphere
-    x0 = sample_sphere(x0_rng, batch_size, model.domain_dim)
-
-    vector_field_fn = lambda x, t, rng: _compute_vector_field_for_sampling(
-        model, params, x, t, cond_vecs, rng
-    )
+    x0 = sample_sphere(x0_rng, batch_size, domain_dim)
 
     # Solve ODE
     dt = 1.0 / n_steps
@@ -1954,38 +1977,57 @@ def generate_samples(
         # Forward Euler method
         for i in step_iter:
             t = i * dt
-            v = vector_field_fn(x, t, dropout_rngs[i])
+            v = vector_field_fn(
+                vector_field_fn_fixed_static_params,
+                vector_field_fn_fixed_params,
+                vector_field_fn_per_sample_params,
+                x,
+                t,
+                dropout_rngs[i],
+            )
             x = geodesic_step(x, v, dt)
     elif method == "midpoint":
         # Midpoint method
         for i in step_iter:
             t = i * dt
             # First half-step
-            v1 = vector_field_fn(x, t, dropout_rngs[i])
+            v1 = vector_field_fn(
+                vector_field_fn_fixed_static_params,
+                vector_field_fn_fixed_params,
+                vector_field_fn_per_sample_params,
+                x,
+                t,
+                dropout_rngs[i],
+            )
             x_mid = geodesic_step(x, v1, dt / 2)
 
             # Second half-step using midpoint derivative
-            v2 = vector_field_fn(x_mid, t + 0.5 * dt, dropout_rngs[i])
+            v2 = vector_field_fn(
+                vector_field_fn_fixed_static_params,
+                vector_field_fn_fixed_params,
+                vector_field_fn_per_sample_params,
+                x_mid,
+                t + 0.5 * dt,
+                dropout_rngs[i],
+            )
             x = geodesic_step(x, v2, dt)
     elif method == "rk4":
         # 4th order Runge-Kutta method
         for i in step_iter:
             t = i * dt
-            x = spherical_rk4_step_with_model(
-                model,
-                params,
+            x = spherical_rk4_step(
+                vector_field_fn,
+                vector_field_fn_fixed_static_params,
+                vector_field_fn_fixed_params,
+                vector_field_fn_per_sample_params,
                 x,
                 t,
                 dt,
-                cond_vecs,
-                dropout_rngs[i],
+                rng=dropout_rngs[i],
             )
     else:
         raise ValueError(f"Unknown ODE solver method: {method}")
 
-    # np.testing.assert_allclose(
-    #    np.asarray(jnp.linalg.norm(x, axis=1, keepdims=True)), 1.0, atol=1e-6, rtol=0
-    # )
     return x
 
 
@@ -2034,7 +2076,6 @@ def sample_loop(
                 model,
                 params,
                 batch_rng,
-                this_batch_size,
                 cond_vecs=batch_cond_vecs,
                 n_steps=n_steps,
                 method=method,
@@ -2045,13 +2086,21 @@ def sample_loop(
     return jnp.concatenate(samples, axis=0)
 
 
-@partial(jax.jit, static_argnames=("model", "n_projections"))
+@partial(
+    jax.jit,
+    static_argnames=(
+        "vector_field_fn",
+        "vector_field_fn_fixed_static_params",
+        "n_projections",
+    ),
+)
 def hutchinson_estimator(
-    model,
-    params,
+    vector_field_fn,
+    vector_field_fn_fixed_static_params,
+    vector_field_fn_fixed_params,
+    vector_field_fn_per_sample_params,
     x,
     t,
-    cond_vecs,
     step_rng,
     n_projections,
 ):
@@ -2060,11 +2109,16 @@ def hutchinson_estimator(
     estimator. Properly handles the (d-1)-dimensional tangent space of the d-dimensional sphere.
 
     Args:
-        model: Vector field model
-        params: Model parameters
+        vector_field_fn: Vector field function
+        vector_field_fn_fixed_static_params: Parameters to pass to vector_field_fn that are constant
+            across all samples and may be marked static to jax.jit. (separate parameter so
+            static_argnums will work.)
+        vector_field_fn_fixed_params: Parameters to pass to vector_field_fn that are constant across
+            all samples
+        vector_field_fn_per_sample_params: PyTree of per-sample parameters with leading dim
+            batch_size.
         x: Current points on the sphere [batch_size, dim]
         t: Current time
-        cond_vecs: Conditioning vectors [batch_size, cond_dim]
         step_rng: JAX random key for this step
         n_projections: Number of random projections to use
 
@@ -2072,22 +2126,21 @@ def hutchinson_estimator(
         Divergence estimate [batch_size]
     """
     batch_size, dim = x.shape
-    assert dim == model.domain_dim
     assert isinstance(t, float) or (isinstance(t, jnp.ndarray) and t.shape == ())
     assert n_projections > 0, "n_projections must be positive"
-    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
 
-    def hutchinson_single(x_i, rng_i, cond_i):
+    def hutchinson_single(x_i, rng_i, per_sample_i):
         """Compute Hutchinson divergence estimate for a single point."""
         dropout_rng, projection_rng = jax.random.split(rng_i)
 
         def f(x_single):
-            return model.apply(
-                params,
+            return vector_field_fn(
+                vector_field_fn_fixed_static_params,
+                vector_field_fn_fixed_params,
+                jax.tree.map(lambda x: x[None, :], per_sample_i),
                 x_single[None, :],
                 jnp.array([t]),
-                cond_i[None, :],
-                rngs={"dropout": dropout_rng},
+                dropout_rng,
             )[0]
 
         # Generate random projection vectors (Rademacher distribution)
@@ -2114,16 +2167,24 @@ def hutchinson_estimator(
     # Split random keys for each batch element
     batch_keys = jax.random.split(step_rng, batch_size)
 
-    return jax.vmap(hutchinson_single)(x, batch_keys, cond_vecs)
+    return jax.vmap(hutchinson_single)(x, batch_keys, vector_field_fn_per_sample_params)
 
 
-@partial(jax.jit, static_argnames=("model",))
+@partial(
+    jax.jit,
+    static_argnames=(
+        "vector_field_fn",
+        "vector_field_fn_fixed_static_params",
+        "n_projections",
+    ),
+)
 def exact_divergence(
-    model,
-    params,
+    vector_field_fn,
+    vector_field_fn_fixed_static_params,
+    vector_field_fn_fixed_params,
+    vector_field_fn_per_sample_params,
     x,
     t,
-    cond_vecs,
     step_rng,
     n_projections,
 ):
@@ -2131,11 +2192,16 @@ def exact_divergence(
     Compute the exact divergence of a vector field on a spherical manifold.
 
     Args:
-        model: Vector field model
-        params: Model parameters
+        vector_field_fn: Vector field function
+        vector_field_fn_fixed_static_params: Parameters to pass to vector_field_fn that are constant
+            across all samples and may be marked static to jax.jit. (separate parameter so
+            static_argnums will work.)
+        vector_field_fn_fixed_params: Parameters to pass to vector_field_fn that are constant across
+            all samples
+        vector_field_fn_per_sample_params: PyTree of per-sample parameters with leading dim
+            batch_size.
         x: Current points on the sphere [batch_size, dim]
         t: Current time (scalar)
-        cond_vecs: Conditioning vectors [batch_size, cond_dim]
         step_rng: JAX random key (for dropout)
         n_projections: Unused (kept for signature compatibility with hutchinson_estimator)
 
@@ -2143,33 +2209,41 @@ def exact_divergence(
         Exact divergence [batch_size]
     """
     batch_size, dim = x.shape
-    assert dim == model.domain_dim
     assert isinstance(t, float) or (isinstance(t, jnp.ndarray) and t.shape == ())
-    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
 
     # Helper to compute divergence for regular vector field
-    def divergence_single(x_i, cond):
+    def divergence_single(x_i, per_sample_i):
         def f(x_single):
-            return model.apply(
-                params,
+            return vector_field_fn(
+                vector_field_fn_fixed_static_params,
+                vector_field_fn_fixed_params,
+                jax.tree.map(lambda x: x[None, :], per_sample_i),
                 x_single[None, :],
                 jnp.array([t]),
-                cond[None, :],
-                rngs={"dropout": step_rng} if step_rng is not None else {},
+                step_rng,
             )[0]
 
         jac = jax.jacfwd(f)(x_i)
         return jnp.trace(jac) - jnp.dot(x_i, jac @ x_i)
 
-    return jax.vmap(divergence_single)(x, cond_vecs)
+    return jax.vmap(divergence_single)(x, vector_field_fn_per_sample_params)
 
 
-@partial(jax.jit, static_argnames=("model", "n_steps", "n_projections"))
+@partial(
+    jax.jit,
+    static_argnames=(
+        "vector_field_fn",
+        "vector_field_fn_fixed_static_params",
+        "n_steps",
+        "n_projections",
+    ),
+)
 def _reverse_path_and_compute_divergence(
-    model,
-    params,
+    vector_field_fn,
+    vector_field_fn_fixed_static_params,
+    vector_field_fn_fixed_params,
+    vector_field_fn_per_sample_params,
     samples,
-    cond_vecs,
     n_steps,
     rng,
     n_projections=10,
@@ -2190,8 +2264,6 @@ def _reverse_path_and_compute_divergence(
         div_sum: Integrated divergence along the path [batch_size]
     """
     batch_size = samples.shape[0]
-    assert samples.shape == (batch_size, model.domain_dim)
-    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
 
     ts = jnp.linspace(1.0, 0.0, n_steps)
 
@@ -2208,24 +2280,26 @@ def _reverse_path_and_compute_divergence(
         # Compute divergence at current point
         step_rng_model, step_rng_div, rng = jax.random.split(rng, 3)
         div_t = hutchinson_estimator(
-            model,
-            params,
+            vector_field_fn,
+            vector_field_fn_fixed_static_params,
+            vector_field_fn_fixed_params,
+            vector_field_fn_per_sample_params,
             x_t,
             t,
-            cond_vecs,
             step_rng_div,
             n_projections,
         )
         div_sum = div_sum + div_t * (1.0 / n_steps)
 
         # Take a step backward along the path
-        next_x = spherical_rk4_step_with_model(
-            model,
-            params,
+        next_x = spherical_rk4_step(
+            vector_field_fn,
+            vector_field_fn_fixed_static_params,
+            vector_field_fn_fixed_params,
+            vector_field_fn_per_sample_params,
             x_t,
             t,
             -1.0 / n_steps,
-            cond_vecs,
             step_rng_model,
         )
 
@@ -2250,7 +2324,7 @@ def compute_log_probability(
     n_projections=10,
 ):
     """
-    Compute the log probability of samples under the flow-matching model.
+    Compute the log probability of samples under a flow-matching model.
 
     Args:
         model: Vector field model
@@ -2266,9 +2340,53 @@ def compute_log_probability(
     """
     batch_size = samples.shape[0]
     assert samples.shape == (batch_size, model.domain_dim)
-
     assert cond_vecs.shape == (batch_size, model.conditioning_dim)
 
+    return compute_log_probability_inner(
+        _compute_vector_field_for_sampling,
+        model,
+        params,
+        cond_vecs,
+        samples,
+        n_steps,
+        rng,
+        n_projections,
+    )
+
+
+def compute_log_probability_inner(
+    vector_field_fn,
+    vector_field_fn_fixed_static_params,
+    vector_field_fn_fixed_params,
+    vector_field_fn_per_sample_params,
+    samples,
+    n_steps=100,
+    rng=None,
+    n_projections=10,
+):
+    """
+    Compute the log probability of samples under a flow-matching model, generic over the method of
+    computing the vector field.
+
+    Args:
+        vector_field_fn: Vector field function
+        vector_field_fn_fixed_static_params: Parameters to pass to vector_field_fn that are constant
+            across all samples and may be marked static to jax.jit. (separate parameter so
+            static_argnums will work.)
+        vector_field_fn_fixed_params: Parameters to pass to vector_field_fn that are constant across
+            all samples
+        vector_field_fn_per_sample_params: PyTree of per-sample parameters with leading dim
+            batch_size.
+        samples: Points on the sphere to evaluate [batch_size, dim]
+        n_steps: Number of integration steps
+        rng: JAX random key for stochastic estimation (if None, uses deterministic keys)
+        n_projections: Number of random projections to use for divergence estimation
+
+    Returns:
+        Log probabilities of the samples [batch_size]
+    """
+    batch_size = samples.shape[0]
+    domain_dim = samples.shape[1]
     if rng is None:
         rng = jax.random.PRNGKey(0)
 
@@ -2276,17 +2394,19 @@ def compute_log_probability(
     samples = samples / jnp.linalg.norm(samples, axis=1, keepdims=True)
 
     div_sum = _reverse_path_and_compute_divergence(
-        model,
-        params,
+        vector_field_fn,
+        vector_field_fn_fixed_static_params,
+        vector_field_fn_fixed_params,
+        vector_field_fn_per_sample_params,
         samples,
-        cond_vecs=cond_vecs,
         n_steps=n_steps,
         rng=rng,
         n_projections=n_projections,
     )
+    assert div_sum.shape == (batch_size,)
 
     # Density of the base distribution (uniform on unit sphere)
-    log_p0 = sphere_log_inverse_surface_area(model.domain_dim)
+    log_p0 = sphere_log_inverse_surface_area(domain_dim)
     log_p1 = log_p0 - div_sum
     return log_p1
 
@@ -2353,7 +2473,14 @@ def test_divergence_estimate(divergence_fn, n_projections, field):
 
     # Call the appropriate divergence function
     div_estimates = divergence_fn(
-        model, {}, x, t, cond_vecs=cond_vecs, step_rng=rng, n_projections=n_projections
+        _compute_vector_field_for_sampling,
+        model,
+        {},
+        None,
+        x,
+        t,
+        step_rng=rng,
+        n_projections=n_projections,
     )
 
     # Calculate error
@@ -2827,7 +2954,6 @@ def _generate_cap_constrained_samples_rejection(
                 model,
                 params,
                 sub_rng,
-                rejection_params.proposal_batch_size,
                 cond_vecs=batch_cond_vecs,
                 n_steps=flow_n_steps,
                 method="rk4",
