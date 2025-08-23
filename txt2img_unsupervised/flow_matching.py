@@ -72,6 +72,7 @@ import matplotlib.ticker as ticker
 from .cap_sampling import (
     LogitsTable,
     process_d_max_dist,
+    random_pt_with_cosine_similarity,
     sample_cap,
     sample_from_cap,
     sphere_log_inverse_surface_area,
@@ -4093,8 +4094,43 @@ class WeightedFlowModel(nn.Module):
             raise NotImplementedError(
                 "VMF density weighting function not implemented yet."
             )
+        elif self.weighting_function in [
+            WeightingFunction.CAP_INDICATOR,
+            WeightingFunction.SMOOTHED_CAP_INDICATOR,
+        ]:
+            self.logits_table = LogitsTable(self.domain_dim - 1, 8192)
+            # Precompute bucket angles α for the logits table indices. Using convention cos(α) = -h
+            # where h are the table heights in [-1, 1].
+            buckets = self.logits_table.buckets
+            idxs = jnp.arange(buckets, dtype=jnp.int32)
+            heights = 2.0 * (idxs.astype(jnp.float32) / (buckets - 1.0)) - 1.0
+            cos_thetas = -heights
+            self._bucket_alphas = jnp.arccos(jnp.clip(cos_thetas, -1.0, 1.0))
 
         self.vector_field = self.mk_vector_field()
+
+    @nn.nowrap
+    def _build_smoothed_weighted_logits_table(self, d_max: jax.Array) -> LogitsTable:
+        """Construct a weighted ``LogitsTable`` reflecting the smoothed-cap indicator around angle
+        0 with edge at θ_cap and linear falloff of width ``boundary_width``.
+
+        For bucket angles α corresponding to table heights, weights are
+        1 for α ≤ θ_cap; linearly decreasing to 0 over (θ_cap, θ_cap + boundary_width]; and 0
+        beyond. This reweights the base slice-area logits so that sampling heights is equivalent to
+        sampling directions with density proportional to area × smoothed-weight.
+        """
+        boundary_width = self.weighting_function_extra_params.boundary_width
+        cap_theta = jnp.arccos(jnp.clip(1.0 - d_max, -1.0, 1.0))
+        alpha_max = jnp.minimum(jnp.pi, cap_theta + boundary_width)
+        alphas = self._bucket_alphas
+        within_support = alphas <= alpha_max
+        linear_falloff = jnp.maximum(
+            0.0, 1.0 - (alphas - cap_theta) / jnp.maximum(boundary_width, 1e-12)
+        )
+        weight_vals = jnp.where(
+            alphas <= cap_theta, 1.0, jnp.where(within_support, linear_falloff, 0.0)
+        )
+        return self.logits_table.weighted(weight_vals)
 
     def dummy_inputs(self) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         """Create dummy inputs for model initialization with the correct shapes.
@@ -4239,7 +4275,8 @@ class WeightedFlowModel(nn.Module):
     ) -> jax.Array:
         """
         Compute the weight of a point under the weighting function defined by the parameters.
-        Returns a float32 scalar in [0, 1].
+        Returns a float32 scalar in [0, 1]. (In principle this could be any nonnegative finite
+        value, but this implementation returns weights in [0, 1].)
         """
         assert x.shape == (self.domain_dim,)
         if self.weighting_function == WeightingFunction.CONSTANT:
@@ -4281,7 +4318,7 @@ class WeightedFlowModel(nn.Module):
 
     def sample_weighting_function_params(
         self, x: jax.Array
-    ) -> Tuple[jax.Array, jax.Array]:
+    ) -> Optional[Tuple[jax.Array, jax.Array]]:
         """
         Given a point x, sample a set of parameters for the weighting function from a distribution
         that's density is proportional to the weighting function and independent of any attribute of
@@ -4295,15 +4332,53 @@ class WeightedFlowModel(nn.Module):
 
         The naive method would be to draw the weighting function's parameters independently of the
         data and scale the loss for each example by the weighting function. In principle this should
-        work but the vast vast majority of examples will end up having very low weights (consider
+        work but if the vast vast majority of examples will end up having very low weights (consider
         what happens in high dimensions where the caps we care about and are training on can have
-        fractional areas as small as e^-262), and thus sample and compute efficiency will be
-        horrible.
+        fractional areas as small as e^-262), then sample and compute efficiency will be horrible.
+        Our EGCG setting is exactly that, so we need a better method.
 
-        The clever method is to draw the weighting function's parameters from a distribution that is
-        FIXME
+        The clever method is, as above, to draw the weighting function's parameters from a
+        distribution that's density is proportional to the weight that would apply given those. This
+        means that when we flip it around the density at any given point is weighted proportionally
+        to the weight at that point.
         """
-        pass
+        if self.weighting_function == WeightingFunction.CONSTANT:
+            return None
+        rng = self.make_rng("sample_weighting_params")
+        if self.weighting_function == WeightingFunction.CAP_INDICATOR:
+            return sample_cap(
+                self.logits_table,
+                rng,
+                x,
+                self.weighting_function_extra_params.d_max_dist,
+            )
+        elif self.weighting_function == WeightingFunction.SMOOTHED_CAP_INDICATOR:
+            # Sample d_max from the configured mixture (independent of x)
+            weights, range_starts, range_ends = process_d_max_dist(
+                self.weighting_function_extra_params.d_max_dist
+            )
+
+            comp_rng, dmax_rng, angle_rng, dir_rng = jax.random.split(rng, 4)
+            component_idx = jax.random.categorical(comp_rng, jnp.log(weights))
+            d_max = jax.random.uniform(
+                dmax_rng,
+                minval=range_starts[component_idx],
+                maxval=range_ends[component_idx],
+            )
+
+            # Build weighted logits table using helper and sample with existing interpolation logic
+            weighted_tbl = self._build_smoothed_weighted_logits_table(d_max)
+            # Pass d_max=2.0 so no additional truncation; support is encoded in weighted_tbl logits
+            sampled_dist = weighted_tbl.sample_cap_cos_distance(angle_rng, 2.0)
+            cap_center = random_pt_with_cosine_similarity(dir_rng, x, sampled_dist)
+
+            return cap_center, d_max
+        elif self.weighting_function == WeightingFunction.VMF_DENSITY:
+            raise NotImplementedError(
+                "VMF density weighting function not implemented yet."
+            )
+        else:
+            raise ValueError(f"Unknown weighting function: {self.weighting_function}")
 
 
 @pytest.mark.parametrize(

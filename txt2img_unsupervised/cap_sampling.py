@@ -133,6 +133,22 @@ class LogitsTable:
         val = idx / (self.buckets - 1)
         return 2 * val - 1
 
+    def weighted(self, weights: jax.Array):
+        """Return a new LogitsTable whose logits are reweighted by a per-bucket weight array.
+
+        The provided ``weights`` array must have the same shape as the underlying table logits
+        (i.e., ``(self.buckets,)``). Values <= 0 are treated as zeros (excluded) by mapping them to
+        ``-inf`` in log-space. The returned table's logits are renormalized with ``log_softmax``.
+        """
+        assert weights.shape == self.table.shape
+        # Map non-positive weights to -inf in log-space, positive weights to log(weights)
+        log_w = jnp.where(weights > 0.0, jnp.log(weights), -jnp.inf)
+        out = LogitsTable.__new__(LogitsTable)
+        out.table = jax.nn.log_softmax(self.table + log_w)
+        out.d = self.d
+        out.buckets = self.buckets
+        return out
+
     @partial(jax.jit, inline=True, static_argnames=("interpolate",))
     def sample_cap_cos_distance(self, rng, d_max, interpolate=True):
         """Sample a cosine distance from the center of a cap with a given max cosine distance,
