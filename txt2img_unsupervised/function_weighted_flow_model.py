@@ -1,16 +1,9 @@
-"""
-Parametric weighted flow matching models for spherical data.
-
-This module contains the WeightedFlowModel class and related functionality that allows training
-flow matching models with parametric weighting functions. This enables learning distributions
-that are weighted versions of the base flow distribution, specified at inference time.
-"""
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Tuple, Union
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
 import numpy as np
 import pytest
 
@@ -24,7 +17,7 @@ from .flow_matching import VectorField, sample_sphere
 
 
 class WeightingFunction(Enum):
-    """The function that weights a WeightedFlowModel's distribution."""
+    """The function that weights a FunctionWeightedFlowModel's distribution."""
 
     CONSTANT = "constant"
     """Constant weight - all samples weighted equally, no conditioning."""
@@ -63,7 +56,8 @@ class WeightingFunction(Enum):
 @dataclass(frozen=True)
 class CapIndicatorExtraParams:
     """
-    Extra hyperparameters for WeightedFlowModels that use the cap indicator weighting function.
+    Extra hyperparameters for FunctionWeightedFlowModels that use the cap indicator weighting
+    function.
     """
 
     d_max_dist: Tuple[Tuple[float, float], ...] = ((0.95, 1.0), (0.05, 2.0))
@@ -79,7 +73,8 @@ class CapIndicatorExtraParams:
 @dataclass(frozen=True)
 class SmoothedCapIndicatorExtraParams:
     """
-    Extra hyperparameters for WeightedFlowModels that use the smoothed cap indicator weighting function.
+    Extra hyperparameters for FunctionWeightedFlowModels that use the smoothed cap indicator
+    weighting function.
     """
 
     d_max_dist: Tuple[Tuple[float, float], ...] = ((0.95, 1.0), (0.05, 2.0))
@@ -97,17 +92,19 @@ class SmoothedCapIndicatorExtraParams:
     """
 
 
-class WeightedFlowModel(nn.Module):
-    """A flow model trained to sample from a distribution, weighted by a function specified at
-    inference time. The *family* of weighting functions is specified at initialization, before
-    training, including the choice of WeightingFunction and some hyperparameters included in
-    weighting_function_extra_params. At inference time, further parameters are passed to the model,
-    fully specifying the weighting function.
+class FunctionWeightedFlowModel(nn.Module):
+    """A function-weighted flow model - i.e. one trained to sample from a distribution, weighted
+    by a function specified at inference time. The *family* of weighting functions is specified at
+    initialization, before training, including the choice of WeightingFunction and some
+    hyperparameters included in weighting_function_extra_params. At inference time, further
+    parameters are passed to the model, fully specifying the weighting function.
+
+    This implements the general concept of a function-weighted generative model.
     """
 
     # Some notes for the paper:
 
-    # Weighted generative models are a superset of class conditional generative models:
+    # Function-weighted generative models are a superset of class conditional generative models:
     # We can recover class-conditional generative models with a very simple extension of this. For
     # concreteness, imagine a model that generates pictures of cats or dogs. And we have a labeled
     # dataset. If we think of the label as part of the example we're generating, then our weighting
@@ -510,7 +507,7 @@ def test_compute_weight(weighting_function, domain_dim):
     else:
         extra_params = CapIndicatorExtraParams()
 
-    model = WeightedFlowModel(
+    model = FunctionWeightedFlowModel(
         domain_dim=domain_dim,
         time_dim=16,
         reference_directions=8,
@@ -654,7 +651,7 @@ def test_process_weighting_function_params(
     else:
         extra_params = CapIndicatorExtraParams()
 
-    model = WeightedFlowModel(
+    model = FunctionWeightedFlowModel(
         domain_dim=domain_dim,
         reference_directions=reference_directions,
         time_dim=16,
