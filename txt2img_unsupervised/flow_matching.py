@@ -472,6 +472,22 @@ class VectorField(nn.Module):
         cond_vec = jnp.ones((1, self.conditioning_dim))
         return x, t, cond_vec
 
+    def prepare_training_conditioning(self, batch):
+        """Prepare conditioning data for training - extract from batch.
+
+        Args:
+            batch: Training batch, may contain "cond_vec" for conditional models
+
+        Returns:
+            Conditioning vectors from the batch [batch_size, conditioning_dim]
+        """
+        if "cond_vec" in batch:
+            return batch["cond_vec"]
+        else:
+            # For unconditional models, create zero-dimensional conditioning
+            batch_size = batch["point_vec"].shape[0]
+            return jnp.zeros((batch_size, 0))
+
     def __call__(self, x, t, cond_vec):
         batch_size = x.shape[0]
         assert x.shape == (batch_size, self.domain_dim)
@@ -938,7 +954,7 @@ def conditional_flow_matching_loss(
     x0,
     x1,
     t,
-    conds,
+    conditioning_data,
     rng=None,
     capture_intermediates=False,
 ):
@@ -947,12 +963,12 @@ def conditional_flow_matching_loss(
     OT field.
 
     Args:
-        model: Vector field model (VectorField)
+        model: Vector field model
         params: Model parameters
         x0: Noise samples from p0 (batched) [batch_size, dim]
         x1: Target samples from p1 (batched) [batch_size, dim]
         t: Time parameters (batched) in [0, 1] [batch_size]
-        conds: Conditioning vectors (batched) [batch_size, cond_dim]
+        conditioning_data: Conditioning data for the model (format model-specific)
         rng: JAX random key (required if model uses dropout)
 
     Returns:
@@ -964,9 +980,9 @@ def conditional_flow_matching_loss(
     assert x0.shape[1] == model.domain_dim
     assert t.shape == (batch_size,)
 
-    assert conds.shape == (batch_size, model.conditioning_dim)
+    # Check if model uses dropout
     if model.input_dropout_rate is not None or model.mlp_dropout_rate is not None:
-        assert rng is not None, "rng is required for VectorField with dropout"
+        assert rng is not None, "rng is required for models with dropout"
 
     # Compute target vector field (ground truth OT field) and current positions
     psi_ts, target_fields = jax.vmap(spherical_ot_field, in_axes=(0, 0, 0))(x0, x1, t)
@@ -978,7 +994,7 @@ def conditional_flow_matching_loss(
         params,
         psi_ts,
         t,
-        conds,
+        conditioning_data,
         rngs={"dropout": rng},
         capture_intermediates=capture_intermediates,
     )
@@ -1048,12 +1064,12 @@ def sample_sphere(rng, batch_size, dim):
 @partial(jax.jit, inline=True, static_argnames=("model", "capture_intermediates"))
 def compute_batch_loss(model, params, batch, rng, capture_intermediates=False):
     """
-    Compute the loss for a batch of data.
+    Compute the loss for a batch of data using conditional flow matching.
 
     Args:
-        model: The vector field model (VectorField)
+        model: The model (must implement prepare_training_conditioning method)
         params: Model parameters
-        batch: Batch of data containing "point_vec" and "cond_vec"
+        batch: Batch of data containing "point_vec" and conditioning data as needed by model
         rng: JAX random key
         capture_intermediates: Whether to capture intermediate values
 
@@ -1064,12 +1080,19 @@ def compute_batch_loss(model, params, batch, rng, capture_intermediates=False):
     batch_size = x1_batch.shape[0]
     assert x1_batch.shape == (batch_size, model.domain_dim)
 
-    rng, noise_rng, time_rng = jax.random.split(rng, 3)
+    # Split RNG for different purposes
+    rng, noise_rng, time_rng, conditioning_rng = jax.random.split(rng, 4)
+
+    # Let model prepare its own conditioning data for training
+    conditioning_data = model.apply(
+        params,
+        batch,
+        method=model.prepare_training_conditioning,
+        rngs={"sample_weighting_params": conditioning_rng},
+    )
+
     x0_batch = sample_sphere(noise_rng, batch_size, model.domain_dim)
     t = jax.random.uniform(time_rng, (batch_size,))
-
-    conds = batch["cond_vec"]
-    assert conds.shape == (batch_size, model.conditioning_dim)
 
     return conditional_flow_matching_loss(
         model,
@@ -1077,7 +1100,7 @@ def compute_batch_loss(model, params, batch, rng, capture_intermediates=False):
         x0_batch,
         x1_batch,
         t,
-        conds,
+        conditioning_data,
         rng=rng,
         capture_intermediates=capture_intermediates,
     )
@@ -1112,16 +1135,17 @@ def train_step(model, state, batch, rng):
     return state, loss, grad_norm, next_rng
 
 
-def _train_loop_for_tests(
+def _train_loop_for_tests_generic(
     model,
     dataset,
     batch_size,
     learning_rate,
     epochs,
     test_dataset=None,
+    compute_nll_fn=None,
 ):
     """
-    Simple training loop for unit tests.
+    Generic training loop for unit tests.
 
     Args:
         model: The model to train
@@ -1130,6 +1154,7 @@ def _train_loop_for_tests(
         learning_rate: Initial learning rate (will use cosine schedule)
         epochs: Number of epochs to train for
         test_dataset: Optional test dataset for evaluation after each epoch
+        compute_nll_fn: Function (model, params, batch, n_steps, rng, n_projections) -> nlls
 
     Returns:
         state: Final training state
@@ -1153,7 +1178,6 @@ def _train_loop_for_tests(
     state = create_train_state(params_rng, model, cosine_schedule)
     np_rng = np.random.Generator(np.random.PCG64(seed=42))
 
-    dummy_cond = jnp.zeros((batch_size, 0)) if model.conditioning_dim == 0 else None
     final_test_loss = None
     final_test_nll = None
     first_step = True
@@ -1168,8 +1192,6 @@ def _train_loop_for_tests(
                 unit="train batches",
                 total=len(dataset) // batch_size,
             ):
-                if dummy_cond is not None:
-                    batch["cond_vec"] = dummy_cond
                 norms = jnp.linalg.norm(batch["point_vec"], axis=1, keepdims=True)
                 np.testing.assert_allclose(np.asarray(norms), 1.0, rtol=0, atol=1e-6)
 
@@ -1182,11 +1204,11 @@ def _train_loop_for_tests(
 
                 if first_step or i % 200 == 0:
                     step_rng, nll_rng = jax.random.split(step_rng)
-                    train_nlls = -compute_log_probability(
+                    # Use model-specific function to compute NLL
+                    train_nlls = -compute_nll_fn(
                         model,
                         state.params,
-                        batch["point_vec"],
-                        cond_vecs=batch["cond_vec"],
+                        batch,
                         n_steps=100,
                         rng=nll_rng,
                         n_projections=10,
@@ -1217,9 +1239,6 @@ def _train_loop_for_tests(
                     unit="test batches",
                     total=len(test_dataset) // batch_size,
                 ):
-                    if dummy_cond is not None:
-                        test_batch["cond_vec"] = dummy_cond
-
                     test_batch_rng, test_nll_rng, test_rng = jax.random.split(
                         test_rng, 3
                     )
@@ -1230,12 +1249,12 @@ def _train_loop_for_tests(
 
                     test_losses.append(batch_test_loss)
 
+                    # Use model-specific function to compute NLL
                     test_nlls.append(
-                        -compute_log_probability(
+                        -compute_nll_fn(
                             model,
                             state.params,
-                            test_batch["point_vec"],
-                            cond_vecs=test_batch["cond_vec"],
+                            test_batch,
                             n_steps=100,
                             rng=test_nll_rng,
                             n_projections=10,
@@ -1270,6 +1289,33 @@ def _train_loop_for_tests(
         return state, train_loss, final_test_loss, final_test_nll
     else:
         return state, train_loss
+
+
+def _compute_nll_vector_field(model, params, batch, n_steps, rng, n_projections):
+    """Compute NLL for VectorField - use real conditioning data from batch."""
+    if "cond_vec" in batch:
+        cond_vecs = batch["cond_vec"]
+    else:
+        # For unconditional models, create zero-dimensional conditioning
+        batch_size = batch["point_vec"].shape[0]
+        cond_vecs = jnp.zeros((batch_size, 0))
+
+    return compute_log_probability(
+        model=model,
+        params=params,
+        samples=batch["point_vec"],
+        cond_vecs=cond_vecs,
+        n_steps=n_steps,
+        rng=rng,
+        n_projections=n_projections,
+    )
+
+
+# Create VectorField-specific training loop using partial application
+_train_loop_for_tests = partial(
+    _train_loop_for_tests_generic,
+    compute_nll_fn=_compute_nll_vector_field,
+)
 
 
 _baseline_model = VectorField(
@@ -2129,6 +2175,21 @@ def hutchinson_estimator(
     batch_size, dim = x.shape
     assert isinstance(t, float) or (isinstance(t, jnp.ndarray) and t.shape == ())
     assert n_projections > 0, "n_projections must be positive"
+    per_sample_leading_dims = jax.tree.map(
+        lambda x: x.shape[0], vector_field_fn_per_sample_params
+    )
+    if per_sample_leading_dims is not None:
+        # Handle both single values and tree structures
+        if isinstance(per_sample_leading_dims, int):
+            # Single array case
+            assert (
+                per_sample_leading_dims == batch_size
+            ), "Per-sample leading dim must equal batch_size"
+        else:
+            # Tree structure case
+            assert all(
+                x == batch_size for x in jax.tree.leaves(per_sample_leading_dims)
+            ), "All per-sample leading dims must equal batch_size"
 
     def hutchinson_single(x_i, rng_i, per_sample_i):
         """Compute Hutchinson divergence estimate for a single point."""
@@ -2138,7 +2199,10 @@ def hutchinson_estimator(
             return vector_field_fn(
                 vector_field_fn_fixed_static_params,
                 vector_field_fn_fixed_params,
-                jax.tree.map(lambda x: x[None, :], per_sample_i),
+                jax.tree.map(
+                    lambda x: x[None, :] if x.ndim >= 1 else jnp.array([x]),
+                    per_sample_i,
+                ),
                 x_single[None, :],
                 jnp.array([t]),
                 dropout_rng,

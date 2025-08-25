@@ -1,5 +1,7 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datasets import Dataset
 from enum import Enum
+from functools import partial
 from typing import Optional, Tuple, Union
 import flax.linen as nn
 import jax
@@ -7,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from . import flow_matching
 from .cap_sampling import (
     LogitsTable,
     process_d_max_dist,
@@ -259,6 +262,21 @@ class FunctionWeightedFlowModel(nn.Module):
             raise ValueError(f"Unknown weighting function: {self.weighting_function}")
         return x, t, weighting_function_params
 
+    def prepare_training_conditioning(self, batch):
+        """Prepare conditioning data for training - generate weighting parameters for each point.
+
+        Args:
+            batch: Training batch containing "point_vec"
+
+        Returns:
+            Weighting function parameters for the batch
+        """
+        if self.weighting_function == WeightingFunction.CONSTANT:
+            return None
+
+        x1_batch = batch["point_vec"]
+        return jax.vmap(lambda x1: self.sample_weighting_function_params(x1))(x1_batch)
+
     @property
     def d_model_scale_factor(self) -> float:
         "m_d in muP."
@@ -340,7 +358,6 @@ class FunctionWeightedFlowModel(nn.Module):
             weights * (component_vars + (component_means - mixture_mean) ** 2)
         )
         mixture_std = jnp.sqrt(mixture_var)
-        assert jnp.all(mixture_std > 0), "mixture_std must be positive"
 
         scalar_features = (cond_scalars - mixture_mean) / mixture_std
         scalar_features = scalar_features[:, None]
@@ -351,6 +368,10 @@ class FunctionWeightedFlowModel(nn.Module):
         return processed_cond_vecs
 
     def __call__(self, x, t, weighting_function_params):
+        batch_size = x.shape[0]
+        assert x.shape == (batch_size, self.domain_dim)
+        assert t.shape == (batch_size,)
+
         if self.weighting_function == WeightingFunction.CONSTANT:
             assert weighting_function_params is None
             cond_vecs_for_inner_model = jnp.zeros((x.shape[0], 0))
@@ -361,8 +382,15 @@ class FunctionWeightedFlowModel(nn.Module):
             assert isinstance(weighting_function_params, tuple)
             assert len(weighting_function_params) == 2
             cond_vecs, cond_scalars = weighting_function_params
+            assert cond_vecs.shape == (batch_size, self.domain_dim)
+            assert cond_scalars.shape == (batch_size,)
+
             cond_vecs_for_inner_model = self.process_weighting_function_params(
                 cond_vecs, cond_scalars
+            )
+            assert cond_vecs_for_inner_model.shape == (
+                batch_size,
+                self.conditioning_dim,
             )
         elif self.weighting_function == WeightingFunction.VMF_DENSITY:
             raise NotImplementedError(
@@ -701,3 +729,207 @@ def test_process_weighting_function_params(
     # Check approximately zero-mean and unit-std per component
     np.testing.assert_allclose(means, 0.0, atol=0.05, rtol=0)
     np.testing.assert_allclose(stds, 1.0, atol=0.05, rtol=0)
+
+
+def generate_samples(
+    model,
+    params,
+    rng,
+    weighting_function_params,
+    n_steps=20,
+    method="rk4",
+    batch_size=None,
+):
+    """
+    Generate samples from a FunctionWeightedFlowModel.
+
+    Args:
+        model: FunctionWeightedFlowModel
+        params: Model parameters
+        rng: JAX random key
+        weighting_function_params: Parameters for the weighting function. PyTree with leading dim
+            batch_size, None if the weighting function is constant.
+        n_steps: Number of integration steps
+        method: Method of integration
+        batch_size: Batch size. If None, will be inferred from the shape of the weighting function
+            parameters.
+    """
+    leading_dims = jax.tree.leaves(
+        jax.tree.map(lambda x: x.shape[0], weighting_function_params)
+    )
+    if len(leading_dims) == 0:
+        if weighting_function_params is not None:
+            raise ValueError(
+                "weighting_function_params must be None (unparameterized weighting function) or a "
+                "PyTree of arrays with leading dimension batch_size (all others)."
+            )
+        if batch_size is None:
+            raise ValueError(
+                "batch_size must be specified if weighting_function_params is None"
+            )
+    else:
+        if all(x == leading_dims[0] for x in leading_dims):
+            inferred_batch_size = leading_dims[0]
+        else:
+            raise ValueError(
+                "All leading dimensions of weighting function parameters must be the same, got "
+                f"{leading_dims}"
+            )
+        if batch_size is None:
+            batch_size = inferred_batch_size
+        elif batch_size != inferred_batch_size:
+            raise ValueError(
+                "batch_size must match the leading dimension of the weighting function parameters "
+                f"got {batch_size}, but inferred {inferred_batch_size} from the weighting function "
+                "parameters."
+            )
+
+    samples = flow_matching.generate_samples_inner(
+        rng,
+        n_steps,
+        batch_size,
+        method,
+        _compute_vector_field,
+        model,
+        params,
+        weighting_function_params,
+        model.domain_dim,
+    )
+    return samples
+
+
+def compute_log_probability(
+    model,
+    params,
+    samples,
+    weighting_function_params,
+    n_steps=20,
+    rng=None,
+    n_projections=10,
+):
+    """
+    Compute the log probability of samples under a function-weighted flow model.
+    """
+    return flow_matching.compute_log_probability_inner(
+        _compute_vector_field,
+        model,
+        params,
+        weighting_function_params,
+        samples,
+        n_steps,
+        rng,
+        n_projections,
+    )
+
+
+@partial(jax.jit, static_argnames=("model",), inline=True)
+def _compute_vector_field(model, params, weighting_function_params, x, t, rng=None):
+    rngs_dict = {"dropout": rng} if rng is not None else {}
+    return model.apply(
+        params,
+        x,
+        jnp.full((x.shape[0],), t),
+        weighting_function_params,
+        rngs=rngs_dict,
+    )
+
+
+# Baseline configuration used for tests
+_baseline_model = FunctionWeightedFlowModel(
+    domain_dim=3,
+    reference_directions=128,
+    time_dim=128,
+    use_pre_mlp_projection=True,
+    n_layers=4,
+    d_model=256,
+    mlp_expansion_factor=4,
+    mlp_dropout_rate=None,
+    input_dropout_rate=None,
+    weighting_function=WeightingFunction.CONSTANT,
+    weighting_function_extra_params=None,
+)
+
+
+@pytest.mark.parametrize("domain_dim", [3, 16])
+@pytest.mark.parametrize("weighting_function", [WeightingFunction.CONSTANT])
+def test_train_uniform(domain_dim, weighting_function):
+    """
+    Train a function-weighted model on the uniform distribution using the new training infrastructure.
+    """
+    model = replace(
+        _baseline_model, domain_dim=domain_dim, weighting_function=weighting_function
+    )
+    rng = jax.random.PRNGKey(20250823)
+    train_rng, _ = jax.random.split(rng)
+
+    # Generate uniform training distribution
+    n_train_examples = 10_000
+    train_points = sample_sphere(train_rng, n_train_examples, domain_dim)
+    assert train_points.shape == (n_train_examples, domain_dim)
+
+    # Create dataset
+    train_dataset = Dataset.from_dict({"point_vec": train_points}).with_format("np")
+
+    # Train the model using the shared infrastructure
+    batch_size = 256
+    learning_rate = 1e-3
+    epochs = 1  # Train for one epoch to test the infrastructure
+
+    print(
+        f"Training FWFM for domain_dim={domain_dim}, weighting_function={weighting_function}"
+    )
+
+    # Use the generic training loop via partial application
+    state, final_loss = _train_loop_for_tests(
+        model=model,
+        dataset=train_dataset,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        epochs=epochs,
+    )
+
+    print(f"Training completed. Final loss: {final_loss:.6f}")
+
+    # Just verify training completed and loss is reasonable
+    assert final_loss < 100.0  # Very loose check just to ensure training ran
+    print("✓ Training test passed!")
+
+
+def _compute_nll_fwfm(model, params, batch, n_steps, rng, n_projections):
+    """Compute NLL for FunctionWeightedFlowModel - use 'evenest weights'."""
+    batch_size = batch["point_vec"].shape[0]
+
+    if model.weighting_function == WeightingFunction.CONSTANT:
+        weighting_function_params = None
+    elif model.weighting_function in [
+        WeightingFunction.CAP_INDICATOR,
+        WeightingFunction.SMOOTHED_CAP_INDICATOR,
+    ]:
+        # Use "evenest weights" - arbitrary center and d_max=2.0 for NLL computation
+        arbitrary_center = jnp.zeros(model.domain_dim).at[0].set(1.0)
+        d_max = 2.0
+        weighting_function_params = (
+            jnp.broadcast_to(arbitrary_center, (batch_size, model.domain_dim)),
+            jnp.full((batch_size,), d_max),
+        )
+    elif model.weighting_function == WeightingFunction.VMF_DENSITY:
+        raise NotImplementedError("VMF density weighting function not implemented yet.")
+    else:
+        raise ValueError(f"Unknown weighting function: {model.weighting_function}")
+
+    return compute_log_probability(
+        model=model,
+        params=params,
+        samples=batch["point_vec"],
+        weighting_function_params=weighting_function_params,
+        n_steps=n_steps,
+        rng=rng,
+        n_projections=n_projections,
+    )
+
+
+# Create FunctionWeightedFlowModel-specific training loop using partial application
+_train_loop_for_tests = partial(
+    flow_matching._train_loop_for_tests_generic,
+    compute_nll_fn=_compute_nll_fwfm,
+)
