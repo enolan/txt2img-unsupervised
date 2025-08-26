@@ -1174,6 +1174,8 @@ def _train_loop_for_tests_generic(
         decay_steps=total_steps,
     )
 
+    n_projections = 10
+
     state = create_train_state(params_rng, model, cosine_schedule)
     np_rng = np.random.Generator(np.random.PCG64(seed=42))
 
@@ -1197,6 +1199,7 @@ def _train_loop_for_tests_generic(
                 state, train_loss, grad_norm, step_rng = train_step(
                     model, state, batch, step_rng
                 )
+                jax.tree.map(lambda x: x.copy_to_host_async(), (train_loss, grad_norm))
 
                 step_count += 1
                 current_lr = cosine_schedule(step_count)
@@ -1210,9 +1213,12 @@ def _train_loop_for_tests_generic(
                         batch,
                         n_steps=100,
                         rng=nll_rng,
-                        n_projections=10,
+                        n_projections=n_projections,
                     )
-                    train_nll = float(np.mean(train_nlls))
+                    train_nll = jnp.mean(train_nlls)
+                train_loss, grad_norm, train_nll = jax.device_get(
+                    (train_loss, grad_norm, train_nll)
+                )
                 if first_step:
                     tqdm.write(
                         f"First step loss: {train_loss:.6f}, grad norm: {grad_norm:.6f}, lr: {current_lr:.6f}, nll: {train_nll:.6f}"
@@ -1256,7 +1262,7 @@ def _train_loop_for_tests_generic(
                             test_batch,
                             n_steps=100,
                             rng=test_nll_rng,
-                            n_projections=10,
+                            n_projections=n_projections,
                         )
                     )
 
@@ -1265,7 +1271,7 @@ def _train_loop_for_tests_generic(
                     avg_test_loss = jax.device_get(jnp.mean(test_losses))
                     final_test_loss = avg_test_loss
 
-                    test_nlls = jnp.asarray(test_nlls)
+                    test_nlls = jnp.concatenate(test_nlls)
                     avg_test_nll = jax.device_get(jnp.mean(test_nlls))
                     final_test_nll = avg_test_nll
 
