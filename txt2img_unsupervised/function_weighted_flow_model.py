@@ -15,6 +15,7 @@ from .cap_sampling import (
     process_d_max_dist,
     random_pt_with_cosine_similarity,
     sample_cap,
+    sphere_log_inverse_surface_area,
 )
 from .flow_matching import VectorField, sample_sphere
 
@@ -837,7 +838,7 @@ def _compute_vector_field(model, params, weighting_function_params, x, t, rng=No
 # Baseline configuration used for tests
 _baseline_model = FunctionWeightedFlowModel(
     domain_dim=3,
-    reference_directions=128,
+    reference_directions=None,
     time_dim=128,
     use_pre_mlp_projection=True,
     n_layers=4,
@@ -851,48 +852,265 @@ _baseline_model = FunctionWeightedFlowModel(
 
 
 @pytest.mark.parametrize("domain_dim", [3, 16])
-@pytest.mark.parametrize("weighting_function", [WeightingFunction.CONSTANT])
+@pytest.mark.parametrize(
+    "weighting_function",
+    [
+        WeightingFunction.CONSTANT,
+        pytest.param(
+            WeightingFunction.CAP_INDICATOR,
+            marks=pytest.mark.xfail(
+                reason="Models can't learn this well"
+            ),
+        ),
+        pytest.param(
+            WeightingFunction.SMOOTHED_CAP_INDICATOR,
+            marks=pytest.mark.xfail(
+                reason="Models can't learn this well"
+            ),
+        ),
+    ],
+)
 def test_train_uniform(domain_dim, weighting_function):
     """
-    Train a function-weighted model on the uniform distribution using the new training infrastructure.
+    Train a function-weighted model on uniform distribution, then verify it produces correct weighted distributions.
     """
+    # Set up model with appropriate extra parameters
+    d_max_dist = ((0.9, 1.0), (0.1, 2.0))
+    if weighting_function == WeightingFunction.SMOOTHED_CAP_INDICATOR:
+        extra_params = SmoothedCapIndicatorExtraParams(
+            d_max_dist=d_max_dist, boundary_width=jnp.pi / 10
+        )
+    elif weighting_function == WeightingFunction.CAP_INDICATOR:
+        extra_params = CapIndicatorExtraParams(d_max_dist=d_max_dist)
+    else:
+        extra_params = None
+
     model = replace(
-        _baseline_model, domain_dim=domain_dim, weighting_function=weighting_function
+        _baseline_model,
+        domain_dim=domain_dim,
+        d_model=512,
+        n_layers=8,
+        weighting_function=weighting_function,
+        weighting_function_extra_params=extra_params,
     )
     rng = jax.random.PRNGKey(20250823)
-    train_rng, _ = jax.random.split(rng)
+    train_rng, test_rng = jax.random.split(rng)
 
     # Generate uniform training distribution
-    n_train_examples = 10_000
+    n_train_examples = 500_000
     train_points = sample_sphere(train_rng, n_train_examples, domain_dim)
     assert train_points.shape == (n_train_examples, domain_dim)
 
     # Create dataset
-    train_dataset = Dataset.from_dict({"point_vec": train_points}).with_format("np")
+    dsets = (
+        Dataset.from_dict({"point_vec": train_points})
+        .with_format("np")
+        .train_test_split(test_size=2048)
+    )
+    train_dataset = dsets["train"]
+    test_dataset = dsets["test"]
 
     # Train the model using the shared infrastructure
-    batch_size = 256
-    learning_rate = 1e-3
-    epochs = 1  # Train for one epoch to test the infrastructure
+    batch_size = 512
+    learning_rate = 1e-4
+    epochs = (2 if domain_dim == 3 else 4) * (
+        1 if weighting_function == WeightingFunction.CONSTANT else 4
+    )
 
     print(
         f"Training FWFM for domain_dim={domain_dim}, weighting_function={weighting_function}"
     )
 
     # Use the generic training loop via partial application
-    state, final_loss = _train_loop_for_tests(
+    state, final_loss, test_loss, test_nll = _train_loop_for_tests(
         model=model,
         dataset=train_dataset,
         batch_size=batch_size,
         learning_rate=learning_rate,
         epochs=epochs,
+        test_dataset=test_dataset,
     )
 
-    print(f"Training completed. Final loss: {final_loss:.6f}")
+    print(
+        f"Training completed. Final loss: {final_loss:.6f}, test loss: {test_loss:.6f}, test NLL: {test_nll:.6f}"
+    )
 
-    # Just verify training completed and loss is reasonable
-    assert final_loss < 100.0  # Very loose check just to ensure training ran
-    print("✓ Training test passed!")
+    # Generate independent test points
+    n_test_points = 1000
+    test_points = sample_sphere(test_rng, n_test_points, domain_dim)
+
+    # Get uniform sphere log density
+    uniform_log_density = sphere_log_inverse_surface_area(domain_dim)
+
+    # Test different parameter sets based on weighting function
+    if weighting_function == WeightingFunction.CONSTANT:
+        param_sets = [None]
+    elif weighting_function in [
+        WeightingFunction.CAP_INDICATOR,
+        WeightingFunction.SMOOTHED_CAP_INDICATOR,
+    ]:
+        # Test multiple cap configurations
+        center = jnp.zeros(domain_dim).at[0].set(1.0)  # [1, 0, 0, ...]
+        param_sets = [
+            (center, jnp.array(d_max, dtype=jnp.float32)) for d_max in [2.0, 1.0, 0.5]
+        ]
+    else:
+        raise ValueError(f"Unknown weighting function: {weighting_function}")
+    # Test each parameter set
+    for i, params in enumerate(param_sets):
+        print(f"Testing parameter set {i+1}/{len(param_sets)}: {params}")
+
+        # Compute true weights
+        if params is None:
+            true_weights = jnp.ones(n_test_points)  # CONSTANT weighting function
+        else:
+            true_weights = jax.vmap(lambda point: model.compute_weight(point, params))(
+                test_points
+            )
+
+        assert jnp.all(true_weights >= 0.0), "All weights must be non-negative"
+        assert jnp.any(true_weights > 0.0), "At least one weight must be positive"
+
+        # Multiply uniform density by weight by this to get weighted density
+        weight_normalization_factor = 1 / jnp.mean(true_weights)
+
+        print(
+            f"  Weight stats: min={true_weights.min():.3f}, max={true_weights.max():.3f}, mean={true_weights.mean():.3f}"
+        )
+        print(
+            f"  Positive weights: {jnp.sum(true_weights > 0)}/{len(true_weights)} points"
+        )
+        print(f"  Weight normalization factor: {weight_normalization_factor:.3f}")
+
+        # Compute model log probabilities
+        if params is None:
+            model_params_batch = None
+        else:
+            center, d_max = params
+            model_params_batch = (
+                jnp.broadcast_to(center, (n_test_points, domain_dim)),
+                jnp.full((n_test_points,), d_max),
+            )
+        if weighting_function in [
+            WeightingFunction.CAP_INDICATOR,
+            WeightingFunction.SMOOTHED_CAP_INDICATOR,
+        ]:
+            # Test density along a geodesic from cap center to antipode (inclusive).
+            num_geodesic_points = 10
+            ts = jnp.linspace(0.0, 1.0, num_geodesic_points)
+            geodesic_points = jax.vmap(
+                lambda tau: flow_matching.compute_psi_t_spherical(center, -center, tau)
+            )(ts)
+            extra_test_points = geodesic_points
+            extended_test_points = jnp.concatenate(
+                [extra_test_points, test_points], axis=0
+            )
+            assert extended_test_points.shape == (
+                num_geodesic_points + n_test_points,
+                domain_dim,
+            )
+
+            extended_model_params_batch = (
+                jnp.broadcast_to(
+                    center, (num_geodesic_points + n_test_points, domain_dim)
+                ),
+                jnp.full((num_geodesic_points + n_test_points,), d_max),
+            )
+        else:
+            extended_test_points = test_points
+            extended_model_params_batch = model_params_batch
+
+        extended_model_log_probs = compute_log_probability(
+            model=model,
+            params=state.params,
+            samples=extended_test_points,
+            weighting_function_params=extended_model_params_batch,
+            n_steps=20,
+            rng=jax.random.PRNGKey(12345),
+            n_projections=10,
+        )
+        model_log_probs = extended_model_log_probs[
+            extended_test_points.shape[0] - n_test_points :
+        ]
+
+        if weighting_function in [
+            WeightingFunction.CAP_INDICATOR,
+            WeightingFunction.SMOOTHED_CAP_INDICATOR,
+        ]:
+            print(
+                "  Geodesic path model log probs (10 points from center to antipode):"
+            )
+            print(f"    log_probs: {extended_model_log_probs[:10]}")
+
+        # Split into zero-weight and positive-weight cases
+        zero_weight_mask = true_weights == 0.0
+        positive_weight_mask = ~zero_weight_mask
+
+        # For positive weights: check the relationship model_log_prob ≈ log(weight) + uniform_log_density
+        if jnp.any(positive_weight_mask):
+            expected_log_probs = (
+                jnp.log(
+                    true_weights[positive_weight_mask] * weight_normalization_factor
+                )
+                + uniform_log_density
+            )
+
+            model_valid_probs_for_positive_weights = model_log_probs[
+                positive_weight_mask
+            ]
+
+            print("  Checking densities for points with positive weight...")
+            print(
+                f"    Model range: [{model_valid_probs_for_positive_weights.min():.3f}, {model_valid_probs_for_positive_weights.max():.3f}]"
+            )
+            print(
+                f"    Model mean: {model_valid_probs_for_positive_weights.mean():.3f} Model std: {model_valid_probs_for_positive_weights.std():.3f}"
+            )
+            print(
+                f"    Expected range: [{expected_log_probs.min():.3f}, {expected_log_probs.max():.3f}]"
+            )
+            print(
+                f"    Mean abs diff: {jnp.mean(jnp.abs(model_valid_probs_for_positive_weights - expected_log_probs)):.3f}"
+            )
+            print(
+                f"    Mean diff: {jnp.mean(model_valid_probs_for_positive_weights - expected_log_probs):.3f}"
+            )
+
+            np.testing.assert_allclose(
+                model_valid_probs_for_positive_weights,
+                expected_log_probs,
+                rtol=0.5,
+                atol=0,  # TODO decrease. was 0.3 before.
+                err_msg=f"Model log probs don't match expected for parameter set {i+1}",
+            )
+        else:
+            print(f"  WARNING: No positive weights found for parameter set {params}")
+
+        # For zero weights the theoretical log probability would be -inf, we test for sufficiently
+        # negative log probability.
+        if jnp.any(zero_weight_mask):
+            MAXIMUM_DENSITY_RATIO = 0.05  # VERY generous ratio... :'(
+            sufficiently_negative_logprob = uniform_log_density + jnp.log(
+                MAXIMUM_DENSITY_RATIO
+            )
+            zero_weight_log_probs = model_log_probs[zero_weight_mask]
+
+            print(
+                f"  Checking densities for points with zero weight - should be less than {sufficiently_negative_logprob}"
+            )
+            print(
+                f"    Model range: [{zero_weight_log_probs.min():.3f}, {zero_weight_log_probs.max():.3f}]"
+            )
+            print(
+                f"    Model mean: {zero_weight_log_probs.mean():.3f} Model std: {zero_weight_log_probs.std():.3f}"
+            )
+            print(
+                f"    Mean diff: {jnp.mean(zero_weight_log_probs - sufficiently_negative_logprob):.3f}"
+            )
+
+            assert jnp.all(
+                zero_weight_log_probs < sufficiently_negative_logprob
+            ), f"{jnp.sum(zero_weight_log_probs >= sufficiently_negative_logprob)} zero-weight points have log prob >= {sufficiently_negative_logprob}"
 
 
 def _compute_nll_fwfm(model, params, batch, n_steps, rng, n_projections):
