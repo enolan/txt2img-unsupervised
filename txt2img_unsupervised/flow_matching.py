@@ -837,7 +837,7 @@ def spherical_ot_field(x0, x1, t):
         )
 
     field_value = jax.lax.cond(
-        angle > jnp.pi - 1e-8,
+        cos_angle < -1.0 + 1e-6,
         # If points are opposite/almost opposite, pick an orthogonal vector
         lambda: get_consistent_tangent_direction(x) * angle,
         handle_general_case,
@@ -912,11 +912,10 @@ def compute_psi_t_spherical(x0, x1, t):
     assert t.shape == ()
 
     cos_angle = jnp.clip(jnp.dot(x0, x1), -1.0, 1.0)
-    angle = jnp.arccos(cos_angle)
 
     def handle_close_or_opposite():
         return jax.lax.cond(
-            angle < 1e-8,
+            cos_angle > 1.0 - 1e-6,
             lambda: x0,  # If points are very close, just return x0
             lambda: handle_antipodal(),
         )
@@ -942,7 +941,7 @@ def compute_psi_t_spherical(x0, x1, t):
         )
 
     return jax.lax.cond(
-        jnp.logical_or(angle < 1e-8, angle > jnp.pi - 1e-8),
+        jnp.logical_or(cos_angle > 1.0 - 1e-6, cos_angle < -1.0 + 1e-6),
         handle_close_or_opposite,
         lambda: slerp(x0, x1, t),
     )
@@ -3978,3 +3977,49 @@ def test_generate_cap_constrained_samples_matches_rejection():
     np.testing.assert_allclose(rs_means, mcmc_means, atol=0.1, rtol=0)
     np.testing.assert_allclose(rs_cos_mean, mcmc_cos_mean, atol=0.05, rtol=0)
     np.testing.assert_allclose(rs_cos_std, mcmc_cos_std, atol=0.05, rtol=0)
+
+
+def test_compute_psi_t_spherical_antipodal_path_is_geodesic():
+    # Two antipodal points on S^2
+    x0 = jnp.array([1.0, 0.0, 0.0], dtype=jnp.float32)
+    x1 = jnp.array([-1.0, 0.0, 0.0], dtype=jnp.float32)
+
+    # Sample a few times in (0,1) and ensure points stay on unit sphere and nonzero
+    ts = jnp.linspace(0.0, 1.0, 5)
+    xs = jax.vmap(lambda t: compute_psi_t_spherical(x0, x1, t))(ts)
+
+    # Endpoints match inputs
+    np.testing.assert_allclose(xs[0], x0, atol=1e-6, rtol=0)
+    np.testing.assert_allclose(xs[-1], x1, atol=1e-6, rtol=0)
+
+    # Intermediate points should be unit-norm and non-zero
+    norms = jnp.linalg.norm(xs, axis=-1)
+    assert jnp.all(norms > 1e-6)
+    np.testing.assert_allclose(norms, 1.0, atol=1e-6, rtol=0)
+
+    # Path should lie on a great circle orthogonal to a consistent tangent direction at x0
+    tangent_dir = get_consistent_tangent_direction(x0)
+    # Check that midpoint is close to tangent_dir (up to sign ambiguity)
+    mid = xs[2]
+    cos_sim = jnp.dot(mid, tangent_dir)
+    assert jnp.abs(cos_sim) > 0.9
+
+
+def test_spherical_ot_field_antipodal_direction_tangent_and_nonzero():
+    x0 = jnp.array([0.0, 1.0, 0.0], dtype=jnp.float32)
+    x1 = jnp.array([0.0, -1.0, 0.0], dtype=jnp.float32)
+
+    # Check a few times including the midpoint
+    for t in [0.0, 0.5, 1.0]:
+        t = jnp.array(t, dtype=jnp.float32)
+        x, v = spherical_ot_field(x0, x1, t)
+
+        # x should be on the sphere
+        np.testing.assert_allclose(jnp.linalg.norm(x), 1.0, atol=1e-6, rtol=0)
+
+        # v should be tangent: dot(x, v) = 0 (within tolerance)
+        np.testing.assert_allclose(jnp.dot(x, v), 0.0, atol=1e-6, rtol=0)
+
+        # At antipodal case, v should be non-zero except at exact endpoints when angle logic may return zero
+        if t not in (0.0, 1.0):
+            assert jnp.linalg.norm(v) > 1e-6
