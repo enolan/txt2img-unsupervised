@@ -77,6 +77,27 @@ model that generates embeddings is a spherical flow matching model with optimal 
 - When state is necessary, use classes to manage it. Use dataclasses where they make sense.
 - Avoid repeating yourself. Use the abstractions available to you to make your code clear and
   concise.
+- When dispatching on an enum, check for all possible values explicitly. Throw an exception if the
+  enum value isn't valid.
+  ```python
+  # BAD
+  if foo == SomeEnum.A:
+    # do stuff
+  elif foo == SomeEnum.B:
+    # do other stuff
+  else:
+    # do stuff for SomeEnum.C, no explicit check for other values
+
+  # GOOD
+  if foo == SomeEnum.A:
+    # do stuff
+  elif foo == SomeEnum.B:
+    # do other stuff
+  elif foo == SomeEnum.C:
+    # do stuff for SomeEnum.C
+  else:
+    raise ValueError(f"Invalid enum value: {foo}")
+  ```
 - Use Python 3.11+ features including type hints
 - Format code with Black
 - Use dataclasses for configuration objects
@@ -84,7 +105,8 @@ model that generates embeddings is a spherical flow matching model with optimal 
   - snake_case for functions and variables
   - CamelCase for classes
   - UPPER_CASE for constants
-- Import order: external libraries, then local, both in alphabetical order
+- Import order: external libraries, then local, both in alphabetical order. Always at the top of a
+  source file, after any docstrings. Never put imports inside functions or classes.
 - Prefer explicit error handling with descriptive error messages
 - Document functions with docstrings ("""description""")
 - Use pytest for testing with descriptive test names (test_function_does_x)
@@ -103,8 +125,10 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
   * `txt2img_unsupervised/coordinate_check.py`. Check the muP implementation in the flow matching
     model is correct by visualizing the activation scale at different model widths.
 * Modules
-  * `txt2img_unsupervised/flow_matching.py`. Spherical flow matching model. Includes baseline and
-    cap conditioned models.
+  * `txt2img_unsupervised/flow_matching.py`. Spherical flow matching model.
+  * `txt2img_unsupervised/function_weighted_flow_model.py`. Function-weighted flow matching model:
+    models that generate a distribution weighted by a function whose parameters are specified at
+    inference time. Used to generate CLIP image embeddings for image generation.
   * `txt2img_unsupervised/cap_sampling.py`. Functions for sampling spherical caps and sampling
     points inside them.
   * `txt2img_unsupervised/transformer_model.py`. The transformer-based image generation model.
