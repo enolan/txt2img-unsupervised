@@ -4029,3 +4029,130 @@ def test_spherical_ot_field_antipodal_direction_tangent_and_nonzero():
         # At antipodal case, v should be non-zero except at exact endpoints when angle logic may return zero
         if t not in (0.0, 1.0):
             assert jnp.linalg.norm(v) > 1e-6
+
+
+def test_train_hemisphere_density():
+    """
+    Train on points uniformly sampled from the northern hemisphere, then verify:
+    - log density on the northern hemisphere ≈ log(2) + uniform sphere log density
+    - log density on the southern hemisphere (outside training support) is near zero (very small)
+
+    Uses sample_from_cap to generate uniform-in-cap points (cap d_max=1 corresponds to hemisphere).
+    """
+    domain_dim = 3
+    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=6, d_model=512)
+
+    # Hemisphere definition: center at north pole, half-angle π/2 ⇒ d_max = 1.0
+    table = LogitsTable(domain_dim - 1, 8192)
+    north = jnp.zeros(domain_dim).at[domain_dim - 1].set(1.0)
+    south = -north
+
+    def sample_cap_batch(rng, center, d_max, n):
+        keys = jax.random.split(rng, n)
+        return jax.vmap(lambda k: sample_from_cap(k, table, center, d_max))(keys)
+
+    # Generate training dataset on northern hemisphere
+    rng = jax.random.PRNGKey(20250828)
+    train_rng, test_rng1, test_rng2 = jax.random.split(rng, 3)
+    n_train = 120_000
+    batch_gen = 4096
+    pts = []
+    remaining = n_train
+    while remaining > 0:
+        this = int(min(batch_gen, remaining))
+        sub_rng, train_rng = jax.random.split(train_rng)
+        pts.append(sample_cap_batch(sub_rng, north, 1.0, this))
+        remaining -= this
+    train_points = jnp.concatenate(pts, axis=0)
+    assert train_points.shape == (n_train, domain_dim)
+
+    dsets = (
+        Dataset.from_dict({"point_vec": train_points})
+        .with_format("np")
+        .train_test_split(test_size=2048)
+    )
+    train_dataset = dsets["train"]
+    test_dataset = dsets["test"]
+
+    # Train
+    batch_size = 512
+    learning_rate = 1e-3
+    epochs = 8
+    state, final_loss, test_loss, test_nll = _train_loop_for_tests(
+        model, train_dataset, batch_size, learning_rate, epochs, test_dataset
+    )
+
+    print(
+        f"Final train loss: {final_loss:.6f}, test loss: {test_loss:.6f}, test NLL: {test_nll:.6f}"
+    )
+
+    # Build two test sets: in-cap (north hemisphere) and opposite (south hemisphere)
+    n_test = 1024
+    north_points = sample_cap_batch(test_rng1, north, 1.0, n_test)
+    # Density falloff is smooth, doesn't exactly reflect the true step-function pdf. We only test
+    # points in the southern hemisphere that are a bit away from the boundary.
+    south_points = sample_cap_batch(test_rng2, south, 0.9, n_test)
+
+    cond_vecs = jnp.zeros((n_test, 0), dtype=jnp.float32)
+    uniform_log_density = sphere_log_inverse_surface_area(domain_dim)
+
+    # Compute log probabilities
+    north_log_probs = compute_log_probability(
+        model,
+        state.params,
+        north_points,
+        cond_vecs,
+        n_steps=100,
+        rng=jax.random.PRNGKey(12345),
+        n_projections=10,
+    )
+    south_log_probs = compute_log_probability(
+        model,
+        state.params,
+        south_points,
+        cond_vecs,
+        n_steps=100,
+        rng=jax.random.PRNGKey(67890),
+        n_projections=10,
+    )
+
+    # Also probe along the geodesic from north to south (inclusive)
+    num_geodesic_points = 10
+    ts = jnp.linspace(0.0, 1.0, num_geodesic_points)
+    geodesic_points = jax.vmap(lambda tau: compute_psi_t_spherical(north, south, tau))(
+        ts
+    )
+    geodesic_log_probs = compute_log_probability(
+        model,
+        state.params,
+        geodesic_points,
+        jnp.zeros((num_geodesic_points, 0), dtype=jnp.float32),
+        n_steps=100,
+        rng=jax.random.PRNGKey(13579),
+        n_projections=10,
+    )
+    print("  Geodesic path model log probs (10 points from north to south):")
+    print(f"    log_probs: {geodesic_log_probs}")
+
+    # In-hemisphere density should be 2x uniform
+    expected_north = uniform_log_density + jnp.log(2.0)
+    print(
+        f"North hemisphere: mean={north_log_probs.mean():.4f}, expected={expected_north:.4f}"
+    )
+    np.testing.assert_allclose(
+        jax.device_get(north_log_probs.mean()),
+        jax.device_get(expected_north),
+        rtol=0,
+        atol=0.1,
+    )
+
+    # Outside support should be very small (close to zero density)
+    MAXIMUM_DENSITY_RATIO = 0.05
+    threshold = uniform_log_density + jnp.log(MAXIMUM_DENSITY_RATIO)
+    print(
+        f"South hemisphere log-prob stats: min={south_log_probs.min():.4f}, max={south_log_probs.max():.4f}, threshold={threshold:.4f}"
+    )
+    too_high = jnp.sum(south_log_probs > threshold)
+    assert (
+        too_high / n_test < 0.05
+    ), f"{too_high} south-hemisphere points have log prob >= threshold"
