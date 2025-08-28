@@ -20,94 +20,46 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import scipy.special
 from functools import partial
 from typing import Tuple
 
 
-def log_surface_area_of_slice(d, h):
-    """Calculate the log of the surface area of a (d-1)-sphere slice at height h on a d-sphere.
-    N.B. A d-sphere is a sphere in d+1 dimensional sphere e.g. a regular sphere is a 2-sphere.
-    """
-
-    d = np.float64(d)
-    h = np.float64(h)
-
-    radius_slice = np.sqrt(1 - h**2)
-
-    # Divide by zero is expected for h = 1 and h = -1.
-    with np.errstate(divide="ignore"):
-        log_surface_area = (
-            np.log(2)
-            + (d / 2) * np.log(np.pi)
-            - scipy.special.loggamma(d / 2)
-            + (d - 1) * np.log(radius_slice)
-        )
-    assert log_surface_area.dtype == np.float64
-    return log_surface_area
-
-
-def test_log_surface_area_of_slice():
-    """Test that log_surface_area_of_slice is correct in lower dimensions."""
-
-    # 2-sphere, slices are circles
-    np.testing.assert_allclose(log_surface_area_of_slice(2, 0), np.log(2 * np.pi))
-    np.testing.assert_allclose(log_surface_area_of_slice(2, 1), -np.inf)
-    np.testing.assert_allclose(log_surface_area_of_slice(2, -1), -np.inf)
-    np.testing.assert_allclose(
-        log_surface_area_of_slice(2, 0.5), np.log(np.sqrt(0.75) * 2 * np.pi)
-    )
-    np.testing.assert_allclose(
-        log_surface_area_of_slice(2, -0.5), np.log(np.sqrt(0.75) * 2 * np.pi)
-    )
-
-    # 3-sphere, slices are spheres
-    np.testing.assert_allclose(log_surface_area_of_slice(3, 0), np.log(4 * np.pi))
-    np.testing.assert_allclose(log_surface_area_of_slice(3, 1), -np.inf)
-    np.testing.assert_allclose(log_surface_area_of_slice(3, -1), -np.inf)
-    np.testing.assert_allclose(log_surface_area_of_slice(3, 0.5), np.log(3 * np.pi))
-    np.testing.assert_allclose(log_surface_area_of_slice(3, -0.5), np.log(3 * np.pi))
-
-
-def test_log_surface_area_symmetry():
-    """Test that log_surface_area_of_slice is symmetric around 0."""
-    negative_heights = np.linspace(-1.0, 0.0, 100, dtype=np.float64)
-    positive_heights = np.linspace(0.0, 1.0, 100, dtype=np.float64)
-    negative_height_log_surface_areas = np.array(
-        [log_surface_area_of_slice(767, h) for h in negative_heights]
-    )
-    positive_height_log_surface_areas = np.array(
-        [log_surface_area_of_slice(767, h) for h in positive_heights]
-    )
-    np.testing.assert_allclose(
-        negative_height_log_surface_areas,
-        positive_height_log_surface_areas[::-1],
-    )
-
-
 @jax.tree_util.register_pytree_node_class
 class LogitsTable:
-    """Precomputed table of the measures of slices of an arbitrary dimensional sphere, stored as
-    the logs of the total measure. Used for sampling points in caps with uniform distribution over
-    the surface of the cap, and for computing the areas of caps. I'm sure a more direct way of doing
-    these things exists but my brain is too smooth for math.
+    """Precomputed table for sampling heights on a d-sphere.
+
+    The logits approximate the log of the band area density with respect to height ``h`` (the
+    coordinate along an axis through the sphere), not the zero-thickness slice area. For a
+    d-sphere, the band area density per unit ``h`` is proportional to ``(1 - h^2)^{(d-2)/2}``.
+
+    Using band-area density (not slice area) is critical: a uniform distribution on the sphere has
+    uniform ``h`` in 3D, and the above formula generalizes that to arbitrary dimensions. Using slice
+    area alone would bias samples toward the equator.
     """
 
     def __init__(self, d, n):
-        """Generate a table of log surface areas of slices of a d-sphere for sampling from caps."""
-        # I'm paranoid about floating point issues and this is a precomputation step so I don't
-        # care if it's a bit slow.
-        slice_heights = np.linspace(-1.0, 1.0, n, dtype=np.float64)
-        slice_logits = np.array(
-            [log_surface_area_of_slice(d, h) for h in slice_heights]
-        )
-        slice_logits = slice_logits.astype(np.float32)
+        """Generate a table of log band-area densities for a d-sphere.
 
-        assert slice_logits.shape == (n,)
+        We discretize heights ``h ∈ [-1, 1]`` into ``n`` buckets and compute logits proportional to
+        the area of the spherical band per unit ``h`` at each height. For a d-sphere, the density is
+        proportional to ``(1 - h^2)^{(d-2)/2}`` times a constant factor that cancels in softmax.
+        """
+        # Precompute on float64 for numerical stability; cast to float32 afterward.
+        slice_heights = np.linspace(-1.0, 1.0, n, dtype=np.float64)
+
+        # Logits ∝ (d-2)/2 * log(1 - h^2)
+        # Handle endpoints robustly: set logits to -inf at |h|=1 where the band measure is 0.
+        with np.errstate(invalid="ignore"):
+            band_logits = ((d - 2) / 2.0) * np.log(1.0 - slice_heights**2)
+            band_logits[np.isnan(band_logits)] = -np.inf
+
+        band_logits = band_logits.astype(np.float32)
+
+        assert band_logits.shape == (n,)
 
         self.d = d
         self.buckets = n
-        self.table = jax.nn.log_softmax(jnp.array(slice_logits))
+        self.table = jax.nn.log_softmax(jnp.array(band_logits))
 
     def tree_flatten(self):
         # For some reason you can't just return the array as the first element of the returned
