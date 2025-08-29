@@ -185,7 +185,8 @@ class TransformerBlock(nn.Module):
             param_dtype=self.weights_dtype,
             kernel_init=nn.initializers.normal(stddev=jnp.sqrt(self.param_variance)),
             dropout_rate=(self.attn_dropout_rate or 0.0),
-        )  # TODO: efficient attention
+            attention_fn=jax.nn.dot_product_attention,
+        )
         self.norm2 = nn.LayerNorm(dtype=self.activations_dtype, param_dtype=jnp.float32)
 
         self.gate_proj = nn.Dense(
