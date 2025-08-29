@@ -49,7 +49,7 @@ class LogitsTable:
 
         # Logits ∝ (d-2)/2 * log(1 - h^2)
         # Handle endpoints robustly: set logits to -inf at |h|=1 where the band measure is 0.
-        with np.errstate(invalid="ignore"):
+        with np.errstate(divide="ignore", invalid="ignore"):
             band_logits = ((d - 2) / 2.0) * np.log(1.0 - slice_heights**2)
             band_logits[np.isnan(band_logits)] = -np.inf
 
