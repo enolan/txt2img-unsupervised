@@ -169,7 +169,6 @@ class TransformerBlock(nn.Module):
     d_model: int
     n_heads: int
     mlp_expansion_factor: int
-    attn_dropout_rate: Optional[float]
     mlp_dropout_rate: Optional[float]
 
     activations_dtype: jnp.dtype
@@ -177,15 +176,38 @@ class TransformerBlock(nn.Module):
     param_variance: float
 
     def setup(self) -> None:
-        # TODO: muP
         self.norm1 = nn.LayerNorm(dtype=self.activations_dtype, param_dtype=jnp.float32)
+
+        # Use standard Flax MHA, but override attention_fn to set muP scaling (1/d_head)
+        def _mup_attention_fn(
+            query,
+            key,
+            value,
+            bias=None,
+            mask=None,
+            *,
+            is_causal: bool = False,
+            **kwargs,
+        ):
+            # Enforce muP scaling: (q @ k^T) / d_head
+            d_head = query.shape[-1]
+            return jax.nn.dot_product_attention(
+                query,
+                key,
+                value,
+                bias=bias,
+                mask=mask,
+                scale=1.0 / float(d_head),
+                is_causal=is_causal,
+            )
+
         self.attn = nn.MultiHeadDotProductAttention(
             num_heads=self.n_heads,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
             kernel_init=nn.initializers.normal(stddev=jnp.sqrt(self.param_variance)),
-            dropout_rate=(self.attn_dropout_rate or 0.0),
-            attention_fn=jax.nn.dot_product_attention,
+            dropout_rate=0.0,
+            attention_fn=_mup_attention_fn,
         )
         self.norm2 = nn.LayerNorm(dtype=self.activations_dtype, param_dtype=jnp.float32)
 
@@ -224,8 +246,7 @@ class TransformerBlock(nn.Module):
         y = self.norm1(tokens)
         if self.dropout is not None:
             y = self.dropout(y)
-        # Full attention (unmasked); deterministic=False so dropout applies when rng provided
-        attn_out = self.attn(y, y, y, deterministic=False)
+        attn_out = self.attn(y, y, y, deterministic=True)
         tokens = tokens + attn_out
 
         y2 = self.norm2(tokens)
@@ -268,7 +289,6 @@ class TransformerVectorField(nn.Module):
     time_dim: int = 128
 
     # Dropouts
-    attn_dropout_rate: Optional[float] = None
     mlp_dropout_rate: Optional[float] = None
     input_dropout_rate: Optional[float] = None
 
@@ -348,7 +368,6 @@ class TransformerVectorField(nn.Module):
             d_model=self.d_model,
             n_heads=self.n_heads,
             mlp_expansion_factor=self.mlp_expansion_factor,
-            attn_dropout_rate=self.attn_dropout_rate,
             mlp_dropout_rate=self.mlp_dropout_rate,
             activations_dtype=self.activations_dtype,
             weights_dtype=self.weights_dtype,
@@ -388,9 +407,67 @@ class TransformerVectorField(nn.Module):
         return lr / self.d_model_scale_factor
 
     def mk_partition_map(self, use_muon: bool):
-        # Provide a simple, safe default: everything uses fixed_lr
-        # (keeps compatibility with training utils without over-specifying internals)
-        return {"params": "fixed_lr"}
+        """Partition map for muP and optional Muon for transformer.
+
+        Groups:
+        - Without Muon: "fixed_lr" and "scaled_lr".
+        - With Muon: "adam_fixed", "adam_scaled", "muon_scaled" (no muon_fixed group here).
+        """
+        if use_muon:
+            muon_dense = {"bias": "adam_fixed", "kernel": "muon_scaled"}
+            adam_dense = {"bias": "adam_fixed", "kernel": "adam_scaled"}
+
+            params_map: Dict[str, Any] = {
+                # Input/output layers use Adam per Muon guidance
+                "in_proj_x": adam_dense,
+                "time_proj": adam_dense,
+                # Optional conditional projection is added below when present
+                "learned_tokens": "adam_fixed",
+                "final_norm": "adam_fixed",
+                "out_proj": adam_dense,
+                "transformer_blocks": {
+                    "norm1": "adam_fixed",
+                    "attn": {
+                        "query": muon_dense,
+                        "key": muon_dense,
+                        "value": muon_dense,
+                        "out": muon_dense,
+                    },
+                    "norm2": "adam_fixed",
+                    "gate_proj": muon_dense,
+                    "value_proj": muon_dense,
+                    "out_proj": muon_dense,
+                },
+            }
+            if self.conditioning_dim > 0:
+                params_map["in_proj_cond"] = adam_dense
+            return {"params": params_map}
+        else:
+            dense = {"bias": "fixed_lr", "kernel": "scaled_lr"}
+            params_map = {
+                "in_proj_x": dense,
+                "time_proj": dense,
+                # Optional conditional projection is added below when present
+                "learned_tokens": "fixed_lr",
+                "final_norm": "fixed_lr",
+                "out_proj": dense,
+                "transformer_blocks": {
+                    "norm1": "fixed_lr",
+                    "attn": {
+                        "query": dense,
+                        "key": dense,
+                        "value": dense,
+                        "out": dense,
+                    },
+                    "norm2": "fixed_lr",
+                    "gate_proj": dense,
+                    "value_proj": dense,
+                    "out_proj": dense,
+                },
+            }
+            if self.conditioning_dim > 0:
+                params_map["in_proj_cond"] = dense
+            return {"params": params_map}
 
     def __call__(self, x, t, cond_vec):
         batch_size = x.shape[0]
@@ -1649,7 +1726,6 @@ def _mk_model(
             n_learned_tokens=overrides.get(
                 "n_learned_tokens", 6 if conditioning_dim == 0 else 5
             ),
-            attn_dropout_rate=overrides.get("attn_dropout_rate", None),
             mlp_dropout_rate=overrides.get("mlp_dropout_rate", None),
             input_dropout_rate=overrides.get("input_dropout_rate", None),
         )
@@ -1668,7 +1744,7 @@ def test_train_trivial(model_kind, domain_dim):
     else:
         model = _mk_model("transformer", domain_dim=domain_dim)
         lr = 1e-3
-        ep = 4 if domain_dim == 3 else 12
+        ep = 3
 
     batch_size = 256
     # Create a unit vector in the first dimension
