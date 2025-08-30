@@ -1535,6 +1535,7 @@ def _train_loop_for_tests_generic(
     )
 
     n_projections = 10
+    nll_steps = 32
 
     state = create_train_state(params_rng, model, cosine_schedule)
     np_rng = np.random.Generator(np.random.PCG64(seed=42))
@@ -1571,7 +1572,7 @@ def _train_loop_for_tests_generic(
                         model,
                         state.params,
                         batch,
-                        n_steps=100,
+                        n_steps=nll_steps,
                         rng=nll_rng,
                         n_projections=n_projections,
                     )
@@ -1620,7 +1621,7 @@ def _train_loop_for_tests_generic(
                             model,
                             state.params,
                             test_batch,
-                            n_steps=100,
+                            n_steps=nll_steps,
                             rng=test_nll_rng,
                             n_projections=n_projections,
                         )
