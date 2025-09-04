@@ -198,12 +198,13 @@ class MLPBlock(nn.Module):
         x_normed = self.norm(x)
         if self.dropout is not None:
             x_normed = self.dropout(x_normed)
-        gate = self.gate_proj(x_normed)
-        value = self.value_proj(x_normed)
 
-        # Project injected inputs and sum with gate and value. Note the scale of the gate and value
-        # increase with the number of injected features. This is probably fine given the per-block
-        # and final LayerNorms.
+        # Scale projections to maintain consistent variance regardless of injection feature count
+        scale_factor = 1.0 / jnp.sqrt(len(self.inj_features) + 1)
+        gate = self.gate_proj(x_normed) * scale_factor
+        value = self.value_proj(x_normed) * scale_factor
+
+        # Project injected inputs and sum with scaled gate and value to maintain variance balance.
         if self.inj_features:
             if inj is None:
                 raise ValueError("injection configured but inj carry was None")
@@ -213,8 +214,8 @@ class MLPBlock(nn.Module):
                 feat = inj.get(key, None)
                 if feat is None:
                     raise ValueError(f"inj carry missing '{key}' feature")
-                gate = gate + getattr(self, f"gate_proj_{key}")(feat)
-                value = value + getattr(self, f"value_proj_{key}")(feat)
+                gate = gate + getattr(self, f"gate_proj_{key}")(feat) * scale_factor
+                value = value + getattr(self, f"value_proj_{key}")(feat) * scale_factor
         else:
             if inj is not None:
                 raise ValueError("inj carry was not None but inj_features is empty")
