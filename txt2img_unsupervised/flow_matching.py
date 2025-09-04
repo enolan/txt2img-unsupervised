@@ -55,7 +55,17 @@ from flax import linen as nn
 from flax.training import train_state
 from functools import partial
 from math import floor, ceil
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    FrozenSet,
+)
 from enum import Enum
 import jax
 import jax.lax
@@ -116,6 +126,9 @@ class MLPBlock(nn.Module):
     weights_dtype: jnp.dtype
     param_variance: float
 
+    # Extra features injected in addition to main bottleneck_dim input.
+    inj_features: FrozenSet[str] = field(default_factory=frozenset)
+
     def setup(self) -> None:
         self.norm = nn.LayerNorm(
             dtype=self.activations_dtype,
@@ -146,8 +159,40 @@ class MLPBlock(nn.Module):
         else:
             self.dropout = None
 
-    def __call__(self, x, _):
-        "Run the layer forward. Unused extra parameter and return value are for scan."
+        for key in self.inj_features:
+            setattr(
+                self,
+                f"gate_proj_{key}",
+                nn.Dense(
+                    features=self.expansion_factor * self.bottleneck_dim,
+                    dtype=self.activations_dtype,
+                    param_dtype=self.weights_dtype,
+                    kernel_init=nn.initializers.variance_scaling(
+                        scale=1.0, mode="fan_in", distribution="normal"
+                    ),
+                    use_bias=False,  # Bias would be redundant with gate_proj
+                ),
+            )
+            setattr(
+                self,
+                f"value_proj_{key}",
+                nn.Dense(
+                    features=self.expansion_factor * self.bottleneck_dim,
+                    dtype=self.activations_dtype,
+                    param_dtype=self.weights_dtype,
+                    kernel_init=nn.initializers.variance_scaling(
+                        scale=1.0, mode="fan_in", distribution="normal"
+                    ),
+                    use_bias=False,  # Bias would be redundant with value_proj
+                ),
+            )
+
+    def __call__(self, x, inj):
+        """Run the layer forward.
+
+        inj is a carry for scan containing a dict with keys matching the inj_features set. mapped to
+        per-example feature arrays. If None, no injection is performed.
+        """
         assert len(x.shape) == 2
         assert x.shape[1] == self.bottleneck_dim
         x_normed = self.norm(x)
@@ -155,6 +200,24 @@ class MLPBlock(nn.Module):
             x_normed = self.dropout(x_normed)
         gate = self.gate_proj(x_normed)
         value = self.value_proj(x_normed)
+
+        # Project injected inputs and sum with gate and value. Note the scale of the gate and value
+        # increase with the number of injected features. This is probably fine given the per-block
+        # and final LayerNorms.
+        if self.inj_features:
+            if inj is None:
+                raise ValueError("injection configured but inj carry was None")
+            # ensure consistent addition order, regardless of set construction order. can matter
+            # since float addition is not commutative.
+            for key in sorted(self.inj_features):
+                feat = inj.get(key, None)
+                if feat is None:
+                    raise ValueError(f"inj carry missing '{key}' feature")
+                gate = gate + getattr(self, f"gate_proj_{key}")(feat)
+                value = value + getattr(self, f"value_proj_{key}")(feat)
+        else:
+            if inj is not None:
+                raise ValueError("inj carry was not None but inj_features is empty")
         gated = jax.nn.silu(gate) * value
         out = self.out_proj(gated)
         assert out.shape == x.shape
@@ -571,6 +634,12 @@ class VectorField(nn.Module):
     # Dropout rate for the input
     input_dropout_rate: Optional[float]
 
+    # Which original inputs to inject at every MLP block. When a feature is injected,
+    # it is omitted from the initial MLP input.
+    mlp_always_inject: FrozenSet[Literal["x", "t", "cond"]] = field(
+        default_factory=frozenset
+    )
+
     activations_dtype: jnp.dtype = jnp.float32
     weights_dtype: jnp.dtype = jnp.float32
 
@@ -590,6 +659,21 @@ class VectorField(nn.Module):
     @property
     def total_input_dim(self) -> int:
         return self.input_feature_dim + self.conditioning_dim + self.time_dim
+
+    @property
+    def initial_total_input_dim(self) -> int:
+        """
+        Total dim of features fed to the initial MLP input. We don't send injected features to the
+        initial MLP input since that would be redundant.
+        """
+        dim = 0
+        if "x" not in self.mlp_always_inject:
+            dim += self.input_feature_dim
+        if "t" not in self.mlp_always_inject:
+            dim += self.time_dim
+        if "cond" not in self.mlp_always_inject:
+            dim += self.conditioning_dim
+        return dim
 
     @property
     def d_model_scale_factor(self) -> float:
@@ -618,7 +702,10 @@ class VectorField(nn.Module):
             # layers, should be optimized by a standard method such as AdamW" so pre_mlp_proj and
             # out_proj use Adam, while MLP projection kernels use Muon. Which learning rates to
             # scale or not is based on the muP rules.
-            muon_dense_layer_partition_map = {
+            muon_dense_layer_partition_map_biasless = {
+                "kernel": "muon_scaled",
+            }
+            muon_dense_layer_partition_map_with_bias = {
                 "bias": "adam_fixed",
                 "kernel": "muon_scaled",
             }
@@ -630,11 +717,19 @@ class VectorField(nn.Module):
                 },
                 "mlp_blocks": {
                     "norm": "adam_fixed",
-                    "gate_proj": muon_dense_layer_partition_map,
-                    "value_proj": muon_dense_layer_partition_map,
-                    "out_proj": muon_dense_layer_partition_map,
+                    "gate_proj": muon_dense_layer_partition_map_with_bias,
+                    "value_proj": muon_dense_layer_partition_map_with_bias,
+                    "out_proj": muon_dense_layer_partition_map_with_bias,
                 },
             }
+            # Optional per-feature injection projections
+            for inj_key in self.mlp_always_inject:
+                params_map["mlp_blocks"][
+                    f"gate_proj_{inj_key}"
+                ] = muon_dense_layer_partition_map_biasless
+                params_map["mlp_blocks"][
+                    f"value_proj_{inj_key}"
+                ] = muon_dense_layer_partition_map_biasless
 
             if self.use_pre_mlp_projection:
                 # pre_mlp_proj uses Adam with appropriate muP scaling
@@ -646,23 +741,34 @@ class VectorField(nn.Module):
                 params_map["mlp_in_bias"] = "adam_fixed"
         else:
             # Simple muP partition map
-            dense_layer_partition_map = {"bias": "fixed_lr", "kernel": "scaled_lr"}
+            dense_layer_partition_map_biasless = {"kernel": "scaled_lr"}
+            dense_layer_partition_map_with_bias = {
+                "bias": "fixed_lr",
+                "kernel": "scaled_lr",
+            }
 
             params_map = {
                 "final_norm": "fixed_lr",
-                "out_proj": dense_layer_partition_map,
+                "out_proj": dense_layer_partition_map_with_bias,
                 "mlp_blocks": {
                     "norm": "fixed_lr",
-                    "gate_proj": dense_layer_partition_map,
-                    "value_proj": dense_layer_partition_map,
-                    "out_proj": dense_layer_partition_map,
+                    "gate_proj": dense_layer_partition_map_with_bias,
+                    "value_proj": dense_layer_partition_map_with_bias,
+                    "out_proj": dense_layer_partition_map_with_bias,
                 },
             }
+            for inj_key in self.mlp_always_inject:
+                params_map["mlp_blocks"][
+                    f"gate_proj_{inj_key}"
+                ] = dense_layer_partition_map_biasless
+                params_map["mlp_blocks"][
+                    f"value_proj_{inj_key}"
+                ] = dense_layer_partition_map_biasless
             if self.use_pre_mlp_projection:
                 # pre_mlp_proj should have its learning rate scaled by 1/m_d because it feeds into the
                 # MLP and gradients go backwards but its initialization should be determined by
                 # total_input_dim because activations go forwards. I think.
-                params_map["pre_mlp_proj"] = dense_layer_partition_map
+                params_map["pre_mlp_proj"] = dense_layer_partition_map_with_bias
             else:
                 params_map["mlp_in_bias"] = "fixed_lr"
 
@@ -675,9 +781,26 @@ class VectorField(nn.Module):
     def setup(self) -> None:
         hidden_init_variance = self.variance_base / self.d_model_scale_factor
 
-        if not self.use_pre_mlp_projection and self.total_input_dim > self.d_model:
+        # Validate mlp_always_inject
+        if not isinstance(self.mlp_always_inject, frozenset):
             raise ValueError(
-                f"input_feature_dim + conditioning_dim + time_dim ({self.total_input_dim}) "
+                "mlp_always_inject must be a frozenset of {'x','t','cond'}"
+            )
+        allowed = {"x", "t", "cond"}
+        unknown = set(self.mlp_always_inject) - allowed
+        if unknown:
+            raise ValueError(f"Unknown mlp_always_inject items: {sorted(unknown)}")
+        if "cond" in self.mlp_always_inject and self.conditioning_dim == 0:
+            raise ValueError(
+                "'cond' specified in mlp_always_inject but conditioning_dim == 0"
+            )
+
+        if (
+            not self.use_pre_mlp_projection
+            and self.initial_total_input_dim > self.d_model
+        ):
+            raise ValueError(
+                f"initial_total_input_dim ({self.initial_total_input_dim}) "
                 f"exceeds d_model ({self.d_model}). Reduce one or more of them or increase d_model."
             )
         if self.time_dim % 2 != 0:
@@ -688,9 +811,13 @@ class VectorField(nn.Module):
                 features=self.d_model,
                 dtype=self.activations_dtype,
                 param_dtype=self.weights_dtype,
+                # If we have no non-injected inputs this is just a bias, and variance_scaling
+                # throws a divide by zero error because of the 0 in the input shape.
                 kernel_init=nn.initializers.variance_scaling(
                     scale=1.0, mode="fan_in", distribution="normal"
-                ),
+                )
+                if self.initial_total_input_dim > 0
+                else nn.initializers.zeros,
                 use_bias=True,
             )
 
@@ -723,6 +850,7 @@ class VectorField(nn.Module):
             variable_broadcast=False,
             split_rngs={"params": True, "dropout": True},
             length=self.n_layers,
+            in_axes=(nn.broadcast,),
         )(
             bottleneck_dim=self.d_model,
             expansion_factor=self.mlp_expansion_factor,
@@ -730,6 +858,7 @@ class VectorField(nn.Module):
             weights_dtype=self.weights_dtype,
             param_variance=hidden_init_variance,
             dropout_rate=self.mlp_dropout_rate,
+            inj_features=self.mlp_always_inject,
         )
 
         self.final_norm = nn.LayerNorm(
@@ -788,16 +917,28 @@ class VectorField(nn.Module):
         time_encoding = jax.vmap(self.time_encoding)(t)
         assert time_encoding.shape == (batch_size, self.time_dim)
 
-        concatenated = jnp.concatenate(
-            [input_features, time_encoding, cond_vec], axis=1
-        )
-        assert concatenated.shape == (batch_size, self.total_input_dim)
+        # Build initial input from non-injected components
+        components = []
+        if "x" not in self.mlp_always_inject:
+            components.append(input_features)
+        if "t" not in self.mlp_always_inject:
+            components.append(time_encoding)
+        if "cond" not in self.mlp_always_inject:
+            components.append(cond_vec)
+
+        if len(components) > 0:
+            concatenated = jnp.concatenate(components, axis=1)
+        else:
+            concatenated = jnp.zeros((batch_size, 0), dtype=self.activations_dtype)
+        assert concatenated.shape[0] == batch_size
 
         if self.use_pre_mlp_projection:
             mlp_in = self.pre_mlp_proj(concatenated)
         else:
-            if self.total_input_dim < self.d_model:
-                padding = jnp.zeros((batch_size, self.d_model - self.total_input_dim))
+            if self.initial_total_input_dim < self.d_model:
+                padding = jnp.zeros(
+                    (batch_size, self.d_model - self.initial_total_input_dim)
+                )
                 mlp_in = jnp.concatenate([concatenated, padding], axis=1)
             else:
                 mlp_in = concatenated
@@ -858,8 +999,19 @@ class VectorField(nn.Module):
         inputs = self.process_inputs(x, t, cond_vec)
         mlp_in = inputs["mlp_input"]
 
+        # Prepare injection carry if configured
+        inj = None
+        if self.mlp_always_inject:
+            inj = {}
+            if "x" in self.mlp_always_inject:
+                inj["x"] = inputs["input_features"]
+            if "t" in self.mlp_always_inject:
+                inj["t"] = inputs["time_encoding"]
+            if "cond" in self.mlp_always_inject:
+                inj["cond"] = inputs["cond_vec"]
+
         # Run them through our MLP and normalize the output
-        mlp_out, _ = self.mlp_blocks(mlp_in, None)
+        mlp_out, _ = self.mlp_blocks(mlp_in, inj)
         mlp_out = self.final_norm(mlp_out)
         assert mlp_out.shape == (batch_size, self.d_model)
 
@@ -1734,16 +1886,27 @@ def _mk_model(
         raise ValueError(f"Unknown model_kind: {model_kind}")
 
 
+@pytest.mark.parametrize(
+    "inject_keys",
+    [
+        frozenset(),
+        frozenset({"x"}),
+        frozenset({"t"}),
+        frozenset({"x", "t"}),
+    ],
+)
 @pytest.mark.parametrize("model_kind", ["mlp", "transformer"])
 @pytest.mark.parametrize("domain_dim", [3, 16])
-def test_train_trivial(model_kind, domain_dim):
+def test_train_trivial(model_kind, domain_dim, inject_keys):
     "Train a model with a single example"
     if model_kind == "mlp":
-        model = _mk_model("mlp", domain_dim=domain_dim)
+        model = _mk_model("mlp", domain_dim=domain_dim, mlp_always_inject=inject_keys)
         lr = 1e-3
-        ep = 1 if domain_dim == 3 else 2
+        ep = 2 if domain_dim == 3 else 2
     else:
         model = _mk_model("transformer", domain_dim=domain_dim)
+        if inject_keys:
+            pytest.skip("Transformer with inject_keys not supported")
         lr = 1e-3
         ep = 3
 
@@ -1850,16 +2013,29 @@ def vmf_scale_kappa(kappa_src, dim_src, dim_target):
     )
 
 
+@pytest.mark.parametrize(
+    "inject_keys",
+    [
+        frozenset(),
+        frozenset({"x"}),
+        frozenset({"t"}),
+        frozenset({"x", "t"}),
+    ],
+)
 @pytest.mark.parametrize("model_kind", ["mlp", "transformer"])
 @pytest.mark.parametrize("domain_dim", [3, 16])
-def test_train_vmf(model_kind, domain_dim):
+def test_train_vmf(model_kind, domain_dim, inject_keys):
     """
     Train a model with data from a von Mises-Fisher distribution and evaluate the samples.
     """
     if model_kind == "mlp":
-        model = _mk_model("mlp", domain_dim=domain_dim, n_layers=2)
+        model = _mk_model(
+            "mlp", domain_dim=domain_dim, n_layers=2, mlp_always_inject=inject_keys
+        )
     else:
         model = _mk_model("transformer", domain_dim=domain_dim)
+        if inject_keys:
+            pytest.skip("Transformer with inject_keys not supported")
     epochs = 1
 
     batch_size = 512
@@ -2065,9 +2241,22 @@ def test_train_uniform_zero_field(model_kind, domain_dim):
     )
 
 
+@pytest.mark.parametrize(
+    "inject_keys",
+    [
+        frozenset(),
+        frozenset({"x"}),
+        frozenset({"t"}),
+        frozenset({"cond"}),
+        frozenset({"x", "t"}),
+        frozenset({"x", "cond"}),
+        frozenset({"t", "cond"}),
+        frozenset({"x", "t", "cond"}),
+    ],
+)
 @pytest.mark.parametrize("model_kind", ["mlp", "transformer"])
 @pytest.mark.parametrize("domain_dim", [3, 16])
-def test_train_conditional_vmf(model_kind, domain_dim):
+def test_train_conditional_vmf(model_kind, domain_dim, inject_keys):
     """
     Train a model with data from two different von Mises-Fisher distributions
     conditioned on a binary conditioning vector.
@@ -2076,12 +2265,20 @@ def test_train_conditional_vmf(model_kind, domain_dim):
     When conditioning vector is 1, samples should come from the second vMF distribution.
     """
     if model_kind == "mlp":
-        model = _mk_model("mlp", domain_dim=domain_dim, conditioning_dim=1, n_layers=2)
+        model = _mk_model(
+            "mlp",
+            domain_dim=domain_dim,
+            conditioning_dim=1,
+            n_layers=2,
+            mlp_always_inject=inject_keys,
+        )
         epochs = 2 if domain_dim == 3 else 4
         batch_size = 256
         lr = 1e-3
     else:
         model = _mk_model("transformer", domain_dim=domain_dim, conditioning_dim=1)
+        if inject_keys:
+            pytest.skip("Transformer with inject_keys not supported")
         epochs = 2
         batch_size = 256
         lr = 1e-3
@@ -4448,8 +4645,17 @@ def test_spherical_ot_field_antipodal_direction_tangent_and_nonzero():
             assert jnp.linalg.norm(v) > 1e-6
 
 
+@pytest.mark.parametrize(
+    "inject_keys",
+    [
+        frozenset(),
+        frozenset({"x"}),
+        frozenset({"t"}),
+        frozenset({"x", "t"}),
+    ],
+)
 @pytest.mark.parametrize("model_kind", ["mlp", "transformer"])
-def test_train_hemisphere_density(model_kind):
+def test_train_hemisphere_density(model_kind, inject_keys):
     """
     Train on points uniformly sampled from the northern hemisphere, then verify:
     - log density on the northern hemisphere ≈ log(2) + uniform sphere log density
@@ -4459,12 +4665,20 @@ def test_train_hemisphere_density(model_kind):
     """
     domain_dim = 3
     if model_kind == "mlp":
-        model = _mk_model("mlp", domain_dim=domain_dim, n_layers=6, d_model=512)
+        model = _mk_model(
+            "mlp",
+            domain_dim=domain_dim,
+            n_layers=6,
+            d_model=512,
+            mlp_always_inject=inject_keys,
+        )
         lr = 1e-3
     else:
         model = _mk_model("transformer", domain_dim=domain_dim, n_learned_tokens=14)
+        if inject_keys:
+            pytest.skip("Transformer with inject_keys not supported")
         lr = 3e-3
-    epochs = 8
+    epochs = 16
 
     # Hemisphere definition: center at north pole, half-angle π/2 ⇒ d_max = 1.0
     table = LogitsTable(domain_dim - 1, 8192)
@@ -4578,3 +4792,50 @@ def test_train_hemisphere_density(model_kind):
     assert (
         too_high / n_test < 0.05
     ), f"{too_high} south-hemisphere points have log prob >= threshold"
+
+
+@pytest.mark.parametrize(
+    "inject_keys",
+    [
+        frozenset(),
+        frozenset({"x"}),
+        frozenset({"t"}),
+        frozenset({"x", "t"}),
+        frozenset({"x", "t", "cond"}),
+    ],
+)
+def test_vector_field_mlp_always_inject_forward(inject_keys):
+    """Sanity-check forward shapes with various per-block injection configurations."""
+    rng = jax.random.PRNGKey(0)
+
+    domain_dim = 8
+    conditioning_dim = 4
+    time_dim = 16
+
+    model = VectorField(
+        activations_dtype=jnp.float32,
+        weights_dtype=jnp.float32,
+        domain_dim=domain_dim,
+        conditioning_dim=conditioning_dim,
+        time_dim=time_dim,
+        reference_directions=16,
+        n_layers=2,
+        d_model=64,
+        mlp_expansion_factor=2,
+        mlp_dropout_rate=None,
+        input_dropout_rate=None,
+        use_pre_mlp_projection=False,
+        mlp_always_inject=inject_keys,
+    )
+
+    batch_size = 7
+    x = sample_sphere(jax.random.PRNGKey(1), batch_size, domain_dim)
+    t = jax.random.uniform(jax.random.PRNGKey(2), (batch_size,))
+    cond_vec = jax.random.normal(jax.random.PRNGKey(3), (batch_size, conditioning_dim))
+
+    params = model.init(rng, *model.dummy_inputs())
+    out = model.apply(params, x, t, cond_vec)
+
+    assert out.shape == (batch_size, domain_dim)
+    dots = jnp.sum(out * x, axis=1)
+    assert jnp.all(jnp.abs(dots) < 1e-5)
