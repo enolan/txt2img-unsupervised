@@ -4678,6 +4678,7 @@ def test_train_hemisphere_density(model_kind, inject_keys):
             n_layers=6,
             d_model=512,
             mlp_always_inject=inject_keys,
+            time_dim=None,
         )
         lr = 1e-3
     else:
