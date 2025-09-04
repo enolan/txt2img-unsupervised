@@ -594,7 +594,7 @@ class VectorField(nn.Module):
       similarities with n randomly selected reference directions. Note that in order for this
       to capture all the information reference_directions must be at least domain_dim. If
       it is None, pass it through unmodified.
-    * Encode the time parameter with a sinusoidal encoding of time_dim components.
+    * Encode the time parameter: sinusoidal encoding if time_dim specified, scalar if None.
     * Pass the conditioning vector through unmodified. It should have mean 0 and variance 1.
     * Concatenate the above into a single vector.
     * If use_pre_mlp_projection is true, apply a linear layer to the concatenated vector to create a
@@ -602,7 +602,7 @@ class VectorField(nn.Module):
     * If use_pre_mlp_projection is false:
       * The following must sum to less than or equal to d_model:
         * reference_directions if it is not None, otherwise domain_dim
-        * time_dim
+        * time_dim if it is not None, otherwise 1 (for scalar encoding)
         * conditioning_dim
       * If they're less, pad the vector with zeros.
     * If use_pre_mlp_projection is false, add a learnable bias to the vector.
@@ -619,8 +619,8 @@ class VectorField(nn.Module):
     reference_directions: Optional[int]
     # Dimension of the conditioning vector. Can be zero for unconditioned models.
     conditioning_dim: int
-    # Dimension of the time encoding. Must be even.
-    time_dim: int
+    # Dimension of the time encoding. Must be even if specified. If None, uses scalar encoding.
+    time_dim: Optional[int]
     # If true, multiply the inputs by a learnable matrix
     use_pre_mlp_projection: bool
     # Number of MLP blocks
@@ -658,7 +658,8 @@ class VectorField(nn.Module):
 
     @property
     def total_input_dim(self) -> int:
-        return self.input_feature_dim + self.conditioning_dim + self.time_dim
+        time_dim = 1 if self.time_dim is None else self.time_dim
+        return self.input_feature_dim + self.conditioning_dim + time_dim
 
     @property
     def initial_total_input_dim(self) -> int:
@@ -670,7 +671,7 @@ class VectorField(nn.Module):
         if "x" not in self.mlp_always_inject:
             dim += self.input_feature_dim
         if "t" not in self.mlp_always_inject:
-            dim += self.time_dim
+            dim += 1 if self.time_dim is None else self.time_dim
         if "cond" not in self.mlp_always_inject:
             dim += self.conditioning_dim
         return dim
@@ -803,7 +804,7 @@ class VectorField(nn.Module):
                 f"initial_total_input_dim ({self.initial_total_input_dim}) "
                 f"exceeds d_model ({self.d_model}). Reduce one or more of them or increase d_model."
             )
-        if self.time_dim % 2 != 0:
+        if self.time_dim is not None and self.time_dim % 2 != 0:
             raise ValueError("Time dimension must be even")
 
         if self.use_pre_mlp_projection:
@@ -880,8 +881,11 @@ class VectorField(nn.Module):
             )
 
     def time_encoding(self, t):
-        "Create a sinusoidal encoding for the time parameter with configurable dimension."
-        return sinusoidal_scalar_encoding(t, self.time_dim)
+        """Create encoding for the time parameter: sinusoidal if time_dim specified, scalar if None."""
+        if self.time_dim is not None:
+            return sinusoidal_scalar_encoding(t, self.time_dim)
+        else:
+            return jnp.array([(t - 0.5) * jnp.sqrt(12.0)])
 
     def process_inputs(self, x, t, cond_vec):
         """
@@ -915,7 +919,8 @@ class VectorField(nn.Module):
             assert input_features.shape == (batch_size, self.domain_dim)
 
         time_encoding = jax.vmap(self.time_encoding)(t)
-        assert time_encoding.shape == (batch_size, self.time_dim)
+        expected_time_dim = 1 if self.time_dim is None else self.time_dim
+        assert time_encoding.shape == (batch_size, expected_time_dim)
 
         # Build initial input from non-injected components
         components = []
@@ -1044,7 +1049,7 @@ class VectorField(nn.Module):
         return tangent_outputs
 
 
-@pytest.mark.parametrize("time_dim", [4, 16, 64])
+@pytest.mark.parametrize("time_dim", [4, 16, 64, None])
 def test_vector_field_time_encoding_statistics(time_dim):
     """
     Test that the time encoding function produces vectors with appropriate statistical properties
@@ -1081,7 +1086,8 @@ def test_vector_field_time_encoding_statistics(time_dim):
     compute_encoding = lambda t: model.apply(params, t, method=model.time_encoding)
     encoded_times = jax.vmap(compute_encoding)(times)
 
-    assert encoded_times.shape == (n_samples, time_dim)
+    expected_time_dim = 1 if time_dim is None else time_dim
+    assert encoded_times.shape == (n_samples, expected_time_dim)
 
     # Check statistics
     means = jnp.mean(encoded_times, axis=0)
