@@ -4097,9 +4097,10 @@ def _generate_cap_constrained_samples_mcmc(
     def mcmc_step(state, step_rng):
         """Single MCMC step for all chains."""
         positions, log_probs = state
+        proposals_rng, accept_rng = jax.random.split(step_rng, 2)
 
         proposals = _mk_geodesic_proposals_reflected(
-            step_rng,
+            proposals_rng,
             positions,
             mcmc_params.step_scale * jnp.arccos(1 - cap_d_max),
             cap_center,
@@ -4124,7 +4125,7 @@ def _generate_cap_constrained_samples_mcmc(
         # Metropolis-Hastings acceptance
         log_accept_probs = jnp.minimum(0.0, proposal_log_probs - log_probs)
         accept_flags = (
-            jnp.log(jax.random.uniform(step_rng, (mcmc_params.n_chains,)))
+            jnp.log(jax.random.uniform(accept_rng, (mcmc_params.n_chains,)))
             < log_accept_probs
         )
 

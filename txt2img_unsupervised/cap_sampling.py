@@ -394,7 +394,8 @@ def sample_cap(
 
     # sample d_max
     weights, range_starts, range_ends = process_d_max_dist(d_max_dist)
-    component_idx = jax.random.categorical(d_max_rng, jnp.log(weights))
+    component_rng, d_max_rng = jax.random.split(d_max_rng, 2)
+    component_idx = jax.random.categorical(component_rng, jnp.log(weights))
     d_max = jax.random.uniform(
         d_max_rng, minval=range_starts[component_idx], maxval=range_ends[component_idx]
     )
