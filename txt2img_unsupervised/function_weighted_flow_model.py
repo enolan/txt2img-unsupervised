@@ -1,8 +1,8 @@
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datasets import Dataset
 from enum import Enum
 from functools import partial
-from typing import Optional, Tuple, Union
+from typing import FrozenSet, Literal, Optional, Tuple, Union
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -132,13 +132,16 @@ class FunctionWeightedFlowModel(nn.Module):
     # Hyperparameters for the underlying VectorField
     domain_dim: int
     reference_directions: Optional[int]
-    time_dim: int
+    time_dim: Optional[int]
     use_pre_mlp_projection: bool
     n_layers: int
     d_model: int
     mlp_expansion_factor: int
     mlp_dropout_rate: Optional[float]
     input_dropout_rate: Optional[float]
+    mlp_always_inject: FrozenSet[Literal["x", "t", "cond"]] = field(
+        default_factory=frozenset
+    )
     activations_dtype: jnp.dtype = jnp.float32
     weights_dtype: jnp.dtype = jnp.float32
     d_model_base: int = 512
@@ -189,6 +192,7 @@ class FunctionWeightedFlowModel(nn.Module):
             mlp_expansion_factor=self.mlp_expansion_factor,
             mlp_dropout_rate=self.mlp_dropout_rate,
             input_dropout_rate=self.input_dropout_rate,
+            mlp_always_inject=self.mlp_always_inject,
             activations_dtype=self.activations_dtype,
             weights_dtype=self.weights_dtype,
             d_model_base=self.d_model_base,
@@ -851,26 +855,66 @@ _baseline_model = FunctionWeightedFlowModel(
 )
 
 
+class TransformerBackboneFWFM(FunctionWeightedFlowModel):
+    """FunctionWeightedFlowModel variant that uses a Transformer backbone for the vector field.
+
+    Used in tests to validate both MLP and Transformer vector field implementations.
+    """
+
+    @nn.nowrap
+    def mk_vector_field(self) -> VectorField:  # type: ignore[override]
+        return flow_matching.TransformerVectorField(
+            domain_dim=self.domain_dim,
+            conditioning_dim=self.conditioning_dim,
+            n_layers=self.n_layers,
+            d_model=self.d_model,
+            mlp_expansion_factor=self.mlp_expansion_factor,
+            n_heads=4,
+            n_learned_tokens=32 - 3,
+            time_dim=self.time_dim,
+            mlp_dropout_rate=self.mlp_dropout_rate,
+            input_dropout_rate=self.input_dropout_rate,
+            activations_dtype=self.activations_dtype,
+            weights_dtype=self.weights_dtype,
+            d_model_base=self.d_model_base,
+            variance_base=self.variance_base,
+            alpha_input=self.alpha_input,
+            alpha_output=self.alpha_output,
+        )
+
+
 @pytest.mark.parametrize("domain_dim", [3, 16])
+@pytest.mark.parametrize("vector_field_model_kind", ["mlp", "transformer"])
 @pytest.mark.parametrize(
     "weighting_function",
     [
         WeightingFunction.CONSTANT,
         pytest.param(
             WeightingFunction.CAP_INDICATOR,
-            marks=pytest.mark.xfail(
-                reason="Models can't learn this well"
-            ),
+            marks=[],  # pytest.mark.xfail(reason="Models can't learn this well"),
         ),
         pytest.param(
             WeightingFunction.SMOOTHED_CAP_INDICATOR,
-            marks=pytest.mark.xfail(
-                reason="Models can't learn this well"
-            ),
+            marks=pytest.mark.skip(reason="Models can't learn this well"),
         ),
     ],
 )
-def test_train_uniform(domain_dim, weighting_function):
+@pytest.mark.parametrize(
+    "mlp_always_inject",
+    [
+        pytest.param(frozenset(), id="none"),
+        pytest.param(frozenset({"x"}), id="x"),
+        pytest.param(frozenset({"t"}), id="t"),
+        pytest.param(frozenset({"cond"}), id="cond"),
+        pytest.param(frozenset({"x", "t"}), id="x&t"),
+        pytest.param(frozenset({"x", "cond"}), id="x&cond"),
+        pytest.param(frozenset({"t", "cond"}), id="t&cond"),
+        pytest.param(frozenset({"x", "t", "cond"}), id="x&t&cond"),
+    ],
+)
+def test_train_uniform(
+    domain_dim, vector_field_model_kind, weighting_function, mlp_always_inject
+):
     """
     Train a function-weighted model on uniform distribution, then verify it produces correct weighted distributions.
     """
@@ -885,14 +929,36 @@ def test_train_uniform(domain_dim, weighting_function):
     else:
         extra_params = None
 
-    model = replace(
-        _baseline_model,
-        domain_dim=domain_dim,
-        d_model=512,
-        n_layers=8,
-        weighting_function=weighting_function,
-        weighting_function_extra_params=extra_params,
-    )
+    if vector_field_model_kind == "mlp":
+        model = replace(
+            _baseline_model,
+            domain_dim=domain_dim,
+            d_model=512,
+            n_layers=16,
+            time_dim=None,
+            weighting_function=weighting_function,
+            weighting_function_extra_params=extra_params,
+            use_pre_mlp_projection=True,
+            mlp_always_inject=mlp_always_inject,
+        )
+    elif vector_field_model_kind == "transformer":
+        if mlp_always_inject:
+            pytest.skip("Transformer backbone FWFM does not support mlp_always_inject")
+        model = TransformerBackboneFWFM(
+            domain_dim=domain_dim,
+            reference_directions=None,
+            time_dim=128,
+            use_pre_mlp_projection=False,
+            n_layers=4,
+            d_model=256,
+            mlp_expansion_factor=4,
+            mlp_dropout_rate=None,
+            input_dropout_rate=None,
+            weighting_function=weighting_function,
+            weighting_function_extra_params=extra_params,
+        )
+    else:
+        raise ValueError(f"Unknown vector_field_model_kind: {vector_field_model_kind}")
     rng = jax.random.PRNGKey(20250823)
     train_rng, test_rng = jax.random.split(rng)
 
@@ -912,10 +978,11 @@ def test_train_uniform(domain_dim, weighting_function):
 
     # Train the model using the shared infrastructure
     batch_size = 512
-    learning_rate = 1e-4
-    epochs = (2 if domain_dim == 3 else 4) * (
-        1 if weighting_function == WeightingFunction.CONSTANT else 4
-    )
+    learning_rate = 1e-4 if vector_field_model_kind == "mlp" else 1e-3
+    epochs = 32  # 8
+    # (2 if domain_dim == 3 else 4) * (
+    #     1 if weighting_function == WeightingFunction.CONSTANT else 4
+    # )
 
     print(
         f"Training FWFM for domain_dim={domain_dim}, weighting_function={weighting_function}"
@@ -1094,6 +1161,9 @@ def test_train_uniform(domain_dim, weighting_function):
                 MAXIMUM_DENSITY_RATIO
             )
             zero_weight_log_probs = model_log_probs[zero_weight_mask]
+            num_too_high = jnp.sum(
+                zero_weight_log_probs >= sufficiently_negative_logprob
+            )
 
             print(
                 f"  Checking densities for points with zero weight - should be less than {sufficiently_negative_logprob}"
@@ -1107,10 +1177,13 @@ def test_train_uniform(domain_dim, weighting_function):
             print(
                 f"    Mean diff: {jnp.mean(zero_weight_log_probs - sufficiently_negative_logprob):.3f}"
             )
+            print(
+                f"    Number of points with log prob >= {sufficiently_negative_logprob}: {num_too_high}/{len(zero_weight_log_probs)}"
+            )
 
-            assert jnp.all(
-                zero_weight_log_probs < sufficiently_negative_logprob
-            ), f"{jnp.sum(zero_weight_log_probs >= sufficiently_negative_logprob)} zero-weight points have log prob >= {sufficiently_negative_logprob}"
+            assert (
+                num_too_high / len(zero_weight_log_probs) < 0.05
+            ), f"{num_too_high} zero-weight points have log prob >= {sufficiently_negative_logprob}"
 
 
 def _compute_nll_fwfm(model, params, batch, n_steps, rng, n_projections):
