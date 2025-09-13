@@ -533,6 +533,10 @@ class TransformerVectorField(nn.Module):
                 params_map["in_proj_cond"] = dense
             return {"params": params_map}
 
+    def sample_base_distribution(self, conditioning_data, batch_size):
+        "Sample base distribution x0 for training."
+        return sample_sphere(self.make_rng("sample_base"), batch_size, self.domain_dim)
+
     def __call__(self, x, t, cond_vec):
         batch_size = x.shape[0]
         assert x.shape == (batch_size, self.domain_dim)
@@ -995,6 +999,10 @@ class VectorField(nn.Module):
             batch_size = batch["point_vec"].shape[0]
             return jnp.zeros((batch_size, 0))
 
+    def sample_base_distribution(self, conditioning_data, batch_size):
+        "Sample base distribution x0 for training."
+        return sample_sphere(self.make_rng("sample_base"), batch_size, self.domain_dim)
+
     def __call__(self, x, t, cond_vec):
         batch_size = x.shape[0]
         assert x.shape == (batch_size, self.domain_dim)
@@ -1317,7 +1325,21 @@ def slerp(x, y, t):
     )
 
 
-def spherical_ot_field(x0, x1, t):
+def _default_antipodal_dir_fn(
+    point: jax.Array, _extra: Optional[jax.Array] = None
+) -> jax.Array:
+    return get_consistent_tangent_direction(point)
+
+
+def spherical_ot_field(
+    x0,
+    x1,
+    t,
+    antipodal_dir_fn: Callable[
+        [jax.Array, Optional[jax.Array]], jax.Array
+    ] = _default_antipodal_dir_fn,
+    antipodal_dir_extra: Optional[jax.Array] = None,
+):
     """
     Special fancy spherical version of the OT field. Compute a tangent vector field on the sphere
     that generates geodesics on the sphere rather than straight lines. Based on vMF distributions
@@ -1327,7 +1349,10 @@ def spherical_ot_field(x0, x1, t):
         x0: Starting point on the sphere [dim]
         x1: Target point on the sphere [dim]
         t: Time parameter in [0, 1]
-
+        antipodal_dir_fn: Function to compute a direction in the tangent space of x0 when x0 and x1
+          are antipodal. In that case all possible geodesics have equal length, so we need to pick
+          one consistently. Default is to pick a choice of direction that is arbitrary.
+        antipodal_dir_extra: Extra information for the antipodal_dir_fn.
     Returns:
         Tuple of (x, field_value) where:
         - x: Current point on the sphere computed from x0, x1, t
@@ -1338,7 +1363,13 @@ def spherical_ot_field(x0, x1, t):
     assert t.shape == ()
 
     # Compute the current point by flowing x0 toward x1 for time t
-    x = compute_psi_t_spherical(x0, x1, t)
+    x = compute_psi_t_spherical(
+        x0,
+        x1,
+        t,
+        antipodal_dir_fn=antipodal_dir_fn,
+        antipodal_dir_extra=antipodal_dir_extra,
+    )
 
     # Compute the angle between x0 and x1, which determines the speed
     cos_angle = jnp.clip(jnp.dot(x0, x1), -1.0, 1.0)
@@ -1358,7 +1389,7 @@ def spherical_ot_field(x0, x1, t):
     field_value = jax.lax.cond(
         cos_angle < -1.0 + 1e-6,
         # If points are opposite/almost opposite, pick an orthogonal vector
-        lambda: get_consistent_tangent_direction(x) * angle,
+        lambda: angle * antipodal_dir_fn(x, antipodal_dir_extra),
         handle_general_case,
     )
 
@@ -1394,25 +1425,23 @@ def get_consistent_tangent_direction(x):
     ref2_tan = ref2 - jnp.dot(ref2, x) * x
     ref2_norm = jnp.linalg.norm(ref2_tan)
 
-    # Final fallback: permute coordinates
-    permuted_x = jnp.roll(x, 1)
-    fallback_tan = permuted_x - jnp.dot(permuted_x, x) * x
-    # Since x and its rolled version cannot be parallel for dim >= 2,
-    # this is safe to normalize
-    fallback_norm = jnp.linalg.norm(fallback_tan)
-
     # Use the first direction with a sufficiently large tangent norm.
-    ref1_fallback = jax.lax.cond(
-        ref2_norm > 1e-8,
-        lambda: ref2_tan / ref2_norm,
-        lambda: fallback_tan / fallback_norm,
-    )
     return jax.lax.cond(
-        ref1_norm > 1e-8, lambda: ref1_tan / ref1_norm, lambda: ref1_fallback
+        ref1_norm > 1e-8,
+        lambda: ref1_tan / ref1_norm,
+        lambda: ref2_tan / ref2_norm,
     )
 
 
-def compute_psi_t_spherical(x0, x1, t):
+def compute_psi_t_spherical(
+    x0,
+    x1,
+    t,
+    antipodal_dir_fn: Callable[
+        [jax.Array, Optional[jax.Array]], jax.Array
+    ] = _default_antipodal_dir_fn,
+    antipodal_dir_extra: Optional[jax.Array] = None,
+):
     """
     Compute the flow map for the spherical OT field.
     In the general case this is just a spherical linear interpolation, but we're careful with the
@@ -1422,6 +1451,10 @@ def compute_psi_t_spherical(x0, x1, t):
         x0: Starting point on the sphere [dim]
         x1: Target point on the sphere [dim]
         t: Time parameter in [0, 1]
+        antipodal_dir_fn: Function to compute a direction in the tangent space of x0 when x0 and x1
+          are antipodal. In that case all possible geodesics have equal length, so we need to pick
+          one consistently. Default is to pick a choice of direction that is arbitrary.
+        antipodal_dir_extra: Extra information for the antipodal_dir_fn.
 
     Returns:
         Point on the sphere resulting from flowing along the vector field
@@ -1440,7 +1473,7 @@ def compute_psi_t_spherical(x0, x1, t):
         )
 
     def handle_antipodal():
-        tangent_dir = get_consistent_tangent_direction(x0)
+        tangent_dir = antipodal_dir_fn(x0, antipodal_dir_extra)
 
         # Create a point that's 90 degrees away from x0 in the tangent direction
         # This is a point on the great circle connecting x0 and -x0 via the tangent direction
@@ -1475,6 +1508,9 @@ def conditional_flow_matching_loss(
     conditioning_data,
     rng=None,
     capture_intermediates=False,
+    antipodal_dir_fn: Callable[
+        [jax.Array, jax.Array], jax.Array
+    ] = _default_antipodal_dir_fn,
 ):
     """
     Compute the Conditional Flow Matching loss from eq. 9 in the paper, modified for the spherical
@@ -1488,6 +1524,10 @@ def conditional_flow_matching_loss(
         t: Time parameters (batched) in [0, 1] [batch_size]
         conditioning_data: Conditioning data for the model (format model-specific)
         rng: JAX random key (required if model uses dropout)
+        antipodal_dir_fn: Function to compute a direction in the tangent space of x0 when x0 and x1
+          are antipodal. In that case all possible geodesics have equal length, so we need to pick
+          one consistently. Default is to pick a choice of direction that is arbitrary. Parameter
+          is conditioning_data.
 
     Returns:
         CFM loss value (scalar)
@@ -1503,7 +1543,15 @@ def conditional_flow_matching_loss(
         assert rng is not None, "rng is required for models with dropout"
 
     # Compute target vector field (ground truth OT field) and current positions
-    psi_ts, target_fields = jax.vmap(spherical_ot_field, in_axes=(0, 0, 0))(x0, x1, t)
+    psi_ts, target_fields = jax.vmap(
+        lambda x0, x1, t: spherical_ot_field(
+            x0,
+            x1,
+            t,
+            antipodal_dir_fn=antipodal_dir_fn,
+            antipodal_dir_extra=conditioning_data,
+        )
+    )(x0, x1, t)
     assert psi_ts.shape == x0.shape
     assert target_fields.shape == x0.shape
 
@@ -1579,8 +1627,21 @@ def sample_sphere(rng, batch_size, dim):
     return normal_samples / jnp.linalg.norm(normal_samples, axis=1, keepdims=True)
 
 
-@partial(jax.jit, inline=True, static_argnames=("model", "capture_intermediates"))
-def compute_batch_loss(model, params, batch, rng, capture_intermediates=False):
+@partial(
+    jax.jit,
+    inline=True,
+    static_argnames=("model", "capture_intermediates", "antipodal_dir_fn"),
+)
+def compute_batch_loss(
+    model,
+    params,
+    batch,
+    rng,
+    capture_intermediates=False,
+    antipodal_dir_fn: Callable[
+        [jax.Array, Optional[jax.Array]], jax.Array
+    ] = _default_antipodal_dir_fn,
+):
     """
     Compute the loss for a batch of data using conditional flow matching.
 
@@ -1609,7 +1670,14 @@ def compute_batch_loss(model, params, batch, rng, capture_intermediates=False):
         rngs={"sample_weighting_params": conditioning_rng},
     )
 
-    x0_batch = sample_sphere(noise_rng, batch_size, model.domain_dim)
+    # Let the model sample its base distribution for training (default: uniform sphere).
+    x0_batch = model.apply(
+        params,
+        conditioning_data,
+        batch_size,
+        method=model.sample_base_distribution,
+        rngs={"sample_base": noise_rng},
+    )
     t = jax.random.uniform(time_rng, (batch_size,))
 
     return conditional_flow_matching_loss(
@@ -1621,6 +1689,7 @@ def compute_batch_loss(model, params, batch, rng, capture_intermediates=False):
         conditioning_data,
         rng=rng,
         capture_intermediates=capture_intermediates,
+        antipodal_dir_fn=antipodal_dir_fn,
     )
 
 
@@ -1755,7 +1824,8 @@ def _train_loop_for_tests_generic(
 
             # Evaluate on test dataset if provided
             if test_dataset is not None:
-                test_rng, step_rng = jax.random.split(step_rng)
+                # Fixed seed so we test the same x0/t/cap across different epochs.
+                test_rng = jax.random.PRNGKey(20250911)
                 test_losses = []
                 test_nlls = []
 
@@ -2612,6 +2682,7 @@ def generate_samples_inner(
     vector_field_fn_fixed_params,
     vector_field_fn_per_sample_params,
     domain_dim,
+    initial_x0: Optional[jax.Array] = None,
 ):
     """
     Generate samples from a flow matching model by solving the ODE, generic over the method of
@@ -2635,9 +2706,14 @@ def generate_samples_inner(
     Returns:
         Generated samples [batch_size, dim]
     """
-    x0_rng, *dropout_rngs = jax.random.split(rng, num=n_steps + 1)
-    # Sample initial points uniformly from the sphere
-    x0 = sample_sphere(x0_rng, batch_size, domain_dim)
+    if initial_x0 is None:
+        x0_rng, *dropout_rngs = jax.random.split(rng, num=n_steps + 1)
+        # Sample initial points uniformly from the sphere
+        x0 = sample_sphere(x0_rng, batch_size, domain_dim)
+    else:
+        assert initial_x0.shape == (batch_size, domain_dim)
+        x0 = initial_x0
+        dropout_rngs = jax.random.split(rng, num=n_steps)
 
     # Solve ODE
     dt = 1.0 / n_steps
@@ -3033,7 +3109,10 @@ def compute_log_probability(
     assert samples.shape == (batch_size, model.domain_dim)
     assert cond_vecs.shape == (batch_size, model.conditioning_dim)
 
-    return compute_log_probability_inner(
+    if rng is None:
+        rng = jax.random.PRNGKey(0)
+
+    x0, div_sum = reverse_path_and_compute_divergence(
         _compute_vector_field_for_sampling,
         model,
         params,
@@ -3043,63 +3122,9 @@ def compute_log_probability(
         rng,
         n_projections,
     )
-
-
-def compute_log_probability_inner(
-    vector_field_fn,
-    vector_field_fn_fixed_static_params,
-    vector_field_fn_fixed_params,
-    vector_field_fn_per_sample_params,
-    samples,
-    n_steps=100,
-    rng=None,
-    n_projections=10,
-):
-    """
-    Compute the log probability of samples under a flow-matching model, generic over the method of
-    computing the vector field.
-
-    Args:
-        vector_field_fn: Vector field function
-        vector_field_fn_fixed_static_params: Parameters to pass to vector_field_fn that are constant
-            across all samples and may be marked static to jax.jit. (separate parameter so
-            static_argnums will work.)
-        vector_field_fn_fixed_params: Parameters to pass to vector_field_fn that are constant across
-            all samples
-        vector_field_fn_per_sample_params: PyTree of per-sample parameters with leading dim
-            batch_size.
-        samples: Points on the sphere to evaluate [batch_size, dim]
-        n_steps: Number of integration steps
-        rng: JAX random key for stochastic estimation (if None, uses deterministic keys)
-        n_projections: Number of random projections to use for divergence estimation
-
-    Returns:
-        Log probabilities of the samples [batch_size]
-    """
-    batch_size = samples.shape[0]
-    domain_dim = samples.shape[1]
-    if rng is None:
-        rng = jax.random.PRNGKey(0)
-
-    # Normalize samples to ensure they're on the unit sphere
-    samples = samples / jnp.linalg.norm(samples, axis=1, keepdims=True)
-
-    div_sum = _reverse_path_and_compute_divergence(
-        vector_field_fn,
-        vector_field_fn_fixed_static_params,
-        vector_field_fn_fixed_params,
-        vector_field_fn_per_sample_params,
-        samples,
-        n_steps=n_steps,
-        rng=rng,
-        n_projections=n_projections,
-    )
-    assert div_sum.shape == (batch_size,)
-
-    # Density of the base distribution (uniform on unit sphere)
-    log_p0 = sphere_log_inverse_surface_area(domain_dim)
-    log_p1 = log_p0 - div_sum
-    return log_p1
+    # Uniform-on-sphere base density
+    log_p0 = sphere_log_inverse_surface_area(model.domain_dim)
+    return log_p0 - div_sum
 
 
 # Used only for test below. It's important that this hashes to different values depending on the

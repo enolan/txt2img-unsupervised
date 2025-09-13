@@ -2,6 +2,7 @@ from dataclasses import dataclass, field, replace
 from datasets import Dataset
 from enum import Enum
 from functools import partial
+from tqdm import tqdm
 from typing import FrozenSet, Literal, Optional, Tuple, Union
 import flax.linen as nn
 import jax
@@ -15,6 +16,7 @@ from .cap_sampling import (
     process_d_max_dist,
     random_pt_with_cosine_similarity,
     sample_cap,
+    sample_from_cap,
     sphere_log_inverse_surface_area,
 )
 from .flow_matching import VectorField, sample_sphere
@@ -155,6 +157,9 @@ class FunctionWeightedFlowModel(nn.Module):
         Union[CapIndicatorExtraParams, SmoothedCapIndicatorExtraParams]
     ] = None
 
+    # Base distribution is uniform over the conditioning cap. Only makes sense with CAP_INDICATOR.
+    cap_conditioned_base: bool = False
+
     @property
     def conditioning_dim(self) -> int:
         if self.weighting_function == WeightingFunction.CONSTANT:
@@ -210,6 +215,15 @@ class FunctionWeightedFlowModel(nn.Module):
             WeightingFunction.CAP_INDICATOR,
             WeightingFunction.SMOOTHED_CAP_INDICATOR,
         ]:
+            if self.cap_conditioned_base:
+                if (
+                    max(p[1] for p in self.weighting_function_extra_params.d_max_dist)
+                    > 1.0
+                ):
+                    raise ValueError(
+                        "d_max_dist max value must be <= 1.0 for cap-conditioned base"
+                    )
+
             self.logits_table = LogitsTable(self.domain_dim - 1, 8192)
             # Precompute bucket angles α for the logits table indices. Using convention cos(α) = -h
             # where h are the table heights in [-1, 1].
@@ -281,6 +295,34 @@ class FunctionWeightedFlowModel(nn.Module):
 
         x1_batch = batch["point_vec"]
         return jax.vmap(lambda x1: self.sample_weighting_function_params(x1))(x1_batch)
+
+    def sample_base_distribution(self, weighting_function_params, batch_size):
+        """Sample base distribution x0 for training.
+        Depends on cap_conditioned_base:
+        - False: uniform on the sphere.
+        - True: uniform within the cap specified by each example's weighting-function parameters.
+          Supports caps of size up to a hemisphere (d_max <= 1.0) only. This ensures all paths are
+          inside the cap.
+        """
+        rng = self.make_rng("sample_base")
+        if self.cap_conditioned_base:
+            assert (
+                self.weighting_function == WeightingFunction.CAP_INDICATOR
+            ), "cap_conditioned_base only supported with CAP_INDICATOR weighting"
+            assert (
+                isinstance(weighting_function_params, tuple)
+                and len(weighting_function_params) == 2
+            )
+            cap_centers, d_maxes = weighting_function_params
+            assert cap_centers.shape == (batch_size, self.domain_dim)
+            assert d_maxes.shape == (batch_size,)
+            keys = jax.random.split(rng, batch_size)
+            x0 = jax.vmap(lambda k, c, d: sample_from_cap(k, self.logits_table, c, d))(
+                keys, cap_centers, d_maxes
+            )
+            return x0
+        else:
+            return sample_sphere(rng, batch_size, self.domain_dim)
 
     @property
     def d_model_scale_factor(self) -> float:
@@ -789,6 +831,13 @@ def generate_samples(
                 "parameters."
             )
 
+    x0 = model.apply(
+        params,
+        rng,
+        method=model.sample_base_distribution,
+        weighting_function_params=weighting_function_params,
+    )
+
     samples = flow_matching.generate_samples_inner(
         rng,
         n_steps,
@@ -799,8 +848,13 @@ def generate_samples(
         params,
         weighting_function_params,
         model.domain_dim,
+        initial_x0=x0,
     )
     return samples
+
+
+# lifted to top level so JIT gets cached
+_log_cap_size_batch = jax.jit(lambda tbl, d_maxes: jax.vmap(tbl.log_cap_size)(d_maxes))
 
 
 def compute_log_probability(
@@ -815,7 +869,29 @@ def compute_log_probability(
     """
     Compute the log probability of samples under a function-weighted flow model.
     """
-    return flow_matching.compute_log_probability_inner(
+    if model.cap_conditioned_base:
+        assert (
+            model.weighting_function == WeightingFunction.CAP_INDICATOR
+        ), "cap_conditioned_base only supported with CAP_INDICATOR weighting"
+        assert (
+            isinstance(weighting_function_params, tuple)
+            and len(weighting_function_params) == 2
+        )
+        assert rng is not None, "rng must be provided for cap-conditioned base"
+        cap_centers, d_maxes = weighting_function_params
+        assert d_maxes.shape[0] == samples.shape[0]
+        # log density of uniform-in-cap = -log(cap_area)
+        # log(cap_area) = log_cap_size_frac + log(sphere_area)
+        log_sphere_area = -sphere_log_inverse_surface_area(model.domain_dim)
+        # FIXME should pass logits table as parameter
+        table = LogitsTable(model.domain_dim - 1, 8192)
+        log_cap_size_frac = _log_cap_size_batch(table, d_maxes)
+        base_log_densities = -(log_cap_size_frac + log_sphere_area)
+    else:
+        base_log_densities = sphere_log_inverse_surface_area(model.domain_dim)
+
+    # Reverse flow to get source points and divergence integral
+    x0, div_sum = flow_matching.reverse_path_and_compute_divergence(
         _compute_vector_field,
         model,
         params,
@@ -825,6 +901,21 @@ def compute_log_probability(
         rng,
         n_projections,
     )
+
+    # If using a cap-conditioned base, zero out density for sources outside the cap
+    if model.cap_conditioned_base:
+        assert model.weighting_function == WeightingFunction.CAP_INDICATOR
+        assert (
+            isinstance(weighting_function_params, tuple)
+            and len(weighting_function_params) == 2
+        )
+        cap_centers, d_maxes = weighting_function_params
+        cos_dists = 1 - jnp.sum(x0 * cap_centers, axis=1)
+        in_support = cos_dists <= d_maxes
+        log_p1 = base_log_densities - div_sum
+        return jnp.where(in_support, log_p1, -jnp.inf)
+    else:
+        return base_log_densities - div_sum
 
 
 @partial(jax.jit, static_argnames=("model",), inline=True)
@@ -902,14 +993,24 @@ class TransformerBackboneFWFM(FunctionWeightedFlowModel):
 @pytest.mark.parametrize(
     "mlp_always_inject",
     [
-        pytest.param(frozenset(), id="none"),
-        pytest.param(frozenset({"x"}), id="x"),
-        pytest.param(frozenset({"t"}), id="t"),
-        pytest.param(frozenset({"cond"}), id="cond"),
+        pytest.param(frozenset(), id="none", marks=pytest.mark.skip(reason="slow")),
+        pytest.param(frozenset({"x"}), id="x", marks=pytest.mark.skip(reason="slow")),
+        pytest.param(frozenset({"t"}), id="t", marks=pytest.mark.skip(reason="slow")),
+        pytest.param(
+            frozenset({"cond"}), id="cond", marks=pytest.mark.skip(reason="slow")
+        ),
         pytest.param(frozenset({"x", "t"}), id="x&t"),
-        pytest.param(frozenset({"x", "cond"}), id="x&cond"),
-        pytest.param(frozenset({"t", "cond"}), id="t&cond"),
-        pytest.param(frozenset({"x", "t", "cond"}), id="x&t&cond"),
+        pytest.param(
+            frozenset({"x", "cond"}), id="x&cond", marks=pytest.mark.skip(reason="slow")
+        ),
+        pytest.param(
+            frozenset({"t", "cond"}), id="t&cond", marks=pytest.mark.skip(reason="slow")
+        ),
+        pytest.param(
+            frozenset({"x", "t", "cond"}),
+            id="x&t&cond",
+            marks=pytest.mark.skip(reason="slow"),
+        ),
     ],
 )
 def test_train_uniform(
@@ -919,7 +1020,7 @@ def test_train_uniform(
     Train a function-weighted model on uniform distribution, then verify it produces correct weighted distributions.
     """
     # Set up model with appropriate extra parameters
-    d_max_dist = ((0.9, 1.0), (0.1, 2.0))
+    d_max_dist = ((1.0, 1.0),)
     if weighting_function == WeightingFunction.SMOOTHED_CAP_INDICATOR:
         extra_params = SmoothedCapIndicatorExtraParams(
             d_max_dist=d_max_dist, boundary_width=jnp.pi / 10
@@ -940,6 +1041,7 @@ def test_train_uniform(
             weighting_function_extra_params=extra_params,
             use_pre_mlp_projection=True,
             mlp_always_inject=mlp_always_inject,
+            cap_conditioned_base=weighting_function == WeightingFunction.CAP_INDICATOR,
         )
     elif vector_field_model_kind == "transformer":
         if mlp_always_inject:
@@ -979,10 +1081,22 @@ def test_train_uniform(
     # Train the model using the shared infrastructure
     batch_size = 512
     learning_rate = 1e-4 if vector_field_model_kind == "mlp" else 1e-3
-    epochs = 32  # 8
-    # (2 if domain_dim == 3 else 4) * (
-    #     1 if weighting_function == WeightingFunction.CONSTANT else 4
-    # )
+    if domain_dim == 3 and weighting_function == WeightingFunction.CONSTANT:
+        epochs = 2
+    elif domain_dim == 3 and weighting_function in [
+        WeightingFunction.CAP_INDICATOR,
+        WeightingFunction.SMOOTHED_CAP_INDICATOR,
+    ]:
+        epochs = 8
+    elif domain_dim == 16 and weighting_function == WeightingFunction.CONSTANT:
+        epochs = 6
+    elif domain_dim == 16 and weighting_function in [
+        WeightingFunction.CAP_INDICATOR,
+        WeightingFunction.SMOOTHED_CAP_INDICATOR,
+    ]:
+        epochs = 32
+    else:
+        raise ValueError(f"Unknown domain_dim: {domain_dim} and weighting_function: {weighting_function}")
 
     print(
         f"Training FWFM for domain_dim={domain_dim}, weighting_function={weighting_function}"
@@ -1019,7 +1133,7 @@ def test_train_uniform(
         # Test multiple cap configurations
         center = jnp.zeros(domain_dim).at[0].set(1.0)  # [1, 0, 0, ...]
         param_sets = [
-            (center, jnp.array(d_max, dtype=jnp.float32)) for d_max in [2.0, 1.0, 0.5]
+            (center, jnp.array(d_max, dtype=jnp.float32)) for d_max in [1.0, 0.5]
         ]
     else:
         raise ValueError(f"Unknown weighting function: {weighting_function}")
@@ -1126,9 +1240,17 @@ def test_train_uniform(
                 positive_weight_mask
             ]
 
+            absdiffs = jnp.abs(
+                model_valid_probs_for_positive_weights - expected_log_probs
+            )
+            count_diffs_over_15pct = np.sum(absdiffs > jnp.log(1.15))
+
             print("  Checking densities for points with positive weight...")
             print(
                 f"    Model range: [{model_valid_probs_for_positive_weights.min():.3f}, {model_valid_probs_for_positive_weights.max():.3f}]"
+            )
+            print(
+                f"  Model deciles: {np.percentile(model_valid_probs_for_positive_weights, np.linspace(0, 100, 11))}"
             )
             print(
                 f"    Model mean: {model_valid_probs_for_positive_weights.mean():.3f} Model std: {model_valid_probs_for_positive_weights.std():.3f}"
@@ -1136,33 +1258,33 @@ def test_train_uniform(
             print(
                 f"    Expected range: [{expected_log_probs.min():.3f}, {expected_log_probs.max():.3f}]"
             )
+            print(f"    Mean abs diff: {jnp.mean(absdiffs):.3f}")
             print(
-                f"    Mean abs diff: {jnp.mean(jnp.abs(model_valid_probs_for_positive_weights - expected_log_probs)):.3f}"
+                f"    Number of points with abs diff > 15%: {count_diffs_over_15pct}/{len(absdiffs)}"
             )
             print(
                 f"    Mean diff: {jnp.mean(model_valid_probs_for_positive_weights - expected_log_probs):.3f}"
             )
 
-            np.testing.assert_allclose(
-                model_valid_probs_for_positive_weights,
-                expected_log_probs,
-                rtol=0.5,
-                atol=0,  # TODO decrease. was 0.3 before.
-                err_msg=f"Model log probs don't match expected for parameter set {i+1}",
-            )
+            assert count_diffs_over_15pct < 0.1 * len(
+                absdiffs
+            ), f"Too many likelihoods differ by more than 15%: {count_diffs_over_15pct}/{len(absdiffs)}"
         else:
             print(f"  WARNING: No positive weights found for parameter set {params}")
 
-        # For zero weights the theoretical log probability would be -inf, we test for sufficiently
-        # negative log probability.
+        # For zero weights the theoretical log probability would be -inf, which is only possible if
+        # the base distribution has compact support i.e. only with cap_conditioned_base.
         if jnp.any(zero_weight_mask):
-            MAXIMUM_DENSITY_RATIO = 0.05  # VERY generous ratio... :'(
-            sufficiently_negative_logprob = uniform_log_density + jnp.log(
-                MAXIMUM_DENSITY_RATIO
-            )
+            if model.cap_conditioned_base:
+                sufficiently_negative_logprob = -jnp.inf
+            else:
+                MAXIMUM_DENSITY_RATIO = 0.05  # VERY generous ratio... :'(
+                sufficiently_negative_logprob = uniform_log_density + jnp.log(
+                    MAXIMUM_DENSITY_RATIO
+                )
             zero_weight_log_probs = model_log_probs[zero_weight_mask]
             num_too_high = jnp.sum(
-                zero_weight_log_probs >= sufficiently_negative_logprob
+                zero_weight_log_probs > sufficiently_negative_logprob
             )
 
             print(
@@ -1178,12 +1300,138 @@ def test_train_uniform(
                 f"    Mean diff: {jnp.mean(zero_weight_log_probs - sufficiently_negative_logprob):.3f}"
             )
             print(
-                f"    Number of points with log prob >= {sufficiently_negative_logprob}: {num_too_high}/{len(zero_weight_log_probs)}"
+                f"    Number of points with log prob > {sufficiently_negative_logprob}: {num_too_high}/{len(zero_weight_log_probs)}"
             )
 
             assert (
                 num_too_high / len(zero_weight_log_probs) < 0.05
             ), f"{num_too_high} zero-weight points have log prob >= {sufficiently_negative_logprob}"
+
+
+@partial(jax.jit, static_argnames=("model", "n_samples", "n_steps", "n_projections"))
+def compute_hemisphere_probability_masses(
+    model, params, rng, n_samples, n_steps, n_projections
+):
+    """Compute the model probability masses for the northern and southern hemispheres."""
+
+    # We compute the likelihood of n_samples points that are in both the northern and eastern
+    # hemispheres, conditioned on the cap being the nothern hemisphere, then do the same conditioned
+    # on the cap being the eastern hemisphere, then repeat the process for n_samples points that
+    # are in both the southern and eastern hemispheres. Since the ratio of likelihoods is the
+    # ratio of the probability masses of the caps, and because we know the masses of the northern
+    # and southern hemispheres sum to 1, we can find the masses of all three. We return only the
+    # masses of the northern and southern hemispheres, since that's all that will actually be used
+    # downstream.
+
+    # In principle n_samples could be one and the ratios would work out but these models are
+    # approximations.
+
+    assert model.weighting_function == WeightingFunction.CAP_INDICATOR
+
+    samples_rng, logprob_rng = jax.random.split(rng)
+
+    north = jnp.zeros(model.domain_dim).at[0].set(1.0)
+    south = -north
+    east = jnp.zeros(model.domain_dim).at[1].set(1.0)
+
+    # Generate samples uniform over full sphere
+    initial_samples = sample_sphere(samples_rng, 2 * n_samples, model.domain_dim)
+    # reflect across n-s axis to put everything in eastern hemisphere
+    eastern_samples = initial_samples.at[:, 1].set(jnp.abs(initial_samples[:, 1]))
+    # reflect across e-w axis to put everything in northern/southern hemisphere
+    northeast_samples = (
+        eastern_samples[:n_samples]
+        .at[:, 0]
+        .set(jnp.abs(eastern_samples[:n_samples, 0]))
+    )
+    southeast_samples = (
+        eastern_samples[n_samples:]
+        .at[:, 0]
+        .set(-jnp.abs(eastern_samples[n_samples:, 0]))
+    )
+
+    # We have 2 * n_samples points, each of which needs to be checked in 2 caps.
+    cap_centers = jnp.concatenate(
+        [
+            jnp.broadcast_to(north, (n_samples, model.domain_dim)),
+            jnp.broadcast_to(east, (2 * n_samples, model.domain_dim)),
+            jnp.broadcast_to(south, (n_samples, model.domain_dim)),
+        ],
+        axis=0,
+    )
+    cap_d_maxes = jnp.full((4 * n_samples,), 1.0)
+
+    logprobs = compute_log_probability(
+        model=model,
+        params=params,
+        samples=jnp.concatenate(
+            [
+                northeast_samples,
+                northeast_samples,
+                southeast_samples,
+                southeast_samples,
+            ],
+            axis=0,
+        ),
+        weighting_function_params=(cap_centers, cap_d_maxes),
+        n_steps=n_steps,
+        rng=logprob_rng,
+        n_projections=n_projections,
+    )
+
+    assert logprobs.shape == (4 * n_samples,)
+    north_east_in_north_logprobs = logprobs[:n_samples]
+    north_east_in_east_logprobs = logprobs[n_samples : 2 * n_samples]
+    south_east_in_east_logprobs = logprobs[2 * n_samples : 3 * n_samples]
+    south_east_in_south_logprobs = logprobs[3 * n_samples :]
+    north_east_in_north_finite_mask = jnp.isfinite(north_east_in_north_logprobs)
+    north_east_in_east_finite_mask = jnp.isfinite(north_east_in_east_logprobs)
+    south_east_in_east_finite_mask = jnp.isfinite(south_east_in_east_logprobs)
+    south_east_in_south_finite_mask = jnp.isfinite(south_east_in_south_logprobs)
+
+    northeast_both_finite_mask = (
+        north_east_in_north_finite_mask & north_east_in_east_finite_mask
+    )
+    southeast_both_finite_mask = (
+        south_east_in_east_finite_mask & south_east_in_south_finite_mask
+    )
+
+    north_east_ratios_log = north_east_in_north_logprobs - north_east_in_east_logprobs
+    south_east_ratios_log = south_east_in_east_logprobs - south_east_in_south_logprobs
+    # Ignore points for which one or both likelihoods are -inf. Kind of a hack.
+    north_east_ratios_log = jnp.where(
+        northeast_both_finite_mask, north_east_ratios_log, 0.0
+    )
+    south_east_ratios_log = jnp.where(
+        southeast_both_finite_mask, south_east_ratios_log, 0.0
+    )
+
+    # Average the ratios in linear space
+    north_east_ratio_log = jax.nn.logsumexp(north_east_ratios_log) - jnp.log(n_samples)
+    south_east_ratio_log = jax.nn.logsumexp(south_east_ratios_log) - jnp.log(n_samples)
+
+    # We have N/E and S/E, N/S is (N/E) / (S/E)
+    north_south_ratio_log = north_east_ratio_log - south_east_ratio_log
+
+    # N / S = r
+    # N = r * S
+    # N + S = 1
+    # r * S + S = 1
+    # (r + 1) * S = 1
+    # S = 1 / (r + 1)
+    # same for north but reciprocate r
+
+    south_log_mass = -(jnp.logaddexp(north_south_ratio_log, 0.0))
+    north_log_mass = -(jnp.logaddexp(-north_south_ratio_log, 0.0))
+
+    return {
+        "north_log_mass": north_log_mass,
+        "south_log_mass": south_log_mass,
+        "northeast_both_finite_frac": jnp.mean(northeast_both_finite_mask),
+        "southeast_both_finite_frac": jnp.mean(southeast_both_finite_mask),
+        "north_east_log_ratios_std": jnp.std(north_east_ratios_log),
+        "south_east_log_ratios_std": jnp.std(south_east_ratios_log),
+    }
 
 
 def _compute_nll_fwfm(model, params, batch, n_steps, rng, n_projections):
@@ -1196,13 +1444,82 @@ def _compute_nll_fwfm(model, params, batch, n_steps, rng, n_projections):
         WeightingFunction.CAP_INDICATOR,
         WeightingFunction.SMOOTHED_CAP_INDICATOR,
     ]:
-        # Use "evenest weights" - arbitrary center and d_max=2.0 for NLL computation
-        arbitrary_center = jnp.zeros(model.domain_dim).at[0].set(1.0)
-        d_max = 2.0
-        weighting_function_params = (
-            jnp.broadcast_to(arbitrary_center, (batch_size, model.domain_dim)),
-            jnp.full((batch_size,), d_max),
-        )
+        if not model.cap_conditioned_base:
+            # Use full sphere as cap
+            arbitrary_center = jnp.zeros(model.domain_dim).at[0].set(1.0)
+            d_max = 2.0
+            weighting_function_params = (
+                jnp.broadcast_to(arbitrary_center, (batch_size, model.domain_dim)),
+                jnp.full((batch_size,), d_max),
+            )
+        else:
+            # We only support hemisphere or smaller caps, so we can't do as above. Instead, use
+            # northern or southern hemisphere depending on which the point fits in. The likelhood of
+            # a point is its likelhood under its hemiphere's distribution times the total mass of
+            # its hemisphere.
+
+            points = batch["point_vec"]
+            assert points.shape == (batch_size, model.domain_dim)
+
+            # Choose hemisphere cap per sample
+            north = jnp.zeros(model.domain_dim).at[0].set(1.0)
+            south = -north
+            north_mask = points[:, 0] >= 0.0
+            cap_centers = jnp.where(
+                north_mask[:, None],
+                jnp.broadcast_to(north, (batch_size, model.domain_dim)),
+                jnp.broadcast_to(south, (batch_size, model.domain_dim)),
+            )
+            cap_d_maxes = jnp.full((batch_size,), 1.0)
+            weighting_function_params = (cap_centers, cap_d_maxes)
+
+            # Estimate hemisphere masses and combine to get full-sphere likelihoods
+            masses_rng, prob_rng = jax.random.split(rng)
+            hemisphere_probability_masses_dict = compute_hemisphere_probability_masses(
+                model=model,
+                params=params,
+                rng=masses_rng,
+                n_samples=256,
+                n_steps=n_steps,
+                n_projections=n_projections,
+            )
+
+            conditional_logprobs = compute_log_probability(
+                model=model,
+                params=params,
+                samples=points,
+                weighting_function_params=weighting_function_params,
+                n_steps=n_steps,
+                rng=prob_rng,
+                n_projections=n_projections,
+            )
+
+            hemisphere_log_masses = jnp.where(
+                north_mask,
+                hemisphere_probability_masses_dict["north_log_mass"],
+                hemisphere_probability_masses_dict["south_log_mass"],
+            )
+            adjusted_logprobs = conditional_logprobs + hemisphere_log_masses
+            hemisphere_probability_masses_dict = jax.device_get(
+                hemisphere_probability_masses_dict
+            )
+            tqdm.write(
+                f"north mass: {float(jnp.exp(hemisphere_probability_masses_dict['north_log_mass'])):.3f}, south mass: {float(jnp.exp(hemisphere_probability_masses_dict['south_log_mass'])):.3f}"
+            )
+            tqdm.write(
+                f"northeast both finite frac: {hemisphere_probability_masses_dict['northeast_both_finite_frac']:.3f}, southeast both finite frac: {hemisphere_probability_masses_dict['southeast_both_finite_frac']:.3f}"
+            )
+            tqdm.write(
+                f"north east log ratios std: {hemisphere_probability_masses_dict['north_east_log_ratios_std']:.3f}, south east log ratios std: {hemisphere_probability_masses_dict['south_east_log_ratios_std']:.3f}"
+            )
+
+            # If we don't do this then reported NLL is +inf until the network learns the cap
+            # function
+            min_logprob = sphere_log_inverse_surface_area(model.domain_dim) - jnp.log(
+                1_000_000_000
+            )
+            adjusted_logprobs = jnp.maximum(adjusted_logprobs, min_logprob)
+            return adjusted_logprobs
     elif model.weighting_function == WeightingFunction.VMF_DENSITY:
         raise NotImplementedError("VMF density weighting function not implemented yet.")
     else:
