@@ -2736,7 +2736,9 @@ def _tsit5_integrate_core(
     settings: "Tsit5Settings",
     rng: Optional[jax.Array] = None,
     step_callback: Optional[Callable] = None,
-) -> Tuple[jax.Array, jax.Array, int]:
+    step_carry_init: Optional[jax.Array] = None,
+    callback_n_projections: Optional[int] = None,
+) -> Tuple[jax.Array, jax.Array, int, jax.Array]:
     """
     Core Tsit5 integration loop shared between forward and reverse integration.
 
@@ -2751,18 +2753,32 @@ def _tsit5_integrate_core(
         t_final: Target final time (scalar)
         settings: Tsit5Settings instance
         rng: Optional random key for stochastic vector fields
-        step_callback: Optional callback(x, t, dt, accept, step_rng) -> Optional[Any] called each iteration
+        step_callback: Optional pure JAX function
+            (x, t, dt, accept, step_rng, carry, vf, vf_fixed_static, vf_fixed, vf_per_sample) -> carry
+            called each iteration inside a jitted step.
+        step_carry_init: Optional initial carry for step_callback (default zeros [batch])
 
     Returns:
         final_x: Final positions [batch_size, dim]
         final_t: Final times [batch_size]
         iter_count: Number of iterations used
+        step_carry: Final callback carry state [batch_size]
     """
     batch_size = x0.shape[0]
     x = x0
     t = t0
     dt_vec = dt_initial
     done = jnp.zeros((batch_size,), dtype=bool)
+
+    # Carry for callback
+    if step_carry_init is None:
+        step_carry = jnp.zeros((batch_size,), dtype=jnp.float32)
+    else:
+        step_carry = step_carry_init
+
+    # Ensure RNG key exists for jitted step
+    if rng is None:
+        rng = jax.random.PRNGKey(0)
 
     # FSAL initial derivative
     k1 = vector_field_fn(
@@ -2774,59 +2790,36 @@ def _tsit5_integrate_core(
         rng,
     )
 
-    max_iters = settings.max_iterations
+    cb = step_callback or _noop_step_callback
 
-    iter_count = 0
-    for iter_count in range(max_iters):
-        # Build Tsit5 endpoints
-        x5, x4, k_last, step_angle = _tsit5_build_endpoints(
-            vector_field_fn,
-            vector_field_fn_fixed_static_params,
-            vector_field_fn_fixed_params,
-            vector_field_fn_per_sample_params,
+    max_iters = settings.max_iterations
+    forward = bool(t_final > float(t0[0]))
+    # Track how many iterations actually executed
+    iter_executed = 0
+    for _ in range(max_iters):
+        x, t, dt_vec, k1, done, rng, step_carry = _tsit5_step_jitted(
             x,
             t,
             dt_vec,
             k1,
+            done,
             rng,
+            step_carry,
+            t_final,
+            forward,
+            settings.atol,
+            settings.rtol,
+            settings.safety,
+            settings.shrink,
+            settings.grow,
+            vector_field_fn=vector_field_fn,
+            vector_field_fn_fixed_static_params=vector_field_fn_fixed_static_params,
+            vector_field_fn_fixed_params=vector_field_fn_fixed_params,
+            vector_field_fn_per_sample_params=vector_field_fn_per_sample_params,
+            step_callback=cb,
+            n_projections=callback_n_projections,
         )
-
-        # Error estimation and step size adaptation
-        err_ratio = _tsit5_error_ratio(x5, x4, step_angle, settings.atol, settings.rtol)
-        accept, dt_new = _tsit5_update_dt(
-            dt_vec, err_ratio, settings.safety, settings.shrink, settings.grow
-        )
-
-        # Call step callback if provided (for divergence computation, etc.)
-        if step_callback is not None:
-            if rng is not None:
-                callback_rng, rng = jax.random.split(rng)
-            else:
-                callback_rng = None
-            step_callback(x, t, dt_vec, accept, callback_rng)
-
-        # Update positions and times
-        t_next = t + dt_vec
-        x_new = jnp.where(accept[:, None], x5, x)
-        t_new = jnp.where(accept, t_next, t)
-
-        # FSAL: reuse last stage derivative as the next step's first derivative for accepted samples.
-        # For rejected samples, keep the previous k1 (same state/time, smaller dt will be tried).
-        x = x_new
-        t = t_new
-        k1 = jnp.where(accept[:, None], k_last, k1)
-        dt_vec = dt_new
-
-        # Clamp dt so we don't overshoot t_final
-        if t_final > t0[0]:  # Forward integration
-            remain = t_final - t
-            dt_vec = jnp.where(remain < dt_vec, remain, dt_vec)
-            done = jnp.logical_or(done, t >= t_final - 1e-12)
-        else:  # Reverse integration (t_final < t0)
-            remain = t_final - t  # This is negative
-            dt_vec = jnp.where(remain > dt_vec, remain, dt_vec)
-            done = jnp.logical_or(done, t <= t_final + 1e-12)
-
+        iter_executed += 1
         if bool(jnp.all(done)):
             break
 
@@ -2834,18 +2827,18 @@ def _tsit5_integrate_core(
     if t_final > t0[0]:  # Forward integration
         min_final_time = float(jnp.min(t))
         max_final_time = float(jnp.max(t))
-        incomplete_samples = jnp.sum(~done)
+        incomplete_samples = int(jnp.sum(~done))
         target_desc = f"t={t_final}"
     else:  # Reverse integration
         min_final_time = float(jnp.min(t))
         max_final_time = float(jnp.max(t))
-        incomplete_samples = jnp.sum(~done)
+        incomplete_samples = int(jnp.sum(~done))
         target_desc = f"t={t_final}"
 
     # Always provide basic diagnostic info if requested via environment variable
     if os.getenv("TSIT5_DEBUG", "").lower() in ("1", "true"):
         print(
-            f"Tsit5 diagnostics: {iter_count+1}/{settings.max_iterations} iterations, "
+            f"Tsit5 diagnostics: {iter_executed}/{settings.max_iterations} iterations, "
             f"{incomplete_samples}/{batch_size} incomplete, "
             f"times: [{min_final_time:.6f}, {max_final_time:.6f}]"
         )
@@ -2860,7 +2853,7 @@ def _tsit5_integrate_core(
             f"or max iterations (current: {settings.max_iterations})."
         )
 
-    return x, t, iter_count
+    return x, t, iter_executed, step_carry
 
 
 def _estimate_initial_dt(atol: float, rtol: float, domain_dim: int) -> float:
@@ -2893,6 +2886,150 @@ def _tsit5_update_dt(
     dt_scale = jnp.clip(dt_scale, dfactor, ifactor)
     dt_new = dt * dt_scale
     return accept, dt_new
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "vector_field_fn",
+        "vector_field_fn_fixed_static_params",
+        "step_callback",
+        "forward",
+        "n_projections",
+    ),
+)
+def _tsit5_step_jitted(
+    x,
+    t,
+    dt_vec,
+    k1,
+    done,
+    rng,
+    carry,
+    t_final,
+    forward,
+    atol,
+    rtol,
+    safety,
+    shrink,
+    grow,
+    *,
+    vector_field_fn,
+    vector_field_fn_fixed_static_params,
+    vector_field_fn_fixed_params,
+    vector_field_fn_per_sample_params,
+    step_callback,
+    n_projections: Optional[int] = None,
+):
+    step_rng, cb_rng = jax.random.split(rng)
+    # Build Tsit5 endpoints
+    x5, x4, k_last, step_angle = _tsit5_build_endpoints(
+        vector_field_fn,
+        vector_field_fn_fixed_static_params,
+        vector_field_fn_fixed_params,
+        vector_field_fn_per_sample_params,
+        x,
+        t,
+        dt_vec,
+        k1,
+        step_rng,
+    )
+
+    # Error estimation and step size adaptation
+    err_ratio = _tsit5_error_ratio(x5, x4, step_angle, atol, rtol)
+    accept, dt_new = _tsit5_update_dt(dt_vec, err_ratio, safety, shrink, grow)
+
+    # Callback to update carry (e.g., accumulate divergence)
+    carry = step_callback(
+        x,
+        t,
+        dt_vec,
+        accept,
+        cb_rng,
+        carry,
+        vector_field_fn,
+        vector_field_fn_fixed_static_params,
+        vector_field_fn_fixed_params,
+        vector_field_fn_per_sample_params,
+        n_projections=n_projections,
+    )
+
+    # Update positions and times
+    t_next = t + dt_vec
+    x_new = jnp.where(accept[:, None], x5, x)
+    t_new = jnp.where(accept, t_next, t)
+
+    # FSAL: reuse last stage derivative where accepted
+    k1_new = jnp.where(accept[:, None], k_last, k1)
+
+    # Clamp dt so we don't overshoot t_final
+    def forward_branch():
+        remain = t_final - t_new
+        dt_vec_new = jnp.where(remain < dt_new, remain, dt_new)
+        done_new = jnp.logical_or(done, t_new >= t_final - 1e-12)
+        return dt_vec_new, done_new
+
+    def reverse_branch():
+        remain = t_final - t_new
+        dt_vec_new = jnp.where(remain > dt_new, remain, dt_new)
+        done_new = jnp.logical_or(done, t_new <= t_final + 1e-12)
+        return dt_vec_new, done_new
+
+    dt_vec_new, done_new = jax.lax.cond(forward, forward_branch, reverse_branch)
+
+    return x_new, t_new, dt_vec_new, k1_new, done_new, step_rng, carry
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "vector_field_fn",
+        "vector_field_fn_fixed_static_params",
+        "n_projections",
+    ),
+)
+def divergence_step_callback(
+    x_current,
+    t_current,
+    dt_vec,
+    accept,
+    step_rng,
+    carry,
+    vector_field_fn,
+    vector_field_fn_fixed_static_params,
+    vector_field_fn_fixed_params,
+    vector_field_fn_per_sample_params,
+    *,
+    n_projections: int,
+):
+    div_t = hutchinson_estimator(
+        vector_field_fn,
+        vector_field_fn_fixed_static_params,
+        vector_field_fn_fixed_params,
+        vector_field_fn_per_sample_params,
+        x_current,
+        t_current,
+        step_rng,
+        n_projections,
+    )
+    return carry + jnp.where(accept, jnp.abs(dt_vec) * div_t, 0.0)
+
+
+def _noop_step_callback(
+    x_current,
+    t_current,
+    dt_vec,
+    accept,
+    step_rng,
+    carry,
+    vector_field_fn,
+    vector_field_fn_fixed_static_params,
+    vector_field_fn_fixed_params,
+    vector_field_fn_per_sample_params,
+    *,
+    n_projections: Optional[int] = None,
+):
+    return carry
 
 
 @partial(jax.jit, inline=True)
@@ -3048,7 +3185,7 @@ def generate_samples(
 
     assert len(cond_vecs.shape) == 2
     batch_size = cond_vecs.shape[0]
-    return generate_samples_inner(
+    x, _eval_counts = generate_samples_inner(
         rng,
         n_steps,
         batch_size,
@@ -3059,6 +3196,7 @@ def generate_samples(
         cond_vecs,
         model.domain_dim,
     )
+    return x
 
 
 def generate_samples_inner(
@@ -3094,7 +3232,9 @@ def generate_samples_inner(
         domain_dim: Dimension of the domain
 
     Returns:
-        Generated samples [batch_size, dim]
+        Tuple (samples, vf_eval_counts) where:
+          - samples: Generated samples [batch_size, dim]
+          - vf_eval_counts: Number of vector-field evaluations per input [batch_size]
     """
     if initial_x0 is None:
         x0_rng, *dropout_rngs = jax.random.split(rng, num=n_steps + 1)
@@ -3112,6 +3252,9 @@ def generate_samples_inner(
     # Use tqdm for progress tracking
     step_iter = tqdm(range(n_steps), desc=f"ODE solving ({method})", leave=False)
 
+    # Track vector-field evaluation counts per input
+    vf_eval_counts: jax.Array
+
     if method == "euler":
         # Forward Euler method
         for i in step_iter:
@@ -3125,6 +3268,7 @@ def generate_samples_inner(
                 dropout_rngs[i],
             )
             x = geodesic_step(x, v, dt)
+        vf_eval_counts = jnp.full((batch_size,), n_steps, dtype=jnp.int32)
 
     elif method == "rk4":
         # 4th order Runge-Kutta method
@@ -3140,6 +3284,7 @@ def generate_samples_inner(
                 dt,
                 rng=dropout_rngs[i],
             )
+        vf_eval_counts = jnp.full((batch_size,), 4 * n_steps, dtype=jnp.int32)
     elif method == "tsit5":
         # Adaptive Tsitouras 5/4 method using shared core implementation
         settings = tsit5_settings or Tsit5Settings()
@@ -3160,7 +3305,7 @@ def generate_samples_inner(
         dt_initial = jnp.full((batch_size,), dt, dtype=jnp.float32)
 
         # Use shared core integration function
-        x, t_final, iteration_count = _tsit5_integrate_core(
+        x, t_final, iteration_count, _ = _tsit5_integrate_core(
             vector_field_fn,
             vector_field_fn_fixed_static_params,
             vector_field_fn_fixed_params,
@@ -3172,10 +3317,14 @@ def generate_samples_inner(
             settings=settings,
             rng=None,
         )
+        # Tsit5 uses one initial k1 evaluation, then 6 evaluations per iteration (FSAL)
+        vf_eval_counts = jnp.full(
+            (batch_size,), 1 + 6 * int(iteration_count), dtype=jnp.int32
+        )
     else:
         raise ValueError(f"Unknown ODE solver method: {method}")
 
-    return x
+    return x, vf_eval_counts
 
 
 def sample_loop(
@@ -3537,29 +3686,9 @@ def reverse_path_and_compute_divergence_tsit5(
     else:
         dt_mag = 0.01
     dt_initial = jnp.full((batch_size,), -abs(dt_mag), dtype=jnp.float32)
-    div_sum = jnp.zeros((batch_size,), dtype=jnp.float32)
-
-    # Step callback to accumulate divergence
-    def step_callback(x_current, t_current, dt_vec, accept, step_rng):
-        nonlocal div_sum
-
-        # Compute divergence at current points
-        div_t = hutchinson_estimator(
-            vector_field_fn,
-            vector_field_fn_fixed_static_params,
-            vector_field_fn_fixed_params,
-            vector_field_fn_per_sample_params,
-            x_current,
-            t_current,
-            step_rng,
-            n_projections,
-        )
-
-        # Accumulate divergence only for accepted samples
-        div_sum = div_sum + jnp.where(accept, jnp.abs(dt_vec) * div_t, 0.0)
 
     # Use shared core integration function
-    x_final, t_final, iteration_count = _tsit5_integrate_core(
+    x_final, t_final, iteration_count, div_sum = _tsit5_integrate_core(
         vector_field_fn,
         vector_field_fn_fixed_static_params,
         vector_field_fn_fixed_params,
@@ -3570,7 +3699,9 @@ def reverse_path_and_compute_divergence_tsit5(
         t_final=0.0,
         settings=settings,
         rng=rng,
-        step_callback=step_callback,
+        step_callback=divergence_step_callback,
+        step_carry_init=jnp.zeros((batch_size,), dtype=jnp.float32),
+        callback_n_projections=n_projections,
     )
 
     return x_final, div_sum
@@ -3930,12 +4061,7 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
     key_x0, key = jax.random.split(key)
     x0 = sample_sphere(key_x0, batch_size, dim)
 
-    # Instrumented vector field to count calls (only meaningful for tsit5 path, which is not jitted)
-    calls = {"n": 0}
-
     def vf(_fixed_static, _fixed_params, _per_params, x, t, _rng):
-        calls["n"] += 1
-
         # Multi-axis rotation field with spatially-dependent mixing
         # This creates a more complex flow similar to what we see in trained models
         batch_size = x.shape[0]
@@ -3986,8 +4112,7 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
         return v * omega_total[:, None]
 
     # High-accuracy reference using very fine RK4
-    calls["n"] = 0
-    x_ref = generate_samples_inner(
+    x_ref, _ = generate_samples_inner(
         rng=jax.random.PRNGKey(11),
         n_steps=4096,
         batch_size=batch_size,
@@ -4001,8 +4126,7 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
     )
 
     # RK4 baseline at moderate steps
-    calls["n"] = 0
-    x_rk4 = generate_samples_inner(
+    x_rk4, rk4_eval_counts = generate_samples_inner(
         rng=jax.random.PRNGKey(1),
         n_steps=n_steps_rk4,
         batch_size=batch_size,
@@ -4016,17 +4140,16 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
     )
 
     # Adaptive Tsit5 with balanced tolerances and new clean API
-    calls["n"] = 0
     tsit_settings = Tsit5Settings(
-        atol=1e-4,
-        rtol=1e-4,
+        atol=1e-14,
+        rtol=0.0,
         safety=0.9,
         shrink=0.5,
         grow=2.0,
         max_iterations=2000,  # Generous limit for challenging field
         auto_dt_estimation=True,  # Let it pick good initial step size
     )
-    x_tsit5 = generate_samples_inner(
+    x_tsit5, tsit5_eval_counts = generate_samples_inner(
         rng=jax.random.PRNGKey(2),
         n_steps=n_steps_rk4,  # ignored by tsit5; step size controlled by tsit5_settings
         batch_size=batch_size,
@@ -4039,7 +4162,8 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
         initial_x0=x0,
         tsit5_settings=tsit_settings,
     )
-    tsit5_calls = calls["n"]
+    # All samples share the same number of vector-field evaluations in our batched implementation
+    tsit5_calls = int(tsit5_eval_counts[0])
 
     # Compare both methods to reference via great-circle distance
     def gc(a, b):
@@ -4057,8 +4181,8 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
     assert max_err_rk4 < 8e-2 and mean_err_rk4 < 2e-2
     assert max_err_tsit5 < 8e-2 and mean_err_tsit5 < 2e-2  # Similar accuracy expected
 
-    # Adaptive should use fewer vector-field evaluations than fixed-step RK4 (4 per RK4 step)
-    rk4_evals = 4 * n_steps_rk4
+    # Adaptive should use fewer vector-field evaluations than fixed-step RK4
+    rk4_evals = int(rk4_eval_counts[0])
     assert (
         tsit5_calls < rk4_evals
     ), f"Adaptive Tsit5 used too many evals: {tsit5_calls} vs RK4 {rk4_evals}"
