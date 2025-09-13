@@ -2823,32 +2823,62 @@ def _tsit5_integrate_core(
     forward = bool(t_final > float(t0[0]))
     # Track how many iterations actually executed
     iter_executed = 0
-    for _ in range(max_iters):
-        x, t, dt_vec, k1, done, rng, step_carry = _tsit5_step_jitted(
-            x,
-            t,
-            dt_vec,
-            k1,
-            done,
-            rng,
-            step_carry,
-            t_final,
-            forward,
-            settings.atol,
-            settings.rtol,
-            settings.safety,
-            settings.shrink,
-            settings.grow,
-            vector_field_fn=vector_field_fn,
-            vector_field_fn_fixed_static_params=vector_field_fn_fixed_static_params,
-            vector_field_fn_fixed_params=vector_field_fn_fixed_params,
-            vector_field_fn_per_sample_params=vector_field_fn_per_sample_params,
-            step_callback=cb,
-            n_projections=callback_n_projections,
-        )
-        iter_executed += 1
-        if bool(jnp.all(done)):
-            break
+
+    # Progress bar showing integration progress based on minimum t value
+    initial_min_t = float(jnp.min(t))
+    current_min_t = initial_min_t
+
+    with tqdm(
+        total=1.0,  # Progress from 0 to 1 (or 1 to 0 for reverse)
+        desc=f"ODE solving (tsit5)",
+        leave=False,
+        initial=abs(current_min_t),
+        unit="t",
+    ) as pbar:
+        for _ in range(max_iters):
+            x, t, dt_vec, k1, done, rng, step_carry = _tsit5_step_jitted(
+                x,
+                t,
+                dt_vec,
+                k1,
+                done,
+                rng,
+                step_carry,
+                t_final,
+                forward,
+                settings.atol,
+                settings.rtol,
+                settings.safety,
+                settings.shrink,
+                settings.grow,
+                vector_field_fn=vector_field_fn,
+                vector_field_fn_fixed_static_params=vector_field_fn_fixed_static_params,
+                vector_field_fn_fixed_params=vector_field_fn_fixed_params,
+                vector_field_fn_per_sample_params=vector_field_fn_per_sample_params,
+                step_callback=cb,
+                n_projections=callback_n_projections,
+            )
+            iter_executed += 1
+
+            # Update progress bar based on minimum t value across batch
+            new_min_t = float(jnp.min(t))
+            progress_delta = new_min_t - current_min_t
+            if abs(progress_delta) > 1e-8:  # Only update if there's meaningful progress
+                pbar.update(progress_delta)
+                current_min_t = new_min_t
+
+            # Update progress bar description with current status
+            incomplete_count = int(jnp.sum(~done))
+            pbar.set_postfix(
+                {
+                    "iter": iter_executed,
+                    "incomplete": f"{incomplete_count}/{batch_size}",
+                    "min_t": f"{current_min_t:.4f}",
+                }
+            )
+
+            if bool(jnp.all(done)):
+                break
 
     # Diagnostic information for debugging
     if t_final > t0[0]:  # Forward integration
@@ -3276,14 +3306,12 @@ def generate_samples_inner(
     dt = 1.0 / n_steps
     x = x0
 
-    # Use tqdm for progress tracking
-    step_iter = tqdm(range(n_steps), desc=f"ODE solving ({method})", leave=False)
-
     # Track vector-field evaluation counts per input
     vf_eval_counts: jax.Array
 
     if method == "euler":
         # Forward Euler method
+        step_iter = tqdm(range(n_steps), desc=f"ODE solving ({method})", leave=False)
         for i in step_iter:
             t = i * dt
             v = vector_field_fn(
@@ -3299,6 +3327,7 @@ def generate_samples_inner(
 
     elif method == "rk4":
         # 4th order Runge-Kutta method
+        step_iter = tqdm(range(n_steps), desc=f"ODE solving ({method})", leave=False)
         for i in step_iter:
             t = i * dt
             x = spherical_rk4_step(
