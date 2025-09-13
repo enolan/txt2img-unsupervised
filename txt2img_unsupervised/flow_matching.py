@@ -2733,7 +2733,7 @@ def _tsit5_integrate_core(
     t0: jax.Array,
     dt_initial: jax.Array,
     t_final: float,
-    settings: 'Tsit5Settings',
+    settings: "Tsit5Settings",
     rng: Optional[jax.Array] = None,
     step_callback: Optional[Callable] = None,
 ) -> Tuple[jax.Array, jax.Array, int]:
@@ -2792,9 +2792,7 @@ def _tsit5_integrate_core(
         )
 
         # Error estimation and step size adaptation
-        err_ratio = _tsit5_error_ratio(
-            x5, x4, step_angle, settings.atol, settings.rtol
-        )
+        err_ratio = _tsit5_error_ratio(x5, x4, step_angle, settings.atol, settings.rtol)
         accept, dt_new = _tsit5_update_dt(
             dt_vec, err_ratio, settings.safety, settings.shrink, settings.grow
         )
@@ -2853,10 +2851,12 @@ def _tsit5_integrate_core(
         target_desc = f"t={t_final}"
 
     # Always provide basic diagnostic info if requested via environment variable
-    if os.getenv('TSIT5_DEBUG', '').lower() in ('1', 'true'):
-        print(f"Tsit5 diagnostics: {iter_count+1}/{settings.max_iterations} iterations, "
-              f"{incomplete_samples}/{batch_size} incomplete, "
-              f"times: [{min_final_time:.6f}, {max_final_time:.6f}]")
+    if os.getenv("TSIT5_DEBUG", "").lower() in ("1", "true"):
+        print(
+            f"Tsit5 diagnostics: {iter_count+1}/{settings.max_iterations} iterations, "
+            f"{incomplete_samples}/{batch_size} incomplete, "
+            f"times: [{min_final_time:.6f}, {max_final_time:.6f}]"
+        )
 
     # Check for integration completeness and raise exceptions for failures
     if incomplete_samples > 0:
@@ -3952,8 +3952,8 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
 
         # Multi-frequency temporal variation (like trained vector fields)
         omega_base = 1.0 + 0.3 * jnp.sin(4.0 * jnp.pi * tt)  # Primary frequency
-        omega_fast = 0.2 * jnp.sin(16.0 * jnp.pi * tt)       # Higher frequency component
-        omega_slow = 0.1 * jnp.cos(jnp.pi * tt)              # Low frequency drift
+        omega_fast = 0.2 * jnp.sin(16.0 * jnp.pi * tt)  # Higher frequency component
+        omega_slow = 0.1 * jnp.cos(jnp.pi * tt)  # Low frequency drift
 
         # Spatially-dependent rotation axes (creates position-dependent complexity)
         # Mix between different rotation axes based on position
@@ -3963,7 +3963,7 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
 
         # Mixing weights based on position (creates spatial complexity)
         z_weight = jnp.abs(x[:, 2])  # Stronger z-rotation near poles
-        xy_norm = jnp.sqrt(x[:, 0]**2 + x[:, 1]**2 + 1e-6)
+        xy_norm = jnp.sqrt(x[:, 0] ** 2 + x[:, 1] ** 2 + 1e-6)
         x_weight = jnp.abs(x[:, 0]) / xy_norm  # x-rotation weight
         y_weight = jnp.abs(x[:, 1]) / xy_norm  # y-rotation weight
 
@@ -3980,9 +3980,7 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
 
         # Combine with temporal and spatial weights
         omega_total = omega_base + omega_fast + omega_slow
-        v = (z_weight[:, None] * v_z +
-             x_weight[:, None] * v_x +
-             y_weight[:, None] * v_y)
+        v = z_weight[:, None] * v_z + x_weight[:, None] * v_x + y_weight[:, None] * v_y
 
         return v * omega_total[:, None]
 
@@ -4019,10 +4017,13 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
     # Adaptive Tsit5 with balanced tolerances and new clean API
     calls["n"] = 0
     tsit_settings = Tsit5Settings(
-        atol=1e-4, rtol=1e-4,
-        safety=0.9, shrink=0.5, grow=2.0,
+        atol=1e-4,
+        rtol=1e-4,
+        safety=0.9,
+        shrink=0.5,
+        grow=2.0,
         max_iterations=2000,  # Generous limit for challenging field
-        auto_dt_estimation=True  # Let it pick good initial step size
+        auto_dt_estimation=True,  # Let it pick good initial step size
     )
     x_tsit5 = generate_samples_inner(
         rng=jax.random.PRNGKey(2),

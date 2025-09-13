@@ -1096,7 +1096,9 @@ def test_train_uniform(
     ]:
         epochs = 32
     else:
-        raise ValueError(f"Unknown domain_dim: {domain_dim} and weighting_function: {weighting_function}")
+        raise ValueError(
+            f"Unknown domain_dim: {domain_dim} and weighting_function: {weighting_function}"
+        )
 
     print(
         f"Training FWFM for domain_dim={domain_dim}, weighting_function={weighting_function}"
