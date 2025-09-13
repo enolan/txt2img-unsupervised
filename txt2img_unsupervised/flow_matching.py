@@ -2810,19 +2810,11 @@ def _tsit5_integrate_core(
         x_new = jnp.where(accept[:, None], x5, x)
         t_new = jnp.where(accept, t_next, t)
 
-        # FSAL: compute derivative at new positions only for accepted steps
-        k_new = vector_field_fn(
-            vector_field_fn_fixed_static_params,
-            vector_field_fn_fixed_params,
-            vector_field_fn_per_sample_params,
-            x_new,
-            t_new,
-            rng,
-        )
-
+        # FSAL: reuse last stage derivative as the next step's first derivative for accepted samples.
+        # For rejected samples, keep the previous k1 (same state/time, smaller dt will be tried).
         x = x_new
         t = t_new
-        k1 = k_new  # FSAL: reuse for next iteration
+        k1 = jnp.where(accept[:, None], k_last, k1)
         dt_vec = dt_new
 
         # Clamp dt so we don't overshoot t_final
@@ -2904,9 +2896,14 @@ def _tsit5_update_dt(
 
 
 @partial(jax.jit, inline=True)
-def parallel_transport(v, from_point, to_point):
-    """
-    Parallel transport a tangent vector v from one point to another on the sphere.
+def parallel_transport(
+    v: jax.Array, from_point: jax.Array, to_point: jax.Array
+) -> jax.Array:
+    """Parallel transport a tangent vector along the great-circle on S^{d-1}.
+
+    The transport is along the unique shortest geodesic from `from_point` to `to_point` when it is
+    well-defined. For nearly coincident or antipodal points the mapping is ambiguous; in those
+    cases we fall back to projecting `v` into the tangent space at `to_point`.
 
     Args:
         v: Tangent vector at from_point [batch_size, dim]
@@ -2916,35 +2913,36 @@ def parallel_transport(v, from_point, to_point):
     Returns:
         Transported vector in the tangent space of to_point [batch_size, dim]
     """
-    # Get unit vector along the geodesic from from_point to to_point
-    geodesic_dir = to_point - from_point * jnp.sum(
-        to_point * from_point, axis=1, keepdims=True
+    # Angle between points and associated trig terms
+    dot = jnp.sum(from_point * to_point, axis=1, keepdims=True)
+    dot = jnp.clip(dot, -1.0, 1.0)
+    theta = jnp.arccos(dot)
+    sin_theta = jnp.sin(theta)
+    cos_theta = jnp.cos(theta)
+
+    # Unit tangent at `from_point` pointing toward `to_point`
+    # u = (to - (from·to) from) / sin(theta)
+    u_num = to_point - dot * from_point
+    eps = 1e-8
+    safe = sin_theta > eps
+    u = jnp.where(safe, u_num / sin_theta, jnp.zeros_like(u_num))
+
+    # Decompose v into component along u and orthogonal component in T_from S^{d-1}
+    a = jnp.sum(v * u, axis=1, keepdims=True)
+
+    # Parallel transport: v_⊥ stays the same, component along u rotates with the geodesic
+    # T(v) = v + a * ((cosθ - 1) u - sinθ * from_point)
+    transported = v + a * ((cos_theta - 1.0) * u - sin_theta * from_point)
+
+    # For ill-conditioned cases (theta≈0 or π), use a projection fallback
+    projected = v - jnp.sum(v * to_point, axis=1, keepdims=True) * to_point
+    transported = jnp.where(safe, transported, projected)
+
+    # Final projection for numerical stability
+    transported = (
+        transported - jnp.sum(transported * to_point, axis=1, keepdims=True) * to_point
     )
-    geodesic_norm = jnp.linalg.norm(geodesic_dir, axis=1, keepdims=True)
-
-    # If points are very close or antipodal, return the vector as is
-    is_valid = geodesic_norm > 1e-8
-    geodesic_dir = jnp.where(
-        is_valid, geodesic_dir / geodesic_norm, jnp.zeros_like(geodesic_dir)
-    )
-
-    # Double cross product gives the parallel transport
-    # (I - u⊗u - v⊗v) * w where u=from_point, v=to_point, w=tangent vector
-    # This is the same as w - (w·u)u - (w·v)v + (w·u)(u·v)v
-    v_dot_from = jnp.sum(v * from_point, axis=1, keepdims=True)
-    v_dot_to = jnp.sum(v * to_point, axis=1, keepdims=True)
-    from_dot_to = jnp.sum(from_point * to_point, axis=1, keepdims=True)
-
-    result = (
-        v
-        - v_dot_from * from_point
-        - v_dot_to * to_point
-        + v_dot_from * from_dot_to * to_point
-    )
-
-    # Project to tangent space of to_point to ensure numerical stability
-    dot_with_to = jnp.sum(result * to_point, axis=1, keepdims=True)
-    return result - dot_with_to * to_point
+    return transported
 
 
 @partial(jax.jit, inline=True, static_argnames=("f", "f_fixed_static_params"))
@@ -3520,27 +3518,30 @@ def reverse_path_and_compute_divergence_tsit5(
     n_steps,
     rng,
     n_projections=10,
+    tsit5_settings: Optional[Tsit5Settings] = None,
 ):
     """
     Adaptive reverse path integration with Tsitouras 5/4 (non-jitted).
     """
     batch_size = samples.shape[0]
-    settings = Tsit5Settings()
+    domain_dim = samples.shape[1]
+    settings = tsit5_settings or Tsit5Settings()
 
     # Initial conditions for reverse integration
     t0 = jnp.ones((batch_size,), dtype=jnp.float32)
-    dt_initial = jnp.full((batch_size,), -1.0 / n_steps, dtype=jnp.float32)
+    # Determine initial negative step size (reverse time). Prefer explicit, else estimate.
+    if settings.initial_dt is not None:
+        dt_mag = float(settings.initial_dt)
+    elif settings.auto_dt_estimation:
+        dt_mag = float(_estimate_initial_dt(settings.atol, settings.rtol, domain_dim))
+    else:
+        dt_mag = 0.01
+    dt_initial = jnp.full((batch_size,), -abs(dt_mag), dtype=jnp.float32)
     div_sum = jnp.zeros((batch_size,), dtype=jnp.float32)
 
     # Step callback to accumulate divergence
     def step_callback(x_current, t_current, dt_vec, accept, step_rng):
-        nonlocal div_sum, rng
-
-        # Generate RNG for divergence computation
-        if step_rng is not None:
-            step_rng_div, rng = jax.random.split(rng)
-        else:
-            step_rng_div, rng = jax.random.split(rng)
+        nonlocal div_sum
 
         # Compute divergence at current points
         div_t = hutchinson_estimator(
@@ -3550,7 +3551,7 @@ def reverse_path_and_compute_divergence_tsit5(
             vector_field_fn_per_sample_params,
             x_current,
             t_current,
-            step_rng_div,
+            step_rng,
             n_projections,
         )
 
