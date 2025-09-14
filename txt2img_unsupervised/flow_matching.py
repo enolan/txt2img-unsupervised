@@ -2824,16 +2824,26 @@ def _tsit5_integrate_core(
     # Track how many iterations actually executed
     iter_executed = 0
 
-    # Progress bar showing integration progress based on minimum t value
-    initial_min_t = float(jnp.min(t))
-    current_min_t = initial_min_t
+    # Progress bar showing integration progress - track the slowest sample
+    if forward:
+        # Forward: track slowest sample (min_t), progress when min_t reaches t_final
+        initial_slowest_t = float(jnp.min(t))
+        initial_progress = max(0.0, initial_slowest_t / t_final)
+    else:
+        # Reverse: track slowest sample (max_t), progress when max_t reaches t_final
+        initial_slowest_t = float(jnp.max(t))
+        initial_progress = max(
+            0.0, (float(t0[0]) - initial_slowest_t) / (float(t0[0]) - t_final)
+        )
+
+    current_slowest_t = initial_slowest_t
 
     with tqdm(
-        total=1.0,  # Progress from 0 to 1 (or 1 to 0 for reverse)
+        total=1.0,  # Progress bar always fills 0 to 1
         desc=f"ODE solving (tsit5)",
         leave=False,
-        initial=abs(current_min_t),
-        unit="t",
+        initial=initial_progress,
+        unit="",  # No unit since we're showing completion fraction
     ) as pbar:
         for _ in range(max_iters):
             x, t, dt_vec, k1, done, rng, step_carry = _tsit5_step_jitted(
@@ -2860,20 +2870,44 @@ def _tsit5_integrate_core(
             )
             iter_executed += 1
 
-            # Update progress bar based on minimum t value across batch
-            new_min_t = float(jnp.min(t))
-            progress_delta = new_min_t - current_min_t
+            # Update progress bar based on slowest sample
+            if forward:
+                # Forward: track slowest sample (min_t)
+                new_slowest_t = float(jnp.min(t))
+                new_progress = max(0.0, min(1.0, new_slowest_t / t_final))
+                current_progress = max(0.0, min(1.0, current_slowest_t / t_final))
+            else:
+                # Reverse: track slowest sample (max_t)
+                new_slowest_t = float(jnp.max(t))
+                new_progress = max(
+                    0.0,
+                    min(1.0, (float(t0[0]) - new_slowest_t) / (float(t0[0]) - t_final)),
+                )
+                current_progress = max(
+                    0.0,
+                    min(
+                        1.0,
+                        (float(t0[0]) - current_slowest_t) / (float(t0[0]) - t_final),
+                    ),
+                )
+
+            progress_delta = new_progress - current_progress
             if abs(progress_delta) > 1e-8:  # Only update if there's meaningful progress
                 pbar.update(progress_delta)
-                current_min_t = new_min_t
+                current_slowest_t = new_slowest_t
 
             # Update progress bar description with current status
             incomplete_count = int(jnp.sum(~done))
+            if forward:
+                slowest_label = "min_t"
+            else:
+                slowest_label = "max_t"
+
             pbar.set_postfix(
                 {
                     "iter": iter_executed,
                     "incomplete": f"{incomplete_count}/{batch_size}",
-                    "min_t": f"{current_min_t:.4f}",
+                    slowest_label: f"{current_slowest_t:.4f}",
                 }
             )
 
@@ -3781,6 +3815,8 @@ def reverse_path_and_compute_divergence(
     Supports fixed-step RK4 (jitted) and adaptive Tsitouras 5/4.
     """
     if method == "rk4":
+        if tsit5_settings is not None:
+            raise ValueError("Tsit5 settings should not be passed when using RK4")
         return reverse_path_and_compute_divergence_rk4(
             vector_field_fn,
             vector_field_fn_fixed_static_params,

@@ -838,7 +838,7 @@ def generate_samples(
         weighting_function_params=weighting_function_params,
     )
 
-    samples = flow_matching.generate_samples_inner(
+    samples, _eval_counts = flow_matching.generate_samples_inner(
         rng,
         n_steps,
         batch_size,
@@ -900,6 +900,8 @@ def compute_log_probability(
         n_steps,
         rng,
         n_projections,
+        method="tsit5",
+        tsit5_settings=flow_matching.Tsit5Settings(atol=1e-8, rtol=1e-8),
     )
 
     # If using a cap-conditioned base, zero out density for sources outside the cap
@@ -1310,7 +1312,6 @@ def test_train_uniform(
             ), f"{num_too_high} zero-weight points have log prob >= {sufficiently_negative_logprob}"
 
 
-@partial(jax.jit, static_argnames=("model", "n_samples", "n_steps", "n_projections"))
 def compute_hemisphere_probability_masses(
     model, params, rng, n_samples, n_steps, n_projections
 ):
