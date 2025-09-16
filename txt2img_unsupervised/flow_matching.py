@@ -1342,9 +1342,10 @@ def spherical_ot_field(
     antipodal_dir_extra: Optional[jax.Array] = None,
 ):
     """
-    Special fancy spherical version of the OT field. Compute a tangent vector field on the sphere
-    that generates geodesics on the sphere rather than straight lines. Based on vMF distributions
-    instead of gaussians.
+    Compute position and velocity field for spherical OT paths. The code that defines the paths is
+    in compute_psi_t_spherical, this function uses autograd to compute the velocity field.
+
+    The field at time t is the velocity, which is the jacobian of position with respect to time.
 
     Args:
         x0: Starting point on the sphere [dim]
@@ -1363,36 +1364,21 @@ def spherical_ot_field(
     assert x0.shape == x1.shape
     assert t.shape == ()
 
-    # Compute the current point by flowing x0 toward x1 for time t
-    x = compute_psi_t_spherical(
-        x0,
-        x1,
-        t,
-        antipodal_dir_fn=antipodal_dir_fn,
-        antipodal_dir_extra=antipodal_dir_extra,
+    # Define position function in terms of time alone
+    position_fn = lambda time: compute_psi_t_spherical(
+        x0, x1, time, antipodal_dir_fn, antipodal_dir_extra
     )
 
-    # Compute the angle between x0 and x1, which determines the speed
-    cos_angle = jnp.clip(jnp.dot(x0, x1), -1.0, 1.0)
-    angle = jnp.arccos(cos_angle)
+    # position_fn gets us x, somewhere on the geodesic between x0 and x1.
+    x = position_fn(t)
+    # the jacobian of position_fn is the velocity of the particle at time t, when it's at position x
+    field_value = jax.jacrev(position_fn)(t)
 
-    def handle_general_case():
-        # Vector field points towards x1 from x, in the tangent space at x.
-        proj_scalar = jnp.dot(x1, x)
-        tangent_component = x1 - proj_scalar * x
-        tangent_norm = jnp.linalg.norm(tangent_component)
-        return jax.lax.cond(
-            tangent_norm > 1e-8,
-            lambda: angle * tangent_component / tangent_norm,
-            lambda: jnp.zeros_like(x),
-        )
+    # Project to tangent space. Mathematically it already should be, but the result from jacrev is
+    # subject to numerical error and may be slightly off-tangent.
+    field_value = field_value - jnp.dot(field_value, x) * x
 
-    field_value = jax.lax.cond(
-        cos_angle < -1.0 + 1e-6,
-        # If points are opposite/almost opposite, pick an orthogonal vector
-        lambda: angle * antipodal_dir_fn(x, antipodal_dir_extra),
-        handle_general_case,
-    )
+    assert x.shape == field_value.shape == x0.shape
 
     return x, field_value
 
