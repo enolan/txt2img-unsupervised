@@ -1986,7 +1986,7 @@ def test_train_trivial(model_kind, domain_dim, inject_keys):
         if inject_keys:
             pytest.skip("Transformer with inject_keys not supported")
         lr = 1e-3
-        ep = 3
+        ep = 4
 
     batch_size = 256
     # Create a unit vector in the first dimension
