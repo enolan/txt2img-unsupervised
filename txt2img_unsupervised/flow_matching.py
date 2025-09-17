@@ -2812,7 +2812,7 @@ def _tsit5_integrate_core(
     step_callback: Optional[Callable] = None,
     step_carry_init: Optional[jax.Array] = None,
     callback_n_projections: Optional[int] = None,
-) -> Tuple[jax.Array, jax.Array, int, jax.Array]:
+) -> Tuple[jax.Array, jax.Array, int, jax.Array, jax.Array]:
     """
     Core Tsit5 integration loop with optional shrinking batch optimization.
 
@@ -2841,6 +2841,7 @@ def _tsit5_integrate_core(
         final_t: Final times [batch_size]
         iter_count: Total work units executed (iterations * effective_batch_size)
         step_carry: Final callback carry state [batch_size]
+        per_trajectory_iterations: Number of iterations per trajectory [batch_size]
     """
     initial_batch_size = x0.shape[0]
     current_batch_size = initial_batch_size
@@ -2855,7 +2856,11 @@ def _tsit5_integrate_core(
         "t": [],
         "step_carry": [],
         "original_indices": [],
+        "iteration_counts": [],
     }
+
+    # Track iterations per trajectory
+    per_trajectory_iterations = jnp.zeros((initial_batch_size,), dtype=jnp.int32)
 
     x = x0
     t = t0
@@ -2940,6 +2945,11 @@ def _tsit5_integrate_core(
             iter_executed += current_batch_size
             actual_iterations += 1
 
+            # Update per-trajectory iteration counts for all trajectories in current batch
+            # We do computational work for all trajectories in the batch, not just live ones
+            current_original_indices = original_indices[original_indices >= 0]
+            per_trajectory_iterations = per_trajectory_iterations.at[current_original_indices].add(1)
+
             # Check if we should reduce batch size
             live_mask = ~done
             live_count = int(jnp.sum(live_mask))
@@ -2967,8 +2977,11 @@ def _tsit5_integrate_core(
                     completed_trajectories["step_carry"].append(
                         step_carry[completed_indices]
                     )
-                    completed_trajectories["original_indices"].append(
-                        original_indices[completed_indices]
+                    completed_original_indices = original_indices[completed_indices]
+                    completed_trajectories["original_indices"].append(completed_original_indices)
+                    # Store per-trajectory iteration counts for completed trajectories
+                    completed_trajectories["iteration_counts"].append(
+                        per_trajectory_iterations[completed_original_indices]
                     )
 
                 # Filter and pad arrays
@@ -3067,8 +3080,11 @@ def _tsit5_integrate_core(
         completed_trajectories["x"].append(x[remaining_indices])
         completed_trajectories["t"].append(t[remaining_indices])
         completed_trajectories["step_carry"].append(step_carry[remaining_indices])
-        completed_trajectories["original_indices"].append(
-            original_indices[remaining_indices]
+        remaining_original_indices = original_indices[remaining_indices]
+        completed_trajectories["original_indices"].append(remaining_original_indices)
+        # Store per-trajectory iteration counts for remaining trajectories
+        completed_trajectories["iteration_counts"].append(
+            per_trajectory_iterations[remaining_original_indices]
         )
 
     # Reassemble all results in original order
@@ -3077,12 +3093,14 @@ def _tsit5_integrate_core(
     all_t = jnp.concatenate(completed_trajectories["t"])
     all_step_carry = jnp.concatenate(completed_trajectories["step_carry"])
     all_orig_indices = jnp.concatenate(completed_trajectories["original_indices"])
+    all_iteration_counts = jnp.concatenate(completed_trajectories["iteration_counts"])
 
     # Create sorting indices to restore original order
     sort_indices = jnp.argsort(all_orig_indices)
     final_x = all_x[sort_indices]
     final_t = all_t[sort_indices]
     final_step_carry = all_step_carry[sort_indices]
+    final_iteration_counts = all_iteration_counts[sort_indices]
 
     # Assert correct output shapes
     assert (
@@ -3133,7 +3151,7 @@ def _tsit5_integrate_core(
             f"or max iterations (current: {settings.max_iterations})."
         )
 
-    return final_x, final_t, iter_executed, final_step_carry
+    return final_x, final_t, iter_executed, final_step_carry, final_iteration_counts
 
 
 def _estimate_initial_dt(atol: float, rtol: float, domain_dim: int) -> float:
@@ -3584,7 +3602,7 @@ def generate_samples_inner(
         dt_initial = jnp.full((batch_size,), dt, dtype=jnp.float32)
 
         # Use batched core integration function for optimization
-        x, t_final, iteration_count, _ = _tsit5_integrate_core(
+        x, t_final, iteration_count, _, per_trajectory_iterations = _tsit5_integrate_core(
             vector_field_fn,
             vector_field_fn_fixed_static_params,
             vector_field_fn_fixed_params,
@@ -3597,9 +3615,7 @@ def generate_samples_inner(
             rng=None,
         )
         # Tsit5 uses one initial k1 evaluation, then 6 evaluations per iteration (FSAL)
-        vf_eval_counts = jnp.full(
-            (batch_size,), 1 + 6 * int(iteration_count), dtype=jnp.int32
-        )
+        vf_eval_counts = 1 + 6 * per_trajectory_iterations
     else:
         raise ValueError(f"Unknown ODE solver method: {method}")
 
@@ -3967,7 +3983,7 @@ def reverse_path_and_compute_divergence_tsit5(
     dt_initial = jnp.full((batch_size,), -abs(dt_mag), dtype=jnp.float32)
 
     # Use batched core integration function for optimization
-    x_final, t_final, iteration_count, div_sum = _tsit5_integrate_core(
+    x_final, t_final, iteration_count, div_sum, _ = _tsit5_integrate_core(
         vector_field_fn,
         vector_field_fn_fixed_static_params,
         vector_field_fn_fixed_params,
@@ -4443,8 +4459,8 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
         initial_x0=x0,
         tsit5_settings=tsit_settings,
     )
-    # All samples share the same number of vector-field evaluations in our batched implementation
-    tsit5_calls = int(tsit5_eval_counts[0])
+    # Sum total vector-field evaluations across all trajectories
+    tsit5_total_evals = int(jnp.sum(tsit5_eval_counts))
 
     # Compare both methods to reference via great-circle distance
     def gc(a, b):
@@ -4463,12 +4479,12 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
     assert max_err_tsit5 < 8e-2 and mean_err_tsit5 < 2e-2  # Similar accuracy expected
 
     # Adaptive should use fewer vector-field evaluations than fixed-step RK4
-    rk4_evals = int(rk4_eval_counts[0])
+    rk4_total_evals = int(rk4_eval_counts[0]) * batch_size  # RK4 uses same count for all trajectories
     assert (
-        tsit5_calls < rk4_evals
-    ), f"Adaptive Tsit5 used too many evals: {tsit5_calls} vs RK4 {rk4_evals}"
+        tsit5_total_evals < rk4_total_evals
+    ), f"Adaptive Tsit5 used too many evals: {tsit5_total_evals} vs RK4 {rk4_total_evals}"
 
-    print(f"\nTsit5 test passed! Used {tsit5_calls} calls vs RK4's {rk4_evals} calls")
+    print(f"\nTsit5 test passed! Used {tsit5_total_evals} calls vs RK4's {rk4_total_evals} calls")
     print(f"Max errors - RK4: {max_err_rk4:.6f}, Tsit5: {max_err_tsit5:.6f}")
     print(f"Mean errors - RK4: {mean_err_rk4:.6f}, Tsit5: {mean_err_tsit5:.6f}")
 
@@ -6038,7 +6054,7 @@ def test_shrinking_batch_produces_identical_results():
     t0 = jnp.zeros((batch_size,), dtype=jnp.float32)
     dt_initial = jnp.full((batch_size,), 0.01, dtype=jnp.float32)
 
-    x_standard, t_standard, iter_standard, _ = _tsit5_integrate_core(
+    x_standard, t_standard, iter_standard, _, _ = _tsit5_integrate_core(
         test_vf,
         None,
         None,
@@ -6051,7 +6067,7 @@ def test_shrinking_batch_produces_identical_results():
     )
 
     # Run batched integration
-    x_batched, t_batched, iter_batched, _ = _tsit5_integrate_core(
+    x_batched, t_batched, iter_batched, _, _ = _tsit5_integrate_core(
         test_vf,
         None,
         None,
@@ -6111,17 +6127,12 @@ def test_shrinking_batch_reduces_work():
 
         # First run with batching enabled
         print("Running with shrinking batch enabled...")
-        x_batched, t_batched, work_batched, _ = _tsit5_integrate_core(
+        x_batched, t_batched, work_batched, _, _ = _tsit5_integrate_core(
             variable_speed_vf, None, None, None, x0, t0, dt_initial, 1.0, settings
         )
 
         print("Running with shrinking batch disabled...")
-        (
-            x_no_batching,
-            t_no_batching,
-            work_no_batching,
-            _,
-        ) = _tsit5_integrate_core(
+        x_no_batching, t_no_batching, work_no_batching, _, _ = _tsit5_integrate_core(
             variable_speed_vf,
             None,
             None,
@@ -6218,7 +6229,7 @@ def test_shrinking_batch_edge_cases():
         dt_initial = jnp.full((batch_size,), 0.01, dtype=jnp.float32)
 
         try:
-            x_final, t_final, iterations, _ = _tsit5_integrate_core(
+            x_final, t_final, iterations, _, _ = _tsit5_integrate_core(
                 simple_vf, None, None, None, x0, t0, dt_initial, 1.0, settings
             )
 
@@ -6265,7 +6276,7 @@ def test_shrinking_batch_disabled_fallback():
     dt_initial = jnp.full((batch_size,), 0.01, dtype=jnp.float32)
 
     # Run with batching disabled (should fall back to _tsit5_integrate_core internally)
-    x_disabled, t_disabled, iter_disabled, _ = _tsit5_integrate_core(
+    x_disabled, t_disabled, iter_disabled, _, _ = _tsit5_integrate_core(
         test_vf,
         None,
         None,
@@ -6278,7 +6289,7 @@ def test_shrinking_batch_disabled_fallback():
     )
 
     # Run with batching enabled
-    x_enabled, t_enabled, iter_enabled, _ = _tsit5_integrate_core(
+    x_enabled, t_enabled, iter_enabled, _, _ = _tsit5_integrate_core(
         test_vf,
         None,
         None,
