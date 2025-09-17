@@ -6069,7 +6069,9 @@ def test_shrinking_batch_produces_identical_results():
 
     print(f"Position error: {position_error:.2e}")
     print(f"Time error: {time_error:.2e}")
-    print(f"Iterations - Standard: {iter_standard}, Batched: {iter_batched}")
+    print(
+        f"Iterations - fixed batch size: {iter_standard}, shrinking batch size: {iter_batched}"
+    )
 
     assert position_error < 1e-6, f"Position error too large: {position_error}"
     assert time_error < 1e-10, f"Time error too large: {time_error}"
