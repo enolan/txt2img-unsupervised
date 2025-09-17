@@ -19,7 +19,13 @@ model that generates embeddings is a spherical flow matching model with optimal 
 
 ## Code Style Guidelines
 - Your goal is to write code that is easy to understand and maintain. Take pride in your work. Don't
-  make the next person to look at this code spend a lot of effort figuring out what it does.
+  make the next person to look at this code spend a lot of effort figuring out what it does. When
+  you write code, ask yourself the following question:
+  * "Is this easy to understand? If I was reading this code for the first time, how long would it
+    take me to understand what's going on?"
+  * "Is this code written in a way that makes it more likely to be correct? Less likely?"
+  Do your best to write code such that the answers to those questions are "yes", "not too long",
+  "yes", and "no".
 - Code should communicate well. That means not including any extraneous information while including
   all necessary information to understand the code and why it is the way it is. Ceteris paribus,
   concise code is clearer.
