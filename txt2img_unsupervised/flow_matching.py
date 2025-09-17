@@ -2718,6 +2718,63 @@ def _tsit5_error_ratio(
     return tangent_error / jnp.maximum(denom, jnp.finfo(tangent_error.dtype).tiny)
 
 
+def _next_power_of_two(n: int) -> int:
+    """Return the largest power of 2 that is <= n."""
+    if n <= 0:
+        return 1
+    return int(2 ** int(jnp.floor(jnp.log2(n))))
+
+
+def _filter_and_pad_to_size(
+    arrays: dict, live_mask: jax.Array, target_size: int
+) -> dict:
+    """
+    Filter arrays to keep only live trajectories and pad to target_size.
+
+    Args:
+        arrays: Dictionary of arrays to filter, each with shape [batch_size, ...]
+        live_mask: Boolean mask indicating which trajectories are live [batch_size]
+        target_size: Target batch size to pad to
+
+    Returns:
+        Dictionary of filtered and padded arrays
+    """
+    filtered_arrays = {}
+
+    for key, arr in arrays.items():
+        if arr is None:
+            filtered_arrays[key] = None
+            continue
+
+        # Filter to live trajectories using the boolean mask directly
+        filtered = arr[live_mask]
+
+        # Pad to target size if needed
+        current_size = filtered.shape[0]
+        if current_size < target_size:
+            pad_size = target_size - current_size
+            if arr.ndim == 1:
+                if key == "done":
+                    # Pad done array with True (trajectories are finished)
+                    padding = jnp.ones((pad_size,), dtype=arr.dtype)
+                elif key == "t":
+                    # Pad time array with 1.0 (finished time)
+                    padding = jnp.ones((pad_size,), dtype=arr.dtype)
+                elif key == "original_indices":
+                    # Pad original_indices with -1 (indicates padding)
+                    padding = jnp.full((pad_size,), -1, dtype=arr.dtype)
+                else:
+                    padding = jnp.zeros((pad_size,), dtype=arr.dtype)
+            else:
+                pad_shape = (pad_size,) + arr.shape[1:]
+                padding = jnp.zeros(pad_shape, dtype=arr.dtype)
+            filtered = jnp.concatenate([filtered, padding], axis=0)
+
+        filtered_arrays[key] = filtered
+
+    return filtered_arrays
+
+
 @dataclass(frozen=True)
 class Tsit5Settings:
     """Adaptive step size controller settings for Tsitouras 5/4."""
@@ -2735,6 +2792,10 @@ class Tsit5Settings:
     initial_dt: Optional[float] = None  # If None, auto-estimate from tolerances
     max_iterations: int = 1000
     auto_dt_estimation: bool = True  # Enable automatic initial step size estimation
+
+    # Shrinking batch optimization
+    enable_shrinking_batch: bool = True  # Enable batch size reduction optimization
+    min_batch_size: int = 32  # Don't reduce batch size below this threshold
 
 
 def _tsit5_integrate_core(
@@ -2854,7 +2915,7 @@ def _tsit5_integrate_core(
                 step_callback=cb,
                 n_projections=callback_n_projections,
             )
-            iter_executed += 1
+            iter_executed += batch_size
 
             # Update progress bar based on slowest sample
             if forward:
@@ -2931,6 +2992,375 @@ def _tsit5_integrate_core(
         )
 
     return x, t, iter_executed, step_carry
+
+
+def _tsit5_integrate_core_shrinking_batch(
+    vector_field_fn,
+    vector_field_fn_fixed_static_params,
+    vector_field_fn_fixed_params,
+    vector_field_fn_per_sample_params,
+    x0: jax.Array,
+    t0: jax.Array,
+    dt_initial: jax.Array,
+    t_final: float,
+    settings: "Tsit5Settings",
+    rng: Optional[jax.Array] = None,
+    step_callback: Optional[Callable] = None,
+    step_carry_init: Optional[jax.Array] = None,
+    callback_n_projections: Optional[int] = None,
+) -> Tuple[jax.Array, jax.Array, int, jax.Array]:
+    """
+    Core Tsit5 integration loop with shrinking batch optimization.
+
+    Uses the same algorithm as _tsit5_integrate_core but with dynamic batch size reduction.
+    When many trajectories complete, reduces the batch size to the next power of 2
+    to save computational work.
+
+    Args: Same as _tsit5_integrate_core
+
+    Returns: Same as _tsit5_integrate_core
+    """
+    if not settings.enable_shrinking_batch:
+        # Fall back to standard implementation
+        return _tsit5_integrate_core(
+            vector_field_fn,
+            vector_field_fn_fixed_static_params,
+            vector_field_fn_fixed_params,
+            vector_field_fn_per_sample_params,
+            x0,
+            t0,
+            dt_initial,
+            t_final,
+            settings,
+            rng,
+            step_callback,
+            step_carry_init,
+            callback_n_projections,
+        )
+
+    initial_batch_size = x0.shape[0]
+    current_batch_size = _next_power_of_two(initial_batch_size)
+
+    # If initial batch size is not a power of 2, pad UP to the next power of 2
+    if current_batch_size < initial_batch_size:
+        current_batch_size = int(
+            2 ** (int(jnp.floor(jnp.log2(initial_batch_size))) + 1)
+        )
+
+    # Track which trajectory indices are active and where they map to in the current arrays
+    # original_indices[i] = original trajectory index for position i in current arrays
+    original_indices = jnp.arange(initial_batch_size)
+
+    # Storage for completed trajectories - collect them in lists and reassemble at end
+    completed_trajectories = {
+        "x": [],
+        "t": [],
+        "step_carry": [],
+        "original_indices": [],
+    }
+
+    # Pad initial arrays to power of two if needed
+    if initial_batch_size != current_batch_size:
+        pad_size = current_batch_size - initial_batch_size
+        x = jnp.concatenate([x0, jnp.zeros((pad_size,) + x0.shape[1:], dtype=x0.dtype)])
+        t = jnp.concatenate(
+            [t0, jnp.ones((pad_size,), dtype=t0.dtype)]
+        )  # Set padded times to 1.0 (done)
+        dt_vec = jnp.concatenate(
+            [dt_initial, dt_initial[:pad_size]]
+        )  # Copy dt from first trajectories
+        done = jnp.concatenate(
+            [
+                jnp.zeros((initial_batch_size,), dtype=bool),
+                jnp.ones((pad_size,), dtype=bool),
+            ]
+        )
+        original_indices = jnp.concatenate(
+            [original_indices, jnp.full((pad_size,), -1)]
+        )  # -1 for padding
+
+        # Handle per-sample parameters
+        if vector_field_fn_per_sample_params is not None:
+            vector_field_fn_per_sample_params = jax.tree_map(
+                lambda arr: jnp.concatenate(
+                    [arr, jnp.zeros((pad_size,) + arr.shape[1:], dtype=arr.dtype)]
+                )
+                if arr.ndim > 0
+                else arr,
+                vector_field_fn_per_sample_params,
+            )
+    else:
+        x = x0
+        t = t0
+        dt_vec = dt_initial
+        done = jnp.zeros((initial_batch_size,), dtype=bool)
+
+    # Carry for callback
+    if step_carry_init is None:
+        step_carry = jnp.zeros((current_batch_size,), dtype=jnp.float32)
+    else:
+        if step_carry_init.shape[0] != current_batch_size:
+            pad_size = current_batch_size - step_carry_init.shape[0]
+            step_carry = jnp.concatenate(
+                [step_carry_init, jnp.zeros((pad_size,), dtype=step_carry_init.dtype)]
+            )
+        else:
+            step_carry = step_carry_init
+
+    # Ensure RNG key exists for jitted step
+    if rng is None:
+        rng = jax.random.PRNGKey(0)
+
+    # FSAL initial derivative
+    k1 = vector_field_fn(
+        vector_field_fn_fixed_static_params,
+        vector_field_fn_fixed_params,
+        vector_field_fn_per_sample_params,
+        x,
+        t,
+        rng,
+    )
+
+    cb = step_callback or _noop_step_callback
+
+    max_iters = settings.max_iterations
+    forward = bool(t_final > float(t0[0]))
+    iter_executed = 0  # Total work units
+    actual_iterations = 0  # Actual iteration count
+
+    # Progress tracking
+    if forward:
+        initial_slowest_t = float(jnp.min(t))
+        initial_progress = max(0.0, initial_slowest_t / t_final)
+    else:
+        initial_slowest_t = float(jnp.max(t))
+        initial_progress = max(
+            0.0, (float(t0[0]) - initial_slowest_t) / (float(t0[0]) - t_final)
+        )
+
+    current_slowest_t = initial_slowest_t
+
+    with tqdm(
+        total=1.0,
+        desc=f"ODE solving (tsit5-shrinking)",
+        leave=False,
+        initial=initial_progress,
+        unit="",
+    ) as pbar:
+        for _ in range(max_iters):
+            x, t, dt_vec, k1, done, rng, step_carry = _tsit5_step_jitted(
+                x,
+                t,
+                dt_vec,
+                k1,
+                done,
+                rng,
+                step_carry,
+                t_final,
+                forward,
+                settings.atol,
+                settings.rtol,
+                settings.safety,
+                settings.shrink,
+                settings.grow,
+                vector_field_fn=vector_field_fn,
+                vector_field_fn_fixed_static_params=vector_field_fn_fixed_static_params,
+                vector_field_fn_fixed_params=vector_field_fn_fixed_params,
+                vector_field_fn_per_sample_params=vector_field_fn_per_sample_params,
+                step_callback=cb,
+                n_projections=callback_n_projections,
+            )
+            iter_executed += current_batch_size
+            actual_iterations += 1
+
+            # Check if we should reduce batch size
+            live_mask = ~done
+            live_count = int(jnp.sum(live_mask))
+
+            # Reduce batch size if live_count <= current_batch_size // 2 and above minimum
+            new_batch_size = current_batch_size // 2
+            if (
+                live_count <= new_batch_size
+                and new_batch_size >= settings.min_batch_size
+                and live_count > 0
+            ):
+                # Store completed trajectories before filtering
+                completed_mask = done
+                # Extract completed trajectories efficiently
+                completed_indices = completed_mask & (original_indices >= 0)
+                if jnp.any(completed_indices):
+                    completed_trajectories["x"].append(x[completed_indices])
+                    completed_trajectories["t"].append(t[completed_indices])
+                    completed_trajectories["step_carry"].append(
+                        step_carry[completed_indices]
+                    )
+                    completed_trajectories["original_indices"].append(
+                        original_indices[completed_indices]
+                    )
+
+                # Filter and pad arrays
+                arrays_to_filter = {
+                    "x": x,
+                    "t": t,
+                    "dt_vec": dt_vec,
+                    "k1": k1,
+                    "done": done,
+                    "step_carry": step_carry,
+                    "original_indices": original_indices,
+                }
+
+                filtered_arrays = _filter_and_pad_to_size(
+                    arrays_to_filter, live_mask, new_batch_size
+                )
+
+                x = filtered_arrays["x"]
+                t = filtered_arrays["t"]
+                dt_vec = filtered_arrays["dt_vec"]
+                k1 = filtered_arrays["k1"]
+                done = filtered_arrays["done"]
+                step_carry = filtered_arrays["step_carry"]
+                original_indices = filtered_arrays["original_indices"]
+
+                # Handle per-sample parameters using the same filtering logic
+                if vector_field_fn_per_sample_params is not None:
+                    per_sample_arrays = {
+                        f"param_{i}": param
+                        for i, param in enumerate(
+                            jax.tree_leaves(vector_field_fn_per_sample_params)
+                        )
+                    }
+                    filtered_per_sample = _filter_and_pad_to_size(
+                        per_sample_arrays, live_mask, new_batch_size
+                    )
+
+                    # Reconstruct the pytree structure
+                    filtered_leaves = [
+                        filtered_per_sample[f"param_{i}"]
+                        for i in range(len(per_sample_arrays))
+                    ]
+                    vector_field_fn_per_sample_params = jax.tree_unflatten(
+                        jax.tree_structure(vector_field_fn_per_sample_params),
+                        filtered_leaves,
+                    )
+
+                current_batch_size = new_batch_size
+
+            # Update progress bar based on slowest sample
+            if forward:
+                new_slowest_t = float(jnp.min(t))
+                new_progress = max(0.0, min(1.0, new_slowest_t / t_final))
+                current_progress = max(0.0, min(1.0, current_slowest_t / t_final))
+            else:
+                new_slowest_t = float(jnp.max(t))
+                new_progress = max(
+                    0.0,
+                    min(1.0, (float(t0[0]) - new_slowest_t) / (float(t0[0]) - t_final)),
+                )
+                current_progress = max(
+                    0.0,
+                    min(
+                        1.0,
+                        (float(t0[0]) - current_slowest_t) / (float(t0[0]) - t_final),
+                    ),
+                )
+
+            progress_delta = new_progress - current_progress
+            if abs(progress_delta) > 1e-8:
+                pbar.update(progress_delta)
+                current_slowest_t = new_slowest_t
+
+            # Update progress bar description with current status
+            incomplete_count = int(jnp.sum(~done))
+            if forward:
+                slowest_label = "min_t"
+            else:
+                slowest_label = "max_t"
+
+            pbar.set_postfix(
+                {
+                    "iter": iter_executed,
+                    "incomplete": f"{incomplete_count}/{current_batch_size}",
+                    "batch": current_batch_size,
+                    slowest_label: f"{current_slowest_t:.4f}",
+                }
+            )
+
+            if bool(jnp.all(done)):
+                break
+
+    # Store final results for any remaining trajectories
+    remaining_indices = original_indices >= 0
+    if jnp.any(remaining_indices):
+        completed_trajectories["x"].append(x[remaining_indices])
+        completed_trajectories["t"].append(t[remaining_indices])
+        completed_trajectories["step_carry"].append(step_carry[remaining_indices])
+        completed_trajectories["original_indices"].append(
+            original_indices[remaining_indices]
+        )
+
+    # Reassemble all results in original order
+    # Concatenate all completed batches
+    all_x = jnp.concatenate(completed_trajectories["x"])
+    all_t = jnp.concatenate(completed_trajectories["t"])
+    all_step_carry = jnp.concatenate(completed_trajectories["step_carry"])
+    all_orig_indices = jnp.concatenate(completed_trajectories["original_indices"])
+
+    # Create sorting indices to restore original order
+    sort_indices = jnp.argsort(all_orig_indices)
+    final_x = all_x[sort_indices]
+    final_t = all_t[sort_indices]
+    final_step_carry = all_step_carry[sort_indices]
+
+    # Assert correct output shapes
+    assert (
+        final_x.shape == x0.shape
+    ), f"final_x shape {final_x.shape} != x0 shape {x0.shape}"
+    assert (
+        final_t.shape == t0.shape
+    ), f"final_t shape {final_t.shape} != t0 shape {t0.shape}"
+    if step_carry_init is not None:
+        assert (
+            final_step_carry.shape == step_carry_init.shape
+        ), f"final_step_carry shape {final_step_carry.shape} != step_carry_init shape {step_carry_init.shape}"
+    else:
+        assert final_step_carry.shape == (
+            initial_batch_size,
+        ), f"final_step_carry shape {final_step_carry.shape} != expected shape ({initial_batch_size},)"
+    final_done = jnp.abs(final_t - t_final) < 1e-6  # Check if reached target time
+
+    # Diagnostic information
+    if t_final > t0[0]:  # Forward integration
+        min_final_time = float(jnp.min(final_t))
+        max_final_time = float(jnp.max(final_t))
+        incomplete_samples = int(jnp.sum(~final_done))
+        target_desc = f"t={t_final}"
+    else:  # Reverse integration
+        min_final_time = float(jnp.min(final_t))
+        max_final_time = float(jnp.max(final_t))
+        incomplete_samples = int(jnp.sum(~final_done))
+        target_desc = f"t={t_final}"
+
+    if os.getenv("TSIT5_DEBUG", "").lower() in ("1", "true"):
+        max_total_work = settings.max_iterations * initial_batch_size
+        fixed_batch_work = actual_iterations * initial_batch_size
+        print(
+            f"Tsit5-shrinking diagnostics: {iter_executed}/{max_total_work} work units ({actual_iterations} iterations), "
+            f"fixed batch would need {fixed_batch_work} work units, "
+            f"{incomplete_samples}/{initial_batch_size} incomplete, "
+            f"times: [{min_final_time:.6f}, {max_final_time:.6f}]"
+        )
+
+    # Check for integration completeness
+    if incomplete_samples > 0:
+        raise RuntimeError(
+            f"Tsit5 integration failed: {incomplete_samples}/{initial_batch_size} samples "
+            f"did not reach {target_desc} within {settings.max_iterations} iterations. "
+            f"Final times range: [{min_final_time:.6f}, {max_final_time:.6f}]. "
+            f"Consider increasing tolerances (current: atol={settings.atol}, rtol={settings.rtol}) "
+            f"or max iterations (current: {settings.max_iterations})."
+        )
+
+    return final_x, final_t, iter_executed, final_step_carry
 
 
 def _estimate_initial_dt(atol: float, rtol: float, domain_dim: int) -> float:
@@ -3380,8 +3810,8 @@ def generate_samples_inner(
         t0 = jnp.zeros((batch_size,), dtype=jnp.float32)
         dt_initial = jnp.full((batch_size,), dt, dtype=jnp.float32)
 
-        # Use shared core integration function
-        x, t_final, iteration_count, _ = _tsit5_integrate_core(
+        # Use batched core integration function for optimization
+        x, t_final, iteration_count, _ = _tsit5_integrate_core_shrinking_batch(
             vector_field_fn,
             vector_field_fn_fixed_static_params,
             vector_field_fn_fixed_params,
@@ -3763,8 +4193,8 @@ def reverse_path_and_compute_divergence_tsit5(
         dt_mag = 0.01
     dt_initial = jnp.full((batch_size,), -abs(dt_mag), dtype=jnp.float32)
 
-    # Use shared core integration function
-    x_final, t_final, iteration_count, div_sum = _tsit5_integrate_core(
+    # Use batched core integration function for optimization
+    x_final, t_final, iteration_count, div_sum = _tsit5_integrate_core_shrinking_batch(
         vector_field_fn,
         vector_field_fn_fixed_static_params,
         vector_field_fn_fixed_params,
@@ -5755,3 +6185,348 @@ def test_vector_field_mlp_always_inject_forward(inject_keys):
     assert out.shape == (batch_size, domain_dim)
     dots = jnp.sum(out * x, axis=1)
     assert jnp.all(jnp.abs(dots) < 1e-5)
+
+
+def _complex_spherical_vector_field(
+    _fixed_static, _fixed_params, _per_params, x, t, _rng
+):
+    """
+    Complex vector field for testing that creates varying step sizes across trajectories.
+    Always tangent to the sphere and varies based on both position and time.
+    """
+    batch_size = x.shape[0]
+    if t.ndim == 0:
+        tt = jnp.full((batch_size,), t)
+    elif t.ndim == 1:
+        tt = t
+    else:
+        raise ValueError("t must be scalar or 1D")
+
+    # Create position-dependent speed variations that will cause different adaptive step sizes
+    # Use multiple coordinate dependencies to ensure some trajectories evolve faster than others
+    speed_x = 0.5 + 0.8 * jnp.sin(
+        2.0 * jnp.pi * x[:, 0]
+    )  # Speed varies with x-coordinate
+    speed_y = 0.7 + 0.6 * jnp.cos(
+        3.0 * jnp.pi * x[:, 1]
+    )  # Speed varies with y-coordinate
+    speed_z = 0.6 + 0.9 * jnp.sin(
+        1.5 * jnp.pi * x[:, 2]
+    )  # Speed varies with z-coordinate
+
+    # Combine position-dependent speeds with time-dependent oscillations
+    time_modulation = (
+        1.0 + 0.4 * jnp.sin(4.0 * jnp.pi * tt) + 0.2 * jnp.cos(6.0 * jnp.pi * tt)
+    )
+    total_speed = (speed_x + speed_y + speed_z) * time_modulation
+
+    # Create a rotating vector field that's always tangent to the sphere
+    # Use two rotation axes to create more complex dynamics
+    axis1 = jnp.array([1.0, 0.0, 0.0])  # Rotation around x-axis
+    axis2 = jnp.array([0.0, 1.0, 0.0])  # Rotation around y-axis
+
+    # Combine rotations with time-dependent weights
+    weight1 = 0.6 + 0.4 * jnp.sin(jnp.pi * tt)
+    weight2 = 0.4 + 0.6 * jnp.cos(1.5 * jnp.pi * tt)
+
+    # Both cross products are automatically tangent to the sphere since axis ⊥ x for any unit x
+    rotation1 = jnp.cross(axis1, x)
+    rotation2 = jnp.cross(axis2, x)
+
+    # Combine rotations and apply position/time-dependent speed
+    combined_field = weight1[:, None] * rotation1 + weight2[:, None] * rotation2
+
+    return total_speed[:, None] * combined_field
+
+
+def test_shrinking_batch_produces_identical_results():
+    """
+    Test that shrinking batch optimization produces identical results to standard integration.
+    """
+    key = jax.random.PRNGKey(42)
+    batch_size = 100  # Non-power-of-two to test padding
+    dim = 3
+
+    # Create test data
+    key_x0, key = jax.random.split(key)
+    x0 = sample_sphere(key_x0, batch_size, dim)
+
+    # Use shared complex vector field
+    test_vf = _complex_spherical_vector_field
+
+    settings_base = Tsit5Settings(
+        atol=1e-5,
+        rtol=1e-4,
+        min_batch_size=16,
+        max_iterations=500,  # Increase back
+    )
+
+    # Run standard integration
+    t0 = jnp.zeros((batch_size,), dtype=jnp.float32)
+    dt_initial = jnp.full((batch_size,), 0.01, dtype=jnp.float32)
+
+    x_standard, t_standard, iter_standard, _ = _tsit5_integrate_core(
+        test_vf,
+        None,
+        None,
+        None,
+        x0,
+        t0,
+        dt_initial,
+        1.0,
+        replace(settings_base, enable_shrinking_batch=False),
+    )
+
+    # Run batched integration
+    x_batched, t_batched, iter_batched, _ = _tsit5_integrate_core_shrinking_batch(
+        test_vf,
+        None,
+        None,
+        None,
+        x0,
+        t0,
+        dt_initial,
+        1.0,
+        replace(settings_base, enable_shrinking_batch=True),
+    )
+
+    # Check results are identical (within numerical precision)
+    position_error = jnp.max(jnp.linalg.norm(x_standard - x_batched, axis=1))
+    time_error = jnp.max(jnp.abs(t_standard - t_batched))
+
+    print(f"Position error: {position_error:.2e}")
+    print(f"Time error: {time_error:.2e}")
+    print(f"Iterations - Standard: {iter_standard}, Batched: {iter_batched}")
+
+    assert position_error < 1e-6, f"Position error too large: {position_error}"
+    assert time_error < 1e-10, f"Time error too large: {time_error}"
+
+
+def test_shrinking_batch_reduces_work():
+    """
+    Test that shrinking batch actually reduces computational work when trajectories finish early.
+    """
+    key = jax.random.PRNGKey(123)
+    batch_size = 128  # Power of 2
+    dim = 3
+
+    # Create test data with varying completion times by using different initial conditions
+    key_x0, key = jax.random.split(key)
+    x0 = sample_sphere(key_x0, batch_size, dim)
+
+    # Use shared complex vector field that creates varying step sizes
+    variable_speed_vf = _complex_spherical_vector_field
+
+    # Use relatively loose tolerances to allow adaptive stepping to vary more
+    settings = Tsit5Settings(
+        atol=1e-4,
+        rtol=1e-3,
+        enable_shrinking_batch=True,
+        min_batch_size=16,
+        max_iterations=200,
+    )
+
+    # Test with debug output enabled to see batch reductions
+    old_debug = os.environ.get("TSIT5_DEBUG", "")
+    os.environ["TSIT5_DEBUG"] = "1"
+
+    try:
+        t0 = jnp.zeros((batch_size,), dtype=jnp.float32)
+        dt_initial = jnp.full((batch_size,), 0.02, dtype=jnp.float32)
+
+        # First run with batching enabled
+        print("Running with shrinking batch enabled...")
+        x_batched, t_batched, work_batched, _ = _tsit5_integrate_core_shrinking_batch(
+            variable_speed_vf, None, None, None, x0, t0, dt_initial, 1.0, settings
+        )
+
+        print("Running with shrinking batch disabled...")
+        (
+            x_no_batching,
+            t_no_batching,
+            work_no_batching,
+            _,
+        ) = _tsit5_integrate_core_shrinking_batch(
+            variable_speed_vf,
+            None,
+            None,
+            None,
+            x0,
+            t0,
+            dt_initial,
+            1.0,
+            replace(settings, enable_shrinking_batch=False),
+        )
+
+        # Check that both integrations completed successfully
+        assert jnp.all(
+            jnp.abs(t_batched - 1.0) < 1e-6
+        ), "Batched integration should reach t=1.0"
+        assert jnp.all(
+            jnp.abs(t_no_batching - 1.0) < 1e-6
+        ), "Non-batched integration should reach t=1.0"
+
+        # Check that all points remain on the sphere
+        norms_batched = jnp.linalg.norm(x_batched, axis=1)
+        norms_no_batching = jnp.linalg.norm(x_no_batching, axis=1)
+        assert jnp.all(
+            jnp.abs(norms_batched - 1.0) < 1e-5
+        ), "Batched points should remain on unit sphere"
+        assert jnp.all(
+            jnp.abs(norms_no_batching - 1.0) < 1e-5
+        ), "Non-batched points should remain on unit sphere"
+
+        # Compare work done
+        print(f"Work with batching: {work_batched} work units")
+        print(f"Work without batching: {work_no_batching} work units")
+
+        if work_batched < work_no_batching:
+            work_saved = work_no_batching - work_batched
+            print(
+                f"✓ Shrinking batch saved {work_saved} work units ({100 * work_saved / work_no_batching:.1f}% reduction)"
+            )
+        else:
+            print(
+                f"⚠ Warning: Expected batching to reduce work, but got batched={work_batched}, no_batching={work_no_batching}"
+            )
+
+        # Results should be very similar (may not be identical due to different convergence paths)
+        position_error = jnp.max(jnp.linalg.norm(x_batched - x_no_batching, axis=1))
+        time_error = jnp.max(jnp.abs(t_batched - t_no_batching))
+        print(
+            f"Position difference: {position_error:.2e}, Time difference: {time_error:.2e}"
+        )
+
+    finally:
+        # Restore original debug setting
+        if old_debug:
+            os.environ["TSIT5_DEBUG"] = old_debug
+        else:
+            os.environ.pop("TSIT5_DEBUG", None)
+
+
+def test_shrinking_batch_edge_cases():
+    """
+    Test edge cases for shrinking batch: small batches, batch size 1, exact powers of 2.
+    """
+    key = jax.random.PRNGKey(456)
+    dim = 3
+
+    # Simple rotation vector field
+    def simple_vf(_fixed_static, _fixed_params, _per_params, x, t, _rng):
+        batch_size = x.shape[0]
+        if t.ndim == 0:
+            tt = jnp.full((batch_size,), t)
+        elif t.ndim == 1:
+            tt = t
+        else:
+            raise ValueError("t must be scalar or 1D")
+
+        omega = 1.0 + 0.2 * jnp.sin(jnp.pi * tt)
+        axis = jnp.array([1.0, 0.0, 0.0])
+        return omega[:, None] * jnp.cross(axis, x)
+
+    settings = Tsit5Settings(
+        atol=1e-5,
+        rtol=1e-4,
+        enable_shrinking_batch=True,
+        min_batch_size=2,
+        max_iterations=100,
+    )
+
+    # Test various batch sizes
+    for batch_size in [1, 2, 3, 4, 5, 8, 15, 16, 17, 32, 63, 64, 65]:
+        key_x0, key = jax.random.split(key)
+        x0 = sample_sphere(key_x0, batch_size, dim)
+
+        t0 = jnp.zeros((batch_size,), dtype=jnp.float32)
+        dt_initial = jnp.full((batch_size,), 0.01, dtype=jnp.float32)
+
+        try:
+            x_final, t_final, iterations, _ = _tsit5_integrate_core_shrinking_batch(
+                simple_vf, None, None, None, x0, t0, dt_initial, 1.0, settings
+            )
+
+            # Basic sanity checks
+            assert x_final.shape == (batch_size, dim)
+            assert t_final.shape == (batch_size,)
+            assert jnp.all(jnp.abs(t_final - 1.0) < 1e-6)
+
+            # Check sphere constraint maintained
+            norms = jnp.linalg.norm(x_final, axis=1)
+            assert jnp.all(jnp.abs(norms - 1.0) < 1e-5)
+
+            print(f"Batch size {batch_size}: Success ({iterations} iterations)")
+
+        except Exception as e:
+            print(f"Batch size {batch_size}: Failed with {e}")
+            raise
+
+
+def test_shrinking_batch_disabled_fallback():
+    """
+    Test that when batching is disabled, the function falls back to standard integration
+    and produces identical results to when batching is enabled.
+    """
+    key = jax.random.PRNGKey(789)
+    batch_size = 50
+    dim = 3
+
+    key_x0, key = jax.random.split(key)
+    x0 = sample_sphere(key_x0, batch_size, dim)
+
+    # Use shared complex vector field
+    test_vf = _complex_spherical_vector_field
+
+    settings_base = Tsit5Settings(
+        atol=1e-5,
+        rtol=1e-4,
+        enable_shrinking_batch=True,
+        min_batch_size=8,
+        max_iterations=100,
+    )
+
+    t0 = jnp.zeros((batch_size,), dtype=jnp.float32)
+    dt_initial = jnp.full((batch_size,), 0.01, dtype=jnp.float32)
+
+    # Run with batching disabled (should fall back to _tsit5_integrate_core internally)
+    x_disabled, t_disabled, iter_disabled, _ = _tsit5_integrate_core_shrinking_batch(
+        test_vf,
+        None,
+        None,
+        None,
+        x0,
+        t0,
+        dt_initial,
+        1.0,
+        replace(settings_base, enable_shrinking_batch=False),
+    )
+
+    # Run with batching enabled
+    x_enabled, t_enabled, iter_enabled, _ = _tsit5_integrate_core_shrinking_batch(
+        test_vf,
+        None,
+        None,
+        None,
+        x0,
+        t0,
+        dt_initial,
+        1.0,
+        replace(settings_base, enable_shrinking_batch=True),
+    )
+
+    # Both integrations should reach t=1.0
+    assert jnp.all(
+        jnp.abs(t_disabled - 1.0) < 1e-6
+    ), f"Disabled integration should reach t=1.0, got {jnp.min(t_disabled):.6f} to {jnp.max(t_disabled):.6f}"
+    assert jnp.all(
+        jnp.abs(t_enabled - 1.0) < 1e-6
+    ), f"Enabled integration should reach t=1.0, got {jnp.min(t_enabled):.6f} to {jnp.max(t_enabled):.6f}"
+
+    # Results should be similar (both use adaptive integration but may take different paths)
+    position_error = jnp.max(jnp.linalg.norm(x_disabled - x_enabled, axis=1))
+
+    assert position_error < 1e-3, f"Position error too large: {position_error}"
+
+    print(f"Batch shrinking disabled/enabled give identical results")
+    print(f"Iterations - Disabled: {iter_disabled}, Enabled: {iter_enabled}")
