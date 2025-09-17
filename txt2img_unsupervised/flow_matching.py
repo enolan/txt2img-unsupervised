@@ -2814,7 +2814,11 @@ def _tsit5_integrate_core(
     callback_n_projections: Optional[int] = None,
 ) -> Tuple[jax.Array, jax.Array, int, jax.Array]:
     """
-    Core Tsit5 integration loop shared between forward and reverse integration.
+    Core Tsit5 integration loop with optional shrinking batch optimization.
+
+    When settings.enable_shrinking_batch is True, dynamically reduces batch size as
+    trajectories complete to save computational work. When False, uses fixed batch
+    size throughout integration.
 
     Args:
         vector_field_fn: Vector field function
@@ -2835,209 +2839,9 @@ def _tsit5_integrate_core(
     Returns:
         final_x: Final positions [batch_size, dim]
         final_t: Final times [batch_size]
-        iter_count: Number of iterations used
+        iter_count: Total work units executed (iterations * effective_batch_size)
         step_carry: Final callback carry state [batch_size]
     """
-    batch_size = x0.shape[0]
-    x = x0
-    t = t0
-    dt_vec = dt_initial
-    done = jnp.zeros((batch_size,), dtype=bool)
-
-    # Carry for callback
-    if step_carry_init is None:
-        step_carry = jnp.zeros((batch_size,), dtype=jnp.float32)
-    else:
-        step_carry = step_carry_init
-
-    # Ensure RNG key exists for jitted step
-    if rng is None:
-        rng = jax.random.PRNGKey(0)
-
-    # FSAL initial derivative
-    k1 = vector_field_fn(
-        vector_field_fn_fixed_static_params,
-        vector_field_fn_fixed_params,
-        vector_field_fn_per_sample_params,
-        x,
-        t,
-        rng,
-    )
-
-    cb = step_callback or _noop_step_callback
-
-    max_iters = settings.max_iterations
-    forward = bool(t_final > float(t0[0]))
-    # Track how many iterations actually executed
-    iter_executed = 0
-
-    # Progress bar showing integration progress - track the slowest sample
-    if forward:
-        # Forward: track slowest sample (min_t), progress when min_t reaches t_final
-        initial_slowest_t = float(jnp.min(t))
-        initial_progress = max(0.0, initial_slowest_t / t_final)
-    else:
-        # Reverse: track slowest sample (max_t), progress when max_t reaches t_final
-        initial_slowest_t = float(jnp.max(t))
-        initial_progress = max(
-            0.0, (float(t0[0]) - initial_slowest_t) / (float(t0[0]) - t_final)
-        )
-
-    current_slowest_t = initial_slowest_t
-
-    with tqdm(
-        total=1.0,  # Progress bar always fills 0 to 1
-        desc=f"ODE solving (tsit5)",
-        leave=False,
-        initial=initial_progress,
-        unit="",  # No unit since we're showing completion fraction
-    ) as pbar:
-        for _ in range(max_iters):
-            x, t, dt_vec, k1, done, rng, step_carry = _tsit5_step_jitted(
-                x,
-                t,
-                dt_vec,
-                k1,
-                done,
-                rng,
-                step_carry,
-                t_final,
-                forward,
-                settings.atol,
-                settings.rtol,
-                settings.safety,
-                settings.shrink,
-                settings.grow,
-                vector_field_fn=vector_field_fn,
-                vector_field_fn_fixed_static_params=vector_field_fn_fixed_static_params,
-                vector_field_fn_fixed_params=vector_field_fn_fixed_params,
-                vector_field_fn_per_sample_params=vector_field_fn_per_sample_params,
-                step_callback=cb,
-                n_projections=callback_n_projections,
-            )
-            iter_executed += batch_size
-
-            # Update progress bar based on slowest sample
-            if forward:
-                # Forward: track slowest sample (min_t)
-                new_slowest_t = float(jnp.min(t))
-                new_progress = max(0.0, min(1.0, new_slowest_t / t_final))
-                current_progress = max(0.0, min(1.0, current_slowest_t / t_final))
-            else:
-                # Reverse: track slowest sample (max_t)
-                new_slowest_t = float(jnp.max(t))
-                new_progress = max(
-                    0.0,
-                    min(1.0, (float(t0[0]) - new_slowest_t) / (float(t0[0]) - t_final)),
-                )
-                current_progress = max(
-                    0.0,
-                    min(
-                        1.0,
-                        (float(t0[0]) - current_slowest_t) / (float(t0[0]) - t_final),
-                    ),
-                )
-
-            progress_delta = new_progress - current_progress
-            if abs(progress_delta) > 1e-8:  # Only update if there's meaningful progress
-                pbar.update(progress_delta)
-                current_slowest_t = new_slowest_t
-
-            # Update progress bar description with current status
-            incomplete_count = int(jnp.sum(~done))
-            if forward:
-                slowest_label = "min_t"
-            else:
-                slowest_label = "max_t"
-
-            pbar.set_postfix(
-                {
-                    "iter": iter_executed,
-                    "incomplete": f"{incomplete_count}/{batch_size}",
-                    slowest_label: f"{current_slowest_t:.4f}",
-                }
-            )
-
-            if bool(jnp.all(done)):
-                break
-
-    # Diagnostic information for debugging
-    if t_final > t0[0]:  # Forward integration
-        min_final_time = float(jnp.min(t))
-        max_final_time = float(jnp.max(t))
-        incomplete_samples = int(jnp.sum(~done))
-        target_desc = f"t={t_final}"
-    else:  # Reverse integration
-        min_final_time = float(jnp.min(t))
-        max_final_time = float(jnp.max(t))
-        incomplete_samples = int(jnp.sum(~done))
-        target_desc = f"t={t_final}"
-
-    # Always provide basic diagnostic info if requested via environment variable
-    if os.getenv("TSIT5_DEBUG", "").lower() in ("1", "true"):
-        print(
-            f"Tsit5 diagnostics: {iter_executed}/{settings.max_iterations} iterations, "
-            f"{incomplete_samples}/{batch_size} incomplete, "
-            f"times: [{min_final_time:.6f}, {max_final_time:.6f}]"
-        )
-
-    # Check for integration completeness and raise exceptions for failures
-    if incomplete_samples > 0:
-        raise RuntimeError(
-            f"Tsit5 integration failed: {incomplete_samples}/{batch_size} samples "
-            f"did not reach {target_desc} within {settings.max_iterations} iterations. "
-            f"Final times range: [{min_final_time:.6f}, {max_final_time:.6f}]. "
-            f"Consider increasing tolerances (current: atol={settings.atol}, rtol={settings.rtol}) "
-            f"or max iterations (current: {settings.max_iterations})."
-        )
-
-    return x, t, iter_executed, step_carry
-
-
-def _tsit5_integrate_core_shrinking_batch(
-    vector_field_fn,
-    vector_field_fn_fixed_static_params,
-    vector_field_fn_fixed_params,
-    vector_field_fn_per_sample_params,
-    x0: jax.Array,
-    t0: jax.Array,
-    dt_initial: jax.Array,
-    t_final: float,
-    settings: "Tsit5Settings",
-    rng: Optional[jax.Array] = None,
-    step_callback: Optional[Callable] = None,
-    step_carry_init: Optional[jax.Array] = None,
-    callback_n_projections: Optional[int] = None,
-) -> Tuple[jax.Array, jax.Array, int, jax.Array]:
-    """
-    Core Tsit5 integration loop with shrinking batch optimization.
-
-    Uses the same algorithm as _tsit5_integrate_core but with dynamic batch size reduction.
-    When many trajectories complete, reduces the batch size to the next power of 2
-    to save computational work.
-
-    Args: Same as _tsit5_integrate_core
-
-    Returns: Same as _tsit5_integrate_core
-    """
-    if not settings.enable_shrinking_batch:
-        # Fall back to standard implementation
-        return _tsit5_integrate_core(
-            vector_field_fn,
-            vector_field_fn_fixed_static_params,
-            vector_field_fn_fixed_params,
-            vector_field_fn_per_sample_params,
-            x0,
-            t0,
-            dt_initial,
-            t_final,
-            settings,
-            rng,
-            step_callback,
-            step_carry_init,
-            callback_n_projections,
-        )
-
     initial_batch_size = x0.shape[0]
     current_batch_size = initial_batch_size
 
@@ -3141,12 +2945,16 @@ def _tsit5_integrate_core_shrinking_batch(
             live_count = int(jnp.sum(live_mask))
 
             # Shrink to live count rounded up to next power of two (respecting minimum)
-            new_batch_size = max(
-                _next_power_of_two(live_count)
-                if live_count > 0
-                else 0,
-                settings.min_batch_size,
-            )
+            # Only shrink if shrinking batch optimization is enabled
+            if settings.enable_shrinking_batch:
+                new_batch_size = max(
+                    _next_power_of_two(live_count)
+                    if live_count > 0
+                    else settings.min_batch_size,
+                    settings.min_batch_size,
+                )
+            else:
+                new_batch_size = current_batch_size  # Keep current batch size
 
             if new_batch_size < current_batch_size and live_count > 0:
                 # Store completed trajectories before filtering
@@ -3776,7 +3584,7 @@ def generate_samples_inner(
         dt_initial = jnp.full((batch_size,), dt, dtype=jnp.float32)
 
         # Use batched core integration function for optimization
-        x, t_final, iteration_count, _ = _tsit5_integrate_core_shrinking_batch(
+        x, t_final, iteration_count, _ = _tsit5_integrate_core(
             vector_field_fn,
             vector_field_fn_fixed_static_params,
             vector_field_fn_fixed_params,
@@ -4159,7 +3967,7 @@ def reverse_path_and_compute_divergence_tsit5(
     dt_initial = jnp.full((batch_size,), -abs(dt_mag), dtype=jnp.float32)
 
     # Use batched core integration function for optimization
-    x_final, t_final, iteration_count, div_sum = _tsit5_integrate_core_shrinking_batch(
+    x_final, t_final, iteration_count, div_sum = _tsit5_integrate_core(
         vector_field_fn,
         vector_field_fn_fixed_static_params,
         vector_field_fn_fixed_params,
@@ -6243,7 +6051,7 @@ def test_shrinking_batch_produces_identical_results():
     )
 
     # Run batched integration
-    x_batched, t_batched, iter_batched, _ = _tsit5_integrate_core_shrinking_batch(
+    x_batched, t_batched, iter_batched, _ = _tsit5_integrate_core(
         test_vf,
         None,
         None,
@@ -6301,7 +6109,7 @@ def test_shrinking_batch_reduces_work():
 
         # First run with batching enabled
         print("Running with shrinking batch enabled...")
-        x_batched, t_batched, work_batched, _ = _tsit5_integrate_core_shrinking_batch(
+        x_batched, t_batched, work_batched, _ = _tsit5_integrate_core(
             variable_speed_vf, None, None, None, x0, t0, dt_initial, 1.0, settings
         )
 
@@ -6311,7 +6119,7 @@ def test_shrinking_batch_reduces_work():
             t_no_batching,
             work_no_batching,
             _,
-        ) = _tsit5_integrate_core_shrinking_batch(
+        ) = _tsit5_integrate_core(
             variable_speed_vf,
             None,
             None,
@@ -6408,7 +6216,7 @@ def test_shrinking_batch_edge_cases():
         dt_initial = jnp.full((batch_size,), 0.01, dtype=jnp.float32)
 
         try:
-            x_final, t_final, iterations, _ = _tsit5_integrate_core_shrinking_batch(
+            x_final, t_final, iterations, _ = _tsit5_integrate_core(
                 simple_vf, None, None, None, x0, t0, dt_initial, 1.0, settings
             )
 
@@ -6455,7 +6263,7 @@ def test_shrinking_batch_disabled_fallback():
     dt_initial = jnp.full((batch_size,), 0.01, dtype=jnp.float32)
 
     # Run with batching disabled (should fall back to _tsit5_integrate_core internally)
-    x_disabled, t_disabled, iter_disabled, _ = _tsit5_integrate_core_shrinking_batch(
+    x_disabled, t_disabled, iter_disabled, _ = _tsit5_integrate_core(
         test_vf,
         None,
         None,
@@ -6468,7 +6276,7 @@ def test_shrinking_batch_disabled_fallback():
     )
 
     # Run with batching enabled
-    x_enabled, t_enabled, iter_enabled, _ = _tsit5_integrate_core_shrinking_batch(
+    x_enabled, t_enabled, iter_enabled, _ = _tsit5_integrate_core(
         test_vf,
         None,
         None,
