@@ -3039,13 +3039,7 @@ def _tsit5_integrate_core_shrinking_batch(
         )
 
     initial_batch_size = x0.shape[0]
-    current_batch_size = _next_power_of_two(initial_batch_size)
-
-    # If initial batch size is not a power of 2, pad UP to the next power of 2
-    if current_batch_size < initial_batch_size:
-        current_batch_size = int(
-            2 ** (int(jnp.floor(jnp.log2(initial_batch_size))) + 1)
-        )
+    current_batch_size = initial_batch_size
 
     # Track which trajectory indices are active and where they map to in the current arrays
     # original_indices[i] = original trajectory index for position i in current arrays
@@ -3059,41 +3053,10 @@ def _tsit5_integrate_core_shrinking_batch(
         "original_indices": [],
     }
 
-    # Pad initial arrays to power of two if needed
-    if initial_batch_size != current_batch_size:
-        pad_size = current_batch_size - initial_batch_size
-        x = jnp.concatenate([x0, jnp.zeros((pad_size,) + x0.shape[1:], dtype=x0.dtype)])
-        t = jnp.concatenate(
-            [t0, jnp.ones((pad_size,), dtype=t0.dtype)]
-        )  # Set padded times to 1.0 (done)
-        dt_vec = jnp.concatenate(
-            [dt_initial, dt_initial[:pad_size]]
-        )  # Copy dt from first trajectories
-        done = jnp.concatenate(
-            [
-                jnp.zeros((initial_batch_size,), dtype=bool),
-                jnp.ones((pad_size,), dtype=bool),
-            ]
-        )
-        original_indices = jnp.concatenate(
-            [original_indices, jnp.full((pad_size,), -1)]
-        )  # -1 for padding
-
-        # Handle per-sample parameters
-        if vector_field_fn_per_sample_params is not None:
-            vector_field_fn_per_sample_params = jax.tree_map(
-                lambda arr: jnp.concatenate(
-                    [arr, jnp.zeros((pad_size,) + arr.shape[1:], dtype=arr.dtype)]
-                )
-                if arr.ndim > 0
-                else arr,
-                vector_field_fn_per_sample_params,
-            )
-    else:
-        x = x0
-        t = t0
-        dt_vec = dt_initial
-        done = jnp.zeros((initial_batch_size,), dtype=bool)
+    x = x0
+    t = t0
+    dt_vec = dt_initial
+    done = jnp.zeros((initial_batch_size,), dtype=bool)
 
     # Carry for callback
     if step_carry_init is None:
@@ -3177,13 +3140,15 @@ def _tsit5_integrate_core_shrinking_batch(
             live_mask = ~done
             live_count = int(jnp.sum(live_mask))
 
-            # Reduce batch size if live_count <= current_batch_size // 2 and above minimum
-            new_batch_size = current_batch_size // 2
-            if (
-                live_count <= new_batch_size
-                and new_batch_size >= settings.min_batch_size
-                and live_count > 0
-            ):
+            # Shrink to live count rounded up to next power of two (respecting minimum)
+            new_batch_size = max(
+                _next_power_of_two(live_count)
+                if live_count > 0
+                else 0,
+                settings.min_batch_size,
+            )
+
+            if new_batch_size < current_batch_size and live_count > 0:
                 # Store completed trajectories before filtering
                 completed_mask = done
                 # Extract completed trajectories efficiently
