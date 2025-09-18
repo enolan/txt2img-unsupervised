@@ -1760,7 +1760,6 @@ def _train_loop_for_tests_generic(
     first_step = True
     step_count = 0
 
-    print("Train! Loop! Go!")
     with tqdm(range(epochs), desc="Training", unit="epochs") as pbar:
         for epoch in pbar:
             # Training loop
@@ -1950,6 +1949,7 @@ def _mk_model(
         raise ValueError(f"Unknown model_kind: {model_kind}")
 
 
+@pytest.mark.usefixtures("starts_with_progressbar")
 @pytest.mark.parametrize(
     "inject_keys",
     [
@@ -2318,6 +2318,7 @@ def test_train_uniform_zero_field(model_kind, domain_dim):
         frozenset({"x", "t", "cond"}),
     ],
 )
+@pytest.mark.usefixtures("starts_with_progressbar")
 @pytest.mark.parametrize("model_kind", ["mlp", "transformer"])
 @pytest.mark.parametrize("domain_dim", [3, 16])
 def test_train_conditional_vmf(model_kind, domain_dim, inject_keys):
@@ -4324,6 +4325,7 @@ def test_vector_field_evaluation():
     sorted_projected_directions = projected_directions[sort_indices]
 
 
+@pytest.mark.usefixtures("starts_with_progressbar")
 def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
     """
     Verify that RK4 and adaptive Tsit5 produce equivalent results (within numerical error), and
@@ -5567,6 +5569,7 @@ def generate_cap_constrained_samples(
         raise ValueError(f"Unknown sampling algorithm: {algorithm}")
 
 
+@pytest.mark.usefixtures("starts_with_progressbar")
 def test_generate_cap_constrained_samples_matches_rejection():
     """
     Train a 3D VectorField on a vMF distribution, then compare cap-constrained samples drawn via:
@@ -5763,6 +5766,7 @@ def test_spherical_ot_field_antipodal_direction_tangent_and_nonzero():
             assert jnp.linalg.norm(v) > 1e-6
 
 
+@pytest.mark.usefixtures("starts_with_progressbar")
 @pytest.mark.parametrize(
     "inject_keys",
     [
@@ -6012,6 +6016,7 @@ def _complex_spherical_vector_field(
     return total_speed[:, None] * combined_field
 
 
+@pytest.mark.usefixtures("starts_with_progressbar")
 def test_shrinking_batch_produces_identical_results():
     """
     Test that shrinking batch optimization produces identical results to standard integration.
@@ -6180,6 +6185,7 @@ def test_shrinking_batch_reduces_work():
             os.environ.pop("TSIT5_DEBUG", None)
 
 
+@pytest.mark.usefixtures("starts_with_progressbar")
 def test_shrinking_batch_edge_cases():
     """
     Test edge cases for shrinking batch: small batches, batch size 1, exact powers of 2.
@@ -6238,6 +6244,7 @@ def test_shrinking_batch_edge_cases():
             raise
 
 
+@pytest.mark.usefixtures("starts_with_progressbar")
 def test_shrinking_batch_disabled_fallback():
     """
     Test that when batching is disabled, the function falls back to standard integration
