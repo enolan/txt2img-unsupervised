@@ -1427,7 +1427,7 @@ def compute_hemisphere_probability_masses(
     south_log_mass = -(jnp.logaddexp(north_south_ratio_log, 0.0))
     north_log_mass = -(jnp.logaddexp(-north_south_ratio_log, 0.0))
 
-    return {
+    output_dict = {
         "north_log_mass": north_log_mass,
         "south_log_mass": south_log_mass,
         "northeast_both_finite_frac": jnp.mean(northeast_both_finite_mask),
@@ -1436,8 +1436,52 @@ def compute_hemisphere_probability_masses(
         "south_east_log_ratios_std": jnp.std(south_east_ratios_log),
     }
 
+    tqdm.write(
+        f"north mass: {float(jnp.exp(output_dict['north_log_mass'])):.3f}, south mass: {float(jnp.exp(output_dict['south_log_mass'])):.3f}"
+    )
+    tqdm.write(
+        f"northeast both finite frac: {output_dict['northeast_both_finite_frac']:.3f}, southeast both finite frac: {output_dict['southeast_both_finite_frac']:.3f}"
+    )
+    tqdm.write(
+        f"north east log ratios std: {output_dict['north_east_log_ratios_std']:.3f}, south east log ratios std: {output_dict['south_east_log_ratios_std']:.3f}"
+    )
 
-def _compute_nll_fwfm(model, params, batch, n_steps, rng, n_projections):
+
+    return output_dict
+
+
+def _precompute_hemisphere_masses_fwfm(model, params, rng, n_steps, n_projections):
+    """Precompute hemisphere probability masses for cap_conditioned_base FWFM models.
+
+    This is extracted from _compute_nll_fwfm to avoid recomputing expensive hemisphere masses
+    for every test batch when using cap_conditioned_base.
+
+    Args:
+        model: FunctionWeightedFlowModel with cap_conditioned_base=True
+        params: Model parameters
+        rng: JAX random key
+        n_steps: Number of integration steps
+        n_projections: Number of divergence projections
+
+    Returns:
+        Dict containing hemisphere probability masses, or None if not applicable
+    """
+    if (
+        model.weighting_function == WeightingFunction.CAP_INDICATOR
+        and model.cap_conditioned_base
+    ):
+        return compute_hemisphere_probability_masses(
+            model=model,
+            params=params,
+            rng=rng,
+            n_samples=64,
+            n_steps=n_steps,
+            n_projections=n_projections,
+        )
+    return None
+
+
+def _compute_nll_fwfm(model, params, batch, n_steps, rng, n_projections, precomputed_stats=None):
     """Compute NLL for FunctionWeightedFlowModel - use 'evenest weights'."""
     batch_size = batch["point_vec"].shape[0]
 
@@ -1477,15 +1521,19 @@ def _compute_nll_fwfm(model, params, batch, n_steps, rng, n_projections):
             weighting_function_params = (cap_centers, cap_d_maxes)
 
             # Estimate hemisphere masses and combine to get full-sphere likelihoods
-            masses_rng, prob_rng = jax.random.split(rng)
-            hemisphere_probability_masses_dict = compute_hemisphere_probability_masses(
-                model=model,
-                params=params,
-                rng=masses_rng,
-                n_samples=256,
-                n_steps=n_steps,
-                n_projections=n_projections,
-            )
+            if precomputed_stats is not None:
+                hemisphere_probability_masses_dict = precomputed_stats
+                prob_rng = rng
+            else:
+                masses_rng, prob_rng = jax.random.split(rng)
+                hemisphere_probability_masses_dict = compute_hemisphere_probability_masses(
+                    model=model,
+                    params=params,
+                    rng=masses_rng,
+                    n_samples=64,
+                    n_steps=n_steps,
+                    n_projections=n_projections,
+                )
 
             conditional_logprobs = compute_log_probability(
                 model=model,
@@ -1505,15 +1553,6 @@ def _compute_nll_fwfm(model, params, batch, n_steps, rng, n_projections):
             adjusted_logprobs = conditional_logprobs + hemisphere_log_masses
             hemisphere_probability_masses_dict = jax.device_get(
                 hemisphere_probability_masses_dict
-            )
-            tqdm.write(
-                f"north mass: {float(jnp.exp(hemisphere_probability_masses_dict['north_log_mass'])):.3f}, south mass: {float(jnp.exp(hemisphere_probability_masses_dict['south_log_mass'])):.3f}"
-            )
-            tqdm.write(
-                f"northeast both finite frac: {hemisphere_probability_masses_dict['northeast_both_finite_frac']:.3f}, southeast both finite frac: {hemisphere_probability_masses_dict['southeast_both_finite_frac']:.3f}"
-            )
-            tqdm.write(
-                f"north east log ratios std: {hemisphere_probability_masses_dict['north_east_log_ratios_std']:.3f}, south east log ratios std: {hemisphere_probability_masses_dict['south_east_log_ratios_std']:.3f}"
             )
 
             # If we don't do this then reported NLL is +inf until the network learns the cap
@@ -1543,4 +1582,5 @@ def _compute_nll_fwfm(model, params, batch, n_steps, rng, n_projections):
 _train_loop_for_tests = partial(
     flow_matching._train_loop_for_tests_generic,
     compute_nll_fn=_compute_nll_fwfm,
+    precompute_test_stats_fn=_precompute_hemisphere_masses_fwfm,
 )

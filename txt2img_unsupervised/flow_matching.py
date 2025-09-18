@@ -1718,6 +1718,7 @@ def _train_loop_for_tests_generic(
     epochs,
     test_dataset=None,
     compute_nll_fn=None,
+    precompute_test_stats_fn=None,
 ):
     """
     Generic training loop for unit tests.
@@ -1729,7 +1730,9 @@ def _train_loop_for_tests_generic(
         learning_rate: Initial learning rate (will use cosine schedule)
         epochs: Number of epochs to train for
         test_dataset: Optional test dataset for evaluation after each epoch
-        compute_nll_fn: Function (model, params, batch, n_steps, rng, n_projections) -> nlls
+        compute_nll_fn: Function (model, params, batch, n_steps, rng, n_projections, precomputed_stats=None) -> nlls
+        precompute_test_stats_fn: Optional function (model, params, rng, n_steps, n_projections) -> precomputed_stats
+                                  Called once before test evaluation to compute expensive global statistics
 
     Returns:
         state: Final training state
@@ -1750,8 +1753,8 @@ def _train_loop_for_tests_generic(
         decay_steps=total_steps,
     )
 
-    n_projections = 10
-    nll_steps = 32
+    n_projections = 64
+    nll_steps = 128
 
     state = create_train_state(params_rng, model, cosine_schedule)
     np_rng = np.random.Generator(np.random.PCG64(seed=42))
@@ -1790,6 +1793,7 @@ def _train_loop_for_tests_generic(
                         n_steps=nll_steps,
                         rng=nll_rng,
                         n_projections=n_projections,
+                        precomputed_stats=None,
                     )
                     train_nll = jnp.mean(train_nlls)
                 train_loss, grad_norm, train_nll = jax.device_get(
@@ -1816,6 +1820,14 @@ def _train_loop_for_tests_generic(
                 test_losses = []
                 test_nlls = []
 
+                # Precompute expensive test statistics if needed
+                precomputed_stats = None
+                if precompute_test_stats_fn is not None:
+                    precompute_rng, test_rng = jax.random.split(test_rng)
+                    precomputed_stats = precompute_test_stats_fn(
+                        model, state.params, precompute_rng, nll_steps, n_projections
+                    )
+
                 for test_batch in tqdm(
                     test_dataset.iter(batch_size, drop_last_batch=False),
                     unit="test batches",
@@ -1840,6 +1852,7 @@ def _train_loop_for_tests_generic(
                             n_steps=nll_steps,
                             rng=test_nll_rng,
                             n_projections=n_projections,
+                            precomputed_stats=precomputed_stats,
                         )
                     )
 
@@ -3086,9 +3099,8 @@ def _tsit5_integrate_core(
                 )
 
             progress_delta = new_progress - current_progress
-            if abs(progress_delta) > 1e-8:
-                pbar.update(progress_delta)
-                current_slowest_t = new_slowest_t
+            pbar.update(progress_delta)
+            current_slowest_t = new_slowest_t
 
             # Update progress bar description with current status
             incomplete_count = int(jnp.sum(~done))
@@ -3100,7 +3112,7 @@ def _tsit5_integrate_core(
             pbar.set_postfix(
                 {
                     "iter": actual_iterations,
-                    "incomplete": f"{incomplete_count}/{current_batch_size}",
+                    "incomplete": f"{incomplete_count}/{initial_batch_size}",
                     "batch": current_batch_size,
                     slowest_label: f"{current_slowest_t:.4f}",
                 }
