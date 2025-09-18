@@ -2917,10 +2917,10 @@ def _tsit5_integrate_core(
 
     with tqdm(
         total=1.0,
-        desc=f"ODE solving (tsit5-shrinking)",
-        leave=False,
+        desc=f"ODE solving. Solver: Tsit5, Direction: {'forward' if forward else 'reverse'}",
+        leave=True,
         initial=initial_progress,
-        unit="",
+        unit="progress",
     ) as pbar:
         for _ in range(max_iters):
             x, t, dt_vec, k1, done, rng, step_carry = _tsit5_step_jitted(
@@ -3555,7 +3555,12 @@ def generate_samples_inner(
 
     if method == "euler":
         # Forward Euler method
-        step_iter = tqdm(range(n_steps), desc=f"ODE solving ({method})", leave=False)
+        step_iter = tqdm(
+            range(n_steps),
+            desc="ODE solving. Solver: Euler, Direction: forward",
+            leave=True,
+            unit="progress",
+        )
         for i in step_iter:
             t = i * dt
             v = vector_field_fn(
@@ -3571,7 +3576,12 @@ def generate_samples_inner(
 
     elif method == "rk4":
         # 4th order Runge-Kutta method
-        step_iter = tqdm(range(n_steps), desc=f"ODE solving ({method})", leave=False)
+        step_iter = tqdm(
+            range(n_steps),
+            desc="ODE solving. Solver: RK4, Direction: forward",
+            leave=True,
+            unit="progress",
+        )
         for i in step_iter:
             t = i * dt
             x = spherical_rk4_step(
