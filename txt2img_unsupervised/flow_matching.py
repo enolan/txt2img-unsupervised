@@ -2774,6 +2774,8 @@ def _filter_and_pad_to_size(
                 elif key == "original_indices":
                     # Pad original_indices with -1 (indicates padding)
                     padding = jnp.full((pad_size,), -1, dtype=arr.dtype)
+                elif key == "cache_valid":
+                    padding = jnp.zeros((pad_size,), dtype=arr.dtype)
                 else:
                     padding = jnp.zeros((pad_size,), dtype=arr.dtype)
             else:
@@ -2807,13 +2809,27 @@ class Tsit5Settings:
     # Shrinking batch optimization
     enable_shrinking_batch: bool = True  # Enable batch size reduction optimization
     min_batch_size: int = 32  # Don't reduce batch size below this threshold
+    reuse_divergence_start: bool = True  # Reuse divergence at interval boundaries
 
 
 class StepCallbackResult(NamedTuple):
-    """Result of a Tsit5 step callback holding carry delta and normalized error."""
+    """Result of a Tsit5 step callback.
+
+    Attributes:
+        delta_carry: Increment to add to the running carry when the step is accepted.
+        error_ratio: Normalized error used by the adaptive controller.
+        start_cache: Quantity that should remain cached when a proposal is rejected.
+        start_cache_stderr: Corresponding uncertainty for ``start_cache``.
+        end_cache: Quantity to cache for the next step when the proposal is accepted.
+        end_cache_stderr: Corresponding uncertainty for ``end_cache``.
+    """
 
     delta_carry: jax.Array
     error_ratio: jax.Array
+    start_cache: jax.Array
+    start_cache_stderr: jax.Array
+    end_cache: jax.Array
+    end_cache_stderr: jax.Array
 
 
 def _tsit5_integrate_core(
@@ -2856,7 +2872,11 @@ def _tsit5_integrate_core(
                 vector_field_fn, vector_field_fn_fixed_static_params,
                 vector_field_fn_fixed_params, vector_field_fn_per_sample_params,
                 x5, x4, dir5, dir4,
-                atol, rtol, *, n_projections=None,
+                atol, rtol,
+                cache_divergence, cache_stderr, cache_valid,
+                reuse_start,
+                *,
+                n_projections=None,
             ) -> StepCallbackResult
             Called each iteration inside a jitted step.
         step_carry_init: Optional initial carry for step_callback (default zeros [batch])
@@ -2925,6 +2945,38 @@ def _tsit5_integrate_core(
         cb = step_callback
         callback_enabled = True
 
+    uses_divergence_cache = callback_enabled and cb is divergence_step_callback
+    reuse_divergence_start = (
+        settings.reuse_divergence_start if uses_divergence_cache else False
+    )
+
+    if uses_divergence_cache:
+        if callback_n_projections is None:
+            raise ValueError(
+                "callback_n_projections must be provided when using divergence_step_callback"
+            )
+        if reuse_divergence_start:
+            rng, init_div_rng = jax.random.split(rng)
+            cache_divergence, cache_stderr = hutchinson_estimator(
+                vector_field_fn,
+                vector_field_fn_fixed_static_params,
+                vector_field_fn_fixed_params,
+                vector_field_fn_per_sample_params,
+                x,
+                t,
+                init_div_rng,
+                callback_n_projections,
+            )
+            cache_valid = jnp.ones((current_batch_size,), dtype=bool)
+        else:
+            cache_divergence = jnp.zeros((current_batch_size,), dtype=x.dtype)
+            cache_stderr = jnp.zeros((current_batch_size,), dtype=x.dtype)
+            cache_valid = jnp.zeros((current_batch_size,), dtype=bool)
+    else:
+        cache_divergence = jnp.zeros((current_batch_size,), dtype=x.dtype)
+        cache_stderr = jnp.zeros((current_batch_size,), dtype=x.dtype)
+        cache_valid = jnp.zeros((current_batch_size,), dtype=bool)
+
     max_iters = settings.max_iterations
     forward = bool(t_final > float(t0[0]))
     iter_executed = 0  # Total work units
@@ -2950,7 +3002,7 @@ def _tsit5_integrate_core(
         unit="progress",
     ) as pbar:
         for _ in range(max_iters):
-            x, t, dt_vec, k1, done, rng, step_carry = _tsit5_step_jitted(
+            (
                 x,
                 t,
                 dt_vec,
@@ -2958,6 +3010,21 @@ def _tsit5_integrate_core(
                 done,
                 rng,
                 step_carry,
+                cache_divergence,
+                cache_stderr,
+                cache_valid,
+            ) = _tsit5_step_jitted(
+                x,
+                t,
+                dt_vec,
+                k1,
+                done,
+                rng,
+                step_carry,
+                cache_divergence,
+                cache_stderr,
+                cache_valid,
+                reuse_divergence_start,
                 t_final,
                 forward,
                 callback_enabled,
@@ -3027,6 +3094,9 @@ def _tsit5_integrate_core(
                     "k1": k1,
                     "done": done,
                     "step_carry": step_carry,
+                    "cache_divergence": cache_divergence,
+                    "cache_stderr": cache_stderr,
+                    "cache_valid": cache_valid,
                     "original_indices": original_indices,
                 }
 
@@ -3040,6 +3110,9 @@ def _tsit5_integrate_core(
                 k1 = filtered_arrays["k1"]
                 done = filtered_arrays["done"]
                 step_carry = filtered_arrays["step_carry"]
+                cache_divergence = filtered_arrays["cache_divergence"]
+                cache_stderr = filtered_arrays["cache_stderr"]
+                cache_valid = filtered_arrays["cache_valid"]
                 original_indices = filtered_arrays["original_indices"]
 
                 # Handle per-sample parameters using the same filtering logic
@@ -3229,6 +3302,7 @@ def _tsit5_update_dt(
         "step_callback",
         "forward",
         "callback_enabled",
+        "reuse_divergence_start",
         "n_projections",
     ),
 )
@@ -3240,6 +3314,10 @@ def _tsit5_step_jitted(
     done,
     rng,
     carry,
+    cache_divergence,
+    cache_stderr,
+    cache_valid,
+    reuse_divergence_start,
     t_final,
     forward,
     callback_enabled,
@@ -3289,6 +3367,10 @@ def _tsit5_step_jitted(
             dir4,
             atol,
             rtol,
+            cache_divergence,
+            cache_stderr,
+            cache_valid,
+            reuse_divergence_start,
             n_projections=n_projections,
         )
         err_ratio_used = jnp.maximum(err_ratio, callback_result.error_ratio)
@@ -3299,6 +3381,24 @@ def _tsit5_step_jitted(
 
     if callback_enabled:
         carry = carry + jnp.where(accept, callback_result.delta_carry, 0.0)
+        cache_divergence = jnp.where(
+            accept, callback_result.end_cache, callback_result.start_cache
+        )
+        cache_stderr = jnp.where(
+            accept,
+            callback_result.end_cache_stderr,
+            callback_result.start_cache_stderr,
+        )
+        if reuse_divergence_start:
+            cache_valid = jnp.where(
+                accept, jnp.ones_like(cache_valid, dtype=bool), cache_valid
+            )
+        else:
+            cache_valid = jnp.where(
+                accept,
+                jnp.zeros_like(cache_valid, dtype=bool),
+                jnp.ones_like(cache_valid, dtype=bool),
+            )
 
     # Update positions and times
     t_next = t + dt_vec
@@ -3323,7 +3423,24 @@ def _tsit5_step_jitted(
 
     dt_vec_new, done_new = jax.lax.cond(forward, forward_branch, reverse_branch)
 
-    return x_new, t_new, dt_vec_new, k1_new, done_new, step_rng, carry
+    cache_valid = jnp.where(
+        done_new,
+        jnp.zeros_like(cache_valid, dtype=bool),
+        cache_valid,
+    )
+
+    return (
+        x_new,
+        t_new,
+        dt_vec_new,
+        k1_new,
+        done_new,
+        step_rng,
+        carry,
+        cache_divergence,
+        cache_stderr,
+        cache_valid,
+    )
 
 
 @partial(
@@ -3332,6 +3449,7 @@ def _tsit5_step_jitted(
         "vector_field_fn",
         "vector_field_fn_fixed_static_params",
         "n_projections",
+        "reuse_start",
     ),
 )
 def divergence_step_callback(
@@ -3350,26 +3468,54 @@ def divergence_step_callback(
     dir4,
     atol,
     rtol,
+    cache_divergence,
+    cache_stderr,
+    cache_valid,
+    reuse_start,
     *,
     n_projections: int,
 ):
     """Accumulate divergence and supply a trapezoidal error estimate for Tsit5 steps."""
     del dir5, dir4
 
-    # Share projection vectors between the two divergence estimates to limit variance in their
-    # difference, while still tracking estimator uncertainty explicitly.
     rng_start, rng_end = jax.random.split(step_rng)
 
-    div_start, div_start_err = hutchinson_estimator(
-        vector_field_fn,
-        vector_field_fn_fixed_static_params,
-        vector_field_fn_fixed_params,
-        vector_field_fn_per_sample_params,
-        x_current,
-        t_current,
-        rng_start,
-        n_projections,
-    )
+    if reuse_start:
+        need_new = jnp.logical_not(cache_valid)
+
+        def _recompute_start(_: None) -> Tuple[jax.Array, jax.Array]:
+            new_start, new_err = hutchinson_estimator(
+                vector_field_fn,
+                vector_field_fn_fixed_static_params,
+                vector_field_fn_fixed_params,
+                vector_field_fn_per_sample_params,
+                x_current,
+                t_current,
+                rng_start,
+                n_projections,
+            )
+            return (
+                jnp.where(need_new, new_start, cache_divergence),
+                jnp.where(need_new, new_err, cache_stderr),
+            )
+
+        div_start, div_start_err = jax.lax.cond(
+            jnp.any(need_new),
+            _recompute_start,
+            lambda _: (cache_divergence, cache_stderr),
+            operand=None,
+        )
+    else:
+        div_start, div_start_err = hutchinson_estimator(
+            vector_field_fn,
+            vector_field_fn_fixed_static_params,
+            vector_field_fn_fixed_params,
+            vector_field_fn_per_sample_params,
+            x_current,
+            t_current,
+            rng_start,
+            n_projections,
+        )
 
     t_end = t_current + dt_vec
 
@@ -3420,7 +3566,14 @@ def divergence_step_callback(
     )
     error_ratio = jnp.maximum(truncation_ratio, statistical_ratio)
 
-    return StepCallbackResult(delta_carry=delta5, error_ratio=error_ratio)
+    return StepCallbackResult(
+        delta_carry=delta5,
+        error_ratio=error_ratio,
+        start_cache=div_start,
+        start_cache_stderr=div_start_err,
+        end_cache=div_end5,
+        end_cache_stderr=div_end5_err,
+    )
 
 
 def _noop_step_callback(
@@ -3439,6 +3592,10 @@ def _noop_step_callback(
     dir4,
     atol,
     rtol,
+    cache_divergence,
+    cache_stderr,
+    cache_valid,
+    reuse_start,
     *,
     n_projections: Optional[int] = None,
 ):
@@ -3458,10 +3615,22 @@ def _noop_step_callback(
         atol,
         rtol,
         n_projections,
+        cache_divergence,
+        cache_stderr,
+        cache_valid,
+        reuse_start,
     )
     zero_delta = jnp.zeros_like(carry)
     zero_error = jnp.zeros_like(carry)
-    return StepCallbackResult(delta_carry=zero_delta, error_ratio=zero_error)
+    zero_std = jnp.zeros_like(carry)
+    return StepCallbackResult(
+        delta_carry=zero_delta,
+        error_ratio=zero_error,
+        start_cache=carry,
+        start_cache_stderr=zero_std,
+        end_cache=carry,
+        end_cache_stderr=zero_std,
+    )
 
 
 @partial(jax.jit, inline=True)
@@ -4712,6 +4881,10 @@ def test_tsit5_step_callback_controls_step_size():
         dir4,
         atol,
         rtol,
+        cache_divergence,
+        cache_stderr,
+        cache_valid,
+        reuse_start,
         *,
         n_projections: Optional[int] = None,
     ) -> StepCallbackResult:
@@ -4730,12 +4903,24 @@ def test_tsit5_step_callback_controls_step_size():
             atol,
             rtol,
             n_projections,
+            cache_divergence,
+            cache_stderr,
+            cache_valid,
+            reuse_start,
         )
         abs_dt = jnp.abs(dt_vec)
         limit = jnp.array(threshold, dtype=abs_dt.dtype)
         error_ratio = abs_dt / limit
         delta_carry = jnp.maximum(carry, abs_dt) - carry
-        return StepCallbackResult(delta_carry=delta_carry, error_ratio=error_ratio)
+        zero_std = jnp.zeros_like(carry)
+        return StepCallbackResult(
+            delta_carry=delta_carry,
+            error_ratio=error_ratio,
+            start_cache=carry,
+            start_cache_stderr=zero_std,
+            end_cache=carry,
+            end_cache_stderr=zero_std,
+        )
 
     settings = Tsit5Settings(
         atol=1e-6,
