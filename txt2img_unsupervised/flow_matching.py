@@ -2622,10 +2622,11 @@ def _tsit5_build_endpoints(
     k1: jax.Array,
     rng: Optional[jax.Array] = None,
 ):
-    """Build Tsit5 stages on the sphere and return 5th/4th endpoints and FSAL derivative.
+    """Build Tsit5 stages on the sphere and return 5th order endpoint and FSAL derivative.
 
-    Returns tuple (x5, x4, k_last, step_angle, dir5, dir4) where:
-    - step_angle is the angular step size estimate based on the 5th order combination direction
+    Returns tuple (x5, k_last, dir5, dir4) where:
+    - x5 is the 5th order accurate position
+    - k_last is the FSAL derivative for the next step
     - dir5, dir4 are the 5th and 4th order direction vectors for tangent space error estimation
     """
     alpha, beta, c_sol, c_err = _tsit5_coeffs(dtype=x.dtype)
@@ -2665,19 +2666,14 @@ def _tsit5_build_endpoints(
     dir_err = jnp.sum(ks_stack * c_err.reshape((1, -1, 1)), axis=1)
     dir4 = dir5 - dir_err
 
-    # dir5 and dir4 are weighted velocities; apply dt to get displacement
+    # dir5 is weighted velocity; apply dt to get displacement
     if isinstance(dt, jax.Array) and dt.ndim == 1:
         displacement5 = dir5 * dt[:, None]
-        displacement4 = dir4 * dt[:, None]
     else:
         displacement5 = dir5 * dt
-        displacement4 = dir4 * dt
     x5 = geodesic_step(x, displacement5, 1.0)
-    x4 = geodesic_step(x, displacement4, 1.0)
     k_last = ks[-1]
-    # Step angle is the magnitude of the displacement
-    step_angle = jnp.linalg.norm(displacement5, axis=1)
-    return x5, x4, k_last, step_angle, dir5, dir4
+    return x5, k_last, dir5, dir4
 
 
 def _tsit5_error_ratio(
@@ -3228,7 +3224,7 @@ def _tsit5_step_jitted(
 ):
     step_rng, cb_rng = jax.random.split(rng)
     # Build Tsit5 endpoints
-    x5, x4, k_last, step_angle, dir5, dir4 = _tsit5_build_endpoints(
+    x5, k_last, dir5, dir4 = _tsit5_build_endpoints(
         vector_field_fn,
         vector_field_fn_fixed_static_params,
         vector_field_fn_fixed_params,
