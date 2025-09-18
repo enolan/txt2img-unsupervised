@@ -3067,7 +3067,7 @@ def _tsit5_integrate_core(
 
             pbar.set_postfix(
                 {
-                    "iter": iter_executed,
+                    "iter": actual_iterations,
                     "incomplete": f"{incomplete_count}/{current_batch_size}",
                     "batch": current_batch_size,
                     slowest_label: f"{current_slowest_t:.4f}",
