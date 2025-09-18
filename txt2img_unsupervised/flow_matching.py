@@ -2742,10 +2742,16 @@ def _filter_and_pad_to_size(
         # Filter to live trajectories using the boolean mask directly
         if padding_axis_len is None:
             padding_axis_len = arr.shape[0]
-            assert live_mask.shape[0] == padding_axis_len, f"Live mask length mismatch: {live_mask.shape[0]=} {padding_axis_len=}"
-            assert jnp.sum(live_mask) <= target_size, f"Input array too long, padding would be negative: {jnp.sum(live_mask)=} {target_size=}"
+            assert (
+                live_mask.shape[0] == padding_axis_len
+            ), f"Live mask length mismatch: {live_mask.shape[0]=} {padding_axis_len=}"
+            assert (
+                jnp.sum(live_mask) <= target_size
+            ), f"Input array too long, padding would be negative: {jnp.sum(live_mask)=} {target_size=}"
         else:
-            assert padding_axis_len == arr.shape[0], f"Padding axis length mismatch: {padding_axis_len=} {arr.shape[0]=}"
+            assert (
+                padding_axis_len == arr.shape[0]
+            ), f"Padding axis length mismatch: {padding_axis_len=} {arr.shape[0]=}"
         filtered = arr[live_mask]
 
         # Pad to target size if needed
@@ -2947,7 +2953,9 @@ def _tsit5_integrate_core(
             # Update per-trajectory iteration counts for all trajectories in current batch
             # We do computational work for all trajectories in the batch, not just live ones
             current_original_indices = original_indices[original_indices >= 0]
-            per_trajectory_iterations = per_trajectory_iterations.at[current_original_indices].add(1)
+            per_trajectory_iterations = per_trajectory_iterations.at[
+                current_original_indices
+            ].add(1)
 
             # Check if we should reduce batch size
             live_mask = ~done
@@ -2977,7 +2985,9 @@ def _tsit5_integrate_core(
                         step_carry[completed_indices]
                     )
                     completed_original_indices = original_indices[completed_indices]
-                    completed_trajectories["original_indices"].append(completed_original_indices)
+                    completed_trajectories["original_indices"].append(
+                        completed_original_indices
+                    )
                     # Store per-trajectory iteration counts for completed trajectories
                     completed_trajectories["iteration_counts"].append(
                         per_trajectory_iterations[completed_original_indices]
@@ -3611,7 +3621,13 @@ def generate_samples_inner(
         dt_initial = jnp.full((batch_size,), dt, dtype=jnp.float32)
 
         # Use batched core integration function for optimization
-        x, t_final, iteration_count, _, per_trajectory_iterations = _tsit5_integrate_core(
+        (
+            x,
+            t_final,
+            iteration_count,
+            _,
+            per_trajectory_iterations,
+        ) = _tsit5_integrate_core(
             vector_field_fn,
             vector_field_fn_fixed_static_params,
             vector_field_fn_fixed_params,
@@ -4488,12 +4504,16 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
     assert max_err_tsit5 < 8e-2 and mean_err_tsit5 < 2e-2  # Similar accuracy expected
 
     # Adaptive should use fewer vector-field evaluations than fixed-step RK4
-    rk4_total_evals = int(rk4_eval_counts[0]) * batch_size  # RK4 uses same count for all trajectories
+    rk4_total_evals = (
+        int(rk4_eval_counts[0]) * batch_size
+    )  # RK4 uses same count for all trajectories
     assert (
         tsit5_total_evals < rk4_total_evals
     ), f"Adaptive Tsit5 used too many evals: {tsit5_total_evals} vs RK4 {rk4_total_evals}"
 
-    print(f"\nTsit5 test passed! Used {tsit5_total_evals} calls vs RK4's {rk4_total_evals} calls")
+    print(
+        f"\nTsit5 test passed! Used {tsit5_total_evals} calls vs RK4's {rk4_total_evals} calls"
+    )
     print(f"Max errors - RK4: {max_err_rk4:.6f}, Tsit5: {max_err_tsit5:.6f}")
     print(f"Mean errors - RK4: {mean_err_rk4:.6f}, Tsit5: {mean_err_tsit5:.6f}")
 
