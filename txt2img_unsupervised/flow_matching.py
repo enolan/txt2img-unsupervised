@@ -2724,7 +2724,7 @@ def _next_power_of_two(n: int) -> int:
 
 
 def _filter_and_pad_to_size(
-    arrays: dict, live_mask: jax.Array, target_size: int
+    arrays: dict, live_mask: jax.Array, forward: bool, target_size: int
 ) -> dict:
     """
     Filter arrays to keep only live trajectories and pad to target_size.
@@ -2770,10 +2770,10 @@ def _filter_and_pad_to_size(
                     padding = jnp.ones((pad_size,), dtype=arr.dtype)
                 elif key == "t":
                     # Pad time array with 1.0 (finished time)
-                    padding = jnp.ones((pad_size,), dtype=arr.dtype)
+                    padding = jnp.full((pad_size,), 1.0 if forward else 0.0, dtype=arr.dtype)
                 elif key == "original_indices":
                     # Pad original_indices with -1 (indicates padding)
-                    padding = jnp.full((pad_size,), -1, dtype=arr.dtype)
+                    padding = np.full((pad_size,), -1, dtype=arr.dtype)
                 elif key == "cache_valid":
                     padding = jnp.zeros((pad_size,), dtype=arr.dtype)
                 else:
