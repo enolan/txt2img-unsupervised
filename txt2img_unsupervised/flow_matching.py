@@ -1988,7 +1988,6 @@ def test_train_trivial(model_kind, domain_dim, inject_keys):
         jax.random.PRNGKey(0),
         cond_vecs=jnp.zeros((20, 0)),
         n_steps=1000,
-        method="rk4",
     )
     cos_sims = samples @ points[0]
 
@@ -2141,7 +2140,6 @@ def test_train_vmf(model_kind, domain_dim, inject_keys):
         jax.random.PRNGKey(42),
         cond_vecs=jnp.zeros((n_test_samples, 0)),
         n_steps=1000,
-        method="rk4",
     )
 
     # Calculate negative log-likelihood of samples under the VMF distribution
@@ -2405,7 +2403,6 @@ def test_train_conditional_vmf(model_kind, domain_dim, inject_keys):
         seed1,
         cond_vecs=cond_vec_0,
         n_steps=500,
-        method="rk4",
     )
     samples_1 = generate_samples(
         model,
@@ -2413,7 +2410,6 @@ def test_train_conditional_vmf(model_kind, domain_dim, inject_keys):
         seed2,
         cond_vecs=cond_vec_1,
         n_steps=500,
-        method="rk4",
     )
 
     # Calculate average cosine similarities
@@ -3467,7 +3463,7 @@ def generate_samples(
     rng,
     cond_vecs,
     n_steps=100,
-    method="rk4",
+    method="tsit5",
 ):
     """
     Generate samples from a VectorField flow matching model by solving the ODE.
@@ -3643,7 +3639,7 @@ def sample_loop(
     rng,
     cond_vecs,
     n_steps=100,
-    method="rk4",
+    method="tsit5",
 ):
     """
     Generate multiple batches of samples from the flow matching model.
@@ -4024,7 +4020,7 @@ def reverse_path_and_compute_divergence(
     n_steps,
     rng,
     n_projections=10,
-    method: str = "rk4",
+    method: str = "tsit5",
     tsit5_settings: Optional[Tsit5Settings] = None,
 ):
     """
@@ -4071,7 +4067,7 @@ def compute_log_probability(
     n_steps=100,
     rng=None,
     n_projections=10,
-    method: str = "rk4",
+    method: str = "tsit5",
 ):
     """
     Compute the log probability of samples under a flow-matching model.
@@ -4786,7 +4782,6 @@ def _generate_cap_constrained_samples_rejection(
                 sub_rng,
                 cond_vecs=batch_cond_vecs,
                 n_steps=flow_n_steps,
-                method="rk4",
             )
 
             # Check which samples are in the cap
