@@ -2722,7 +2722,7 @@ def _next_power_of_two(n: int) -> int:
     """Return the largest power of 2 that is <= n."""
     if n <= 0:
         return 1
-    return int(2 ** int(jnp.floor(jnp.log2(n))))
+    return int(2 ** int(jnp.ceil(jnp.log2(n))))
 
 
 def _filter_and_pad_to_size(
@@ -2740,6 +2740,7 @@ def _filter_and_pad_to_size(
         Dictionary of filtered and padded arrays
     """
     filtered_arrays = {}
+    padding_axis_len = None
 
     for key, arr in arrays.items():
         if arr is None:
@@ -2747,6 +2748,12 @@ def _filter_and_pad_to_size(
             continue
 
         # Filter to live trajectories using the boolean mask directly
+        if padding_axis_len is None:
+            padding_axis_len = arr.shape[0]
+            assert live_mask.shape[0] == padding_axis_len, f"Live mask length mismatch: {live_mask.shape[0]=} {padding_axis_len=}"
+            assert jnp.sum(live_mask) <= target_size, f"Input array too long, padding would be negative: {jnp.sum(live_mask)=} {target_size=}"
+        else:
+            assert padding_axis_len == arr.shape[0], f"Padding axis length mismatch: {padding_axis_len=} {arr.shape[0]=}"
         filtered = arr[live_mask]
 
         # Pad to target size if needed
