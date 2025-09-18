@@ -2720,7 +2720,7 @@ def _next_power_of_two(n: int) -> int:
     """Return the largest power of 2 that is <= n."""
     if n <= 0:
         return 1
-    return int(2 ** int(jnp.ceil(jnp.log2(n))))
+    return int(2 ** int(np.ceil(np.log2(n))))
 
 
 def _filter_and_pad_to_size(
@@ -2891,7 +2891,7 @@ def _tsit5_integrate_core(
 
     # Track which trajectory indices are active and where they map to in the current arrays
     # original_indices[i] = original trajectory index for position i in current arrays
-    original_indices = jnp.arange(initial_batch_size)
+    original_indices = np.arange(initial_batch_size)
 
     # Storage for completed trajectories - collect them in lists and reassemble at end
     completed_trajectories = {
@@ -2903,7 +2903,7 @@ def _tsit5_integrate_core(
     }
 
     # Track iterations per trajectory
-    per_trajectory_iterations = jnp.zeros((initial_batch_size,), dtype=jnp.int32)
+    per_trajectory_iterations = np.zeros((initial_batch_size,), dtype=np.int32)
 
     x = x0
     if forward:
@@ -3039,13 +3039,11 @@ def _tsit5_integrate_core(
             # Update per-trajectory iteration counts for all trajectories in current batch
             # We do computational work for all trajectories in the batch, not just live ones
             current_original_indices = original_indices[original_indices >= 0]
-            per_trajectory_iterations = per_trajectory_iterations.at[
-                current_original_indices
-            ].add(1)
+            per_trajectory_iterations[current_original_indices] += 1
 
             # Check if we should reduce batch size
             live_mask = ~done
-            live_count = int(jnp.sum(live_mask))
+            live_count, new_extreme_t = jax.device_get((jnp.sum(live_mask), jnp.min(t) if forward else jnp.max(t)))
 
             # Shrink to live count rounded up to next power of two (respecting minimum)
             # Only shrink if shrinking batch optimization is enabled
@@ -3094,7 +3092,7 @@ def _tsit5_integrate_core(
                 }
 
                 filtered_arrays = _filter_and_pad_to_size(
-                    arrays_to_filter, live_mask, new_batch_size
+                    arrays_to_filter, live_mask, forward, new_batch_size
                 )
 
                 x = filtered_arrays["x"]
@@ -3117,7 +3115,7 @@ def _tsit5_integrate_core(
                         )
                     }
                     filtered_per_sample = _filter_and_pad_to_size(
-                        per_sample_arrays, live_mask, new_batch_size
+                        per_sample_arrays, live_mask, forward, new_batch_size
                     )
 
                     # Reconstruct the pytree structure
@@ -3134,10 +3132,8 @@ def _tsit5_integrate_core(
 
             # Update progress bar based on slowest sample
             if forward:
-                new_extreme_t = float(jnp.min(t))
                 raw_progress = new_extreme_t
             else:
-                new_extreme_t = float(jnp.max(t))
                 raw_progress = 1.0 - new_extreme_t
 
             new_progress = max(0.0, min(1.0, raw_progress))
@@ -3149,7 +3145,6 @@ def _tsit5_integrate_core(
             current_extreme_t = new_extreme_t
 
             # Update progress bar description with current status
-            incomplete_count = int(jnp.sum(~done))
             if forward:
                 slowest_label = "min_t"
             else:
@@ -3158,13 +3153,13 @@ def _tsit5_integrate_core(
             pbar.set_postfix(
                 {
                     "iter": actual_iterations,
-                    "incomplete": f"{incomplete_count}/{current_batch_size}",
+                    "incomplete": f"{live_count}/{initial_batch_size}",
                     "batch": current_batch_size,
                     slowest_label: f"{current_extreme_t:.4f}",
                 }
             )
 
-            if bool(jnp.all(done)):
+            if bool(live_count == 0):
                 break
 
         if display_progress < 1.0:
