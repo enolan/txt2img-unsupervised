@@ -67,6 +67,7 @@ from typing import (
     Tuple,
     Union,
     FrozenSet,
+    NamedTuple,
 )
 from tqdm import tqdm, trange
 from tqdm.contrib import tenumerate
@@ -2799,6 +2800,13 @@ class Tsit5Settings:
     min_batch_size: int = 32  # Don't reduce batch size below this threshold
 
 
+class StepCallbackResult(NamedTuple):
+    """Result of a Tsit5 step callback holding carry delta and normalized error."""
+
+    delta_carry: jax.Array
+    error_ratio: jax.Array
+
+
 def _tsit5_integrate_core(
     vector_field_fn,
     vector_field_fn_fixed_static_params,
@@ -2832,9 +2840,16 @@ def _tsit5_integrate_core(
         t_final: Target final time (scalar)
         settings: Tsit5Settings instance
         rng: Optional random key for stochastic vector fields
-        step_callback: Optional pure JAX function
-            (x, t, dt, accept, step_rng, carry, vf, vf_fixed_static, vf_fixed, vf_per_sample) -> carry
-            called each iteration inside a jitted step.
+        step_callback: Optional pure JAX function that returns a StepCallbackResult.
+            Signature:
+            step_callback(
+                x, t, dt, step_rng, carry,
+                vector_field_fn, vector_field_fn_fixed_static_params,
+                vector_field_fn_fixed_params, vector_field_fn_per_sample_params,
+                x5, x4, dir5, dir4,
+                atol, rtol, *, n_projections=None,
+            ) -> StepCallbackResult
+            Called each iteration inside a jitted step.
         step_carry_init: Optional initial carry for step_callback (default zeros [batch])
 
     Returns:
@@ -2889,7 +2904,12 @@ def _tsit5_integrate_core(
         rng,
     )
 
-    cb = step_callback or _noop_step_callback
+    if step_callback is None:
+        cb = _noop_step_callback
+        callback_enabled = False
+    else:
+        cb = step_callback
+        callback_enabled = True
 
     max_iters = settings.max_iterations
     forward = bool(t_final > float(t0[0]))
@@ -2926,6 +2946,7 @@ def _tsit5_integrate_core(
                 step_carry,
                 t_final,
                 forward,
+                callback_enabled,
                 settings.atol,
                 settings.rtol,
                 settings.safety,
@@ -3176,6 +3197,7 @@ def _tsit5_update_dt(
         "vector_field_fn_fixed_static_params",
         "step_callback",
         "forward",
+        "callback_enabled",
         "n_projections",
     ),
 )
@@ -3189,6 +3211,7 @@ def _tsit5_step_jitted(
     carry,
     t_final,
     forward,
+    callback_enabled,
     atol,
     rtol,
     safety,
@@ -3204,7 +3227,7 @@ def _tsit5_step_jitted(
 ):
     step_rng, cb_rng = jax.random.split(rng)
     # Build Tsit5 endpoints
-    x5, x4, k_last, step_angle, dir5, dir4 = _tsit5_build_endpoints(
+    x5, x4, k_last, _, dir5, dir4 = _tsit5_build_endpoints(
         vector_field_fn,
         vector_field_fn_fixed_static_params,
         vector_field_fn_fixed_params,
@@ -3218,22 +3241,33 @@ def _tsit5_step_jitted(
 
     # Error estimation and step size adaptation using tangent space error
     err_ratio = _tsit5_error_ratio(dir5, dir4, dt_vec, atol, rtol)
-    accept, dt_new = _tsit5_update_dt(dt_vec, err_ratio, safety, shrink, grow)
+    if callback_enabled:
+        callback_result = step_callback(
+            x,
+            t,
+            dt_vec,
+            cb_rng,
+            carry,
+            vector_field_fn,
+            vector_field_fn_fixed_static_params,
+            vector_field_fn_fixed_params,
+            vector_field_fn_per_sample_params,
+            x5,
+            x4,
+            dir5,
+            dir4,
+            atol,
+            rtol,
+            n_projections=n_projections,
+        )
+        err_ratio_used = jnp.maximum(err_ratio, callback_result.error_ratio)
+    else:
+        err_ratio_used = err_ratio
 
-    # Callback to update carry (e.g., accumulate divergence)
-    carry = step_callback(
-        x,
-        t,
-        dt_vec,
-        accept,
-        cb_rng,
-        carry,
-        vector_field_fn,
-        vector_field_fn_fixed_static_params,
-        vector_field_fn_fixed_params,
-        vector_field_fn_per_sample_params,
-        n_projections=n_projections,
-    )
+    accept, dt_new = _tsit5_update_dt(dt_vec, err_ratio_used, safety, shrink, grow)
+
+    if callback_enabled:
+        carry = carry + jnp.where(accept, callback_result.delta_carry, 0.0)
 
     # Update positions and times
     t_next = t + dt_vec
@@ -3273,44 +3307,130 @@ def divergence_step_callback(
     x_current,
     t_current,
     dt_vec,
-    accept,
     step_rng,
     carry,
     vector_field_fn,
     vector_field_fn_fixed_static_params,
     vector_field_fn_fixed_params,
     vector_field_fn_per_sample_params,
+    x5,
+    x4,
+    dir5,
+    dir4,
+    atol,
+    rtol,
     *,
     n_projections: int,
 ):
-    div_t = hutchinson_estimator(
+    """Accumulate divergence and supply a trapezoidal error estimate for Tsit5 steps."""
+    del dir5, dir4
+
+    # Share projection vectors between the two divergence estimates to limit variance in their
+    # difference, while still tracking estimator uncertainty explicitly.
+    rng_start, rng_end = jax.random.split(step_rng)
+
+    div_start, div_start_err = hutchinson_estimator(
         vector_field_fn,
         vector_field_fn_fixed_static_params,
         vector_field_fn_fixed_params,
         vector_field_fn_per_sample_params,
         x_current,
         t_current,
-        step_rng,
+        rng_start,
         n_projections,
     )
-    return carry + jnp.where(accept, jnp.abs(dt_vec) * div_t, 0.0)
+
+    t_end = t_current + dt_vec
+
+    div_end5, div_end5_err = hutchinson_estimator(
+        vector_field_fn,
+        vector_field_fn_fixed_static_params,
+        vector_field_fn_fixed_params,
+        vector_field_fn_per_sample_params,
+        x5,
+        t_end,
+        rng_end,
+        n_projections,
+    )
+
+    div_end4, div_end4_err = hutchinson_estimator(
+        vector_field_fn,
+        vector_field_fn_fixed_static_params,
+        vector_field_fn_fixed_params,
+        vector_field_fn_per_sample_params,
+        x4,
+        t_end,
+        rng_end,
+        n_projections,
+    )
+
+    dt_abs = jnp.abs(dt_vec)
+    delta5 = 0.5 * dt_abs * (div_start + div_end5)
+    delta4 = 0.5 * dt_abs * (div_start + div_end4)
+    local_error = jnp.abs(delta5 - delta4)
+    # Standard error of the trapezoidal divergence integral for the accepted step.
+    delta5_stderr = 0.5 * dt_abs * jnp.sqrt(div_start_err**2 + div_end5_err**2)
+
+    proposed_carry = carry + delta5
+    scale = jnp.maximum(jnp.abs(carry), jnp.abs(proposed_carry))
+    denom = atol + rtol * scale
+    denom = jnp.maximum(denom, jnp.finfo(delta5.dtype).tiny)
+
+    truncation_ratio = local_error / denom
+    statistical_multiplier = (
+        3.0  # Require roughly three-sigma confidence on divergence integral.
+    )
+    denom_floor = jnp.array(1e-2, dtype=denom.dtype)
+    stat_denom = jnp.maximum(denom, denom_floor)
+    statistical_ratio = (delta5_stderr * statistical_multiplier) / stat_denom
+    # Ensure numeric stability when delta5_stderr == 0.
+    statistical_ratio = jnp.nan_to_num(
+        statistical_ratio, nan=0.0, posinf=jnp.inf, neginf=jnp.inf
+    )
+    error_ratio = jnp.maximum(truncation_ratio, statistical_ratio)
+
+    return StepCallbackResult(delta_carry=delta5, error_ratio=error_ratio)
 
 
 def _noop_step_callback(
     x_current,
     t_current,
     dt_vec,
-    accept,
     step_rng,
     carry,
     vector_field_fn,
     vector_field_fn_fixed_static_params,
     vector_field_fn_fixed_params,
     vector_field_fn_per_sample_params,
+    x5,
+    x4,
+    dir5,
+    dir4,
+    atol,
+    rtol,
     *,
     n_projections: Optional[int] = None,
 ):
-    return carry
+    del (
+        x_current,
+        t_current,
+        dt_vec,
+        step_rng,
+        vector_field_fn,
+        vector_field_fn_fixed_static_params,
+        vector_field_fn_fixed_params,
+        vector_field_fn_per_sample_params,
+        x5,
+        x4,
+        dir5,
+        dir4,
+        atol,
+        rtol,
+        n_projections,
+    )
+    zero_delta = jnp.zeros_like(carry)
+    zero_error = jnp.zeros_like(carry)
+    return StepCallbackResult(delta_carry=zero_delta, error_ratio=zero_error)
 
 
 @partial(jax.jit, inline=True)
@@ -3699,7 +3819,9 @@ def hutchinson_estimator(
         n_projections: Number of random projections to use
 
     Returns:
-        Divergence estimate [batch_size]
+        Tuple containing:
+            divergence estimate [batch_size]
+            standard error of the estimate [batch_size]
     """
     batch_size, dim = x.shape
     # Allow scalar t or per-sample vector t
@@ -3733,7 +3855,7 @@ def hutchinson_estimator(
             ), "All per-sample leading dims must equal batch_size"
 
     def hutchinson_single(x_i, t_i, rng_i, per_sample_i):
-        """Compute Hutchinson divergence estimate for a single point."""
+        """Compute Hutchinson divergence estimate and standard error for a single point."""
         dropout_rng, projection_rng = jax.random.split(rng_i)
 
         def f(x_single):
@@ -3762,13 +3884,33 @@ def hutchinson_estimator(
 
         trace_estimates = jax.vmap(vjp_fn)(v_samples)
         trace_estimate = jnp.mean(trace_estimates)
+        samples_dtype = trace_estimates.dtype
+        n_proj = jnp.array(float(n_projections), dtype=samples_dtype)
+        # Population variance estimate (dividing by n) so sum_sq = var * n
+        sample_variance = jnp.var(trace_estimates, dtype=samples_dtype)
+        second_moment = jnp.mean(jnp.square(trace_estimates))
+
+        # Bayesian shrinkage toward a prior second moment to keep variance non-zero with tiny n.
+        # We treat the variance as Inverse-Gamma(alpha0, beta0) with weak strength and set beta0
+        # from the empirical second moment. Observing n_proj samples updates the posterior to
+        # Inverse-Gamma(alpha0 + n/2, beta0 + (n/2)*sample_variance). The posterior mean beta/(
+        # alpha-1) gives a conservative variance estimate that never collapses to zero even when
+        # n_proj is 1, avoiding pathological step-size growth from underestimated uncertainty.
+        alpha0 = jnp.array(1.0, dtype=samples_dtype)
+        beta0 = 0.5 * second_moment
+        alpha_post = alpha0 + 0.5 * n_proj
+        beta_post = beta0 + 0.5 * sample_variance * n_proj
+        posterior_var = beta_post / jnp.maximum(
+            alpha_post - 1.0, jnp.finfo(samples_dtype).tiny
+        )
+        trace_stderr = jnp.sqrt(posterior_var / n_proj)
 
         # Compute the curvature correction term: x^T J x
         # We can compute this exactly using forward-mode autodiff
         _, jvp_result = jax.jvp(f, (x_i,), (x_i,))
         curvature_term = jnp.dot(x_i, jvp_result)
 
-        return trace_estimate - curvature_term
+        return trace_estimate - curvature_term, trace_stderr
 
     # Split random keys for each batch element
     batch_keys = jax.random.split(step_rng, batch_size)
@@ -3903,7 +4045,7 @@ def reverse_path_and_compute_divergence_rk4(
 
         # Compute divergence at current point
         step_rng_model, step_rng_div, rng = jax.random.split(rng, 3)
-        div_t = hutchinson_estimator(
+        div_t, _ = hutchinson_estimator(
             vector_field_fn,
             vector_field_fn_fixed_static_params,
             vector_field_fn_fixed_params,
@@ -4156,6 +4298,11 @@ def test_divergence_estimate(divergence_fn, n_projections, field):
         n_projections=n_projections,
     )
 
+    if isinstance(div_estimates, tuple):
+        div_estimates, div_std = div_estimates
+    else:
+        div_std = None
+
     # Calculate error
     error = jnp.abs(div_estimates - expected_divergence)
     mean_error = jnp.mean(error)
@@ -4172,6 +4319,8 @@ def test_divergence_estimate(divergence_fn, n_projections, field):
         assert (
             abs(mean_error) < 0.2
         ), f"Hutchinson estimator not calculating correct divergence: got {mean_error}, expected {expected_divergence}"
+        if div_std is not None:
+            assert jnp.all(div_std >= 0)
 
 
 def test_vector_field_evaluation():
@@ -4473,6 +4622,228 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
     print(f"\nTsit5 test passed! Used {tsit5_calls} calls vs RK4's {rk4_evals} calls")
     print(f"Max errors - RK4: {max_err_rk4:.6f}, Tsit5: {max_err_tsit5:.6f}")
     print(f"Mean errors - RK4: {mean_err_rk4:.6f}, Tsit5: {mean_err_tsit5:.6f}")
+
+
+@pytest.mark.usefixtures("starts_with_progressbar")
+def test_tsit5_step_callback_controls_step_size():
+    """The integrator should respect error reported by the step callback when sizing dt."""
+
+    batch_size = 4
+    domain_dim = 3
+    threshold = 0.05
+
+    unit_point = jnp.concatenate(
+        [
+            jnp.array([1.0], dtype=jnp.float32),
+            jnp.zeros((domain_dim - 1,), dtype=jnp.float32),
+        ]
+    )
+    x0 = jnp.tile(unit_point[None, :], (batch_size, 1))
+    t0 = jnp.zeros((batch_size,), dtype=jnp.float32)
+    dt_initial = jnp.full((batch_size,), 0.2, dtype=jnp.float32)
+    step_carry_init = jnp.zeros((batch_size,), dtype=jnp.float32)
+
+    def zero_field(_static, _fixed, _per_sample, x, _t, _rng):
+        del _static, _fixed, _per_sample, _t, _rng
+        return jnp.zeros_like(x)
+
+    def limiting_callback(
+        x_current,
+        t_current,
+        dt_vec,
+        step_rng,
+        carry,
+        vector_field_fn,
+        vector_field_fn_fixed_static_params,
+        vector_field_fn_fixed_params,
+        vector_field_fn_per_sample_params,
+        x5,
+        x4,
+        dir5,
+        dir4,
+        atol,
+        rtol,
+        *,
+        n_projections: Optional[int] = None,
+    ) -> StepCallbackResult:
+        del (
+            x_current,
+            t_current,
+            step_rng,
+            vector_field_fn,
+            vector_field_fn_fixed_static_params,
+            vector_field_fn_fixed_params,
+            vector_field_fn_per_sample_params,
+            x5,
+            x4,
+            dir5,
+            dir4,
+            atol,
+            rtol,
+            n_projections,
+        )
+        abs_dt = jnp.abs(dt_vec)
+        limit = jnp.array(threshold, dtype=abs_dt.dtype)
+        error_ratio = abs_dt / limit
+        delta_carry = jnp.maximum(carry, abs_dt) - carry
+        return StepCallbackResult(delta_carry=delta_carry, error_ratio=error_ratio)
+
+    settings = Tsit5Settings(
+        atol=1e-6,
+        rtol=1e-6,
+        initial_dt=0.2,
+        max_iterations=4096,
+        enable_shrinking_batch=False,
+    )
+
+    _, final_t, _, accepted_max_dt = _tsit5_integrate_core(
+        zero_field,
+        None,
+        None,
+        None,
+        x0,
+        t0,
+        dt_initial,
+        t_final=1.0,
+        settings=settings,
+        rng=jax.random.PRNGKey(0),
+        step_callback=limiting_callback,
+        step_carry_init=step_carry_init,
+    )
+
+    assert jnp.allclose(final_t, 1.0, atol=1e-5)
+    max_dt = float(jnp.max(accepted_max_dt))
+    assert max_dt < 0.2
+    assert max_dt <= threshold + 1e-5
+
+
+@pytest.mark.usefixtures("starts_with_progressbar")
+def test_tsit5_divergence_matches_reference_with_less_work():
+    """Tsit5 divergence integration matches a fine RK4 baseline while using fewer steps."""
+
+    batch_size = 4
+    domain_dim = 3
+    n_projections = 128
+
+    key = jax.random.PRNGKey(123)
+    key_x0, key = jax.random.split(key)
+    x0 = sample_sphere(key_x0, batch_size, domain_dim)
+
+    def vf(_static, _fixed, _per_sample, x, t, _rng):
+        del _static, _fixed, _per_sample, _rng
+        if isinstance(t, jax.Array):
+            if t.ndim == 0:
+                tt = jnp.full((x.shape[0],), t)
+            elif t.ndim == 1:
+                tt = t
+            else:
+                raise ValueError("t must be scalar or 1D")
+        else:
+            tt = jnp.full((x.shape[0],), float(t))
+
+        z_axis = jnp.array([0.0, 0.0, 1.0], dtype=x.dtype)
+        y_axis = jnp.array([0.0, 1.0, 0.0], dtype=x.dtype)
+        x_axis = jnp.array([1.0, 0.0, 0.0], dtype=x.dtype)
+
+        base = jnp.cross(z_axis, x)
+        fast = jnp.cross(y_axis, x)
+        slow = jnp.cross(x_axis, x)
+
+        omega = (
+            1.0 + 0.4 * jnp.sin(6.0 * jnp.pi * tt) + 0.2 * jnp.cos(2.0 * jnp.pi * tt)
+        )
+        mix = 0.6 + 0.3 * x[:, 0] + 0.1 * x[:, 1]
+        combined = mix[:, None] * base + (1.0 - mix)[:, None] * slow + 0.25 * fast
+        return omega[:, None] * combined
+
+    forward_steps = 2048
+    x_final, _ = generate_samples_inner(
+        rng=jax.random.PRNGKey(7),
+        n_steps=forward_steps,
+        batch_size=batch_size,
+        method="rk4",
+        vector_field_fn=vf,
+        vector_field_fn_fixed_static_params=None,
+        vector_field_fn_fixed_params=None,
+        vector_field_fn_per_sample_params=None,
+        domain_dim=domain_dim,
+        initial_x0=x0,
+    )
+
+    ref_steps = 4096
+    coarse_steps = 96
+
+    key_ref, key_coarse, key_tsit, _ = jax.random.split(key, 4)
+
+    _, div_ref = reverse_path_and_compute_divergence_rk4(
+        vf,
+        None,
+        None,
+        None,
+        x_final,
+        ref_steps,
+        key_ref,
+        n_projections=n_projections,
+    )
+
+    _, div_coarse = reverse_path_and_compute_divergence_rk4(
+        vf,
+        None,
+        None,
+        None,
+        x_final,
+        coarse_steps,
+        key_coarse,
+        n_projections=n_projections,
+    )
+
+    settings = Tsit5Settings(
+        atol=1e-6,
+        rtol=1e-6,
+        safety=0.9,
+        shrink=0.5,
+        grow=2.0,
+        initial_dt=0.1,
+        auto_dt_estimation=False,
+        enable_shrinking_batch=False,
+        max_iterations=256,
+    )
+
+    t0 = jnp.ones((batch_size,), dtype=jnp.float32)
+    dt_initial = jnp.full((batch_size,), -settings.initial_dt, dtype=jnp.float32)
+
+    _, t_final, work_units, div_tsit5 = _tsit5_integrate_core(
+        vf,
+        None,
+        None,
+        None,
+        x_final,
+        t0,
+        dt_initial,
+        0.0,
+        settings,
+        rng=key_tsit,
+        step_callback=divergence_step_callback,
+        step_carry_init=jnp.zeros((batch_size,), dtype=jnp.float32),
+        callback_n_projections=128,
+    )
+
+    assert jnp.allclose(t_final, 0.0, atol=1e-5)
+
+    iterations_tsit5 = work_units // batch_size
+
+    print(f"{div_tsit5=} {div_ref=} {div_coarse=}")
+    tsit5_err = jnp.abs(div_tsit5 - div_ref)
+    coarse_err = jnp.abs(div_coarse - div_ref)
+    print(f"tsit5 error vs ref: {tsit5_err}")
+    print(f"coarse error vs ref: {coarse_err}")
+    print(f"tsit5 used {iterations_tsit5} work units vs {coarse_steps} for coarse RK4")
+
+    max_tsit5_err = float(jnp.max(tsit5_err))
+    max_coarse_err = float(jnp.max(coarse_err))
+
+    assert max_tsit5_err <= max_coarse_err + 1e-4
+    assert iterations_tsit5 < coarse_steps
 
 
 def test_vector_field_without_reference_directions():
