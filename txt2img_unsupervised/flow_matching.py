@@ -1753,7 +1753,7 @@ def _train_loop_for_tests_generic(
         decay_steps=total_steps,
     )
 
-    n_projections = 64
+    n_projections = 32
     nll_steps = 128
 
     state = create_train_state(params_rng, model, cosine_schedule)
@@ -1766,6 +1766,9 @@ def _train_loop_for_tests_generic(
 
     with tqdm(range(epochs), desc="Training", unit="epochs") as pbar:
         for epoch in pbar:
+            # Compute NLL once at the start of each epoch (plus first step)
+            epoch_train_nll = None
+
             # Training loop
             for i, batch in tenumerate(
                 dataset.iter(batch_size, drop_last_batch=True),
@@ -1783,7 +1786,8 @@ def _train_loop_for_tests_generic(
                 step_count += 1
                 current_lr = cosine_schedule(step_count)
 
-                if first_step or i % 200 == 0:
+                # Only compute NLL once per epoch (at the beginning) or on first step
+                if first_step or (i == 0):
                     step_rng, nll_rng = jax.random.split(step_rng)
                     # Use model-specific function to compute NLL
                     train_nlls = -compute_nll_fn(
@@ -1795,21 +1799,23 @@ def _train_loop_for_tests_generic(
                         n_projections=n_projections,
                         precomputed_stats=None,
                     )
-                    train_nll = jnp.mean(train_nlls)
-                train_loss, grad_norm, train_nll = jax.device_get(
-                    (train_loss, grad_norm, train_nll)
-                )
+                    epoch_train_nll = jnp.mean(train_nlls)
+
+                train_loss, grad_norm = jax.device_get((train_loss, grad_norm))
+                if epoch_train_nll is not None:
+                    epoch_train_nll = jax.device_get(epoch_train_nll)
+
                 if first_step:
                     tqdm.write(
-                        f"First step loss: {train_loss:.6f}, grad norm: {grad_norm:.6f}, lr: {current_lr:.6f}, nll: {train_nll:.6f}"
+                        f"First step loss: {train_loss:.6f}, grad norm: {grad_norm:.6f}, lr: {current_lr:.6f}, nll: {epoch_train_nll:.6f}"
                     )
                     first_step = False
                 pbar.set_postfix(
                     {
-                        "loss": float(train_loss),
-                        "train_nll": float(train_nll),
-                        "grad_norm": float(grad_norm),
-                        "lr": float(current_lr),
+                        "loss": f"{float(train_loss):.6f}",
+                        "train_nll": f"{float(epoch_train_nll) if epoch_train_nll is not None else 0.0:.6f}",
+                        "grad_norm": f"{float(grad_norm):.6f}",
+                        "lr": f"{float(current_lr):.6f}",
                     }
                 )
 
@@ -1866,7 +1872,7 @@ def _train_loop_for_tests_generic(
                     final_test_nll = avg_test_nll
 
                     tqdm.write(
-                        f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Train NLL: {train_nll:.6f}, Grad Norm: {grad_norm:.6f}, Test Loss: {avg_test_loss:.6f}, Test NLL: {avg_test_nll:.6f}"
+                        f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Train NLL: {epoch_train_nll:.6f}, Grad Norm: {grad_norm:.6f}, Test Loss: {avg_test_loss:.6f}, Test NLL: {avg_test_nll:.6f}"
                     )
                 else:
                     tqdm.write(

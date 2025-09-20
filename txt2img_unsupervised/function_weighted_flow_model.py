@@ -901,7 +901,7 @@ def compute_log_probability(
         rng,
         n_projections,
         method="tsit5",
-        tsit5_settings=flow_matching.Tsit5Settings(atol=1e-8, rtol=1e-8),
+        tsit5_settings=flow_matching.Tsit5Settings(atol=1e-2, rtol=1e-2),
     )
 
     # If using a cap-conditioned base, zero out density for sources outside the cap
