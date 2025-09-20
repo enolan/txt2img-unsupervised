@@ -3056,7 +3056,8 @@ def _tsit5_integrate_core(
 
             # Check if we should reduce batch size
             live_mask = ~done
-            live_count, new_extreme_t = jax.device_get((jnp.sum(live_mask), jnp.min(t) if forward else jnp.max(t)))
+            live_count, min_t, max_t = jax.device_get((jnp.sum(live_mask), jnp.min(t), jnp.max(t)))
+            new_extreme_t = min_t if forward else max_t
 
             # Shrink to live count rounded up to next power of two (respecting minimum)
             # Only shrink if shrinking batch optimization is enabled
@@ -3158,17 +3159,13 @@ def _tsit5_integrate_core(
             current_extreme_t = new_extreme_t
 
             # Update progress bar description with current status
-            if forward:
-                slowest_label = "min_t"
-            else:
-                slowest_label = "max_t"
-
             pbar.set_postfix(
                 {
                     "iter": actual_iterations,
                     "incomplete": f"{live_count}/{initial_batch_size}",
                     "batch": current_batch_size,
-                    slowest_label: f"{current_extreme_t:.4f}",
+                    "min_t": f"{min_t:.4f}",
+                    "max_t": f"{max_t:.4f}",
                 }
             )
 
