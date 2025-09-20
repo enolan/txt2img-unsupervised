@@ -1403,10 +1403,11 @@ def compute_hemisphere_probability_masses(
     return output_dict
 
 
-def _precompute_hemisphere_masses_fwfm(model, params, rng, n_steps, n_projections):
-    """Precompute hemisphere probability masses for cap_conditioned_base FWFM models.
+def compute_hemisphere_masses(model, params, rng, n_steps, n_projections):
+    """Precompute hemisphere probability masses for NLL calculation in cap_conditioned_base FWFM
+    models. If cap_conditioned_base is off, returns None.
 
-    This is extracted from _compute_nll_fwfm to avoid recomputing expensive hemisphere masses
+    This is extracted from compute_nll to avoid recomputing expensive hemisphere masses
     for every test batch when using cap_conditioned_base.
 
     Args:
@@ -1434,10 +1435,12 @@ def _precompute_hemisphere_masses_fwfm(model, params, rng, n_steps, n_projection
     return None
 
 
-def _compute_nll_fwfm(
+def compute_nll(
     model, params, batch, n_steps, rng, n_projections, precomputed_stats=None
 ):
-    """Compute NLL for FunctionWeightedFlowModel - use 'evenest weights'."""
+    """Compute NLL for FunctionWeightedFlowModel using weighting function params that produce the
+    flattest weights possible.
+    """
     batch_size = batch["point_vec"].shape[0]
 
     if model.weighting_function == WeightingFunction.CONSTANT:
@@ -1518,13 +1521,13 @@ def _compute_nll_fwfm(
                 1_000_000_000
             )
             adjusted_logprobs = jnp.maximum(adjusted_logprobs, min_logprob)
-            return adjusted_logprobs
+            return -adjusted_logprobs
     elif model.weighting_function == WeightingFunction.VMF_DENSITY:
         raise NotImplementedError("VMF density weighting function not implemented yet.")
     else:
         raise ValueError(f"Unknown weighting function: {model.weighting_function}")
 
-    return compute_log_probability(
+    return -compute_log_probability(
         model=model,
         params=params,
         samples=batch["point_vec"],
@@ -1538,6 +1541,6 @@ def _compute_nll_fwfm(
 # Create FunctionWeightedFlowModel-specific training loop using partial application
 _train_loop_for_tests = partial(
     flow_matching._train_loop_for_tests_generic,
-    compute_nll_fn=_compute_nll_fwfm,
-    precompute_test_stats_fn=_precompute_hemisphere_masses_fwfm,
+    compute_nll_fn=compute_nll,
+    precompute_test_stats_fn=compute_hemisphere_masses,
 )

@@ -1426,7 +1426,7 @@ def _train_loop_for_tests_generic(
                 if first_step or (i == 0):
                     step_rng, nll_rng = jax.random.split(step_rng)
                     # Use model-specific function to compute NLL
-                    train_nlls = -compute_nll_fn(
+                    train_nlls = compute_nll_fn(
                         model,
                         state.params,
                         batch,
@@ -1487,7 +1487,7 @@ def _train_loop_for_tests_generic(
 
                     # Use model-specific function to compute NLL
                     test_nlls.append(
-                        -compute_nll_fn(
+                        compute_nll_fn(
                             model,
                             state.params,
                             test_batch,
@@ -1537,7 +1537,7 @@ def _compute_nll_vector_field(model, params, batch, n_steps, rng, n_projections)
         batch_size = batch["point_vec"].shape[0]
         cond_vecs = jnp.zeros((batch_size, 0))
 
-    return compute_log_probability(
+    return -compute_log_probability(
         model=model,
         params=params,
         samples=batch["point_vec"],
