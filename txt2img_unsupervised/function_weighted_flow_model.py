@@ -784,7 +784,7 @@ def generate_samples(
     rng,
     weighting_function_params,
     n_steps=20,
-    method="rk4",
+    method="tsit5",
     batch_size=None,
 ):
     """
