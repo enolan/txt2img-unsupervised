@@ -1,5 +1,6 @@
 """Serializable configuration for the model and training parameters."""
 import argparse
+import importlib
 import dacite
 import jax
 import jax.numpy as jnp
@@ -7,8 +8,26 @@ import json
 import pytest
 from copy import copy
 from enum import Enum
-from dataclasses import dataclass, field
-from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Type
+from dataclasses import asdict, dataclass, field
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    FrozenSet,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
+
+from txt2img_unsupervised.function_weighted_flow_model import (
+    CapIndicatorExtraParams,
+    SmoothedCapIndicatorExtraParams,
+    WeightingFunction,
+)
 
 
 class BaseModelConfig:
@@ -156,12 +175,15 @@ class FlowMatchingModelConfig(BaseModelConfig):
     n_layers: int
     domain_dim: int
     reference_directions: Optional[int]
-    time_dim: int
+    time_dim: Optional[int]
     use_pre_mlp_projection: bool
     d_model: int
     mlp_expansion_factor: int
     mlp_dropout_rate: Optional[float]
     input_dropout_rate: Optional[float]
+    mlp_always_inject: FrozenSet[Literal["x", "t", "cond"]] = field(
+        default_factory=frozenset
+    )
 
     # Optional parameters with defaults
     activations_dtype: jnp.dtype = jnp.float32
@@ -170,9 +192,34 @@ class FlowMatchingModelConfig(BaseModelConfig):
     variance_base: float = 1 / 512
     alpha_input: float = 1.0
     alpha_output: float = 1.0
+    weighting_function: WeightingFunction = WeightingFunction.CONSTANT
+    weighting_function_extra_params: Optional[
+        Union[CapIndicatorExtraParams, SmoothedCapIndicatorExtraParams]
+    ] = None
+    cap_conditioned_base: bool = False
 
     # Class variable to store the model type
     model_type: ClassVar[str] = "flow_matching"
+
+    @property
+    def conditioning_dim(self) -> int:
+        if self.weighting_function == WeightingFunction.CONSTANT:
+            return 0
+        if self.weighting_function in (
+            WeightingFunction.CAP_INDICATOR,
+            WeightingFunction.SMOOTHED_CAP_INDICATOR,
+        ):
+            feature_dim = (
+                self.reference_directions
+                if self.reference_directions is not None
+                else self.domain_dim
+            )
+            return feature_dim + 1
+        if self.weighting_function == WeightingFunction.VMF_DENSITY:
+            raise NotImplementedError(
+                "VMF density weighting function not implemented yet."
+            )
+        raise ValueError(f"Unknown weighting function: {self.weighting_function}")
 
     @classmethod
     def from_json_dict(cls, dict: dict[str, Any]) -> "FlowMatchingModelConfig":
@@ -190,6 +237,32 @@ class FlowMatchingModelConfig(BaseModelConfig):
             out["weights_dtype"] = str_to_x_or_valueerror(
                 dict["weights_dtype"], str_to_dtype, "weights dtype"
             )
+
+        if "mlp_always_inject" in dict and dict["mlp_always_inject"] is not None:
+            out["mlp_always_inject"] = frozenset(dict["mlp_always_inject"])
+
+        if "weighting_function" in dict:
+            out["weighting_function"] = str_to_x_or_valueerror(
+                dict["weighting_function"],
+                str_to_weighting_function,
+                "weighting function",
+            )
+
+        extra_params = dict.get("weighting_function_extra_params")
+        weighting_function = out.get("weighting_function", WeightingFunction.CONSTANT)
+        if extra_params is not None:
+            if weighting_function == WeightingFunction.CAP_INDICATOR:
+                out["weighting_function_extra_params"] = CapIndicatorExtraParams(
+                    **extra_params
+                )
+            elif weighting_function == WeightingFunction.SMOOTHED_CAP_INDICATOR:
+                out[
+                    "weighting_function_extra_params"
+                ] = SmoothedCapIndicatorExtraParams(**extra_params)
+            else:
+                raise ValueError(
+                    "weighting_function_extra_params provided for unsupported weighting function"
+                )
 
         out = dacite.from_dict(
             data_class=cls, data=out, config=dacite.Config(check_types=False)
@@ -212,6 +285,17 @@ class FlowMatchingModelConfig(BaseModelConfig):
             self.weights_dtype, dtype_to_str, "dtype"
         )
 
+        out["mlp_always_inject"] = sorted(self.mlp_always_inject)
+        out["weighting_function"] = x_to_str_or_valueerror(
+            self.weighting_function,
+            weighting_function_to_str,
+            "weighting function",
+        )
+        if self.weighting_function_extra_params is not None:
+            out["weighting_function_extra_params"] = asdict(
+                self.weighting_function_extra_params
+            )
+
         return out
 
     def validate(self):
@@ -223,7 +307,11 @@ class FlowMatchingModelConfig(BaseModelConfig):
             )
 
         # Flow matching specific validation
+        if self.time_dim is not None and self.time_dim % 2 != 0:
+            raise ValueError("Time dimension must be even")
+
         if not self.use_pre_mlp_projection:
+            time_dim = 1 if self.time_dim is None else self.time_dim
             total_input_dim = (
                 (
                     self.reference_directions
@@ -231,7 +319,7 @@ class FlowMatchingModelConfig(BaseModelConfig):
                     else self.domain_dim
                 )
                 + self.conditioning_dim
-                + self.time_dim
+                + time_dim
             )
             if total_input_dim > self.d_model:
                 raise ValueError(
@@ -239,8 +327,48 @@ class FlowMatchingModelConfig(BaseModelConfig):
                     f"Increase d_model or reduce input dimensions."
                 )
 
-        if self.time_dim % 2 != 0:
-            raise ValueError("Time dimension must be even")
+        if not isinstance(self.mlp_always_inject, frozenset):
+            raise ValueError(
+                "mlp_always_inject must be a frozenset of {'x','t','cond'}"
+            )
+
+        allowed = {"x", "t", "cond"}
+        unknown = set(self.mlp_always_inject) - allowed
+        if unknown:
+            raise ValueError(f"Unknown mlp_always_inject items: {sorted(unknown)}")
+
+        if "cond" in self.mlp_always_inject and self.conditioning_dim == 0:
+            raise ValueError(
+                "'cond' specified in mlp_always_inject but conditioning_dim == 0"
+            )
+
+        if (
+            self.cap_conditioned_base
+            and self.weighting_function != WeightingFunction.CAP_INDICATOR
+        ):
+            raise ValueError(
+                "cap_conditioned_base is only supported with CAP_INDICATOR weighting"
+            )
+
+        if (
+            self.weighting_function
+            in (
+                WeightingFunction.CAP_INDICATOR,
+                WeightingFunction.SMOOTHED_CAP_INDICATOR,
+            )
+            and self.weighting_function_extra_params is None
+        ):
+            raise ValueError(
+                "weighting_function_extra_params must be provided for cap-based weighting functions"
+            )
+
+        if (
+            self.weighting_function == WeightingFunction.CONSTANT
+            and self.weighting_function_extra_params is not None
+        ):
+            raise ValueError(
+                "weighting_function_extra_params should not be provided for CONSTANT weighting"
+            )
 
 
 def invert_dict(d: dict[Any, Any]) -> dict[Any, Any]:
@@ -255,6 +383,15 @@ str_to_dtype: dict[str, jnp.dtype] = {
 }
 
 dtype_to_str: dict[jnp.dtype, str] = invert_dict(str_to_dtype)
+
+str_to_weighting_function = {
+    "constant": WeightingFunction.CONSTANT,
+    "cap_indicator": WeightingFunction.CAP_INDICATOR,
+    "smoothed_cap_indicator": WeightingFunction.SMOOTHED_CAP_INDICATOR,
+    "vmf_density": WeightingFunction.VMF_DENSITY,
+}
+
+weighting_function_to_str = invert_dict(str_to_weighting_function)
 
 str_to_activation: dict[str, Callable[[jax.Array], jax.Array]] = {
     "relu": jax.nn.relu,
@@ -327,6 +464,122 @@ def test_transformermodelconfig_roundtrip_from_object() -> None:
         TransformerModelConfig.from_json_dict(TransformerModelConfig.to_json_dict(cfg))
         == cfg
     )
+
+
+def test_transformer_config_instantiates_image_model() -> None:
+    """Ensure TransformerModelConfig can create an ImageModel via its dictionary."""
+
+    cfg = TransformerModelConfig(
+        n_layers=2,
+        d_model=64,
+        num_heads=8,
+        ff_dim=256,
+        dropout=None,
+        image_tokens=128,
+        use_biases=True,
+        activation_function=jax.nn.gelu,
+    )
+
+    # Work around circular import
+    ImageModel = importlib.import_module(
+        "txt2img_unsupervised.transformer_model"
+    ).ImageModel
+    model = ImageModel(**cfg.__dict__)
+
+    assert isinstance(model, ImageModel)
+
+
+def test_flow_matching_config_roundtrip_from_object() -> None:
+    """FlowMatchingModelConfig serializes to/from JSON dictionaries with new fields."""
+
+    cfg = FlowMatchingModelConfig(
+        n_layers=3,
+        domain_dim=8,
+        reference_directions=8,
+        time_dim=16,
+        use_pre_mlp_projection=True,
+        d_model=256,
+        mlp_expansion_factor=4,
+        mlp_dropout_rate=0.2,
+        input_dropout_rate=None,
+        mlp_always_inject=frozenset({"x", "t"}),
+        activations_dtype=jnp.bfloat16,
+        weights_dtype=jnp.bfloat16,
+        d_model_base=1024,
+        variance_base=1 / 1024,
+        alpha_input=0.7,
+        alpha_output=1.3,
+        weighting_function=WeightingFunction.SMOOTHED_CAP_INDICATOR,
+        weighting_function_extra_params=SmoothedCapIndicatorExtraParams(
+            boundary_width=0.2
+        ),
+        cap_conditioned_base=False,
+    )
+
+    regenerated = FlowMatchingModelConfig.from_json_dict(
+        FlowMatchingModelConfig.to_json_dict(cfg)
+    )
+    assert regenerated == cfg
+
+
+def test_flow_matching_config_roundtrip_from_json() -> None:
+    """FlowMatchingModelConfig parses JSON dictionaries with weighting config."""
+
+    json_dict = {
+        "n_layers": 2,
+        "domain_dim": 4,
+        "reference_directions": None,
+        "time_dim": None,
+        "use_pre_mlp_projection": False,
+        "d_model": 32,
+        "mlp_expansion_factor": 2,
+        "mlp_dropout_rate": 0.1,
+        "input_dropout_rate": 0.05,
+        "mlp_always_inject": ["x", "cond"],
+        "activations_dtype": "float32",
+        "weights_dtype": "float32",
+        "d_model_base": 256,
+        "variance_base": 1 / 256,
+        "alpha_input": 0.9,
+        "alpha_output": 1.1,
+        "weighting_function": "cap_indicator",
+        "weighting_function_extra_params": {"d_max_dist": [[0.8, 1.0], [0.2, 1.5]]},
+        "cap_conditioned_base": False,
+        "model_type": "flow_matching",
+    }
+
+    cfg = FlowMatchingModelConfig.from_json_dict(json_dict)
+    assert cfg.weighting_function == WeightingFunction.CAP_INDICATOR
+    assert cfg.mlp_always_inject == frozenset({"x", "cond"})
+    assert isinstance(cfg.weighting_function_extra_params, CapIndicatorExtraParams)
+    assert FlowMatchingModelConfig.to_json_dict(cfg)["mlp_always_inject"] == [
+        "cond",
+        "x",
+    ]
+
+
+def test_flow_matching_config_instantiates_function_weighted_flow_model() -> None:
+    """Ensure FlowMatchingModelConfig can create a FunctionWeightedFlowModel via its dictionary."""
+
+    cfg = FlowMatchingModelConfig(
+        n_layers=2,
+        domain_dim=3,
+        reference_directions=None,
+        time_dim=16,
+        use_pre_mlp_projection=True,
+        d_model=128,
+        mlp_expansion_factor=4,
+        mlp_dropout_rate=None,
+        input_dropout_rate=None,
+    )
+
+    # Work around circular import
+    FunctionWeightedFlowModel = importlib.import_module(
+        "txt2img_unsupervised.function_weighted_flow_model"
+    ).FunctionWeightedFlowModel
+    model = FunctionWeightedFlowModel(**cfg.__dict__)
+
+    assert isinstance(model, FunctionWeightedFlowModel)
 
 
 class LearningRateSchedule(Enum):
