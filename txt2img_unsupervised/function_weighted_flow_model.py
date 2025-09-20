@@ -830,16 +830,16 @@ def generate_samples(
                 f"got {batch_size}, but inferred {inferred_batch_size} from the weighting function "
                 "parameters."
             )
-
+    x0_rng, path_rng = jax.random.split(rng)
     x0 = model.apply(
         params,
-        rng,
+        x0_rng,
         method=model.sample_base_distribution,
         weighting_function_params=weighting_function_params,
     )
 
     samples, _eval_counts = flow_matching.generate_samples_inner(
-        rng,
+        path_rng,
         n_steps,
         batch_size,
         method,
