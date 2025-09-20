@@ -1,5 +1,6 @@
 """Serializable configuration for the model and training parameters."""
 import argparse
+import importlib
 import dacite
 import jax
 import jax.numpy as jnp
@@ -327,6 +328,53 @@ def test_transformermodelconfig_roundtrip_from_object() -> None:
         TransformerModelConfig.from_json_dict(TransformerModelConfig.to_json_dict(cfg))
         == cfg
     )
+
+
+def test_transformer_config_instantiates_image_model() -> None:
+    """Ensure TransformerModelConfig can create an ImageModel via its dictionary."""
+
+    cfg = TransformerModelConfig(
+        n_layers=2,
+        d_model=64,
+        num_heads=8,
+        ff_dim=256,
+        dropout=None,
+        image_tokens=128,
+        use_biases=True,
+        activation_function=jax.nn.gelu,
+    )
+
+    # Work around circular import
+    ImageModel = importlib.import_module(
+        "txt2img_unsupervised.transformer_model"
+    ).ImageModel
+    model = ImageModel(**cfg.__dict__)
+
+    assert isinstance(model, ImageModel)
+
+
+def test_flow_matching_config_instantiates_function_weighted_flow_model() -> None:
+    """Ensure FlowMatchingModelConfig can create a FunctionWeightedFlowModel via its dictionary."""
+
+    cfg = FlowMatchingModelConfig(
+        n_layers=2,
+        domain_dim=3,
+        reference_directions=None,
+        time_dim=16,
+        use_pre_mlp_projection=True,
+        d_model=128,
+        mlp_expansion_factor=4,
+        mlp_dropout_rate=None,
+        input_dropout_rate=None,
+    )
+
+    # Work around circular import
+    FunctionWeightedFlowModel = importlib.import_module(
+        "txt2img_unsupervised.function_weighted_flow_model"
+    ).FunctionWeightedFlowModel
+    model = FunctionWeightedFlowModel(**cfg.__dict__)
+
+    assert isinstance(model, FunctionWeightedFlowModel)
 
 
 class LearningRateSchedule(Enum):
