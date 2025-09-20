@@ -227,370 +227,6 @@ class MLPBlock(nn.Module):
         return x + out, None
 
 
-class TransformerBlock(nn.Module):
-    """
-    Pre-norm transformer block with full attention and SwiGLU MLP.
-    """
-
-    d_model: int
-    n_heads: int
-    mlp_expansion_factor: int
-    mlp_dropout_rate: Optional[float]
-
-    activations_dtype: jnp.dtype
-    weights_dtype: jnp.dtype
-    param_variance: float
-
-    def setup(self) -> None:
-        self.norm1 = nn.LayerNorm(dtype=self.activations_dtype, param_dtype=jnp.float32)
-
-        # Use standard Flax MHA, but override attention_fn to set muP scaling (1/d_head)
-        def _mup_attention_fn(
-            query,
-            key,
-            value,
-            bias=None,
-            mask=None,
-            *,
-            is_causal: bool = False,
-            **kwargs,
-        ):
-            # Enforce muP scaling: (q @ k^T) / d_head
-            d_head = query.shape[-1]
-            return jax.nn.dot_product_attention(
-                query,
-                key,
-                value,
-                bias=bias,
-                mask=mask,
-                scale=1.0 / float(d_head),
-                is_causal=is_causal,
-            )
-
-        self.attn = nn.MultiHeadDotProductAttention(
-            num_heads=self.n_heads,
-            dtype=self.activations_dtype,
-            param_dtype=self.weights_dtype,
-            kernel_init=nn.initializers.normal(stddev=jnp.sqrt(self.param_variance)),
-            dropout_rate=0.0,
-            attention_fn=_mup_attention_fn,
-        )
-        self.norm2 = nn.LayerNorm(dtype=self.activations_dtype, param_dtype=jnp.float32)
-
-        self.gate_proj = nn.Dense(
-            features=self.mlp_expansion_factor * self.d_model,
-            dtype=self.activations_dtype,
-            param_dtype=self.weights_dtype,
-            kernel_init=nn.initializers.normal(stddev=jnp.sqrt(self.param_variance)),
-        )
-        self.value_proj = nn.Dense(
-            features=self.mlp_expansion_factor * self.d_model,
-            dtype=self.activations_dtype,
-            param_dtype=self.weights_dtype,
-            kernel_init=nn.initializers.normal(stddev=jnp.sqrt(self.param_variance)),
-        )
-        self.out_proj = nn.Dense(
-            features=self.d_model,
-            dtype=self.activations_dtype,
-            param_dtype=self.weights_dtype,
-            kernel_init=nn.initializers.normal(
-                stddev=jnp.sqrt(self.param_variance / self.mlp_expansion_factor)
-            ),
-        )
-
-        self.dropout = (
-            nn.Dropout(rate=self.mlp_dropout_rate, deterministic=False)
-            if self.mlp_dropout_rate is not None
-            else None
-        )
-
-    def __call__(self, tokens, _):
-        # tokens: [batch, seq_len, d_model]
-        assert tokens.ndim == 3
-        assert tokens.shape[-1] == self.d_model
-
-        y = self.norm1(tokens)
-        if self.dropout is not None:
-            y = self.dropout(y)
-        attn_out = self.attn(y, y, y, deterministic=True)
-        tokens = tokens + attn_out
-
-        y2 = self.norm2(tokens)
-        if self.dropout is not None:
-            y2 = self.dropout(y2)
-        gate = self.gate_proj(y2)
-        value = self.value_proj(y2)
-        ffn_out = self.out_proj(jax.nn.silu(gate) * value)
-        tokens = tokens + ffn_out
-
-        return tokens, None
-
-
-class TransformerVectorField(nn.Module):
-    """
-    Drop-in replacement for VectorField using a Transformer backbone.
-
-    Inputs become tokens:
-      - x projected to d_model
-      - t encoded via sinusoidal encoding, then projected to d_model
-      - optional conditioning vector projected to d_model (skipped if conditioning_dim == 0)
-      - n_learned_tokens trainable tokens
-
-    Output is taken from the 0th learned token after the transformer stack, projected to domain_dim
-    and projected into the tangent space at x.
-    """
-
-    # Dimensions
-    domain_dim: int
-    conditioning_dim: int
-
-    # Architecture
-    n_layers: int
-    d_model: int
-    mlp_expansion_factor: int
-    n_heads: int
-    n_learned_tokens: int
-
-    # Time encoding
-    time_dim: int = 128
-
-    # Dropouts
-    mlp_dropout_rate: Optional[float] = None
-    input_dropout_rate: Optional[float] = None
-
-    # Dtypes / scaling
-    activations_dtype: jnp.dtype = jnp.float32
-    weights_dtype: jnp.dtype = jnp.float32
-    d_model_base: int = 512
-    variance_base: float = 1 / 512
-    alpha_input: float = 1.0
-    alpha_output: float = 1.0
-
-    @property
-    def d_model_scale_factor(self) -> float:
-        return self.d_model / self.d_model_base
-
-    def setup(self) -> None:
-        if self.n_learned_tokens < 1:
-            raise ValueError("n_learned_tokens must be at least 1")
-        if self.time_dim % 2 != 0:
-            raise ValueError("time_dim must be even for sinusoidal time encoding")
-
-        hidden_init_variance = self.variance_base / self.d_model_scale_factor
-
-        # Input projections
-        # We scale x by sqrt(domain_dim) in __call__, so inputs to this layer have per-dim var ≈ 1.
-        # Use variance scaling for fan-in so outputs are approximately unit variance at init.
-        self.in_proj_x = nn.Dense(
-            features=self.d_model,
-            dtype=self.activations_dtype,
-            param_dtype=self.weights_dtype,
-            kernel_init=nn.initializers.variance_scaling(1.0, "fan_in", "normal"),
-            use_bias=True,
-        )
-        if self.conditioning_dim > 0:
-            self.in_proj_cond = nn.Dense(
-                features=self.d_model,
-                dtype=self.activations_dtype,
-                param_dtype=self.weights_dtype,
-                kernel_init=nn.initializers.variance_scaling(1.0, "fan_in", "normal"),
-                use_bias=True,
-            )
-        else:
-            self.in_proj_cond = None
-
-        # Project sinusoidally encoded time (time_dim) to d_model
-        self.time_proj = nn.Dense(
-            features=self.d_model,
-            dtype=self.activations_dtype,
-            param_dtype=self.weights_dtype,
-            kernel_init=nn.initializers.variance_scaling(1.0, "fan_in", "normal"),
-            use_bias=True,
-        )
-
-        # Learnable tokens
-        self.learned_tokens = self.param(
-            "learned_tokens",
-            nn.initializers.normal(stddev=1.0),
-            (self.n_learned_tokens, self.d_model),
-        )
-
-        # No explicit token-type biases; Dense layers include biases initialized to zero.
-
-        self.input_dropout = (
-            nn.Dropout(rate=self.input_dropout_rate, deterministic=False)
-            if self.input_dropout_rate is not None
-            else None
-        )
-
-        # Transformer stack (scan + remat)
-        self.transformer_blocks = nn.scan(
-            nn.remat(TransformerBlock),
-            variable_axes={"params": 0, "intermediates": 0},
-            variable_broadcast=False,
-            split_rngs={"params": True, "dropout": True},
-            length=self.n_layers,
-        )(
-            d_model=self.d_model,
-            n_heads=self.n_heads,
-            mlp_expansion_factor=self.mlp_expansion_factor,
-            mlp_dropout_rate=self.mlp_dropout_rate,
-            activations_dtype=self.activations_dtype,
-            weights_dtype=self.weights_dtype,
-            param_variance=hidden_init_variance,
-        )
-
-        self.final_norm = nn.LayerNorm(
-            dtype=self.activations_dtype,
-            param_dtype=jnp.float32,
-        )
-
-        self.out_proj = nn.Dense(
-            features=self.domain_dim,
-            dtype=self.activations_dtype,
-            param_dtype=self.weights_dtype,
-            kernel_init=nn.initializers.normal(stddev=jnp.sqrt(hidden_init_variance)),
-        )
-
-    def time_encoding(self, t):
-        """Encode time to a time_dim-dimensional vector."""
-        return sinusoidal_scalar_encoding(t, self.time_dim)
-
-    def dummy_inputs(self):
-        x = jnp.ones((1, self.domain_dim))
-        t = jnp.ones((1,))
-        cond_vec = jnp.zeros((1, self.conditioning_dim))
-        return x, t, cond_vec
-
-    def prepare_training_conditioning(self, batch):
-        if "cond_vec" in batch:
-            return batch["cond_vec"]
-        else:
-            batch_size = batch["point_vec"].shape[0]
-            return jnp.zeros((batch_size, 0))
-
-    def scale_lr(self, lr: float) -> float:
-        return lr / self.d_model_scale_factor
-
-    def mk_partition_map(self, use_muon: bool):
-        """Partition map for muP and optional Muon for transformer.
-
-        Groups:
-        - Without Muon: "fixed_lr" and "scaled_lr".
-        - With Muon: "adam_fixed", "adam_scaled", "muon_scaled" (no muon_fixed group here).
-        """
-        if use_muon:
-            muon_dense = {"bias": "adam_fixed", "kernel": "muon_scaled"}
-            adam_dense = {"bias": "adam_fixed", "kernel": "adam_scaled"}
-
-            params_map: Dict[str, Any] = {
-                # Input/output layers use Adam per Muon guidance
-                "in_proj_x": adam_dense,
-                "time_proj": adam_dense,
-                # Optional conditional projection is added below when present
-                "learned_tokens": "adam_fixed",
-                "final_norm": "adam_fixed",
-                "out_proj": adam_dense,
-                "transformer_blocks": {
-                    "norm1": "adam_fixed",
-                    "attn": {
-                        "query": muon_dense,
-                        "key": muon_dense,
-                        "value": muon_dense,
-                        "out": muon_dense,
-                    },
-                    "norm2": "adam_fixed",
-                    "gate_proj": muon_dense,
-                    "value_proj": muon_dense,
-                    "out_proj": muon_dense,
-                },
-            }
-            if self.conditioning_dim > 0:
-                params_map["in_proj_cond"] = adam_dense
-            return {"params": params_map}
-        else:
-            dense = {"bias": "fixed_lr", "kernel": "scaled_lr"}
-            params_map = {
-                "in_proj_x": dense,
-                "time_proj": dense,
-                # Optional conditional projection is added below when present
-                "learned_tokens": "fixed_lr",
-                "final_norm": "fixed_lr",
-                "out_proj": dense,
-                "transformer_blocks": {
-                    "norm1": "fixed_lr",
-                    "attn": {
-                        "query": dense,
-                        "key": dense,
-                        "value": dense,
-                        "out": dense,
-                    },
-                    "norm2": "fixed_lr",
-                    "gate_proj": dense,
-                    "value_proj": dense,
-                    "out_proj": dense,
-                },
-            }
-            if self.conditioning_dim > 0:
-                params_map["in_proj_cond"] = dense
-            return {"params": params_map}
-
-    def sample_base_distribution(self, conditioning_data, batch_size):
-        "Sample base distribution x0 for training."
-        return sample_sphere(self.make_rng("sample_base"), batch_size, self.domain_dim)
-
-    def __call__(self, x, t, cond_vec):
-        batch_size = x.shape[0]
-        assert x.shape == (batch_size, self.domain_dim)
-        assert t.shape == (batch_size,)
-        assert cond_vec.shape == (batch_size, self.conditioning_dim)
-
-        # Tokenize inputs
-        # Scale x by sqrt(domain_dim) so each component has var≈1 for uniform-on-sphere x
-        x_tok = self.in_proj_x(x * jnp.sqrt(self.domain_dim))  # [b, d_model]
-        # Time token: sinusoidal encoding (time_dim) projected to d_model
-        t_enc = jax.vmap(self.time_encoding)(t)  # [b, time_dim]
-        t_tok = self.time_proj(t_enc)  # [b, d_model]
-
-        tokens = [x_tok[:, None, :], t_tok[:, None, :]]
-        if self.conditioning_dim > 0:
-            # Assumes cond_vec has mean 0 and var 1 per component by dataset design
-            cond_tok = self.in_proj_cond(cond_vec)
-            tokens.append(cond_tok[:, None, :])
-        derived_tokens = jnp.concatenate(tokens, axis=1)
-
-        learned = repeat(self.learned_tokens, "t d -> b t d", b=batch_size)
-
-        seq = jnp.concatenate(
-            [derived_tokens, learned], axis=1
-        )  # [b, seq_len, d_model]
-        if self.input_dropout is not None:
-            seq = self.input_dropout(seq)
-        seq = seq * self.alpha_input
-
-        seq, _ = self.transformer_blocks(seq, None)
-        seq = self.final_norm(seq)
-
-        derived_len = 2 + (1 if self.conditioning_dim > 0 else 0)
-        learned0 = seq[:, derived_len + 0, :]  # [b, d_model]
-
-        points_out = self.out_proj(learned0)  # [b, domain_dim]
-
-        # Project to tangent space at x
-        dot_products = jnp.sum(points_out * x, axis=1, keepdims=True)
-        tangent_outputs = points_out - dot_products * x
-
-        # Match VectorField initial magnitude scaling to ~pi/2
-        expected_magnitude = jnp.sqrt(2) * jnp.exp(
-            jax.lax.lgamma(self.domain_dim / 2)
-            - jax.lax.lgamma((self.domain_dim - 1) / 2)
-        )
-        domain_scale_factor = (jnp.pi / 2) / expected_magnitude
-        tangent_outputs = tangent_outputs * domain_scale_factor * self.alpha_output
-
-        return tangent_outputs
-
-
 class VectorField(nn.Module):
     """
     Model of a vector field conditioned on a time t in [0, 1] and a arbitrary-dimensional vector.
@@ -1929,40 +1565,6 @@ _baseline_model = VectorField(
 )
 
 
-def _mk_model(
-    model_kind: str, *, domain_dim: int, conditioning_dim: int = 0, **overrides
-):
-    """Factory for test models: 'mlp' (VectorField) or 'transformer'."""
-    if model_kind == "mlp":
-        base = replace(
-            _baseline_model,
-            domain_dim=domain_dim,
-            conditioning_dim=conditioning_dim,
-        )
-        if overrides:
-            base = replace(base, **overrides)
-        return base
-    elif model_kind == "transformer":
-        n_layers = overrides.get("n_layers", 4)
-        d_model = overrides.get("d_model", 64)
-        return TransformerVectorField(
-            domain_dim=domain_dim,
-            conditioning_dim=conditioning_dim,
-            n_layers=n_layers,
-            d_model=d_model,
-            mlp_expansion_factor=overrides.get("mlp_expansion_factor", 4),
-            n_heads=overrides.get("n_heads", 4),
-            # target 8 total tokens for these simple tests
-            n_learned_tokens=overrides.get(
-                "n_learned_tokens", 6 if conditioning_dim == 0 else 5
-            ),
-            mlp_dropout_rate=overrides.get("mlp_dropout_rate", None),
-            input_dropout_rate=overrides.get("input_dropout_rate", None),
-        )
-    else:
-        raise ValueError(f"Unknown model_kind: {model_kind}")
-
-
 @pytest.mark.usefixtures("starts_with_progressbar")
 @pytest.mark.parametrize(
     "inject_keys",
@@ -1973,20 +1575,16 @@ def _mk_model(
         frozenset({"x", "t"}),
     ],
 )
-@pytest.mark.parametrize("model_kind", ["mlp", "transformer"])
 @pytest.mark.parametrize("domain_dim", [3, 16])
-def test_train_trivial(model_kind, domain_dim, inject_keys):
+def test_train_trivial(domain_dim, inject_keys):
     "Train a model with a single example"
-    if model_kind == "mlp":
-        model = _mk_model("mlp", domain_dim=domain_dim, mlp_always_inject=inject_keys)
-        lr = 1e-3
-        ep = 2 if domain_dim == 3 else 2
-    else:
-        model = _mk_model("transformer", domain_dim=domain_dim)
-        if inject_keys:
-            pytest.skip("Transformer with inject_keys not supported")
-        lr = 1e-3
-        ep = 4
+    model = replace(
+        _baseline_model,
+        domain_dim=domain_dim,
+        mlp_always_inject=inject_keys,
+    )
+    lr = 1e-3
+    ep = 2
 
     batch_size = 256
     # Create a unit vector in the first dimension
@@ -2099,20 +1697,17 @@ def vmf_scale_kappa(kappa_src, dim_src, dim_target):
         frozenset({"x", "t"}),
     ],
 )
-@pytest.mark.parametrize("model_kind", ["mlp", "transformer"])
 @pytest.mark.parametrize("domain_dim", [3, 16])
-def test_train_vmf(model_kind, domain_dim, inject_keys):
+def test_train_vmf(domain_dim, inject_keys):
     """
     Train a model with data from a von Mises-Fisher distribution and evaluate the samples.
     """
-    if model_kind == "mlp":
-        model = _mk_model(
-            "mlp", domain_dim=domain_dim, n_layers=2, mlp_always_inject=inject_keys
-        )
-    else:
-        model = _mk_model("transformer", domain_dim=domain_dim)
-        if inject_keys:
-            pytest.skip("Transformer with inject_keys not supported")
+    model = replace(
+        _baseline_model,
+        domain_dim=domain_dim,
+        n_layers=2,
+        mlp_always_inject=inject_keys,
+    )
     epochs = 1
 
     batch_size = 512
@@ -2187,9 +1782,8 @@ def test_train_vmf(model_kind, domain_dim, inject_keys):
     ), f"Sample NLL {sample_nll} too far from differential entropy {differential_entropy}"
 
 
-@pytest.mark.parametrize("model_kind", ["mlp", "transformer"])
 @pytest.mark.parametrize("domain_dim", [3, 16])
-def test_train_uniform_zero_field(model_kind, domain_dim):
+def test_train_uniform_zero_field(domain_dim):
     """
     Train a model with uniformly distributed data on the sphere and verify that the learned
     vector field is approximately zero everywhere.
@@ -2197,10 +1791,12 @@ def test_train_uniform_zero_field(model_kind, domain_dim):
     Since the uniform distribution is the stationary distribution (source equals target),
     the optimal flow field should be zero everywhere.
     """
-    if model_kind == "mlp":
-        model = _mk_model("mlp", domain_dim=domain_dim, n_layers=4, d_model=256)
-    else:
-        model = _mk_model("transformer", domain_dim=domain_dim)
+    model = replace(
+        _baseline_model,
+        domain_dim=domain_dim,
+        n_layers=4,
+        d_model=256,
+    )
     epochs = 8
 
     batch_size = 512
@@ -2331,9 +1927,8 @@ def test_train_uniform_zero_field(model_kind, domain_dim):
     ],
 )
 @pytest.mark.usefixtures("starts_with_progressbar")
-@pytest.mark.parametrize("model_kind", ["mlp", "transformer"])
 @pytest.mark.parametrize("domain_dim", [3, 16])
-def test_train_conditional_vmf(model_kind, domain_dim, inject_keys):
+def test_train_conditional_vmf(domain_dim, inject_keys):
     """
     Train a model with data from two different von Mises-Fisher distributions
     conditioned on a binary conditioning vector.
@@ -2341,24 +1936,16 @@ def test_train_conditional_vmf(model_kind, domain_dim, inject_keys):
     When conditioning vector is 0, samples should come from the first vMF distribution.
     When conditioning vector is 1, samples should come from the second vMF distribution.
     """
-    if model_kind == "mlp":
-        model = _mk_model(
-            "mlp",
-            domain_dim=domain_dim,
-            conditioning_dim=1,
-            n_layers=2,
-            mlp_always_inject=inject_keys,
-        )
-        epochs = 2 if domain_dim == 3 else 4
-        batch_size = 256
-        lr = 1e-3
-    else:
-        model = _mk_model("transformer", domain_dim=domain_dim, conditioning_dim=1)
-        if inject_keys:
-            pytest.skip("Transformer with inject_keys not supported")
-        epochs = 2
-        batch_size = 256
-        lr = 1e-3
+    model = replace(
+        _baseline_model,
+        domain_dim=domain_dim,
+        conditioning_dim=1,
+        n_layers=2,
+        mlp_always_inject=inject_keys,
+    )
+    epochs = 2 if domain_dim == 3 else 4
+    batch_size = 256
+    lr = 1e-3
 
     # Define two different vMF distributions
     mean_direction1 = np.zeros(domain_dim)
@@ -6361,8 +5948,7 @@ def test_spherical_ot_field_antipodal_direction_tangent_and_nonzero():
         frozenset({"x", "t"}),
     ],
 )
-@pytest.mark.parametrize("model_kind", ["mlp", "transformer"])
-def test_train_hemisphere_density(model_kind, inject_keys):
+def test_train_hemisphere_density(inject_keys):
     """
     Train on points uniformly sampled from the northern hemisphere, then verify:
     - log density on the northern hemisphere ≈ log(2) + uniform sphere log density
@@ -6371,21 +5957,15 @@ def test_train_hemisphere_density(model_kind, inject_keys):
     Uses sample_from_cap to generate uniform-in-cap points (cap d_max=1 corresponds to hemisphere).
     """
     domain_dim = 3
-    if model_kind == "mlp":
-        model = _mk_model(
-            "mlp",
-            domain_dim=domain_dim,
-            n_layers=6,
-            d_model=512,
-            mlp_always_inject=inject_keys,
-            time_dim=None,
-        )
-        lr = 1e-3
-    else:
-        model = _mk_model("transformer", domain_dim=domain_dim, n_learned_tokens=14)
-        if inject_keys:
-            pytest.skip("Transformer with inject_keys not supported")
-        lr = 3e-3
+    model = replace(
+        _baseline_model,
+        domain_dim=domain_dim,
+        n_layers=6,
+        d_model=512,
+        mlp_always_inject=inject_keys,
+        time_dim=None,
+    )
+    lr = 1e-3
     epochs = 16
 
     # Hemisphere definition: center at north pole, half-angle π/2 ⇒ d_max = 1.0

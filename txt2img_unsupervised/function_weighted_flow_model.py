@@ -948,36 +948,7 @@ _baseline_model = FunctionWeightedFlowModel(
 )
 
 
-class TransformerBackboneFWFM(FunctionWeightedFlowModel):
-    """FunctionWeightedFlowModel variant that uses a Transformer backbone for the vector field.
-
-    Used in tests to validate both MLP and Transformer vector field implementations.
-    """
-
-    @nn.nowrap
-    def mk_vector_field(self) -> VectorField:  # type: ignore[override]
-        return flow_matching.TransformerVectorField(
-            domain_dim=self.domain_dim,
-            conditioning_dim=self.conditioning_dim,
-            n_layers=self.n_layers,
-            d_model=self.d_model,
-            mlp_expansion_factor=self.mlp_expansion_factor,
-            n_heads=4,
-            n_learned_tokens=32 - 3,
-            time_dim=self.time_dim,
-            mlp_dropout_rate=self.mlp_dropout_rate,
-            input_dropout_rate=self.input_dropout_rate,
-            activations_dtype=self.activations_dtype,
-            weights_dtype=self.weights_dtype,
-            d_model_base=self.d_model_base,
-            variance_base=self.variance_base,
-            alpha_input=self.alpha_input,
-            alpha_output=self.alpha_output,
-        )
-
-
 @pytest.mark.parametrize("domain_dim", [3, 16])
-@pytest.mark.parametrize("vector_field_model_kind", ["mlp", "transformer"])
 @pytest.mark.parametrize(
     "weighting_function",
     [
@@ -1015,9 +986,7 @@ class TransformerBackboneFWFM(FunctionWeightedFlowModel):
         ),
     ],
 )
-def test_train_uniform(
-    domain_dim, vector_field_model_kind, weighting_function, mlp_always_inject
-):
+def test_train_uniform(domain_dim, weighting_function, mlp_always_inject):
     """
     Train a function-weighted model on uniform distribution, then verify it produces correct weighted distributions.
     """
@@ -1032,37 +1001,18 @@ def test_train_uniform(
     else:
         extra_params = None
 
-    if vector_field_model_kind == "mlp":
-        model = replace(
-            _baseline_model,
-            domain_dim=domain_dim,
-            d_model=512,
-            n_layers=16,
-            time_dim=None,
-            weighting_function=weighting_function,
-            weighting_function_extra_params=extra_params,
-            use_pre_mlp_projection=True,
-            mlp_always_inject=mlp_always_inject,
-            cap_conditioned_base=weighting_function == WeightingFunction.CAP_INDICATOR,
-        )
-    elif vector_field_model_kind == "transformer":
-        if mlp_always_inject:
-            pytest.skip("Transformer backbone FWFM does not support mlp_always_inject")
-        model = TransformerBackboneFWFM(
-            domain_dim=domain_dim,
-            reference_directions=None,
-            time_dim=128,
-            use_pre_mlp_projection=False,
-            n_layers=4,
-            d_model=256,
-            mlp_expansion_factor=4,
-            mlp_dropout_rate=None,
-            input_dropout_rate=None,
-            weighting_function=weighting_function,
-            weighting_function_extra_params=extra_params,
-        )
-    else:
-        raise ValueError(f"Unknown vector_field_model_kind: {vector_field_model_kind}")
+    model = replace(
+        _baseline_model,
+        domain_dim=domain_dim,
+        d_model=512,
+        n_layers=16,
+        time_dim=None,
+        weighting_function=weighting_function,
+        weighting_function_extra_params=extra_params,
+        use_pre_mlp_projection=True,
+        mlp_always_inject=mlp_always_inject,
+        cap_conditioned_base=weighting_function == WeightingFunction.CAP_INDICATOR,
+    )
     rng = jax.random.PRNGKey(20250823)
     train_rng, test_rng = jax.random.split(rng)
 
@@ -1082,7 +1032,7 @@ def test_train_uniform(
 
     # Train the model using the shared infrastructure
     batch_size = 512
-    learning_rate = 1e-4 if vector_field_model_kind == "mlp" else 1e-3
+    learning_rate = 1e-4
     if domain_dim == 3 and weighting_function == WeightingFunction.CONSTANT:
         epochs = 2
     elif domain_dim == 3 and weighting_function in [
