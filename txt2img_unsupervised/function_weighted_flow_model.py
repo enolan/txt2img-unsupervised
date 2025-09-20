@@ -976,6 +976,7 @@ class TransformerBackboneFWFM(FunctionWeightedFlowModel):
         )
 
 
+@pytest.mark.usefixtures("starts_with_progressbar")
 @pytest.mark.parametrize("domain_dim", [3, 16])
 @pytest.mark.parametrize("vector_field_model_kind", ["mlp", "transformer"])
 @pytest.mark.parametrize(
@@ -995,15 +996,15 @@ class TransformerBackboneFWFM(FunctionWeightedFlowModel):
 @pytest.mark.parametrize(
     "mlp_always_inject",
     [
-        pytest.param(frozenset(), id="none", marks=pytest.mark.skip(reason="slow")),
+        pytest.param(frozenset(), id="none"),
         pytest.param(frozenset({"x"}), id="x", marks=pytest.mark.skip(reason="slow")),
         pytest.param(frozenset({"t"}), id="t", marks=pytest.mark.skip(reason="slow")),
         pytest.param(
             frozenset({"cond"}), id="cond", marks=pytest.mark.skip(reason="slow")
         ),
-        pytest.param(frozenset({"x", "t"}), id="x&t"),
+        pytest.param(frozenset({"x", "t"}), id="x&t", marks=pytest.mark.skip(reason="slow")),
         pytest.param(
-            frozenset({"x", "cond"}), id="x&cond", marks=pytest.mark.skip(reason="slow")
+            frozenset({"x", "cond"}), id="x&cond",
         ),
         pytest.param(
             frozenset({"t", "cond"}), id="t&cond", marks=pytest.mark.skip(reason="slow")
@@ -1067,7 +1068,7 @@ def test_train_uniform(
     train_rng, test_rng = jax.random.split(rng)
 
     # Generate uniform training distribution
-    n_train_examples = 500_000
+    n_train_examples = 1_000_000
     train_points = sample_sphere(train_rng, n_train_examples, domain_dim)
     assert train_points.shape == (n_train_examples, domain_dim)
 
@@ -1075,21 +1076,21 @@ def test_train_uniform(
     dsets = (
         Dataset.from_dict({"point_vec": train_points})
         .with_format("np")
-        .train_test_split(test_size=2048)
+        .train_test_split(test_size=4096)
     )
     train_dataset = dsets["train"]
     test_dataset = dsets["test"]
 
     # Train the model using the shared infrastructure
     batch_size = 512
-    learning_rate = 1e-4 if vector_field_model_kind == "mlp" else 1e-3
+    learning_rate = 1e-4
     if domain_dim == 3 and weighting_function == WeightingFunction.CONSTANT:
         epochs = 2
     elif domain_dim == 3 and weighting_function in [
         WeightingFunction.CAP_INDICATOR,
         WeightingFunction.SMOOTHED_CAP_INDICATOR,
     ]:
-        epochs = 8
+        epochs = 6
     elif domain_dim == 16 and weighting_function == WeightingFunction.CONSTANT:
         epochs = 6
     elif domain_dim == 16 and weighting_function in [
