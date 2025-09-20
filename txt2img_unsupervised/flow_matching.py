@@ -2376,7 +2376,9 @@ def _filter_and_pad_to_size(
                     padding = jnp.ones((pad_size,), dtype=arr.dtype)
                 elif key == "t":
                     # Pad time array with 1.0 (finished time)
-                    padding = jnp.full((pad_size,), 1.0 if forward else 0.0, dtype=arr.dtype)
+                    padding = jnp.full(
+                        (pad_size,), 1.0 if forward else 0.0, dtype=arr.dtype
+                    )
                 elif key == "original_indices":
                     # Pad original_indices with -1 (indicates padding)
                     padding = np.full((pad_size,), -1, dtype=arr.dtype)
@@ -2649,7 +2651,9 @@ def _tsit5_integrate_core(
 
             # Check if we should reduce batch size
             live_mask = ~done
-            live_count, min_t, max_t = jax.device_get((jnp.sum(live_mask), jnp.min(t), jnp.max(t)))
+            live_count, min_t, max_t = jax.device_get(
+                (jnp.sum(live_mask), jnp.min(t), jnp.max(t))
+            )
             new_extreme_t = min_t if forward else max_t
 
             # Shrink to live count rounded up to next power of two (respecting minimum)

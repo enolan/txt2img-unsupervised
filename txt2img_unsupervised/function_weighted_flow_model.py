@@ -973,9 +973,12 @@ _baseline_model = FunctionWeightedFlowModel(
         pytest.param(
             frozenset({"cond"}), id="cond", marks=pytest.mark.skip(reason="slow")
         ),
-        pytest.param(frozenset({"x", "t"}), id="x&t", marks=pytest.mark.skip(reason="slow")),
         pytest.param(
-            frozenset({"x", "cond"}), id="x&cond",
+            frozenset({"x", "t"}), id="x&t", marks=pytest.mark.skip(reason="slow")
+        ),
+        pytest.param(
+            frozenset({"x", "cond"}),
+            id="x&cond",
         ),
         pytest.param(
             frozenset({"t", "cond"}), id="t&cond", marks=pytest.mark.skip(reason="slow")
@@ -1397,7 +1400,6 @@ def compute_hemisphere_probability_masses(
         f"north east log ratios std: {output_dict['north_east_log_ratios_std']:.3f}, south east log ratios std: {output_dict['south_east_log_ratios_std']:.3f}"
     )
 
-
     return output_dict
 
 
@@ -1432,7 +1434,9 @@ def _precompute_hemisphere_masses_fwfm(model, params, rng, n_steps, n_projection
     return None
 
 
-def _compute_nll_fwfm(model, params, batch, n_steps, rng, n_projections, precomputed_stats=None):
+def _compute_nll_fwfm(
+    model, params, batch, n_steps, rng, n_projections, precomputed_stats=None
+):
     """Compute NLL for FunctionWeightedFlowModel - use 'evenest weights'."""
     batch_size = batch["point_vec"].shape[0]
 
@@ -1477,13 +1481,15 @@ def _compute_nll_fwfm(model, params, batch, n_steps, rng, n_projections, precomp
                 prob_rng = rng
             else:
                 masses_rng, prob_rng = jax.random.split(rng)
-                hemisphere_probability_masses_dict = compute_hemisphere_probability_masses(
-                    model=model,
-                    params=params,
-                    rng=masses_rng,
-                    n_samples=64,
-                    n_steps=n_steps,
-                    n_projections=n_projections,
+                hemisphere_probability_masses_dict = (
+                    compute_hemisphere_probability_masses(
+                        model=model,
+                        params=params,
+                        rng=masses_rng,
+                        n_samples=64,
+                        n_steps=n_steps,
+                        n_projections=n_projections,
+                    )
                 )
 
             conditional_logprobs = compute_log_probability(

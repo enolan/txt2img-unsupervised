@@ -621,7 +621,12 @@ def two_stage_sample_loop(
             else:
                 raise ValueError(f"Unsupported flow sampling algorithm: {algo}")
 
-            samples, ess, _ = flow_matching.generate_cap_constrained_samples(
+            (
+                samples,
+                log_densities,
+                ess,
+                _,
+            ) = flow_matching.generate_cap_constrained_samples(
                 flow_mdl,
                 flow_params_gpu,
                 cap_keys[cap_idx],
@@ -639,7 +644,9 @@ def two_stage_sample_loop(
             for i, img_idx in enumerate(img_indices):
                 generated_clip_embeddings[img_idx] = jax.device_get(samples[i])
 
-            tqdm.write(f"Cap {cap_idx} ESS: {ess}")
+            tqdm.write(
+                f"Cap {cap_idx} ESS: {ess} Log densities: {jnp.sort(log_densities)} (uniform is ~1458)"
+            )
             postfix = {
                 "n_imgs": n_samples_for_cap,
                 "ESS": f"{float(ess):.1f}",
