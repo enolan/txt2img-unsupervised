@@ -248,17 +248,28 @@ class FlowMatchingModelConfig(BaseModelConfig):
                 "weighting function",
             )
 
+        def _convert_d_max_dist_to_tuples(params_dict):
+            """Convert d_max_dist from list of lists to tuple of tuples if present."""
+            processed = params_dict.copy()
+            if "d_max_dist" in processed:
+                processed["d_max_dist"] = tuple(
+                    tuple(pair) for pair in processed["d_max_dist"]
+                )
+            return processed
+
         extra_params = dict.get("weighting_function_extra_params")
         weighting_function = out.get("weighting_function", WeightingFunction.CONSTANT)
         if extra_params is not None:
             if weighting_function == WeightingFunction.CAP_INDICATOR:
+                processed_params = _convert_d_max_dist_to_tuples(extra_params)
                 out["weighting_function_extra_params"] = CapIndicatorExtraParams(
-                    **extra_params
+                    **processed_params
                 )
             elif weighting_function == WeightingFunction.SMOOTHED_CAP_INDICATOR:
+                processed_params = _convert_d_max_dist_to_tuples(extra_params)
                 out[
                     "weighting_function_extra_params"
-                ] = SmoothedCapIndicatorExtraParams(**extra_params)
+                ] = SmoothedCapIndicatorExtraParams(**processed_params)
             else:
                 raise ValueError(
                     "weighting_function_extra_params provided for unsupported weighting function"
@@ -490,9 +501,10 @@ def test_transformer_config_instantiates_image_model() -> None:
 
 
 def test_flow_matching_config_roundtrip_from_object() -> None:
-    """FlowMatchingModelConfig serializes to/from JSON dictionaries with new fields."""
+    """FlowMatchingModelConfig serializes to/from actual JSON strings with new fields."""
 
-    cfg = FlowMatchingModelConfig(
+    # Test with SmoothedCapIndicatorExtraParams
+    cfg1 = FlowMatchingModelConfig(
         n_layers=3,
         domain_dim=8,
         reference_directions=8,
@@ -516,14 +528,38 @@ def test_flow_matching_config_roundtrip_from_object() -> None:
         cap_conditioned_base=False,
     )
 
-    regenerated = FlowMatchingModelConfig.from_json_dict(
-        FlowMatchingModelConfig.to_json_dict(cfg)
+    # Serialize to JSON string and back
+    json_str1 = json.dumps(cfg1.to_json_dict())
+    regenerated1 = FlowMatchingModelConfig.from_json_dict(json.loads(json_str1))
+    assert regenerated1 == cfg1
+
+    # Test with CapIndicatorExtraParams (this should catch the d_max_dist bug)
+    cfg2 = FlowMatchingModelConfig(
+        n_layers=2,
+        domain_dim=4,
+        reference_directions=None,
+        time_dim=None,
+        use_pre_mlp_projection=False,
+        d_model=32,
+        mlp_expansion_factor=2,
+        mlp_dropout_rate=0.1,
+        input_dropout_rate=0.05,
+        mlp_always_inject=frozenset({"x", "cond"}),
+        weighting_function=WeightingFunction.CAP_INDICATOR,
+        weighting_function_extra_params=CapIndicatorExtraParams(
+            d_max_dist=((0.8, 1.0), (0.2, 1.5))
+        ),
+        cap_conditioned_base=False,
     )
-    assert regenerated == cfg
+
+    # Serialize to JSON string and back
+    json_str2 = json.dumps(cfg2.to_json_dict())
+    regenerated2 = FlowMatchingModelConfig.from_json_dict(json.loads(json_str2))
+    assert regenerated2 == cfg2
 
 
 def test_flow_matching_config_roundtrip_from_json() -> None:
-    """FlowMatchingModelConfig parses JSON dictionaries with weighting config."""
+    """FlowMatchingModelConfig does proper round-trip: JSON dict -> config -> JSON dict."""
 
     json_dict = {
         "n_layers": 2,
@@ -548,14 +584,20 @@ def test_flow_matching_config_roundtrip_from_json() -> None:
         "model_type": "flow_matching",
     }
 
+    # Do the round-trip
     cfg = FlowMatchingModelConfig.from_json_dict(json_dict)
-    assert cfg.weighting_function == WeightingFunction.CAP_INDICATOR
-    assert cfg.mlp_always_inject == frozenset({"x", "cond"})
-    assert isinstance(cfg.weighting_function_extra_params, CapIndicatorExtraParams)
-    assert FlowMatchingModelConfig.to_json_dict(cfg)["mlp_always_inject"] == [
-        "cond",
-        "x",
-    ]
+    roundtrip_dict = cfg.to_json_dict()
+
+    # The round-trip dict should equal the original, except for minor formatting differences
+    # like mlp_always_inject being sorted and d_max_dist being tuple format
+    expected_dict = json_dict.copy()
+    expected_dict["mlp_always_inject"] = ["cond", "x"]  # sorted
+    expected_dict["weighting_function_extra_params"]["d_max_dist"] = (
+        (0.8, 1.0),
+        (0.2, 1.5),
+    )  # tuple format
+
+    assert roundtrip_dict == expected_dict
 
 
 def test_flow_matching_config_instantiates_function_weighted_flow_model() -> None:
