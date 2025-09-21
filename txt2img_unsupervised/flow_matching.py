@@ -1281,7 +1281,10 @@ def compute_batch_loss(
     """
     x1_batch = batch["point_vec"]
     batch_size = x1_batch.shape[0]
-    assert x1_batch.shape == (batch_size, model.domain_dim)
+    assert x1_batch.shape == (
+        batch_size,
+        model.domain_dim,
+    ), f"x1_batch.shape: {x1_batch.shape}, model.domain_dim: {model.domain_dim}"
 
     # Split RNG for different purposes
     rng, noise_rng, time_rng, conditioning_rng = jax.random.split(rng, 4)
