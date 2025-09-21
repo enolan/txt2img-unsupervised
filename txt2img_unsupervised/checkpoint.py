@@ -27,7 +27,7 @@ from .config import (
     TrainingConfig,
     TransformerModelConfig,
 )
-from .flow_matching import VectorField
+from .function_weighted_flow_model import FunctionWeightedFlowModel
 from .muon import muon
 from .transformer_model import ImageModel
 from .triangle_schedule import triangle_schedule
@@ -444,9 +444,7 @@ class FlowMatchingTrainState(BaseTrainState):
         """Create a flow matching model instance from configuration."""
         if not isinstance(model_cfg, FlowMatchingModelConfig):
             raise ValueError(f"Expected FlowMatchingModelConfig, got {type(model_cfg)}")
-        cfg_dict = copy(model_cfg.__dict__)
-        cfg_dict["conditioning_dim"] = 0
-        return VectorField(**cfg_dict)
+        return FunctionWeightedFlowModel(**model_cfg.__dict__)
 
 
 def mk_checkpoint_manager(

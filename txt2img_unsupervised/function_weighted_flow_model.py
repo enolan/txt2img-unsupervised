@@ -833,9 +833,10 @@ def generate_samples(
     x0_rng, path_rng = jax.random.split(rng)
     x0 = model.apply(
         params,
-        x0_rng,
+        rngs={"sample_base": x0_rng},
         method=model.sample_base_distribution,
         weighting_function_params=weighting_function_params,
+        batch_size=batch_size,
     )
 
     samples, _eval_counts = flow_matching.generate_samples_inner(

@@ -28,11 +28,16 @@ from txt2img_unsupervised.config import (
 )
 from txt2img_unsupervised.flow_matching import (
     compute_batch_loss,
-    compute_log_probability,
     LogitsTable,
-    sample_loop,
     create_mollweide_projection_figure,
+)
+from txt2img_unsupervised.function_weighted_flow_model import (
     generate_samples,
+    compute_nll,
+    compute_hemisphere_masses,
+    WeightingFunction,
+    CapIndicatorExtraParams,
+    SmoothedCapIndicatorExtraParams,
 )
 from txt2img_unsupervised.train_data_loading import get_batch
 from txt2img_unsupervised.training_infra import (
@@ -84,7 +89,7 @@ def parse_arguments():
     parser.add_argument(
         "--nll-n-projections",
         type=int,
-        default=10,
+        default=32,
         help="Number of projections for NLL calculation during evaluation",
     )
 
@@ -117,6 +122,13 @@ def parse_arguments():
     parser.add_argument("--alpha-input", type=float, help="Alpha scaling for inputs")
     parser.add_argument("--alpha-output", type=float, help="Alpha scaling for outputs")
 
+    # Add arguments for FunctionWeightedFlowModel weighting function configuration
+    parser.add_argument(
+        "--weighting-function",
+        type=str,
+        choices=["constant", "cap_indicator", "smoothed_cap_indicator"],
+        help="Weighting function type for FunctionWeightedFlowModel",
+    )
     args, _unknown = parser.parse_known_args()
     return args
 
@@ -199,19 +211,87 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_ste
     if mdl.domain_dim != 3:
         return
 
-    # Create empty conditioning vectors
-    cond_vecs = jnp.zeros((n_samples, mdl.conditioning_dim))
+    # Generate appropriate weighting function parameters for visualization
+    if mdl.weighting_function == WeightingFunction.CONSTANT:
+        weighting_function_params = None
+    elif mdl.weighting_function in [
+        WeightingFunction.CAP_INDICATOR,
+        WeightingFunction.SMOOTHED_CAP_INDICATOR,
+    ]:
+        if not mdl.cap_conditioned_base:
+            # Use full-sphere cap to visualize complete learned distribution
+            arbitrary_center = jnp.zeros(mdl.domain_dim).at[0].set(1.0)  # [1, 0, 0]
+            d_max = 2.0  # Full sphere
+            weighting_function_params = (
+                jnp.tile(arbitrary_center[None, :], (n_samples, 1)),
+                jnp.full((n_samples,), d_max, dtype=jnp.float32),
+            )
+        else:
+            # For cap-conditioned base, sample from hemispheres weighted by their masses
+            hemisphere_rng, choice_rng = jax.random.split(rng)
 
-    samples = sample_loop(
-        mdl,
-        params,
-        n_samples,
-        batch_size,
-        rng,
-        cond_vecs,
-        n_steps=n_steps,
-    )
+            hemisphere_masses = compute_hemisphere_masses(
+                mdl, params, hemisphere_rng, n_steps, 32
+            )
+            north_log_mass = hemisphere_masses["north_log_mass"]
+            south_log_mass = hemisphere_masses["south_log_mass"]
 
+            log_masses = jnp.array([north_log_mass, south_log_mass])
+            hemisphere_choices = jax.random.categorical(
+                choice_rng, log_masses, shape=(n_samples,)
+            )
+            assert hemisphere_choices.shape == (n_samples,)
+
+            north_center = jnp.array([1.0, 0.0, 0.0])
+            south_center = jnp.array([-1.0, 0.0, 0.0])
+
+            centers = jnp.where(
+                hemisphere_choices[:, None],
+                north_center[None, :],
+                south_center[None, :],
+            )
+
+            d_maxes = jnp.ones((n_samples,), dtype=jnp.float32)
+
+            weighting_function_params = (centers, d_maxes)
+    else:
+        raise ValueError(
+            f"Unsupported weighting function for visualization: {mdl.weighting_function}"
+        )
+
+    samples = []
+    samples_so_far = 0
+
+    while samples_so_far < n_samples:
+        this_batch_size = min(batch_size, n_samples - samples_so_far)
+        batch_rng, rng = jax.random.split(rng)
+
+        # Get weighting function parameters for this batch
+        if weighting_function_params is None:
+            batch_weighting_params = None
+        else:
+            batch_weighting_params = (
+                weighting_function_params[0][
+                    samples_so_far : samples_so_far + this_batch_size
+                ],
+                weighting_function_params[1][
+                    samples_so_far : samples_so_far + this_batch_size
+                ],
+            )
+
+        batch_samples = generate_samples(
+            mdl,
+            params,
+            batch_rng,
+            batch_weighting_params,
+            n_steps=n_steps,
+            batch_size=this_batch_size,
+        )
+
+        samples.append(batch_samples)
+        samples_so_far += this_batch_size
+
+    samples = jnp.concatenate(samples, axis=0)
     mean_sim = mean_cosine_similarity(samples)
 
     samples = jax.device_get(samples)
@@ -245,7 +325,7 @@ def save_checkpoint_and_evaluate(
     viz_samples: int = 100,
     viz_batch_size: int = 2048,
     integration_steps: int = 100,
-    nll_n_projections: int = 1,
+    nll_n_projections: int = 32,
 ) -> None:
     """Save checkpoint and evaluate on test dataset."""
     save_checkpoint(my_train_state, checkpoint_manager, global_step, skip_saving)
@@ -300,25 +380,30 @@ def save_checkpoint_and_evaluate(
         losses.append(loss)
 
     # Computing NLL is slow so we only do 1k examples.
+    hemisphere_rng, nll_rng = jax.random.split(test_rng)
+    nll_precomputed_stats = compute_hemisphere_masses(
+        mdl, eval_params, hemisphere_rng, integration_steps, nll_n_projections
+    )
     for batch_idx in trange(
         ceil(min(1000, len(test_dataset)) / training_cfg.batch_size),
         desc="test nll batches",
     ):
-        test_rng, batch_rng, nll_batch_rng = jax.random.split(test_rng, 3)
+        nll_rng, nll_batch_rng = jax.random.split(nll_rng)
 
-        batch_size = test_batch["point_vec"].shape[0]
-        cond_vecs = jnp.zeros((batch_size, mdl.conditioning_dim))
+        batch_for_nll = {
+            "point_vec": test_batch["point_vec"],
+        }
 
-        log_prob = compute_log_probability(
+        nll_values = compute_nll(
             mdl,
             eval_params,
-            test_batch["point_vec"],
-            cond_vecs,
+            batch_for_nll,
             n_steps=integration_steps,
             rng=nll_batch_rng,
             n_projections=nll_n_projections,
+            precomputed_stats=nll_precomputed_stats,
         )
-        nll = -jnp.mean(log_prob)
+        nll = jnp.mean(nll_values)
         nlls.append(nll)
 
     test_loss = jnp.mean(jnp.stack(losses))
