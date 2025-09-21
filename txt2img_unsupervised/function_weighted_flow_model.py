@@ -1270,7 +1270,8 @@ def test_train_uniform(domain_dim, weighting_function, mlp_always_inject):
 def compute_hemisphere_probability_masses(
     model, params, rng, n_samples, n_steps, n_projections
 ):
-    """Compute the model probability masses for the northern and southern hemispheres."""
+    """Compute the model probability masses for the northern (centered on [1, ...]) and southern
+    (centered on [-1, ...]) hemispheres."""
 
     # We compute the likelihood of n_samples points that are in both the northern and eastern
     # hemispheres, conditioned on the cap being the nothern hemisphere, then do the same conditioned
@@ -1296,7 +1297,7 @@ def compute_hemisphere_probability_masses(
     initial_samples = sample_sphere(samples_rng, 2 * n_samples, model.domain_dim)
     # reflect across n-s axis to put everything in eastern hemisphere
     eastern_samples = initial_samples.at[:, 1].set(jnp.abs(initial_samples[:, 1]))
-    # reflect across e-w axis to put everything in northern/southern hemisphere
+    # reflect across e-w axes to put everything in northern/southern hemispheres
     northeast_samples = (
         eastern_samples[:n_samples]
         .at[:, 0]
