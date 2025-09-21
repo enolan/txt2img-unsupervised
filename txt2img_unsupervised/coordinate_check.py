@@ -18,7 +18,12 @@ from contextlib import nullcontext
 from mpl_toolkits.mplot3d import Axes3D
 
 from .cap_sampling import LogitsTable
-from .flow_matching import CapConditionedVectorField
+from .function_weighted_flow_model import (
+    FunctionWeightedFlowModel,
+    WeightingFunction,
+    CapIndicatorExtraParams,
+    SmoothedCapIndicatorExtraParams,
+)
 from . import flow_matching
 from .muon import muon
 
@@ -36,6 +41,8 @@ def process_intermediates(intermediates):
     Returns:
         A dictionary with human-readable keys and extracted values
     """
+    # FunctionWeightedFlowModel delegates to vector_field, so intermediates are nested
+    intermediates = intermediates["vector_field"]
     result = {}
     result["model_output"] = intermediates["__call__"][0]
     result["final_norm_output"] = intermediates["final_norm"]["__call__"][0]
@@ -71,7 +78,7 @@ def process_intermediates(intermediates):
     static_argnames=["mdl"],
     donate_argnames=["rng"],
 )
-def compute_loss_no_grad(logits_tbl, mdl, params, rng, pts):
+def compute_loss_no_grad(mdl, params, rng, pts):
     """Compute loss without gradients for test evaluation."""
     rng, next_rng = jax.random.split(rng)
     loss = flow_matching.compute_batch_loss(
@@ -79,13 +86,12 @@ def compute_loss_no_grad(logits_tbl, mdl, params, rng, pts):
         params,
         {"point_vec": pts},
         rng,
-        logits_tbl,
         capture_intermediates=False,
     )
     return loss, next_rng
 
 
-def compute_test_loss(logits_tbl, mdl, params, rng, test_pts, batch_size):
+def compute_test_loss(mdl, params, rng, test_pts, batch_size):
     """Compute average loss over the test dataset."""
     n_batches = len(test_pts) // batch_size
     total_loss = 0.0
@@ -94,7 +100,7 @@ def compute_test_loss(logits_tbl, mdl, params, rng, test_pts, batch_size):
         start_idx = i * batch_size
         end_idx = start_idx + batch_size
         batch = test_pts[start_idx:end_idx]
-        loss, rng = compute_loss_no_grad(logits_tbl, mdl, params, rng, batch)
+        loss, rng = compute_loss_no_grad(mdl, params, rng, batch)
         total_loss += loss
 
     return total_loss / n_batches
@@ -105,7 +111,7 @@ def compute_test_loss(logits_tbl, mdl, params, rng, test_pts, batch_size):
     static_argnames=["mdl"],
     donate_argnames=["rng"],
 )
-def compute_gradients(logits_tbl, mdl, params, rng, pts):
+def compute_gradients(mdl, params, rng, pts):
     """
     Compute gradients. This is split from apply_updates so we can do this on GPU and
     apply_updates on CPU.
@@ -117,7 +123,6 @@ def compute_gradients(logits_tbl, mdl, params, rng, pts):
         params,
         {"point_vec": pts},
         rng,
-        logits_tbl,
         capture_intermediates=True,
     )
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
@@ -145,9 +150,7 @@ def grad_update(opt, grad, opt_state, params):
 str_devices = lambda x: jax.tree.map(lambda y: y.device, x)
 
 
-def train_step(
-    logits_tbl, mdl, opt, params, opt_state, rng, pts, use_cpu_offload=False
-):
+def train_step(mdl, opt, params, opt_state, rng, pts, use_cpu_offload=False):
     """Complete training step, optionally with CPU-GPU split."""
     gpu_params = (
         jax.device_put(params, device=jax.devices("gpu")[0])
@@ -155,7 +158,7 @@ def train_step(
         else params
     )
     loss, processed_intermediates, grad, next_rng = compute_gradients(
-        logits_tbl, mdl, gpu_params, rng, pts
+        mdl, gpu_params, rng, pts
     )
 
     if use_cpu_offload:
@@ -169,16 +172,22 @@ def train_step(
     return loss, processed_intermediates, new_params, new_opt_state, next_rng
 
 
-@partial(jax.jit, static_argnames=["model", "domain_dim"])
-def init_model_params(model, init_key, domain_dim):
+@partial(jax.jit, static_argnames=["model"])
+def init_model_params(model, init_key):
     """JIT-compiled model initialization function."""
-    return model.init(
-        init_key,
-        jnp.zeros((1, domain_dim)),
-        jnp.zeros((1,)),
-        jnp.zeros((1, domain_dim)),
-        jnp.zeros((1,)),
-    )
+    return model.init(init_key, *model.dummy_inputs())
+
+
+def parse_time_dim(value):
+    """Parse time_dim argument - accepts 'none' or an integer."""
+    if value.lower() == "none":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"time_dim must be 'none' or an integer, got '{value}'"
+        )
 
 
 def main():
@@ -210,7 +219,12 @@ def main():
     parser.add_argument(
         "--reference-directions", type=int, required=False, default=None
     )
-    parser.add_argument("--time-dim", type=int, required=True)
+    parser.add_argument(
+        "--time-dim",
+        type=parse_time_dim,
+        required=True,
+        help="Time dimension for encoding (integer) or 'none' for scalar encoding",
+    )
     parser.add_argument("--use-pre-mlp-projection", type=bool, required=True)
     parser.add_argument("--n-layers", type=int, required=True)
     parser.add_argument("--mlp-expansion-factor", type=int, required=False, default=4)
@@ -276,6 +290,14 @@ def main():
         default=5,
         help="Number of Muon learning rate points to test between muon-lr-low and muon-lr-high",
     )
+    parser.add_argument(
+        "--weighting-function",
+        type=str,
+        required=False,
+        default="cap_indicator",
+        choices=["constant", "cap_indicator", "smoothed_cap_indicator"],
+        help="Weighting function for the FunctionWeightedFlowModel (default: cap_indicator)",
+    )
 
     args = parser.parse_args()
 
@@ -285,6 +307,21 @@ def main():
         raise ValueError("n_train_steps must be at least 1")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Charts will be saved to: {args.output_dir}")
+
+    # Parse weighting function
+    if args.weighting_function == "constant":
+        weighting_function = WeightingFunction.CONSTANT
+        weighting_function_extra_params = None
+    elif args.weighting_function == "cap_indicator":
+        weighting_function = WeightingFunction.CAP_INDICATOR
+        weighting_function_extra_params = CapIndicatorExtraParams()
+    elif args.weighting_function == "smoothed_cap_indicator":
+        weighting_function = WeightingFunction.SMOOTHED_CAP_INDICATOR
+        weighting_function_extra_params = SmoothedCapIndicatorExtraParams()
+    else:
+        raise ValueError(f"Unknown weighting function: {args.weighting_function}")
+
+    print(f"Using weighting function: {weighting_function}")
 
     dsets = (
         Dataset.from_parquet(str(args.dataset_path))
@@ -303,7 +340,6 @@ def main():
         f"Dataset loaded with {len(dset_train)} training examples and {len(dset_test)} test examples. First example: {dset_train[0]}"
     )
     dset_train = dset_train.select(range(args.batch_size * args.n_train_steps))
-    logits_table = LogitsTable(d=domain_dim - 1, n=8192)
 
     doing_lr_sweep = args.lr_low is not None and args.lr_high is not None
     if doing_lr_sweep and args.lr_base is not None:
@@ -400,10 +436,9 @@ def main():
             key_idx += 1
             seed_keys = jax.random.split(master_key, args.n_seeds)
 
-            model = CapConditionedVectorField(
+            model = FunctionWeightedFlowModel(
                 domain_dim=domain_dim,
                 reference_directions=args.reference_directions,
-                conditioning_dim=None,
                 time_dim=args.time_dim,
                 use_pre_mlp_projection=args.use_pre_mlp_projection,
                 n_layers=args.n_layers,
@@ -411,6 +446,8 @@ def main():
                 mlp_expansion_factor=args.mlp_expansion_factor,
                 mlp_dropout_rate=None,
                 input_dropout_rate=None,
+                weighting_function=weighting_function,
+                weighting_function_extra_params=weighting_function_extra_params,
             )
             tqdm.write(f"Model: {model}")
             tqdm.write(f"m_d = {model.d_model_scale_factor}")
@@ -472,7 +509,7 @@ def main():
                 )
                 with device_ctx:
                     tqdm.write("Initializing parameters")
-                    params = init_model_params(model, init_key, domain_dim)
+                    params = init_model_params(model, init_key)
 
                     tqdm.write(f"Initializing optimizer state")
                     opt_state = init_opt_state(params)
@@ -486,7 +523,6 @@ def main():
                     total=args.n_train_steps,
                 ):
                     loss, processed_intermediates, params, opt_state, rng = train_step(
-                        logits_table,
                         model,
                         opt,
                         params,
@@ -506,7 +542,6 @@ def main():
                 # After training, evaluate on test set
                 tqdm.write("Evaluating on test set")
                 test_loss = compute_test_loss(
-                    logits_table,
                     model,
                     params,
                     rng,
