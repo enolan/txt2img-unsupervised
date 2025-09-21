@@ -1,0 +1,11 @@
+{
+  "batch_size": 2048,
+  "epochs": 10,
+  "gradient_accumulation_steps": 1,
+  "gradient_clipping": 3.0,
+  "learning_rate": 0.0,
+  "learning_rate_schedule": "constant",
+  "use_muon": true,
+  "adam_learning_rate": 1e-2,
+  "muon_learning_rate": 1e-3
+}
