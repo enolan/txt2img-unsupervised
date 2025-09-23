@@ -230,13 +230,27 @@ class FunctionWeightedFlowModel(nn.Module):
             WeightingFunction.CAP_INDICATOR,
             WeightingFunction.SMOOTHED_CAP_INDICATOR,
         ]:
-            if self.base_distribution == BaseDistribution.CAP:
-                if (
-                    max(p[1] for p in self.weighting_function_extra_params.d_max_dist)
-                    > 1.0
-                ):
+            # Validate d_max_dist ascending order
+            d_max_values = [
+                p[1] for p in self.weighting_function_extra_params.d_max_dist
+            ]
+            for i in range(1, len(d_max_values)):
+                if d_max_values[i] <= d_max_values[i - 1]:
                     raise ValueError(
-                        "d_max_dist max value must be <= 1.0 for cap-conditioned base"
+                        f"d_max_dist upper bounds must be in ascending order, but got {d_max_values[i-1]:.3f} >= {d_max_values[i]:.3f}"
+                    )
+
+            # Sanity check: verify d_max_dist compatibility with base distribution
+            max_d_max = max(d_max_values)
+            if self.base_distribution == BaseDistribution.CAP:
+                if max_d_max != 1.0:
+                    raise ValueError(
+                        f"CAP base distribution requires d_max_dist maximum to be exactly 1.0 (hemisphere), but got {max_d_max}"
+                    )
+            else:
+                if max_d_max != 2.0:
+                    raise ValueError(
+                        f"Non-CAP base distributions require d_max_dist maximum to be exactly 2.0 (full sphere), but got {max_d_max}"
                     )
 
             self.logits_table = LogitsTable(self.domain_dim - 1, 8192)
@@ -1106,7 +1120,14 @@ def test_train_trivial_distribution(
     produces the correct weighted distributions.
     """
     # Set up model with appropriate extra parameters
-    d_max_dist = ((1.0, 1.0),)
+    # Use different d_max_dist based on base distribution:
+    # - CAP: can only handle caps up to hemisphere (d_max <= 1.0)
+    # - Others: should include full sphere (d_max up to 2.0) to learn larger caps
+    if base_distribution == BaseDistribution.CAP:
+        d_max_dist = ((1.0, 1.0),)  # Only hemisphere-sized caps for CAP base
+    else:
+        d_max_dist = ((0.9, 1.0), (0.1, 2.0))  # Include full sphere for other bases
+
     if weighting_function == WeightingFunction.SMOOTHED_CAP_INDICATOR:
         extra_params = SmoothedCapIndicatorExtraParams(
             d_max_dist=d_max_dist, boundary_width=jnp.pi / 10
