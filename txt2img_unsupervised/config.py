@@ -305,6 +305,13 @@ class FlowMatchingModelConfig(BaseModelConfig):
         )
 
         out["mlp_always_inject"] = sorted(self.mlp_always_inject)
+        # We have to use the dictionaries to turn the enums into strings for json, otherwise we'd
+        # get the all caps CAP_INDICATOR instead of the lowercase in the dict
+        out["base_distribution"] = x_to_str_or_valueerror(
+            self.base_distribution,
+            base_distribution_to_str,
+            "base distribution",
+        )
         out["weighting_function"] = x_to_str_or_valueerror(
             self.weighting_function,
             weighting_function_to_str,
