@@ -366,12 +366,7 @@ def save_checkpoint_and_evaluate(
             sharding=examples_sharding,
         )
 
-        test_batch = {
-            "point_vec": batch[vector_column],
-            "cond_vec": jnp.zeros(
-                (batch[vector_column].shape[0], 0), dtype=jnp.float32
-            ),
-        }
+        test_batch = {"point_vec": batch[vector_column]}
         loss = compute_batch_loss(
             mdl,
             eval_params,
@@ -610,10 +605,7 @@ if __name__ == "__main__":
     def loss_fn(params, batch, rng, mdl=None, logits_table=None):
         # The loss function expects a batch with 'point_vec' key
         vecs = batch[args.vector_column]
-        flow_batch = {
-            "point_vec": vecs,
-            "cond_vec": jnp.zeros((vecs.shape[0], 0), dtype=jnp.float32),
-        }
+        flow_batch = {"point_vec": vecs}
         return compute_batch_loss(mdl, params, flow_batch, rng)
 
     train_state, global_step = train_loop(
