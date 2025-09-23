@@ -2725,7 +2725,7 @@ def _tsit5_integrate_core(
                     per_sample_arrays = {
                         f"param_{i}": param
                         for i, param in enumerate(
-                            jax.tree_leaves(vector_field_fn_per_sample_params)
+                            jax.tree.leaves(vector_field_fn_per_sample_params)
                         )
                     }
                     filtered_per_sample = _filter_and_pad_to_size(
@@ -2737,8 +2737,8 @@ def _tsit5_integrate_core(
                         filtered_per_sample[f"param_{i}"]
                         for i in range(len(per_sample_arrays))
                     ]
-                    vector_field_fn_per_sample_params = jax.tree_unflatten(
-                        jax.tree_structure(vector_field_fn_per_sample_params),
+                    vector_field_fn_per_sample_params = jax.tree.unflatten(
+                        jax.tree.structure(vector_field_fn_per_sample_params),
                         filtered_leaves,
                     )
 

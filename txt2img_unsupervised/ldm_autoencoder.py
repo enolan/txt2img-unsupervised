@@ -207,7 +207,7 @@ class LDMAutoencoder(nn.Module):
                 },
             }
         }
-        return frozen_dict.freeze(jax.tree_map(jnp.array, params))
+        return frozen_dict.freeze(jax.tree.map(jnp.array, params))
 
 
 class LDMDecoder(nn.Module):
