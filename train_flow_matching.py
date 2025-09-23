@@ -32,6 +32,7 @@ from txt2img_unsupervised.flow_matching import (
     create_mollweide_projection_figure,
 )
 from txt2img_unsupervised.function_weighted_flow_model import (
+    BaseDistribution,
     generate_samples,
     compute_nll,
     compute_hemisphere_masses,
@@ -218,7 +219,7 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_ste
         WeightingFunction.CAP_INDICATOR,
         WeightingFunction.SMOOTHED_CAP_INDICATOR,
     ]:
-        if not mdl.cap_conditioned_base:
+        if mdl.base_distribution != BaseDistribution.CAP:
             # Use full-sphere cap to visualize complete learned distribution
             arbitrary_center = jnp.zeros(mdl.domain_dim).at[0].set(1.0)  # [1, 0, 0]
             d_max = 2.0  # Full sphere
