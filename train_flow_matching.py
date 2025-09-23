@@ -436,6 +436,9 @@ def fast_post_step_hook(loss, metrics, global_step, norm):
     else:
         to_log["debug/clipped_updates"] = 0
 
+    if "gradient_noise_scale" in metrics:
+        to_log["train/gradient_noise_scale"] = metrics["gradient_noise_scale"]
+
     # Log warnings based on metrics
     if not np.isfinite(loss):
         tqdm.write(f"Loss nonfinite 😢 ({loss})")

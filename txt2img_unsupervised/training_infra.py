@@ -674,6 +674,7 @@ def make_train_step_with_metrics(loss_fn):
 
         grad_fn = jax.value_and_grad(loss_fn, argnums=0)
         loss, grads = grad_fn(state.params, batch, step_rng)
+
         new_state = state.apply_gradients(grads=grads)
 
         # Use the gradient norm from state if available, otherwise compute it
@@ -681,6 +682,14 @@ def make_train_step_with_metrics(loss_fn):
             norm = new_state.get_last_norm()
         else:
             norm = optax.global_norm(grads)
+
+        grad_vars = jax.tree_util.tree_map(lambda grad: jnp.var(grad), grads)
+        trace_sigma = optax.tree_utils.tree_sum(grad_vars)
+        metrics["gradient_noise_scale"] = jnp.where(
+            norm > 0.0,
+            trace_sigma / norm**2,
+            jnp.nan,
+        )
 
         new_state = new_state.replace(rng=new_rng)
         return new_state, loss, norm, metrics
