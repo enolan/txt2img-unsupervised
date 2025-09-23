@@ -24,6 +24,7 @@ from typing import (
 )
 
 from txt2img_unsupervised.function_weighted_flow_model import (
+    BaseDistribution,
     CapIndicatorExtraParams,
     SmoothedCapIndicatorExtraParams,
     WeightingFunction,
@@ -196,7 +197,7 @@ class FlowMatchingModelConfig(BaseModelConfig):
     weighting_function_extra_params: Optional[
         Union[CapIndicatorExtraParams, SmoothedCapIndicatorExtraParams]
     ] = None
-    cap_conditioned_base: bool = False
+    base_distribution: BaseDistribution = BaseDistribution.SPHERE
 
     # Class variable to store the model type
     model_type: ClassVar[str] = "flow_matching"
@@ -246,6 +247,13 @@ class FlowMatchingModelConfig(BaseModelConfig):
                 dict["weighting_function"],
                 str_to_weighting_function,
                 "weighting function",
+            )
+
+        if "base_distribution" in dict:
+            out["base_distribution"] = str_to_x_or_valueerror(
+                dict["base_distribution"],
+                str_to_base_distribution,
+                "base distribution",
             )
 
         def _convert_d_max_dist_to_tuples(params_dict):
@@ -354,11 +362,11 @@ class FlowMatchingModelConfig(BaseModelConfig):
             )
 
         if (
-            self.cap_conditioned_base
+            self.base_distribution == BaseDistribution.CAP
             and self.weighting_function != WeightingFunction.CAP_INDICATOR
         ):
             raise ValueError(
-                "cap_conditioned_base is only supported with CAP_INDICATOR weighting"
+                "CAP base distribution is only supported with CAP_INDICATOR weighting"
             )
 
         if (
@@ -403,6 +411,14 @@ str_to_weighting_function = {
 }
 
 weighting_function_to_str = invert_dict(str_to_weighting_function)
+
+str_to_base_distribution = {
+    "sphere": BaseDistribution.SPHERE,
+    "cap": BaseDistribution.CAP,
+    "hemisphere": BaseDistribution.HEMISPHERE,
+}
+
+base_distribution_to_str = invert_dict(str_to_base_distribution)
 
 str_to_activation: dict[str, Callable[[jax.Array], jax.Array]] = {
     "relu": jax.nn.relu,
@@ -525,7 +541,7 @@ def test_flow_matching_config_roundtrip_from_object() -> None:
         weighting_function_extra_params=SmoothedCapIndicatorExtraParams(
             boundary_width=0.2
         ),
-        cap_conditioned_base=False,
+        base_distribution=BaseDistribution.SPHERE,
     )
 
     # Serialize to JSON string and back
@@ -549,7 +565,7 @@ def test_flow_matching_config_roundtrip_from_object() -> None:
         weighting_function_extra_params=CapIndicatorExtraParams(
             d_max_dist=((0.8, 1.0), (0.2, 1.5))
         ),
-        cap_conditioned_base=False,
+        base_distribution=BaseDistribution.SPHERE,
     )
 
     # Serialize to JSON string and back
@@ -580,7 +596,7 @@ def test_flow_matching_config_roundtrip_from_json() -> None:
         "alpha_output": 1.1,
         "weighting_function": "cap_indicator",
         "weighting_function_extra_params": {"d_max_dist": [[0.8, 1.0], [0.2, 1.5]]},
-        "cap_conditioned_base": False,
+        "base_distribution": "sphere",
         "model_type": "flow_matching",
     }
 

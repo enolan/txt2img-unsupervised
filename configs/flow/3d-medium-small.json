@@ -12,5 +12,5 @@
             [1.0, 1.0]
         ]
     },
-    "cap_conditioned_base": true
+    "base_distribution": "cap"
 }

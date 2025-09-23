@@ -1,7 +1,9 @@
 from dataclasses import dataclass, field, replace
 from datasets import Dataset
+from einops import repeat
 from enum import Enum
 from functools import partial
+from scipy import stats
 from tqdm import tqdm
 from typing import FrozenSet, Literal, Optional, Tuple, Union
 import flax.linen as nn
@@ -20,6 +22,19 @@ from .cap_sampling import (
     sphere_log_inverse_surface_area,
 )
 from .flow_matching import VectorField, sample_sphere
+
+
+class BaseDistribution(Enum):
+    """The base distribution for FunctionWeightedFlowModel sampling."""
+
+    SPHERE = "sphere"
+    """Uniform distribution on the entire sphere."""
+
+    CAP = "cap"
+    """Uniform distribution within the conditioning cap."""
+
+    HEMISPHERE = "hemisphere"
+    """Uniform distribution on the hemisphere where x[0] >= 0."""
 
 
 class WeightingFunction(Enum):
@@ -157,8 +172,8 @@ class FunctionWeightedFlowModel(nn.Module):
         Union[CapIndicatorExtraParams, SmoothedCapIndicatorExtraParams]
     ] = None
 
-    # Base distribution is uniform over the conditioning cap. Only makes sense with CAP_INDICATOR.
-    cap_conditioned_base: bool = False
+    # Base distribution type for sampling x0
+    base_distribution: BaseDistribution = BaseDistribution.SPHERE
 
     @property
     def conditioning_dim(self) -> int:
@@ -215,7 +230,7 @@ class FunctionWeightedFlowModel(nn.Module):
             WeightingFunction.CAP_INDICATOR,
             WeightingFunction.SMOOTHED_CAP_INDICATOR,
         ]:
-            if self.cap_conditioned_base:
+            if self.base_distribution == BaseDistribution.CAP:
                 if (
                     max(p[1] for p in self.weighting_function_extra_params.d_max_dist)
                     > 1.0
@@ -298,17 +313,18 @@ class FunctionWeightedFlowModel(nn.Module):
 
     def sample_base_distribution(self, weighting_function_params, batch_size):
         """Sample base distribution x0 for training.
-        Depends on cap_conditioned_base:
-        - False: uniform on the sphere.
-        - True: uniform within the cap specified by each example's weighting-function parameters.
+        Depends on base_distribution:
+        - SPHERE: uniform on the sphere.
+        - CAP: uniform within the cap specified by each example's weighting-function parameters.
           Supports caps of size up to a hemisphere (d_max <= 1.0) only. This ensures all paths are
           inside the cap.
+        - HEMISPHERE: uniform on the hemisphere (first coordinate >= 0).
         """
         rng = self.make_rng("sample_base")
-        if self.cap_conditioned_base:
+        if self.base_distribution == BaseDistribution.CAP:
             assert (
                 self.weighting_function == WeightingFunction.CAP_INDICATOR
-            ), "cap_conditioned_base only supported with CAP_INDICATOR weighting"
+            ), "CAP base distribution only supported with CAP_INDICATOR weighting"
             assert (
                 isinstance(weighting_function_params, tuple)
                 and len(weighting_function_params) == 2
@@ -321,8 +337,15 @@ class FunctionWeightedFlowModel(nn.Module):
                 keys, cap_centers, d_maxes
             )
             return x0
-        else:
+        elif self.base_distribution == BaseDistribution.HEMISPHERE:
+            # Sample from full sphere, then mirror across the zeroth axis to put the point in the
+            # target hemisphere.
+            full_uniform = sample_sphere(rng, batch_size, self.domain_dim)
+            return full_uniform.at[:, 0].set(jnp.abs(full_uniform[:, 0]))
+        elif self.base_distribution == BaseDistribution.SPHERE:
             return sample_sphere(rng, batch_size, self.domain_dim)
+        else:
+            raise ValueError(f"Unknown base distribution: {self.base_distribution}")
 
     @property
     def d_model_scale_factor(self) -> float:
@@ -702,6 +725,71 @@ def test_compute_weight(weighting_function, domain_dim):
             np.testing.assert_allclose(midpoint_weight, 0.5, rtol=0, atol=1e-6)
 
 
+@pytest.mark.parametrize(
+    "base_distribution",
+    [
+        BaseDistribution.SPHERE,
+        BaseDistribution.HEMISPHERE,
+        BaseDistribution.CAP,
+    ],
+)
+@pytest.mark.parametrize("domain_dim", [3, 8])
+def test_fwfm_base_distribution_sampling(base_distribution, domain_dim):
+    """Test that FWFM samples correctly from different base distributions."""
+
+    model = FunctionWeightedFlowModel(
+        domain_dim=domain_dim,
+        reference_directions=None,
+        time_dim=16,
+        use_pre_mlp_projection=True,
+        n_layers=1,
+        d_model=32,
+        mlp_expansion_factor=2,
+        mlp_dropout_rate=None,
+        input_dropout_rate=None,
+        weighting_function=WeightingFunction.CAP_INDICATOR,
+        weighting_function_extra_params=CapIndicatorExtraParams()
+        if base_distribution is not BaseDistribution.CAP
+        else CapIndicatorExtraParams(d_max_dist=((1.0, 1.0),)),
+        base_distribution=base_distribution,
+    )
+
+    params = model.init(jax.random.PRNGKey(0), *model.dummy_inputs())
+
+    cap_center = jnp.zeros(domain_dim).at[1].set(1.0)  # just something off axis
+    batch_size = 10_000
+    samples = model.apply(
+        params,
+        rngs={"sample_base": jax.random.PRNGKey(42)},
+        method=model.sample_base_distribution,
+        weighting_function_params=(
+            repeat(cap_center, "d -> b d", b=batch_size),
+            jnp.full((batch_size,), 0.25),
+        ),
+        batch_size=batch_size,
+    )
+
+    assert samples.shape == (batch_size, domain_dim)
+
+    # All samples should be on unit sphere
+    norms = jnp.linalg.norm(samples, axis=1)
+    np.testing.assert_allclose(norms, 1.0, atol=1e-6)
+
+    if base_distribution == BaseDistribution.HEMISPHERE:
+        # All samples should have first coordinate >= 0
+        assert jnp.all(
+            samples[:, 0] >= 0
+        ), "All samples should be in northern hemisphere"
+    elif base_distribution == BaseDistribution.SPHERE:
+        # For full sphere, roughly half should be positive, half negative
+        positive_count = jnp.sum(samples[:, 0] >= 0)
+        np.testing.assert_allclose(positive_count / batch_size, 0.5, atol=0.01)
+    elif base_distribution == BaseDistribution.CAP:
+        # All samples should be in the cap
+        cos_dists = 1 - jnp.dot(samples, cap_center)
+        assert jnp.all(cos_dists <= 0.25)
+
+
 @pytest.mark.parametrize("domain_dim", [3, 8, 16])
 @pytest.mark.parametrize("reference_directions", [None, 8, 16])
 @pytest.mark.parametrize(
@@ -870,10 +958,10 @@ def compute_log_probability(
     """
     Compute the log probability of samples under a function-weighted flow model.
     """
-    if model.cap_conditioned_base:
+    if model.base_distribution == BaseDistribution.CAP:
         assert (
             model.weighting_function == WeightingFunction.CAP_INDICATOR
-        ), "cap_conditioned_base only supported with CAP_INDICATOR weighting"
+        ), "CAP base distribution only supported with CAP_INDICATOR weighting"
         assert (
             isinstance(weighting_function_params, tuple)
             and len(weighting_function_params) == 2
@@ -888,7 +976,12 @@ def compute_log_probability(
         table = LogitsTable(model.domain_dim - 1, 8192)
         log_cap_size_frac = _log_cap_size_batch(table, d_maxes)
         base_log_densities = -(log_cap_size_frac + log_sphere_area)
-    else:
+    elif model.base_distribution == BaseDistribution.HEMISPHERE:
+        # Northern hemisphere has half the area of the full sphere, so density is 2x
+        base_log_densities = sphere_log_inverse_surface_area(
+            model.domain_dim
+        ) + jnp.log(2.0)
+    else:  # BaseDistribution.SPHERE
         base_log_densities = sphere_log_inverse_surface_area(model.domain_dim)
 
     # Reverse flow to get source points and divergence integral
@@ -906,7 +999,7 @@ def compute_log_probability(
     )
 
     # If using a cap-conditioned base, zero out density for sources outside the cap
-    if model.cap_conditioned_base:
+    if model.base_distribution == BaseDistribution.CAP:
         assert model.weighting_function == WeightingFunction.CAP_INDICATOR
         assert (
             isinstance(weighting_function_params, tuple)
@@ -917,7 +1010,12 @@ def compute_log_probability(
         in_support = cos_dists <= d_maxes
         log_p1 = base_log_densities - div_sum
         return jnp.where(in_support, log_p1, -jnp.inf)
-    else:
+    elif model.base_distribution == BaseDistribution.HEMISPHERE:
+        # For hemisphere, zero out density for sources outside the hemisphere
+        in_hemisphere = x0[:, 0] >= 0
+        log_p1 = base_log_densities - div_sum
+        return jnp.where(in_hemisphere, log_p1, -jnp.inf)
+    else:  # BaseDistribution.SPHERE
         return base_log_densities - div_sum
 
 
@@ -951,6 +1049,7 @@ _baseline_model = FunctionWeightedFlowModel(
 
 @pytest.mark.usefixtures("starts_with_progressbar")
 @pytest.mark.parametrize("domain_dim", [3, 16])
+@pytest.mark.parametrize("data_distribution", ["uniform", "vmf"])
 @pytest.mark.parametrize(
     "weighting_function",
     [
@@ -964,6 +1063,10 @@ _baseline_model = FunctionWeightedFlowModel(
             marks=pytest.mark.skip(reason="Models can't learn this well"),
         ),
     ],
+)
+@pytest.mark.parametrize(
+    "base_distribution",
+    [BaseDistribution.SPHERE, BaseDistribution.HEMISPHERE, BaseDistribution.CAP],
 )
 @pytest.mark.parametrize(
     "mlp_always_inject",
@@ -991,9 +1094,16 @@ _baseline_model = FunctionWeightedFlowModel(
         ),
     ],
 )
-def test_train_uniform(domain_dim, weighting_function, mlp_always_inject):
+def test_train_trivial_distribution(
+    domain_dim,
+    data_distribution,
+    weighting_function,
+    mlp_always_inject,
+    base_distribution,
+):
     """
-    Train a function-weighted model on uniform distribution, then verify it produces correct weighted distributions.
+    Train a function-weighted model on a trivial distribution (uniform or vMF), then verify it
+    produces the correct weighted distributions.
     """
     # Set up model with appropriate extra parameters
     d_max_dist = ((1.0, 1.0),)
@@ -1005,6 +1115,10 @@ def test_train_uniform(domain_dim, weighting_function, mlp_always_inject):
         extra_params = CapIndicatorExtraParams(d_max_dist=d_max_dist)
     else:
         extra_params = None
+        if base_distribution == BaseDistribution.CAP:
+            pytest.skip(
+                "CAP base distribution doesn't make sense without a cap indicator weighting function"
+            )
 
     model = replace(
         _baseline_model,
@@ -1016,14 +1130,39 @@ def test_train_uniform(domain_dim, weighting_function, mlp_always_inject):
         weighting_function_extra_params=extra_params,
         use_pre_mlp_projection=True,
         mlp_always_inject=mlp_always_inject,
-        cap_conditioned_base=weighting_function == WeightingFunction.CAP_INDICATOR,
+        base_distribution=BaseDistribution.HEMISPHERE  # BaseDistribution.CAP
+        if weighting_function == WeightingFunction.CAP_INDICATOR
+        else BaseDistribution.SPHERE,
     )
     rng = jax.random.PRNGKey(20250823)
     train_rng, test_rng = jax.random.split(rng)
 
-    # Generate uniform training distribution
+    # Generate training distribution based on data_distribution parameter
     n_train_examples = 1_000_000
-    train_points = sample_sphere(train_rng, n_train_examples, domain_dim)
+    if data_distribution == "uniform":
+        train_points = flow_matching.sample_sphere(
+            train_rng, n_train_examples, domain_dim
+        )
+        uniform_log_density = flow_matching.sphere_log_inverse_surface_area(domain_dim)
+
+        def data_log_density_fn(test_points):
+            return jnp.full((test_points.shape[0],), uniform_log_density)
+
+    elif data_distribution == "vmf":
+        mean_direction = np.zeros(domain_dim)
+        mean_direction[1] = 1.0
+
+        vmf = stats.vonmises_fisher(mean_direction, 2.0)
+        np_seed = int(jax.random.randint(train_rng, (), 0, 2**31 - 1))
+        train_points = vmf.rvs(n_train_examples, random_state=np_seed)
+
+        def data_log_density_fn(test_points):
+            test_points_np = np.array(test_points)
+            return jnp.asarray(vmf.logpdf(test_points_np))
+
+    else:
+        raise ValueError(f"Unknown data_distribution: {data_distribution}")
+
     assert train_points.shape == (n_train_examples, domain_dim)
 
     # Create dataset
@@ -1037,28 +1176,33 @@ def test_train_uniform(domain_dim, weighting_function, mlp_always_inject):
 
     # Train the model using the shared infrastructure
     batch_size = 512
-    learning_rate = 1e-4
+    learning_rate = 1e-4 if data_distribution == "uniform" else 5e-4
+
+    # Determine epochs based on distribution, dimension, and weighting function
+    # vMF may need more training due to concentrated distribution
+    distribution_difficulty_multiplier = 2 if data_distribution == "vmf" else 1
+
     if domain_dim == 3 and weighting_function == WeightingFunction.CONSTANT:
-        epochs = 2
+        epochs = 2 * distribution_difficulty_multiplier
     elif domain_dim == 3 and weighting_function in [
         WeightingFunction.CAP_INDICATOR,
         WeightingFunction.SMOOTHED_CAP_INDICATOR,
     ]:
-        epochs = 6
+        epochs = 6 * distribution_difficulty_multiplier
     elif domain_dim == 16 and weighting_function == WeightingFunction.CONSTANT:
-        epochs = 6
+        epochs = 6 * distribution_difficulty_multiplier
     elif domain_dim == 16 and weighting_function in [
         WeightingFunction.CAP_INDICATOR,
         WeightingFunction.SMOOTHED_CAP_INDICATOR,
     ]:
-        epochs = 32
+        epochs = 32 * distribution_difficulty_multiplier
     else:
         raise ValueError(
             f"Unknown domain_dim: {domain_dim} and weighting_function: {weighting_function}"
         )
 
     print(
-        f"Training FWFM for domain_dim={domain_dim}, weighting_function={weighting_function}"
+        f"Training FWFM for domain_dim={domain_dim}, data_distribution={data_distribution}, weighting_function={weighting_function}"
     )
 
     # Use the generic training loop via partial application
@@ -1078,10 +1222,6 @@ def test_train_uniform(domain_dim, weighting_function, mlp_always_inject):
     # Generate independent test points
     n_test_points = 1000
     test_points = sample_sphere(test_rng, n_test_points, domain_dim)
-
-    # Get uniform sphere log density
-    uniform_log_density = sphere_log_inverse_surface_area(domain_dim)
-
     # Test different parameter sets based on weighting function
     if weighting_function == WeightingFunction.CONSTANT:
         param_sets = [None]
@@ -1111,7 +1251,9 @@ def test_train_uniform(domain_dim, weighting_function, mlp_always_inject):
         assert jnp.all(true_weights >= 0.0), "All weights must be non-negative"
         assert jnp.any(true_weights > 0.0), "At least one weight must be positive"
 
-        # Multiply uniform density by weight by this to get weighted density
+        base_log_densities = data_log_density_fn(test_points)
+
+        # Multiply base density by this weight by this to get weighted density
         weight_normalization_factor = 1 / jnp.mean(true_weights)
 
         print(
@@ -1186,13 +1328,13 @@ def test_train_uniform(domain_dim, weighting_function, mlp_always_inject):
         zero_weight_mask = true_weights == 0.0
         positive_weight_mask = ~zero_weight_mask
 
-        # For positive weights: check the relationship model_log_prob ≈ log(weight) + uniform_log_density
+        # For positive weights: check the relationship model_log_prob ≈ log(weight) + base_log_density
         if jnp.any(positive_weight_mask):
             expected_log_probs = (
                 jnp.log(
                     true_weights[positive_weight_mask] * weight_normalization_factor
                 )
-                + uniform_log_density
+                + base_log_densities[positive_weight_mask]
             )
 
             model_valid_probs_for_positive_weights = model_log_probs[
@@ -1219,6 +1361,9 @@ def test_train_uniform(domain_dim, weighting_function, mlp_always_inject):
             )
             print(f"    Mean abs diff: {jnp.mean(absdiffs):.3f}")
             print(
+                f"    Abs diff deciles: {np.percentile(absdiffs, np.linspace(0, 100, 11))}"
+            )
+            print(
                 f"    Number of points with abs diff > 15%: {count_diffs_over_15pct}/{len(absdiffs)}"
             )
             print(
@@ -1232,13 +1377,18 @@ def test_train_uniform(domain_dim, weighting_function, mlp_always_inject):
             print(f"  WARNING: No positive weights found for parameter set {params}")
 
         # For zero weights the theoretical log probability would be -inf, which is only possible if
-        # the base distribution has compact support i.e. only with cap_conditioned_base.
+        # the base distribution has compact support i.e. only with cap-conditioned or hemisphere base.
         if jnp.any(zero_weight_mask):
-            if model.cap_conditioned_base:
+            if model.base_distribution in [
+                BaseDistribution.CAP,
+                BaseDistribution.HEMISPHERE,
+            ]:
                 sufficiently_negative_logprob = -jnp.inf
             else:
                 MAXIMUM_DENSITY_RATIO = 0.05  # VERY generous ratio... :'(
-                sufficiently_negative_logprob = uniform_log_density + jnp.log(
+                # Use the mean data log density as reference
+                mean_base_log_density = jnp.mean(base_log_densities[zero_weight_mask])
+                sufficiently_negative_logprob = mean_base_log_density + jnp.log(
                     MAXIMUM_DENSITY_RATIO
                 )
             zero_weight_log_probs = model_log_probs[zero_weight_mask]
@@ -1424,7 +1574,7 @@ def compute_hemisphere_masses(model, params, rng, n_steps, n_projections):
     """
     if (
         model.weighting_function == WeightingFunction.CAP_INDICATOR
-        and model.cap_conditioned_base
+        and model.base_distribution == BaseDistribution.CAP
     ):
         return compute_hemisphere_probability_masses(
             model=model,
@@ -1451,7 +1601,7 @@ def compute_nll(
         WeightingFunction.CAP_INDICATOR,
         WeightingFunction.SMOOTHED_CAP_INDICATOR,
     ]:
-        if not model.cap_conditioned_base:
+        if model.base_distribution == BaseDistribution.SPHERE:
             # Use full sphere as cap
             arbitrary_center = jnp.zeros(model.domain_dim).at[0].set(1.0)
             d_max = 2.0
@@ -1459,7 +1609,33 @@ def compute_nll(
                 jnp.broadcast_to(arbitrary_center, (batch_size, model.domain_dim)),
                 jnp.full((batch_size,), d_max),
             )
-        else:
+        elif model.base_distribution == BaseDistribution.HEMISPHERE:
+            # Use full sphere as cap, but we'll need minimum logprob logic like CAP case
+            arbitrary_center = jnp.zeros(model.domain_dim).at[0].set(1.0)
+            d_max = 2.0
+            weighting_function_params = (
+                jnp.broadcast_to(arbitrary_center, (batch_size, model.domain_dim)),
+                jnp.full((batch_size,), d_max),
+            )
+
+            # Compute log probabilities
+            logprobs = compute_log_probability(
+                model=model,
+                params=params,
+                samples=batch["point_vec"],
+                weighting_function_params=weighting_function_params,
+                n_steps=n_steps,
+                rng=rng,
+                n_projections=n_projections,
+            )
+
+            # Apply minimum logprob logic to prevent +inf NLL
+            min_logprob = sphere_log_inverse_surface_area(model.domain_dim) - jnp.log(
+                1_000_000_000
+            )
+            adjusted_logprobs = jnp.maximum(logprobs, min_logprob)
+            return -adjusted_logprobs
+        else:  # BaseDistribution.CAP
             # We only support hemisphere or smaller caps, so we can't do as above. Instead, use
             # northern or southern hemisphere depending on which the point fits in. The likelhood of
             # a point is its likelhood under its hemiphere's distribution times the total mass of
