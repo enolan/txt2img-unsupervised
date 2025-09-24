@@ -1987,7 +1987,7 @@ def sample_from_cap_backwards_forwards(
     # Step 3: Fit vMF distribution to pre-image points
     vmf_mu, vmf_kappa = stats.vonmises_fisher.fit(jax.device_get(pre_image_points))
     fitted_vmf = stats.vonmises_fisher(vmf_mu, vmf_kappa)
-    print(f"Fitted vMF mu: {vmf_mu}, kappa: {vmf_kappa}")
+    print(f"Fitted vMF kappa: {vmf_kappa}")
 
     # Step 4: Sample from vMF and flow forward
 

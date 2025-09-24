@@ -8,7 +8,6 @@ import argparse
 import gc
 import jax
 import jax.numpy as jnp
-import jax.tree_util as jtu
 import numpy as np
 import orbax.checkpoint as ocp
 import PIL.Image
@@ -16,9 +15,8 @@ import PIL.ImageDraw
 import subprocess
 import torch
 import transformers
-from copy import copy, deepcopy
+from copy import deepcopy
 from einops import rearrange, repeat
-from flax.core import freeze
 from functools import partial
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -30,13 +28,17 @@ from tqdm import tqdm, trange
 from typing import List, Tuple, Union
 
 from . import flow_matching, ldm_autoencoder
+from .function_weighted_flow_model import (
+    FunctionWeightedFlowModel,
+    WeightingFunction,
+    sample_from_cap_backwards_forwards,
+)
 from .checkpoint import get_model_from_checkpoint, load_params
 from .ldm_autoencoder import LDMAutoencoder
 from .transformer_model import (
     ImageModel,
     LogitFilterMethod,
     TransformerModelConfig,
-    gpt_1_config,
     sample,
 )
 
@@ -492,19 +494,16 @@ def two_stage_sample_loop(
     temperature=1.0,
     force_f32=True,
     n_flow_steps=100,
-    n_flow_proposals=128,
-    flow_algorithm=None,
-    algorithm_params=None,
 ):
-    """Two-stage sampling pipeline that uses a flow model to generate CLIP embeddings constrained to
-    caps with importance sampling, then uses an image model to generate codes, then decodes with an
+    """Two-stage sampling pipeline that uses a function-weighted flow model to generate CLIP
+    embeddings constrained to caps, then uses an image model to generate codes, then decodes with an
     autoencoder.
 
     Args:
         im_mdl: ImageModel instance
         im_params: Parameters for the ImageModel (on CPU)
-        flow_mdl: VectorField instance
-        flow_params: Parameters for the VectorField (on CPU)
+        flow_mdl: FunctionWeightedFlowModel instance
+        flow_params: Parameters for the FunctionWeightedFlowModel (on CPU)
         ae_mdl: LDMAutoencoder instance
         ae_params: Parameters for the LDMAutoencoder (on CPU)
         batch_size: Batch size for processing
@@ -548,113 +547,106 @@ def two_stage_sample_loop(
         flow_params, NamedSharding(mesh, PartitionSpec(None))
     )
 
-    # Prepare importance sampler utilities
-    table = flow_matching.LogitsTable(d=flow_mdl.domain_dim - 1, n=16384)
-    cond_vec = jnp.zeros((flow_mdl.conditioning_dim,), dtype=jnp.float32)
-
-    # Sample CLIP embeddings from flow model via cap-constrained importance sampling
+    # Sample CLIP embeddings based on the flow model's weighting function
     flow_rng, rng = jax.random.split(rng)
-
-    # Group all images by identical cap constraints to pool proposal samples
-    cap_specs = [
-        (tuple(center), float(d_max))
-        for center, d_max in zip(cap_centers, max_cos_distances)
-    ]
-
-    # Find unique cap specifications and which image indices want each one
-    unique_caps = {}
-    for img_idx, cap_spec in enumerate(cap_specs):
-        if cap_spec not in unique_caps:
-            unique_caps[cap_spec] = []
-        unique_caps[cap_spec].append(img_idx)
-
-    print(f"Grouped {n_imgs} images into {len(unique_caps)} unique caps")
 
     # Initialize results array
     generated_clip_embeddings = np.zeros((n_imgs, 768), dtype=np.float32)
 
-    # Generate random keys for each unique cap
-    cap_keys = jax.random.split(flow_rng, len(unique_caps))
+    if flow_mdl.weighting_function == WeightingFunction.CONSTANT:
+        # Use backwards-forwards sampling for constant weighting models
+        print("Using backwards-forwards sampling for CONSTANT weighting function")
 
-    # Sample embeddings per unique cap
-    with tqdm(total=len(unique_caps), desc="flow sampling", unit="cap") as pbar:
-        for cap_idx, ((center_tuple, d_max), img_indices) in enumerate(
-            unique_caps.items()
-        ):
-            center = jnp.array(center_tuple)
-            n_samples_for_cap = len(img_indices)
+        # Group images by identical cap constraints to reduce the number of sampling calls
+        cap_specs = [
+            (tuple(center), float(d_max))
+            for center, d_max in zip(cap_centers, max_cos_distances)
+        ]
 
-            # Use more proposals when sampling for multiple images with same cap
-            # This improves importance sampling statistics
-            total_proposals = n_flow_proposals * max(1, n_samples_for_cap // 4)
+        # Find unique cap specifications and which image indices want each one
+        unique_caps = {}
+        for img_idx, cap_spec in enumerate(cap_specs):
+            if cap_spec not in unique_caps:
+                unique_caps[cap_spec] = []
+            unique_caps[cap_spec].append(img_idx)
 
-            # Build per-cap algorithm params
-            algo = (
-                flow_algorithm
-                if flow_algorithm is not None
-                else flow_matching.SamplingAlgorithm.SIR
-            )
-            if algo == flow_matching.SamplingAlgorithm.SIR:
-                # Derive per-cap SIR params from base, adjust n_proposal_samples
-                base = algorithm_params or flow_matching.SIRParams(
-                    n_proposal_samples=total_proposals,
-                    n_projections=10,
-                    batch_size=512,
+        print(f"Grouped {n_imgs} images into {len(unique_caps)} unique caps")
+
+        # Generate random keys for each unique cap
+        cap_keys = jax.random.split(flow_rng, len(unique_caps))
+
+        with tqdm(total=len(unique_caps), desc="flow sampling", unit="cap") as pbar:
+            for cap_idx, ((center_tuple, d_max), img_indices) in enumerate(
+                unique_caps.items()
+            ):
+                center = jnp.array(center_tuple)
+                n_samples_for_cap = len(img_indices)
+
+                samples, ess = sample_from_cap_backwards_forwards(
+                    flow_mdl,
+                    flow_params_gpu,
+                    center,
+                    d_max,
+                    cap_keys[cap_idx],
+                    n_backward_samples=32,
+                    n_forward_samples=4 * n_samples_for_cap,  # 4x rule of thumb
+                    batch_size=batch_size,  # Internal processing batch size
                 )
-                sir_params = flow_matching.SIRParams(
-                    n_proposal_samples=total_proposals,
-                    n_projections=base.n_projections,
-                    batch_size=base.batch_size,
-                )
-                algo_params_for_cap = sir_params
-            elif algo == flow_matching.SamplingAlgorithm.REJECTION:
-                algo_params_for_cap = algorithm_params or flow_matching.RejectionParams(
-                    proposal_batch_size=256
-                )
-            elif algo == flow_matching.SamplingAlgorithm.MCMC:
-                algo_params_for_cap = algorithm_params or flow_matching.MCMCParams(
-                    n_chains=512,
-                    n_steps_per_chain=128,
-                    step_scale=1 / 3,
-                    burnin_steps=16,
-                )
-            else:
-                raise ValueError(f"Unsupported flow sampling algorithm: {algo}")
 
-            (
-                samples,
-                log_densities,
-                ess,
-                _,
-            ) = flow_matching.generate_cap_constrained_samples(
-                flow_mdl,
-                flow_params_gpu,
-                cap_keys[cap_idx],
-                center,
-                d_max,
-                table,
-                cond_vec,
-                n_output_samples=n_samples_for_cap,
-                flow_n_steps=n_flow_steps,
-                algorithm=algo,
-                algorithm_params=algo_params_for_cap,
-            )
+                if samples.shape[0] < n_samples_for_cap:
+                    raise RuntimeError(
+                        f"Only generated {samples.shape[0]} samples but needed {n_samples_for_cap} for cap {cap_idx}"
+                    )
 
-            # Distribute results back to original image indices
-            for i, img_idx in enumerate(img_indices):
-                generated_clip_embeddings[img_idx] = jax.device_get(samples[i])
+                # Distribute results back to original image indices
+                for i, img_idx in enumerate(img_indices):
+                    generated_clip_embeddings[img_idx] = jax.device_get(samples[i])
 
-            tqdm.write(
-                f"Cap {cap_idx} ESS: {ess} Log densities: {jnp.sort(log_densities)} (uniform is ~1458)"
-            )
-            postfix = {
-                "n_imgs": n_samples_for_cap,
-                "ESS": f"{float(ess):.1f}",
-            }
-            if algo == flow_matching.SamplingAlgorithm.SIR:
-                postfix["proposals"] = total_proposals
-            pbar.set_postfix(postfix)
-            pbar.update(1)
+                print(f"Cap {cap_idx} ESS: {float(ess):.1f}")
+                pbar.set_postfix(
+                    {"n_imgs": n_samples_for_cap, "ESS": f"{float(ess):.1f}"}
+                )
+                pbar.update(1)
+
+    elif flow_mdl.weighting_function == WeightingFunction.CAP_INDICATOR:
+        # Use standard flow matching with cap info as weighting function params
+        print("Using flow matching with CAP_INDICATOR weighting function")
+
+        # Process in batches
+        batches = batches_split(batch_size, n_imgs)
+
+        with tqdm(total=n_imgs, desc="flow sampling", unit="img") as pbar:
+            ctr = 0
+            for batch in batches:
+                # Generate batch of random keys
+                batch_rngs = jax.random.split(flow_rng, batch + 1)
+                flow_rng = batch_rngs[0]  # Update for next iteration
+                rngs_batch = batch_rngs[1:]
+
+                cap_centers_batch = cap_centers[ctr : ctr + batch]
+                max_cos_distances_batch = max_cos_distances[ctr : ctr + batch]
+
+                # Prepare weighting function params (cap centers and d_maxes)
+                weighting_function_params = (
+                    jnp.array(cap_centers_batch),
+                    jnp.array(max_cos_distances_batch),
+                )
+
+                samples = flow_matching.generate_samples(
+                    flow_mdl,
+                    flow_params_gpu,
+                    rngs_batch[0],
+                    weighting_function_params,
+                    n_steps=n_flow_steps,
+                )
+
+                generated_clip_embeddings[ctr : ctr + batch] = jax.device_get(samples)
+                pbar.update(batch)
+                ctr += batch
+    else:
+        raise ValueError(
+            f"Unsupported weighting function: {flow_mdl.weighting_function}"
+        )
 
     cos_distances = 1 - np.sum(generated_clip_embeddings * cap_centers, axis=1)
     assert cos_distances.shape == (n_imgs,)
@@ -790,64 +782,6 @@ def main():
         type=int,
         default=100,
         help="Number of ODE integration steps for flow model",
-    )
-    parser.add_argument(
-        "--flow-algorithm",
-        type=str,
-        choices=["sir", "rejection", "mcmc"],
-        default="sir",
-        help="Flow sampling algorithm to use",
-    )
-    # SIR params
-    parser.add_argument(
-        "--sir-n-projections",
-        type=int,
-        default=10,
-        help="Number of random projections for log-probability estimation (SIR)",
-    )
-    parser.add_argument(
-        "--sir-batch-size",
-        type=int,
-        default=512,
-        help="Batch size for probability evaluation (SIR)",
-    )
-    # Rejection params
-    parser.add_argument(
-        "--rejection-proposal-batch-size",
-        type=int,
-        default=256,
-        help="Batch size of proposals for rejection sampling",
-    )
-    # MCMC params
-    parser.add_argument(
-        "--mcmc-n-chains",
-        type=int,
-        default=512,
-        help="Number of MCMC chains",
-    )
-    parser.add_argument(
-        "--mcmc-steps-per-chain",
-        type=int,
-        default=128,
-        help="Number of MCMC steps per chain",
-    )
-    parser.add_argument(
-        "--mcmc-step-scale",
-        type=float,
-        default=1.0 / 3.0,
-        help="Step scale as a fraction of cap radius (std dev of geodesic distance)",
-    )
-    parser.add_argument(
-        "--mcmc-burnin-steps",
-        type=int,
-        default=16,
-        help="Number of burn-in steps to discard for MCMC",
-    )
-    parser.add_argument(
-        "--n-flow-proposals",
-        type=int,
-        default=128,
-        help="Number of proposal samples for cap-constrained importance sampling",
     )
     parser.add_argument("transformer_checkpoint_dir", type=Path)
     parser.add_argument("autoencoder_checkpoint", type=Path)
@@ -1043,8 +977,10 @@ def main():
         print(f"Loaded flow model step {flow_step}")
 
         # Validate flow model compatibility
-        if not isinstance(flow_mdl, flow_matching.VectorField):
-            raise ValueError(f"Flow model must be a VectorField, got {type(flow_mdl)}")
+        if not isinstance(flow_mdl, FunctionWeightedFlowModel):
+            raise ValueError(
+                f"Flow model must be a FunctionWeightedFlowModel, got {type(flow_mdl)}"
+            )
         if flow_mdl.domain_dim != 768:
             raise ValueError(
                 f"Flow model domain_dim must be 768 (CLIP embedding size), got {flow_mdl.domain_dim}"
@@ -1052,26 +988,6 @@ def main():
 
     # Choose sampling method based on whether flow model is provided
     if args.flow_model is not None:
-        # Map CLI choice to SamplingAlgorithm via Enum value
-        flow_algorithm = flow_matching.SamplingAlgorithm(args.flow_algorithm)
-        # Base algorithm params from CLI
-        if flow_algorithm == flow_matching.SamplingAlgorithm.SIR:
-            algorithm_params = flow_matching.SIRParams(
-                n_proposal_samples=args.n_flow_proposals,
-                n_projections=args.sir_n_projections,
-                batch_size=args.sir_batch_size,
-            )
-        elif flow_algorithm == flow_matching.SamplingAlgorithm.REJECTION:
-            algorithm_params = flow_matching.RejectionParams(
-                proposal_batch_size=args.rejection_proposal_batch_size
-            )
-        else:
-            algorithm_params = flow_matching.MCMCParams(
-                n_chains=args.mcmc_n_chains,
-                n_steps_per_chain=args.mcmc_steps_per_chain,
-                step_scale=args.mcmc_step_scale,
-                burnin_steps=args.mcmc_burnin_steps,
-            )
         imgs = two_stage_sample_loop(
             im_mdl=im_mdl,
             im_params=im_params,
@@ -1088,9 +1004,6 @@ def main():
             temperature=args.temperature,
             force_f32=args.force_fp32,
             n_flow_steps=args.n_flow_steps,
-            n_flow_proposals=args.n_flow_proposals,
-            flow_algorithm=flow_algorithm,
-            algorithm_params=algorithm_params,
         )
     else:
         imgs = sample_loop(
