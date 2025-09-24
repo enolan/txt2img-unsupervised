@@ -2659,11 +2659,12 @@ def _tsit5_integrate_core(
             )
             new_extreme_t = min_t if forward else max_t
 
-            # Shrink to live count rounded up to next power of two (respecting minimum)
+            # Shrink to live count rounded up to next multiple of 128 (respecting minimum)
             # Only shrink if shrinking batch optimization is enabled
+            residue = live_count % 128
             if settings.enable_shrinking_batch:
                 new_batch_size = max(
-                    _next_power_of_two(live_count)
+                    live_count + (128 - residue if residue > 0 else 0)
                     if live_count > 0
                     else settings.min_batch_size,
                     settings.min_batch_size,
