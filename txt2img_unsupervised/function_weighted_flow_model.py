@@ -19,6 +19,7 @@ from .cap_sampling import (
     random_pt_with_cosine_similarity,
     sample_cap,
     sample_from_cap,
+    sample_from_cap_v,
     sphere_log_inverse_surface_area,
 )
 from .flow_matching import VectorField, sample_sphere
@@ -1887,6 +1888,304 @@ def compute_nll(
         rng=rng,
         n_projections=n_projections,
     )
+
+
+def sample_from_cap_backwards_forwards(
+    model,
+    params,
+    cap_center: jax.Array,
+    cap_d_max: float,
+    rng,
+    tbl: Optional[LogitsTable] = None,
+    n_backward_samples: int = 32,
+    n_forward_samples: int = 128,
+    batch_size: int = None,
+) -> Tuple[jax.Array, jax.Array]:
+    """
+    Sample from a cap-conditioned distribution using CNF backwards-forwards method.
+
+    This algorithm works on models trained with constant weighting functions and enables
+    cap-conditioned sampling by:
+    1. Sampling points uniformly from the target cap
+    2. Finding their pre-image points via reverse CNF integration
+    3. Fitting a vMF distribution to the pre-image points
+    4. Sampling from the vMF and flowing forward through the CNF
+    5. Resampling with importance weights and rejecting points outside the cap
+
+    Args:
+        model: FunctionWeightedFlowModel trained with CONSTANT weighting and SPHERE base distribution
+        params: Model parameters
+        cap_center: Unit vector defining cap center, shape (domain_dim,)
+        cap_d_max: Maximum cosine distance for the cap (0 to 2)
+        n_backward_samples: Number of samples to draw from cap for fitting vMF
+        n_forward_samples: Number of samples to draw forward. Some will be rejected.
+        batch_size: Batch size for processing (if None, uses n_cap_samples)
+
+    Returns:
+        - samples: Array of shape (n_in_cap_samples, domain_dim) containing samples from
+          P(x | x in cap), where n_in_cap_samples <= n_forward_samples due to rejection
+          sampling
+        - ess: Effective sample size computed from importance weights (scalar array)
+    """
+    assert cap_center.shape == (model.domain_dim,)
+    assert jnp.allclose(
+        jnp.linalg.norm(cap_center), 1.0, atol=1e-6, rtol=0
+    ), "cap_center must be unit vector"
+    assert (
+        model.weighting_function == WeightingFunction.CONSTANT
+    ), "Only supported for constant weighting models"
+    assert (
+        model.base_distribution == BaseDistribution.SPHERE
+    ), "Only supported for sphere base distribution"
+
+    if batch_size is None:
+        batch_size = min(n_backward_samples, 256)
+
+    # Step 1: Sample points uniformly from the cap
+    cap_rng, reverse_rng, vmf_rng, forward_rng, resample_rng = jax.random.split(rng, 5)
+
+    if tbl is None:
+        tbl = LogitsTable(model.domain_dim - 1, 8192)
+
+    cap_points = sample_from_cap_v(
+        cap_rng, tbl, cap_center, cap_d_max, n_backward_samples
+    )
+    assert cap_points.shape == (n_backward_samples, model.domain_dim)
+
+    # Step 2: Find pre-image points via reverse integration
+    weighting_function_params = None
+
+    pre_image_points = []
+
+    with tqdm(
+        total=n_backward_samples, desc="Finding pre-image points", unit="sample"
+    ) as pbar:
+        for i in range(0, n_backward_samples, batch_size):
+            end_idx = min(i + batch_size, n_backward_samples)
+            batch_cap_points = cap_points[i:end_idx]
+
+            batch_reverse_rng, reverse_rng = jax.random.split(reverse_rng)
+
+            x0_batch, _ = flow_matching.reverse_path_and_compute_divergence_tsit5(
+                _compute_vector_field,
+                model,
+                params,
+                weighting_function_params,
+                batch_cap_points,
+                0,  # n_steps ignored with tsit5
+                batch_reverse_rng,
+                n_projections=0,  # ingored when not doing divergence
+                compute_divergence=False,
+            )
+
+            pre_image_points.append(x0_batch)
+            pbar.update(end_idx - i)
+
+    pre_image_points = jnp.concatenate(pre_image_points, axis=0)
+    assert pre_image_points.shape == (n_backward_samples, model.domain_dim)
+
+    # Step 3: Fit vMF distribution to pre-image points
+    vmf_mu, vmf_kappa = stats.vonmises_fisher.fit(jax.device_get(pre_image_points))
+    fitted_vmf = stats.vonmises_fisher(vmf_mu, vmf_kappa)
+    print(f"Fitted vMF mu: {vmf_mu}, kappa: {vmf_kappa}")
+
+    # Step 4: Sample from vMF and flow forward
+
+    vmf_samples = fitted_vmf.rvs(
+        size=n_forward_samples,
+        random_state=np.random.default_rng(
+            int(jax.random.randint(vmf_rng, (), 0, 2**31 - 1))
+        ),
+    )
+    assert vmf_samples.shape == (n_forward_samples, model.domain_dim)
+    vmf_samples = jax.device_put(vmf_samples)
+
+    # Flow samples forward through CNF in batches
+    forward_samples = []
+
+    with tqdm(total=n_forward_samples, desc="Flowing forward", unit="sample") as pbar:
+        for i in range(0, n_forward_samples, batch_size):
+            end_idx = min(i + batch_size, n_forward_samples)
+            batch_vmf_samples = vmf_samples[i:end_idx]
+
+            batch_forward_rng, forward_rng = jax.random.split(forward_rng)
+
+            batch_forward_samples, _ = flow_matching.generate_samples_inner(
+                batch_forward_rng,
+                1,  # n_steps ignored with tsit5
+                end_idx - i,
+                "tsit5",
+                _compute_vector_field,
+                model,
+                params,
+                weighting_function_params,
+                model.domain_dim,
+                initial_x0=batch_vmf_samples,
+            )
+
+            forward_samples.append(batch_forward_samples)
+            pbar.update(end_idx - i)
+
+    forward_samples = jnp.concatenate(forward_samples, axis=0)
+    assert forward_samples.shape == (n_forward_samples, model.domain_dim)
+
+    # Step 5: Importance sampling and rejection
+
+    proposal_log_densities = jax.device_put(
+        fitted_vmf.logpdf(jax.device_get(vmf_samples))
+    )
+    assert proposal_log_densities.shape == (n_forward_samples,)
+
+    # Check which samples are in the cap
+    cos_similarities = jnp.dot(forward_samples, cap_center)
+    cos_distances = 1 - cos_similarities
+    in_cap_mask = cos_distances <= cap_d_max
+
+    # Importance weights. Target is the pushforward density weighted by an in cap indicator
+    # function, proposal is the pushforward density weighted by our vMF applied to the noise points.
+    # The pushforward part cancels.
+    importance_weights = jnp.where(in_cap_mask, 0, -jnp.inf) - proposal_log_densities
+
+    if jnp.sum(in_cap_mask) == 0:
+        raise ValueError(
+            "No samples in cap. Try increasing n_backward_samples or n_forward_samples."
+        )
+
+    # Effective Sample Size (ESS) for importance weights
+    # Use unnormalized weights w_i = exp(log w_i)
+    max_logw = jnp.max(importance_weights)
+    stable_weights = jnp.exp(importance_weights - max_logw)
+    sum_w = jnp.sum(stable_weights)
+    sum_w2 = jnp.sum(stable_weights * stable_weights)
+    ess = (sum_w * sum_w) / jnp.maximum(sum_w2, 1e-12)
+
+    # Sample indices according to weights
+    resampled_indices = jax.random.categorical(
+        resample_rng, importance_weights, shape=(n_forward_samples,)
+    )
+
+    return forward_samples[resampled_indices], ess
+
+
+@pytest.mark.usefixtures("starts_with_progressbar")
+def test_cap_conditioned_cnf_sampling():
+    """Test the new cap-conditioned CNF sampling algorithm."""
+    # Create a simple constant-weighted model for testing
+    model = FunctionWeightedFlowModel(
+        domain_dim=3,
+        reference_directions=None,
+        time_dim=16,
+        use_pre_mlp_projection=True,
+        n_layers=2,
+        d_model=64,
+        mlp_expansion_factor=2,
+        mlp_dropout_rate=None,
+        input_dropout_rate=None,
+        weighting_function=WeightingFunction.CONSTANT,
+        weighting_function_extra_params=None,
+        base_distribution=BaseDistribution.SPHERE,
+    )
+
+    # Initialize model parameters
+    rng = jax.random.PRNGKey(42)
+    params = model.init(rng, *model.dummy_inputs())
+
+    # Test cap parameters
+    cap_center = jnp.array([1.0, 0.0, 0.0])  # Along x-axis
+    cap_d_max = 0.5  # Small cap
+
+    # Test the algorithm
+    test_rng = jax.random.PRNGKey(123)
+    samples = sample_from_cap_backwards_forwards(
+        model=model,
+        params=params,
+        cap_center=cap_center,
+        cap_d_max=cap_d_max,
+        n_backward_samples=50,
+        n_forward_samples=100,
+        rng=test_rng,
+        batch_size=32,
+    )
+
+    # Basic sanity checks
+    assert samples.shape[1] == 3  # Correct dimension
+    assert samples.shape[0] <= 100  # At most n_forward_samples
+
+    assert samples.shape[0] > 0
+
+    # All samples should be unit vectors
+    norms = jnp.linalg.norm(samples, axis=1)
+    np.testing.assert_allclose(norms, 1.0, atol=1e-5)
+
+    # All samples should be within the cap
+    cos_similarities = jnp.dot(samples, cap_center)
+    cos_distances = 1 - cos_similarities
+    assert jnp.all(
+        cos_distances <= cap_d_max + 1e-6
+    )  # Small tolerance for numerical errors
+
+    print(f"Generated {samples.shape[0]} valid samples")
+    print(f"Average cosine distance to cap center: {jnp.mean(cos_distances):.3f}")
+    print(f"Max cosine distance to cap center: {jnp.max(cos_distances):.3f}")
+
+
+@pytest.mark.usefixtures("starts_with_progressbar")
+def test_cap_conditioned_cnf_sampling_edge_cases():
+    """Test edge cases for cap-conditioned sampling."""
+    # Create a simple model
+    model = FunctionWeightedFlowModel(
+        domain_dim=3,
+        reference_directions=None,
+        time_dim=8,
+        use_pre_mlp_projection=True,
+        n_layers=1,
+        d_model=32,
+        mlp_expansion_factor=2,
+        mlp_dropout_rate=None,
+        input_dropout_rate=None,
+        weighting_function=WeightingFunction.CONSTANT,
+    )
+
+    rng = jax.random.PRNGKey(42)
+    params = model.init(rng, *model.dummy_inputs())
+
+    # Test with very large cap (should behave like uniform sampling)
+    cap_center = jnp.array([0.0, 0.0, 1.0])
+    large_cap_samples, ess = sample_from_cap_backwards_forwards(
+        model=model,
+        params=params,
+        cap_center=cap_center,
+        cap_d_max=2.0,  # Full sphere
+        n_backward_samples=30,
+        n_forward_samples=50,
+        rng=jax.random.PRNGKey(456),
+    )
+
+    if large_cap_samples.shape[0] > 0:
+        # Should get samples spread across the sphere
+        cos_distances = 1 - jnp.dot(large_cap_samples, cap_center)
+        assert jnp.all(cos_distances <= 2.0)  # Within full sphere
+        print(f"Large cap test: generated {large_cap_samples.shape[0]} samples")
+
+    # Test with very small cap
+    small_cap_samples, ess = sample_from_cap_backwards_forwards(
+        model=model,
+        params=params,
+        cap_center=cap_center,
+        cap_d_max=0.1,  # Very small cap
+        n_backward_samples=20,
+        n_forward_samples=30,
+        rng=jax.random.PRNGKey(789),
+    )
+
+    if small_cap_samples.shape[0] > 0:
+        # All samples should be very close to cap center
+        cos_distances = 1 - jnp.dot(small_cap_samples, cap_center)
+        assert jnp.all(cos_distances <= 0.1 + 1e-6)
+        assert jnp.mean(cos_distances) < 0.08  # Should be quite concentrated
+        print(
+            f"Small cap test: generated {small_cap_samples.shape[0]} samples, avg distance: {jnp.mean(cos_distances):.4f}"
+        )
 
 
 # Create FunctionWeightedFlowModel-specific training loop using partial application

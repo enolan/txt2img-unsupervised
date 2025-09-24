@@ -14,11 +14,11 @@ from txt2img_unsupervised.flow_matching import (
     create_mollweide_projection_figure,
 )
 from txt2img_unsupervised.function_weighted_flow_model import (
-    sample_loop,
-    compute_hemisphere_masses,
     BaseDistribution,
     WeightingFunction,
     sample_full_sphere,
+    sample_from_cap_backwards_forwards,
+    sample_loop,
 )
 from txt2img_unsupervised.training_infra import setup_jax_for_training
 
@@ -274,19 +274,36 @@ def main():
                     args.n_steps,
                 )
         else:
-            # Non-CAP models can handle any d_max directly
-            cap_centers = jnp.tile(cap_center, (args.n_samples, 1))
-            cap_d_maxes = jnp.full((args.n_samples,), max_cos_distance)
-            weighting_function_params = (cap_centers, cap_d_maxes)
-            samples = sample_loop(
-                mdl,
-                params,
-                samples_rng,
-                weighting_function_params,
-                args.n_samples,
-                args.batch_size,
-                args.n_steps,
-            )
+            # Non-CAP base distribution
+            if mdl.weighting_function == WeightingFunction.CONSTANT and mdl.base_distribution == BaseDistribution.SPHERE:
+                # Use CNF backwards-forwards cap-conditioned sampling for constant weighting
+                n_backward = 256
+                samples, ess = sample_from_cap_backwards_forwards(
+                    model=mdl,
+                    params=params,
+                    cap_center=cap_center,
+                    cap_d_max=max_cos_distance,
+                    rng=samples_rng,
+                    tbl=None,
+                    n_backward_samples=n_backward,
+                    n_forward_samples=args.n_samples * 4,
+                    batch_size=args.batch_size,
+                )
+                print(f"Effective sample size (ESS): {ess:.1f}")
+            else:
+                # Generic sampling via weighting function parameters
+                cap_centers = jnp.tile(cap_center, (args.n_samples, 1))
+                cap_d_maxes = jnp.full((args.n_samples,), max_cos_distance)
+                weighting_function_params = (cap_centers, cap_d_maxes)
+                samples = sample_loop(
+                    mdl,
+                    params,
+                    samples_rng,
+                    weighting_function_params,
+                    args.n_samples,
+                    args.batch_size,
+                    args.n_steps,
+                )
     else:
         # Unconditioned sampling - use d_max=2.0 (full sphere)
         print("Sampling from full sphere")

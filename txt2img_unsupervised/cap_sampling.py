@@ -305,6 +305,15 @@ def sample_from_cap(rng, table, v, d_max):
     return pt
 
 
+@partial(jax.jit, inline=True, static_argnames=("n"))
+def sample_from_cap_v(rng, table, v, d_max, n):
+    """Sample n points inside a cap, defined by a center vector v and a maximum cosine distance d_max
+    to that center."""
+    rngs = jax.random.split(rng, n)
+    pts = jax.vmap(lambda rng: sample_from_cap(rng, table, v, d_max))(rngs)
+    return pts
+
+
 def process_d_max_dist(
     d_max_dist: list[tuple[float, float]] = None
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:

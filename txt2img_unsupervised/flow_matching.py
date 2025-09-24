@@ -3889,6 +3889,7 @@ def reverse_path_and_compute_divergence_tsit5(
     n_steps,
     rng,
     n_projections=10,
+    compute_divergence: bool = True,
     tsit5_settings: Optional[Tsit5Settings] = None,
 ):
     """
@@ -3918,8 +3919,10 @@ def reverse_path_and_compute_divergence_tsit5(
         False,
         settings=settings,
         rng=rng,
-        step_callback=divergence_step_callback,
-        step_carry_init=jnp.zeros((batch_size,), dtype=jnp.float32),
+        step_callback=divergence_step_callback if compute_divergence else None,
+        step_carry_init=jnp.zeros((batch_size,), dtype=jnp.float32)
+        if compute_divergence
+        else None,
         callback_n_projections=n_projections,
     )
 
