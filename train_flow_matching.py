@@ -39,6 +39,8 @@ from txt2img_unsupervised.function_weighted_flow_model import (
     WeightingFunction,
     CapIndicatorExtraParams,
     SmoothedCapIndicatorExtraParams,
+    sample_loop,
+    sample_full_sphere,
 )
 from txt2img_unsupervised.train_data_loading import get_batch
 from txt2img_unsupervised.training_infra import (
@@ -215,84 +217,24 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_ste
     # Generate appropriate weighting function parameters for visualization
     if mdl.weighting_function == WeightingFunction.CONSTANT:
         weighting_function_params = None
+        samples = sample_loop(
+            mdl,
+            params,
+            rng,
+            weighting_function_params,
+            n_samples,
+            batch_size,
+            n_steps,
+        )
     elif mdl.weighting_function in [
         WeightingFunction.CAP_INDICATOR,
         WeightingFunction.SMOOTHED_CAP_INDICATOR,
     ]:
-        if mdl.base_distribution != BaseDistribution.CAP:
-            # Use full-sphere cap to visualize complete learned distribution
-            arbitrary_center = jnp.zeros(mdl.domain_dim).at[0].set(1.0)  # [1, 0, 0]
-            d_max = 2.0  # Full sphere
-            weighting_function_params = (
-                jnp.tile(arbitrary_center[None, :], (n_samples, 1)),
-                jnp.full((n_samples,), d_max, dtype=jnp.float32),
-            )
-        else:
-            # For cap-conditioned base, sample from hemispheres weighted by their masses
-            hemisphere_rng, choice_rng = jax.random.split(rng)
-
-            hemisphere_masses = compute_hemisphere_masses(
-                mdl, params, hemisphere_rng, n_steps, 32
-            )
-            north_log_mass = hemisphere_masses["north_log_mass"]
-            south_log_mass = hemisphere_masses["south_log_mass"]
-
-            log_masses = jnp.array([north_log_mass, south_log_mass])
-            hemisphere_choices = jax.random.categorical(
-                choice_rng, log_masses, shape=(n_samples,)
-            )
-            assert hemisphere_choices.shape == (n_samples,)
-
-            north_center = jnp.array([1.0, 0.0, 0.0])
-            south_center = jnp.array([-1.0, 0.0, 0.0])
-
-            centers = jnp.where(
-                hemisphere_choices[:, None],
-                north_center[None, :],
-                south_center[None, :],
-            )
-
-            d_maxes = jnp.ones((n_samples,), dtype=jnp.float32)
-
-            weighting_function_params = (centers, d_maxes)
+        samples = sample_full_sphere(mdl, params, rng, n_samples, batch_size, n_steps)
     else:
         raise ValueError(
             f"Unsupported weighting function for visualization: {mdl.weighting_function}"
         )
-
-    samples = []
-    samples_so_far = 0
-
-    while samples_so_far < n_samples:
-        this_batch_size = min(batch_size, n_samples - samples_so_far)
-        batch_rng, rng = jax.random.split(rng)
-
-        # Get weighting function parameters for this batch
-        if weighting_function_params is None:
-            batch_weighting_params = None
-        else:
-            batch_weighting_params = (
-                weighting_function_params[0][
-                    samples_so_far : samples_so_far + this_batch_size
-                ],
-                weighting_function_params[1][
-                    samples_so_far : samples_so_far + this_batch_size
-                ],
-            )
-
-        batch_samples = generate_samples(
-            mdl,
-            params,
-            batch_rng,
-            batch_weighting_params,
-            n_steps=n_steps,
-            batch_size=this_batch_size,
-        )
-
-        samples.append(batch_samples)
-        samples_so_far += this_batch_size
-
-    samples = jnp.concatenate(samples, axis=0)
     mean_sim = mean_cosine_similarity(samples)
 
     samples = jax.device_get(samples)

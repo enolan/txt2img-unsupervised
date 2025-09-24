@@ -11,8 +11,14 @@ from pathlib import Path
 
 from txt2img_unsupervised.checkpoint import load_params
 from txt2img_unsupervised.flow_matching import (
-    sample_loop,
     create_mollweide_projection_figure,
+)
+from txt2img_unsupervised.function_weighted_flow_model import (
+    sample_loop,
+    compute_hemisphere_masses,
+    BaseDistribution,
+    WeightingFunction,
+    sample_full_sphere,
 )
 from txt2img_unsupervised.training_infra import setup_jax_for_training
 
@@ -221,7 +227,6 @@ def main():
 
     if use_cap_conditioning:
         cap_center = latlon_to_unit_vector(args.longitude, args.latitude)
-
         max_cos_distance = 1 - np.cos(np.radians(args.cap_radius))
 
         print(
@@ -231,29 +236,63 @@ def main():
             f"Cap angular radius: {args.cap_radius}° (cosine distance: {max_cos_distance:.6f})"
         )
 
-        # Use the same cap center and max cosine distance for all samples
-        cap_centers = jnp.tile(cap_center, (args.n_samples, 1))
-        cap_d_maxes = jnp.full((args.n_samples,), max_cos_distance)
+        # Validate d_max constraints for CAP base distribution
+        if mdl.base_distribution == BaseDistribution.CAP:
+            if max_cos_distance > 1.0:
+                if max_cos_distance < 2.0:
+                    raise ValueError(
+                        f"Invalid d_max {max_cos_distance:.3f}: for CAP models, d_max must be <= 1.0 or exactly 2.0, not between 1.0 and 2.0"
+                    )
+                elif max_cos_distance == 2.0:
+                    print(
+                        "CAP base distribution with d_max = 2.0. Using hemisphere sampling strategy."
+                    )
+                    samples = sample_full_sphere(
+                        mdl,
+                        params,
+                        samples_rng,
+                        args.n_samples,
+                        args.batch_size,
+                        args.n_steps,
+                    )
+                else:
+                    raise ValueError(
+                        f"Invalid d_max {max_cos_distance:.3f}: must be <= 2.0"
+                    )
+            else:
+                # Direct sampling for d_max <= 1.0
+                cap_centers = jnp.tile(cap_center, (args.n_samples, 1))
+                cap_d_maxes = jnp.full((args.n_samples,), max_cos_distance)
+                weighting_function_params = (cap_centers, cap_d_maxes)
+                samples = sample_loop(
+                    mdl,
+                    params,
+                    samples_rng,
+                    weighting_function_params,
+                    args.n_samples,
+                    args.batch_size,
+                    args.n_steps,
+                )
+        else:
+            # Non-CAP models can handle any d_max directly
+            cap_centers = jnp.tile(cap_center, (args.n_samples, 1))
+            cap_d_maxes = jnp.full((args.n_samples,), max_cos_distance)
+            weighting_function_params = (cap_centers, cap_d_maxes)
+            samples = sample_loop(
+                mdl,
+                params,
+                samples_rng,
+                weighting_function_params,
+                args.n_samples,
+                args.batch_size,
+                args.n_steps,
+            )
     else:
-        # Use random cap centers for unconditioned sampling
-        cap_centers = jax.random.normal(centers_rng, (args.n_samples, mdl.domain_dim))
-        cap_centers = cap_centers / jnp.linalg.norm(cap_centers, axis=1, keepdims=True)
-
-        # Set maximum cap size for unconditioned sampling
-        cap_d_maxes = jnp.full((args.n_samples,), 2.0)
-
-    assert cap_centers.shape == (args.n_samples, mdl.domain_dim)
-
-    samples = sample_loop(
-        mdl,
-        params,
-        args.n_samples,
-        args.batch_size,
-        samples_rng,
-        cap_centers=cap_centers,
-        cap_d_maxes=cap_d_maxes,
-        n_steps=args.n_steps,
-    )
+        # Unconditioned sampling - use d_max=2.0 (full sphere)
+        print("Sampling from full sphere")
+        samples = sample_full_sphere(
+            mdl, params, centers_rng, args.n_samples, args.batch_size, args.n_steps
+        )
 
     samples = jax.device_get(samples)
 

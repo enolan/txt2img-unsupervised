@@ -956,6 +956,69 @@ def generate_samples(
     return samples
 
 
+def sample_loop(
+    model,
+    params,
+    rng,
+    weighting_function_params,
+    n_samples,
+    batch_size,
+    n_steps=20,
+    method="tsit5",
+):
+    """
+    Generate samples from a FunctionWeightedFlowModel in batches with a progress bar.
+
+    Args:
+        model: FunctionWeightedFlowModel
+        params: Model parameters
+        rng: JAX random key
+        weighting_function_params: Parameters for the weighting function. PyTree with leading dim
+            n_samples, None if the weighting function is constant.
+        n_samples: Total number of samples to generate
+        batch_size: Batch size for generation
+        n_steps: Number of integration steps
+        method: Method of integration
+
+    Returns:
+        samples: Array of shape (n_samples, domain_dim)
+    """
+    from tqdm import tqdm
+
+    samples = []
+    samples_so_far = 0
+
+    with tqdm(total=n_samples, desc="Generating samples", unit="samples") as pbar:
+        while samples_so_far < n_samples:
+            current_batch_size = min(batch_size, n_samples - samples_so_far)
+            batch_rng, rng = jax.random.split(rng)
+
+            # Extract batch from weighting_function_params if provided
+            if weighting_function_params is not None:
+                batch_weighting_function_params = jax.tree.map(
+                    lambda x: x[samples_so_far : samples_so_far + current_batch_size],
+                    weighting_function_params,
+                )
+            else:
+                batch_weighting_function_params = None
+
+            batch_samples = generate_samples(
+                model,
+                params,
+                batch_rng,
+                batch_weighting_function_params,
+                n_steps=n_steps,
+                method=method,
+                batch_size=current_batch_size,
+            )
+
+            samples.append(batch_samples)
+            samples_so_far += current_batch_size
+            pbar.update(current_batch_size)
+
+    return jnp.concatenate(samples, axis=0)
+
+
 # lifted to top level so JIT gets cached
 _log_cap_size_batch = jax.jit(lambda tbl, d_maxes: jax.vmap(tbl.log_cap_size)(d_maxes))
 
@@ -1606,6 +1669,95 @@ def compute_hemisphere_masses(model, params, rng, n_steps, n_projections):
             n_projections=n_projections,
         )
     return None
+
+
+def sample_full_sphere(
+    model, params, rng, n_samples, batch_size, n_steps=20, method="tsit5"
+):
+    """
+    Sample from the full sphere using hemisphere sampling strategy for CAP models, or direct
+    sampling for non-CAP models.
+
+    For CAP base distribution models, we can't directly sample from the full sphere, only caps at
+    most a hemisphere. In order to sample from the full sphere, we compute the masses of two
+    hemispheres (where the zeroth coordinate is positive/negative) and sample from each hemisphere
+    proportionally to their masses. For all other models, we simply sample with d_max=2.0.
+
+    Args:
+        model: FunctionWeightedFlowModel
+        params: Model parameters
+        rng: JAX random key
+        n_samples: Total number of samples to generate
+        batch_size: Batch size for generation
+        n_steps: Number of integration steps
+        method: Integration method
+
+    Returns:
+        Array of samples with shape (n_samples, domain_dim)
+    """
+    if model.base_distribution == BaseDistribution.CAP:
+        if model.weighting_function != WeightingFunction.CAP_INDICATOR:
+            raise ValueError(
+                "Hemisphere sampling strategy requires CAP_INDICATOR weighting function"
+            )
+
+        hemisphere_rng, choice_rng = jax.random.split(rng)
+
+        hemisphere_masses = compute_hemisphere_masses(
+            model, params, hemisphere_rng, n_steps, 32
+        )
+        north_log_mass = hemisphere_masses["north_log_mass"]
+        south_log_mass = hemisphere_masses["south_log_mass"]
+
+        log_masses = jnp.array([north_log_mass, south_log_mass])
+        hemisphere_choices = jax.random.categorical(
+            choice_rng, log_masses, shape=(n_samples,)
+        )
+
+        north_center = jnp.array([1.0, 0.0, 0.0])
+        south_center = jnp.array([-1.0, 0.0, 0.0])
+
+        # Assign hemisphere centers based on choices
+        cap_centers = jnp.where(
+            hemisphere_choices[:, None],
+            north_center[None, :],
+            south_center[None, :],
+        )
+
+        cap_d_maxes = jnp.ones((n_samples,), dtype=jnp.float32)
+        weighting_function_params = (cap_centers, cap_d_maxes)
+
+        return sample_loop(
+            model,
+            params,
+            choice_rng,
+            weighting_function_params,
+            n_samples,
+            batch_size,
+            n_steps,
+            method,
+        )
+    else:
+        # For non-CAP models, use random centers with d_max=2.0 (full sphere). The center
+        # *shouldn't* matter, but in imperfect models density may be slightly weighted towards the
+        # cap center.
+        centers_rng, samples_rng = jax.random.split(rng)
+        cap_centers = flow_matching.sample_sphere(
+            centers_rng, n_samples, model.domain_dim
+        )
+        cap_d_maxes = jnp.full((n_samples,), 2.0)
+        weighting_function_params = (cap_centers, cap_d_maxes)
+
+        return sample_loop(
+            model,
+            params,
+            samples_rng,
+            weighting_function_params,
+            n_samples,
+            batch_size,
+            n_steps,
+            method,
+        )
 
 
 def compute_nll(
