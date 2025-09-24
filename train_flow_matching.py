@@ -95,6 +95,18 @@ def parse_arguments():
         default=32,
         help="Number of projections for NLL calculation during evaluation",
     )
+    parser.add_argument(
+        "--nll-batch-size",
+        type=int,
+        default=None,
+        help="Batch size to use for NLL evaluation (defaults to training batch size)",
+    )
+    parser.add_argument(
+        "--max-nll-examples",
+        type=int,
+        default=1000,
+        help="Maximum number of examples to evaluate NLL on",
+    )
 
     # Add arguments for FlowMatchingModelConfig fields
     parser.add_argument("--n-layers", type=int, help="Number of layers in the model")
@@ -269,6 +281,8 @@ def save_checkpoint_and_evaluate(
     viz_batch_size: int = 2048,
     integration_steps: int = 100,
     nll_n_projections: int = 32,
+    nll_batch_size: Optional[int] = None,
+    max_nll_examples: int = 1000,
 ) -> None:
     """Save checkpoint and evaluate on test dataset."""
     save_checkpoint(my_train_state, checkpoint_manager, global_step, skip_saving)
@@ -298,7 +312,7 @@ def save_checkpoint_and_evaluate(
         len(test_dataset) // training_cfg.batch_size,
         desc="test loss batches",
     ):
-        test_rng, batch_rng, nll_batch_rng = jax.random.split(test_rng, 3)
+        test_rng, batch_rng = jax.random.split(test_rng, 2)
 
         batch = get_batch(
             test_dataset,
@@ -317,20 +331,30 @@ def save_checkpoint_and_evaluate(
         )
         losses.append(loss)
 
-    # Computing NLL is slow so we only do 1k examples.
+    # Computing NLL is slow so we only do a limited number of examples.
     hemisphere_rng, nll_rng = jax.random.split(test_rng)
     nll_precomputed_stats = compute_hemisphere_masses(
         mdl, eval_params, hemisphere_rng, integration_steps, nll_n_projections
     )
-    for batch_idx in trange(
-        ceil(min(1000, len(test_dataset)) / training_cfg.batch_size),
-        desc="test nll batches",
-    ):
+    # Plan batches up to a hard cap of nll_batch_size examples, truncating the last batch if needed
+    eval_batch_size = nll_batch_size or training_cfg.batch_size
+    extra_examples = len(test_dataset) % eval_batch_size
+    effective_dataset_size = len(test_dataset) - extra_examples
+    example_limit = min(max_nll_examples, effective_dataset_size)
+    full_batches = example_limit // eval_batch_size
+    remainder = example_limit - full_batches * eval_batch_size
+
+    for batch_idx in trange(full_batches, desc="test nll batches"):
         nll_rng, nll_batch_rng = jax.random.split(nll_rng)
 
-        batch_for_nll = {
-            "point_vec": test_batch["point_vec"],
-        }
+        nll_batch = get_batch(
+            test_dataset,
+            eval_batch_size,
+            batch_idx,
+            fields=[vector_column],
+            sharding=examples_sharding,
+        )
+        batch_for_nll = {"point_vec": nll_batch[vector_column]}
 
         nll_values = compute_nll(
             mdl,
@@ -341,8 +365,31 @@ def save_checkpoint_and_evaluate(
             n_projections=nll_n_projections,
             precomputed_stats=nll_precomputed_stats,
         )
-        nll = jnp.mean(nll_values)
-        nlls.append(nll)
+        nlls.append(jnp.mean(nll_values))
+
+    # Handle truncated final batch if needed
+    if remainder > 0:
+        nll_rng, nll_batch_rng = jax.random.split(nll_rng)
+        nll_batch = get_batch(
+            test_dataset,
+            eval_batch_size,
+            full_batches,
+            fields=[vector_column],
+            sharding=examples_sharding,
+        )
+        truncated_vecs = nll_batch[vector_column][:remainder]
+        batch_for_nll = {"point_vec": truncated_vecs}
+
+        nll_values = compute_nll(
+            mdl,
+            eval_params,
+            batch_for_nll,
+            n_steps=integration_steps,
+            rng=nll_batch_rng,
+            n_projections=nll_n_projections,
+            precomputed_stats=nll_precomputed_stats,
+        )
+        nlls.append(jnp.mean(nll_values))
 
     test_loss = jnp.mean(jnp.stack(losses))
     test_nll = jnp.mean(jnp.stack(nlls))
@@ -539,6 +586,8 @@ if __name__ == "__main__":
             viz_batch_size=kwargs.get("viz_batch_size", args.viz_batch_size),
             integration_steps=kwargs.get("integration_steps", args.integration_steps),
             nll_n_projections=kwargs.get("nll_n_projections", args.nll_n_projections),
+            nll_batch_size=kwargs.get("nll_batch_size", args.nll_batch_size),
+            max_nll_examples=kwargs.get("max_nll_examples", args.max_nll_examples),
         ),
     )
     signal_handler = SignalHandler()
@@ -595,4 +644,6 @@ if __name__ == "__main__":
             viz_batch_size=args.viz_batch_size,
             integration_steps=args.integration_steps,
             nll_n_projections=args.nll_n_projections,
+            nll_batch_size=args.nll_batch_size,
+            max_nll_examples=args.max_nll_examples,
         )
