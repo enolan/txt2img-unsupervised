@@ -275,7 +275,10 @@ def main():
                 )
         else:
             # Non-CAP base distribution
-            if mdl.weighting_function == WeightingFunction.CONSTANT and mdl.base_distribution == BaseDistribution.SPHERE:
+            if (
+                mdl.weighting_function == WeightingFunction.CONSTANT
+                and mdl.base_distribution == BaseDistribution.SPHERE
+            ):
                 # Use CNF backwards-forwards cap-conditioned sampling for constant weighting
                 n_backward = 256
                 samples, ess = sample_from_cap_backwards_forwards(
