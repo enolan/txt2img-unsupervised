@@ -34,7 +34,9 @@ from .function_weighted_flow_model import (
     VmfProposalParams,
     VmfMixtureProposalParams,
     WeightingFunction,
-    sample_from_cap_backwards_forwards,
+    sample_from_cap_backwards_forwards_importance,
+    sample_from_cap_backwards_forwards_mcmc,
+    sample_loop as flow_sample_loop,
 )
 from .checkpoint import get_model_from_checkpoint, load_params
 from .ldm_autoencoder import LDMAutoencoder
@@ -498,6 +500,10 @@ def two_stage_sample_loop(
     force_f32=True,
     n_flow_steps=100,
     flow_batch_size=None,
+    flow_sampling_method="backwards-forwards-importance",
+    mcmc_chains=32,
+    mcmc_steps=1000,
+    mcmc_burnin=200,
 ):
     """Two-stage sampling pipeline that uses a function-weighted flow model to generate CLIP
     embeddings constrained to caps, then uses an image model to generate codes, then decodes with an
@@ -520,6 +526,10 @@ def two_stage_sample_loop(
         force_f32: Whether to force float32 precision for transformer
         n_flow_steps: Number of ODE integration steps for flow model
         flow_batch_size: Batch size for flow model sampling (defaults to batch_size)
+        flow_sampling_method: Sampling method for CONSTANT weighting ("backwards-forwards-importance" or "backwards-forwards-mcmc")
+        mcmc_chains: Number of MCMC chains (only used with flow_sampling_method="backwards-forwards-mcmc")
+        mcmc_steps: Number of MCMC steps after burnin (only used with flow_sampling_method="backwards-forwards-mcmc")
+        mcmc_burnin: Number of MCMC burnin steps (only used with flow_sampling_method="backwards-forwards-mcmc")
 
     Returns:
         List of PIL images
@@ -564,8 +574,8 @@ def two_stage_sample_loop(
     generated_clip_embeddings = np.zeros((n_imgs, 768), dtype=np.float32)
 
     if flow_mdl.weighting_function == WeightingFunction.CONSTANT:
-        # Use backwards-forwards sampling for constant weighting models
-        print("Using backwards-forwards sampling for CONSTANT weighting function")
+        # Use specified sampling method for constant weighting models
+        print(f"Using {flow_sampling_method} sampling for CONSTANT weighting function")
 
         # Group images by identical cap constraints to reduce the number of sampling calls
         cap_specs = [
@@ -592,18 +602,60 @@ def two_stage_sample_loop(
                 center = jnp.array(center_tuple)
                 n_samples_for_cap = len(img_indices)
 
-                samples, ess = sample_from_cap_backwards_forwards(
-                    flow_mdl,
-                    flow_params_gpu,
-                    center,
-                    d_max,
-                    cap_keys[cap_idx],
-                    n_backward_samples=32,
-                    n_forward_samples=4 * n_samples_for_cap,  # 4x rule of thumb
-                    batch_size=flow_batch_size_effective,
-                    proposal_distribution=ProposalDistribution.VMF_MIXTURE,
-                    proposal_params=VmfMixtureProposalParams(),
-                )
+                if d_max >= 2.0:
+                    # Unconditioned sampling - use standard flow matching
+                    samples = flow_sample_loop(
+                        flow_mdl,
+                        flow_params_gpu,
+                        cap_keys[cap_idx],
+                        weighting_function_params=None,
+                        n_samples=n_samples_for_cap,
+                        batch_size=flow_batch_size_effective,
+                        n_steps=n_flow_steps,
+                    )
+                    ess = float(
+                        n_samples_for_cap
+                    )  # All samples are effective for unconditioned
+                elif flow_sampling_method == "backwards-forwards-importance":
+                    samples, ess = sample_from_cap_backwards_forwards_importance(
+                        flow_mdl,
+                        flow_params_gpu,
+                        center,
+                        d_max,
+                        cap_keys[cap_idx],
+                        n_backward_samples=32,
+                        n_forward_samples=4 * n_samples_for_cap,  # 4x rule of thumb
+                        batch_size=flow_batch_size_effective,
+                        proposal_distribution=ProposalDistribution.VMF_MIXTURE,
+                        proposal_params=VmfMixtureProposalParams(n_components=4),
+                        iterative_improvement=True,
+                        n_improvement_iterations=2,
+                    )
+                elif flow_sampling_method == "backwards-forwards-mcmc":
+                    embeddings_rng, select_rng = jax.random.split(cap_keys[cap_idx])
+                    samples, ess = sample_from_cap_backwards_forwards_mcmc(
+                        flow_mdl,
+                        flow_params_gpu,
+                        center,
+                        d_max,
+                        embeddings_rng,
+                        n_chains=mcmc_chains,
+                        n_steps=mcmc_steps,
+                        n_burnin=mcmc_burnin,
+                        batch_size=flow_batch_size_effective,
+                        target_acceptance_rate=0.5,
+                    )
+                    indices = jax.random.choice(
+                        select_rng,
+                        samples.shape[0],
+                        (n_samples_for_cap,),
+                        replace=samples.shape[0] < n_samples_for_cap,
+                    )
+                    samples = samples[indices]
+                else:
+                    raise ValueError(
+                        f"Unknown flow_sampling_method: {flow_sampling_method}"
+                    )
 
                 if samples.shape[0] < n_samples_for_cap:
                     raise RuntimeError(
@@ -800,6 +852,31 @@ def main():
         type=int,
         default=None,
         help="Batch size for flow model sampling (defaults to --batch-size)",
+    )
+    parser.add_argument(
+        "--flow-sampling-method",
+        type=str,
+        choices=["backwards-forwards-importance", "backwards-forwards-mcmc"],
+        default="backwards-forwards-importance",
+        help="Sampling method for CONSTANT weighting flow models",
+    )
+    parser.add_argument(
+        "--mcmc-chains",
+        type=int,
+        default=32,
+        help="Number of MCMC chains (only used with --flow-sampling-method=backwards-forwards-mcmc)",
+    )
+    parser.add_argument(
+        "--mcmc-steps",
+        type=int,
+        default=1000,
+        help="Number of MCMC steps after burnin (only used with --flow-sampling-method=backwards-forwards-mcmc)",
+    )
+    parser.add_argument(
+        "--mcmc-burnin",
+        type=int,
+        default=200,
+        help="Number of MCMC burnin steps (only used with --flow-sampling-method=backwards-forwards-mcmc),",
     )
     parser.add_argument("transformer_checkpoint_dir", type=Path)
     parser.add_argument("autoencoder_checkpoint", type=Path)
@@ -1023,6 +1100,10 @@ def main():
             temperature=args.temperature,
             force_f32=args.force_fp32,
             n_flow_steps=args.n_flow_steps,
+            flow_sampling_method=args.flow_sampling_method,
+            mcmc_chains=args.mcmc_chains,
+            mcmc_steps=args.mcmc_steps,
+            mcmc_burnin=args.mcmc_burnin,
         )
     else:
         imgs = sample_loop(

@@ -2029,7 +2029,7 @@ def _compute_iterative_importance_weights(
     return in_cap_samples, log_importance_weights
 
 
-def sample_from_cap_backwards_forwards(
+def sample_from_cap_backwards_forwards_importance(
     model,
     params,
     cap_center: jax.Array,
@@ -2046,7 +2046,7 @@ def sample_from_cap_backwards_forwards(
     improvement_sample_size: Optional[int] = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """
-    Sample from a cap-conditioned distribution using CNF backwards-forwards method.
+    Sample from a cap-conditioned distribution using CNF backwards-forwards importance sampling method.
 
     This algorithm works on models trained with constant weighting functions and enables
     cap-conditioned sampling by:
@@ -2677,7 +2677,7 @@ def test_cap_conditioned_cnf_sampling():
 
     # Test the algorithm
     test_rng = jax.random.PRNGKey(123)
-    samples, ess = sample_from_cap_backwards_forwards(
+    samples, ess = sample_from_cap_backwards_forwards_importance(
         model=model,
         params=params,
         cap_center=cap_center,
@@ -2732,7 +2732,7 @@ def test_cap_conditioned_cnf_sampling_edge_cases():
 
     # Test with very large cap (should behave like uniform sampling)
     cap_center = jnp.array([0.0, 0.0, 1.0])
-    large_cap_samples, ess = sample_from_cap_backwards_forwards(
+    large_cap_samples, ess = sample_from_cap_backwards_forwards_importance(
         model=model,
         params=params,
         cap_center=cap_center,
@@ -2749,7 +2749,7 @@ def test_cap_conditioned_cnf_sampling_edge_cases():
         print(f"Large cap test: generated {large_cap_samples.shape[0]} samples")
 
     # Test with very small cap
-    small_cap_samples, ess = sample_from_cap_backwards_forwards(
+    small_cap_samples, ess = sample_from_cap_backwards_forwards_importance(
         model=model,
         params=params,
         cap_center=cap_center,
@@ -2795,7 +2795,7 @@ def test_cap_conditioned_cnf_sampling_new_interface():
     cap_d_max = 0.5
 
     # Test VMF proposal distribution explicitly
-    vmf_samples, vmf_ess = sample_from_cap_backwards_forwards(
+    vmf_samples, vmf_ess = sample_from_cap_backwards_forwards_importance(
         model=model,
         params=params,
         cap_center=cap_center,
@@ -2813,7 +2813,10 @@ def test_cap_conditioned_cnf_sampling_new_interface():
     assert jnp.all(cos_distances_vmf <= cap_d_max + 1e-6)
 
     # Test VMF mixture proposal distribution
-    vmf_mixture_samples, vmf_mixture_ess = sample_from_cap_backwards_forwards(
+    (
+        vmf_mixture_samples,
+        vmf_mixture_ess,
+    ) = sample_from_cap_backwards_forwards_importance(
         model=model,
         params=params,
         cap_center=cap_center,
@@ -2867,7 +2870,10 @@ def test_iterative_cap_conditioned_cnf_sampling():
     rng1, rng2 = jax.random.split(rng, 2)
 
     print("Testing single-shot algorithm...")
-    single_shot_samples, single_shot_ess = sample_from_cap_backwards_forwards(
+    (
+        single_shot_samples,
+        single_shot_ess,
+    ) = sample_from_cap_backwards_forwards_importance(
         model,
         params,
         cap_center,
@@ -2879,7 +2885,7 @@ def test_iterative_cap_conditioned_cnf_sampling():
     )
 
     print("Testing iterative algorithm...")
-    iterative_samples, iterative_ess = sample_from_cap_backwards_forwards(
+    iterative_samples, iterative_ess = sample_from_cap_backwards_forwards_importance(
         model,
         params,
         cap_center,
@@ -2921,7 +2927,7 @@ def test_iterative_cap_conditioned_cnf_sampling():
     (
         iterative_mixture_samples,
         iterative_mixture_ess,
-    ) = sample_from_cap_backwards_forwards(
+    ) = sample_from_cap_backwards_forwards_importance(
         model,
         params,
         cap_center,
@@ -2946,6 +2952,309 @@ def test_iterative_cap_conditioned_cnf_sampling():
     print(
         f"Iterative mixture: {iterative_mixture_samples.shape[0]} samples, ESS: {float(iterative_mixture_ess):.1f}"
     )
+
+
+def sample_from_cap_backwards_forwards_mcmc(
+    model,
+    params,
+    cap_center: jax.Array,
+    cap_d_max: float,
+    rng,
+    tbl: Optional[LogitsTable] = None,
+    n_chains: int = 32,
+    n_steps: int = 1000,
+    n_burnin: int = 200,
+    batch_size: int = None,
+    target_acceptance_rate: float = 0.5,
+    adapt_steps: int = 500,
+    initial_step_size: float = 0.1,
+    clip_step_sizes: bool = False,
+) -> Tuple[jax.Array, jax.Array]:
+    """
+    Sample from a cap-conditioned distribution using CNF backwards-forwards MCMC with adaptive step sizes.
+
+    This algorithm uses parallel MCMC chains with geodesic proposals to sample from
+    P(x | φ(x) ∈ cap). It addresses the limitations of the backwards-forwards importance sampling method
+    by naturally exploring the density of the constraint set rather than using importance sampling
+    with a simple proposal to uniform cap samples.
+
+    Args:
+        model: FunctionWeightedFlowModel trained with CONSTANT weighting and SPHERE base distribution
+        params: Model parameters
+        cap_center: Unit vector defining cap center, shape (domain_dim,)
+        cap_d_max: Maximum cosine distance for the cap (0 to 2)
+        rng: JAX random key
+        tbl: LogitsTable for cap sampling (auto-created if None)
+        n_chains: Number of parallel MCMC chains
+        n_steps: Number of MCMC steps after burnin
+        n_burnin: Number of burnin steps
+        batch_size: Batch size for processing (if None, uses n_chains)
+        target_acceptance_rate: Target acceptance rate for step size adaptation
+        adapt_steps: Number of steps over which to adapt step sizes
+        initial_step_size: Initial step size for geodesic proposals
+        clip_step_sizes: Whether to clip step sizes to reasonable geodesic bounds
+
+    Returns:
+        - samples: Array of shape (n_chains * n_steps, domain_dim) containing samples
+          from φ applied to the MCMC samples (these are the final outputs)
+        - ess: Effective sample size (equals n_chains * n_steps for MCMC)
+    """
+    assert cap_center.shape == (model.domain_dim,)
+    assert jnp.allclose(
+        jnp.linalg.norm(cap_center), 1.0, atol=1e-6, rtol=0
+    ), "cap_center must be unit vector"
+    assert (
+        model.weighting_function == WeightingFunction.CONSTANT
+    ), "Only supported for constant weighting models"
+    assert (
+        model.base_distribution == BaseDistribution.SPHERE
+    ), "Only supported for sphere base distribution"
+
+    if batch_size is None:
+        batch_size = min(n_chains, 256)
+
+    if tbl is None:
+        tbl = LogitsTable(model.domain_dim - 1, 8192)
+
+    # Initialize chains by sampling from cap and flowing backwards
+    init_rng, mcmc_rng = jax.random.split(rng, 2)
+
+    # Sample initial points from the cap
+    cap_points = jax.vmap(
+        lambda key: sample_from_cap_v(key, tbl, cap_center, cap_d_max, 1)
+    )(jax.random.split(init_rng, n_chains))
+    cap_points = cap_points[:, 0, :]  # Remove singleton dimension
+
+    # Flow backwards to get initial chain positions
+    weighting_function_params = None
+
+    # Process in batches to avoid memory issues
+    initial_positions = []
+    for i in range(0, n_chains, batch_size):
+        end_idx = min(i + batch_size, n_chains)
+        batch_cap_points = cap_points[i:end_idx]
+
+        batch_reverse_rng, init_rng = jax.random.split(init_rng)
+
+        x0_batch, _ = flow_matching.reverse_path_and_compute_divergence_tsit5(
+            _compute_vector_field,
+            model,
+            params,
+            weighting_function_params,
+            batch_cap_points,
+            0,  # n_steps ignored with tsit5
+            batch_reverse_rng,
+            n_projections=0,
+            compute_divergence=False,
+        )
+
+        initial_positions.append(x0_batch)
+
+    positions = jnp.concatenate(initial_positions, axis=0)
+    assert positions.shape == (n_chains, model.domain_dim)
+
+    # Initialize adaptive step sizes
+    step_sizes = jnp.full(n_chains, initial_step_size)
+
+    # Track acceptance rates for adaptation
+    recent_accepts = jnp.zeros(n_chains)
+    adaptation_window = 50
+
+    # Storage for samples
+    all_samples = []
+
+    # Initialize outputs cache by flowing initial positions forward
+    # This avoids redundant computation in the first iteration
+    current_outputs = []
+    for i in range(0, n_chains, batch_size):
+        end_idx = min(i + batch_size, n_chains)
+        batch_positions = positions[i:end_idx]
+
+        init_output_rng, mcmc_rng = jax.random.split(mcmc_rng)
+
+        batch_outputs, _ = flow_matching.generate_samples_inner(
+            init_output_rng,
+            1,
+            end_idx - i,
+            "tsit5",
+            _compute_vector_field,
+            model,
+            params,
+            weighting_function_params,
+            model.domain_dim,
+            initial_x0=batch_positions,
+        )
+
+        current_outputs.append(batch_outputs)
+
+    current_outputs = jnp.concatenate(current_outputs, axis=0)
+
+    # MCMC loop
+    with tqdm(total=n_burnin + n_steps, desc="MCMC sampling", unit="step") as pbar:
+        for step in range(n_burnin + n_steps):
+            step_rng, mcmc_rng = jax.random.split(mcmc_rng)
+
+            # Generate unconstrained geodesic proposals for all chains
+            # The constraint is on φ(x₀), not x₀, so we don't need cap reflection here
+            directions_rng, distances_rng = jax.random.split(step_rng, 2)
+
+            # Sample directions in tangent spaces
+            directions = jax.random.normal(directions_rng, (n_chains, model.domain_dim))
+            # Project to tangent space (orthogonal to position vectors)
+            directions = (
+                directions
+                - jnp.sum(directions * positions, axis=1, keepdims=True) * positions
+            )
+            directions = directions / jnp.linalg.norm(directions, axis=1, keepdims=True)
+
+            # Sample geodesic distances
+            distances = jax.random.normal(distances_rng, (n_chains,)) * step_sizes
+
+            # Make geodesic moves on the sphere
+            proposals = flow_matching.geodesic_step(positions, directions, distances)
+
+            # Batch forward flow computation for proposals
+            proposal_outputs = []
+            for i in range(0, n_chains, batch_size):
+                end_idx = min(i + batch_size, n_chains)
+                batch_proposals = proposals[i:end_idx]
+
+                batch_forward_rng, step_rng = jax.random.split(step_rng)
+
+                batch_proposal_outputs, _ = flow_matching.generate_samples_inner(
+                    batch_forward_rng,
+                    1,  # n_steps ignored with tsit5
+                    end_idx - i,
+                    "tsit5",
+                    _compute_vector_field,
+                    model,
+                    params,
+                    weighting_function_params,
+                    model.domain_dim,
+                    initial_x0=batch_proposals,
+                )
+
+                proposal_outputs.append(batch_proposal_outputs)
+
+            proposal_outputs = jnp.concatenate(proposal_outputs, axis=0)
+
+            # Check which proposals land in the cap
+            cos_similarities = jnp.dot(proposal_outputs, cap_center)
+            cos_distances = 1 - cos_similarities
+            in_cap_mask = cos_distances <= cap_d_max
+
+            # Accept proposals that land in cap and update outputs cache
+            positions = jnp.where(in_cap_mask[:, None], proposals, positions)
+            current_outputs = jnp.where(
+                in_cap_mask[:, None], proposal_outputs, current_outputs
+            )
+
+            # Update acceptance tracking
+            recent_accepts = recent_accepts * 0.95 + in_cap_mask * 0.05
+
+            # Adapt step sizes during adaptation period
+            if step < adapt_steps:
+                # Dual averaging adaptation (Nesterov's schedule)
+                adaptation_rate = jnp.minimum(0.1, 10.0 / (step + 10))
+                log_step_sizes = jnp.log(step_sizes)
+                log_step_sizes += adaptation_rate * (
+                    recent_accepts - target_acceptance_rate
+                )
+
+                if clip_step_sizes:
+                    # Clip to reasonable geodesic bounds:
+                    # - Max π/2 (quarter circle) for effective local exploration
+                    # - Min 1e-8 to handle very narrow constraint regions
+                    step_sizes = jnp.exp(
+                        jnp.clip(log_step_sizes, jnp.log(1e-8), jnp.log(jnp.pi / 2))
+                    )
+                else:
+                    # Trust dual averaging completely - it should find appropriate step sizes
+                    step_sizes = jnp.exp(log_step_sizes)
+
+            # Store samples after burnin - use cached outputs
+            if step >= n_burnin:
+                all_samples.append(current_outputs)
+
+            # Update progress
+            avg_accept_rate = jnp.mean(recent_accepts)
+            avg_step_size = jnp.mean(step_sizes)
+            pbar.set_postfix(
+                accept_rate=f"{float(avg_accept_rate):.2f}",
+                step_size=f"{float(avg_step_size):.3f}",
+            )
+            pbar.update(1)
+
+    # Combine all samples
+    samples = jnp.concatenate(all_samples, axis=0)
+    assert samples.shape == (n_chains * n_steps, model.domain_dim)
+
+    # Verify all samples are in cap
+    final_cos_distances = 1 - jnp.dot(samples, cap_center)
+    n_in_cap = jnp.sum(final_cos_distances <= cap_d_max + 1e-6)
+    tqdm.write(
+        f"Final samples in cap: {n_in_cap}/{len(samples)} ({float(n_in_cap)/len(samples)*100:.1f}%)"
+    )
+
+    # ESS equals total samples for MCMC (no importance weighting)
+    ess = jnp.array(float(n_chains * n_steps))
+
+    return samples, ess
+
+
+def test_cap_conditioned_cnf_sampling_backwards_forwards_mcmc():
+    """Test MCMC-based cap-conditioned sampling"""
+    domain_dim = 3
+    model = FunctionWeightedFlowModel(
+        domain_dim=domain_dim,
+        reference_directions=None,
+        time_dim=16,
+        use_pre_mlp_projection=False,
+        n_layers=2,
+        d_model=32,
+        mlp_expansion_factor=2,
+        mlp_dropout_rate=None,
+        input_dropout_rate=None,
+        weighting_function=WeightingFunction.CONSTANT,
+        base_distribution=BaseDistribution.SPHERE,
+    )
+
+    rng = jax.random.PRNGKey(42)
+    init_rng, test_rng = jax.random.split(rng)
+
+    params = model.init(init_rng, *model.dummy_inputs())
+
+    cap_center = jnp.array([1.0, 0.0, 0.0])
+    cap_d_max = 0.5
+
+    # Test with small parameters for quick execution
+    samples, ess = sample_from_cap_backwards_forwards_mcmc(
+        model,
+        params,
+        cap_center,
+        cap_d_max,
+        test_rng,
+        n_chains=4,
+        n_steps=10,
+        n_burnin=5,
+        batch_size=4,
+        target_acceptance_rate=0.6,
+        adapt_steps=8,
+        initial_step_size=0.1,
+    )
+
+    assert samples.shape == (4 * 10, domain_dim)
+    assert ess == 4 * 10
+
+    # Verify all samples are unit vectors
+    norms = jnp.linalg.norm(samples, axis=1)
+    np.testing.assert_allclose(norms, 1.0, atol=1e-5)
+
+    # Verify all samples are in the cap
+    cos_distances = 1 - jnp.dot(samples, cap_center)
+    assert jnp.all(cos_distances <= cap_d_max + 1e-5), "Some samples outside cap"
+
+    print(f"MCMC test: {samples.shape[0]} samples, all in cap, ESS: {float(ess):.1f}")
 
 
 # Create FunctionWeightedFlowModel-specific training loop using partial application

@@ -17,7 +17,7 @@ from txt2img_unsupervised.function_weighted_flow_model import (
     BaseDistribution,
     WeightingFunction,
     sample_full_sphere,
-    sample_from_cap_backwards_forwards,
+    sample_from_cap_backwards_forwards_importance,
     sample_loop,
 )
 from txt2img_unsupervised.training_infra import setup_jax_for_training
@@ -281,7 +281,7 @@ def main():
             ):
                 # Use CNF backwards-forwards cap-conditioned sampling for constant weighting
                 n_backward = 256
-                samples, ess = sample_from_cap_backwards_forwards(
+                samples, ess = sample_from_cap_backwards_forwards_importance(
                     model=mdl,
                     params=params,
                     cap_center=cap_center,
