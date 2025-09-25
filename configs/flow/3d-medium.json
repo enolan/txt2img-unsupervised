@@ -6,11 +6,7 @@
     "use_pre_mlp_projection": true,
     "d_model": 512,
     "mlp_expansion_factor": 4,
-    "weighting_function": "cap_indicator",
-    "weighting_function_extra_params": {
-        "d_max_dist": [
-            [1.0, 1.0]
-        ]
-    },
-    "base_distribution": "cap"
+    "weighting_function": "constant",
+    "weighting_function_extra_params": null,
+    "base_distribution": "sphere"
 }
