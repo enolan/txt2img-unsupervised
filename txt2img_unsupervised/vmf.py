@@ -239,7 +239,9 @@ def _sample_w_wood(
 
 
 def fit(
-    x: Array, max_kappa: Optional[float] = _DEFAULT_MAX_KAPPA
+    x: Array,
+    max_kappa: Optional[float] = _DEFAULT_MAX_KAPPA,
+    weights: Optional[Array] = None,
 ) -> Tuple[Array, float]:
     """Fit vMF distribution parameters via maximum likelihood.
 
@@ -247,14 +249,30 @@ def fit(
         x: Data points on unit sphere, shape (n, d)
         max_kappa: Optional upper bound for the concentration estimate. ``None`` disables
             clamping.
+        weights: Optional log-weights for each example, shape (n,). If provided, examples
+            are weighted according to softmax(weights) in the MLE computation.
 
     Returns:
         Tuple of (mu_hat, kappa_hat)
     """
-    _, dim = x.shape
+    n, dim = x.shape
 
-    # Compute empirical mean direction
-    R = jnp.mean(x, axis=0)
+    # Input validation for weights
+    if weights is not None:
+        weights = jnp.asarray(weights)
+        if weights.shape != (n,):
+            raise ValueError(f"weights must have shape ({n},), got {weights.shape}")
+        if not jnp.all(jnp.isfinite(weights)):
+            raise ValueError("weights must be finite")
+
+    # Compute empirical mean direction (weighted or unweighted)
+    if weights is None:
+        R = jnp.mean(x, axis=0)
+    else:
+        # Convert log-weights to probabilities via softmax
+        probs = jax.nn.softmax(weights)
+        R = jnp.sum(probs[:, None] * x, axis=0)
+
     R_norm = jnp.linalg.norm(R)
 
     mu_hat = R / jnp.maximum(R_norm, 1e-8)

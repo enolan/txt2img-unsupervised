@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import jax
 from jax import Array, random
 import jax.numpy as jnp
 import jax.scipy.special as jsp
@@ -117,6 +118,7 @@ def fit(
     max_iters: int = 100,
     tol: float = 1e-5,
     max_kappa: Optional[float] = vmf._DEFAULT_MAX_KAPPA,
+    weights: Optional[Array] = None,
 ) -> Tuple[VmfMixture, Array]:
     """Fit a von Mises-Fisher mixture using expectation-maximization.
 
@@ -128,6 +130,8 @@ def fit(
         tol: Convergence tolerance on log-likelihood improvements.
         max_kappa: Optional upper bound for component concentration parameters passed through to
             the underlying vMF fits. ``None`` disables clamping.
+        weights: Optional log-weights for each example, shape (n,). If provided, examples
+            are weighted according to softmax(weights) in the EM algorithm.
 
     Returns:
         A tuple containing the fitted mixture parameters and posterior responsibilities
@@ -144,6 +148,18 @@ def fit(
     n, dim = x.shape
     if n_components > n:
         raise ValueError("n_components cannot exceed the number of samples")
+
+    # Input validation for weights
+    if weights is not None:
+        weights = jnp.asarray(weights, dtype=x.dtype)
+        if weights.shape != (n,):
+            raise ValueError(f"weights must have shape ({n},), got {weights.shape}")
+        if not jnp.all(jnp.isfinite(weights)):
+            raise ValueError("weights must be finite")
+        # Convert log-weights to probabilities via softmax
+        example_probs = jax.nn.softmax(weights)
+    else:
+        example_probs = None
 
     dtype = x.dtype
     permutation = random.permutation(key, n)
@@ -168,10 +184,18 @@ def fit(
         log_norm = jsp.logsumexp(log_joint, axis=1)
         responsibilities = jnp.exp(log_joint - log_norm[:, None])
 
-        log_likelihood = float(jnp.sum(log_norm))
+        # Include example weights in log-likelihood and responsibilities if provided
+        if example_probs is not None:
+            log_likelihood = float(jnp.sum(example_probs * log_norm))
+            # Weight responsibilities by example probabilities
+            responsibilities = responsibilities * example_probs[:, None]
+            effective_n = jnp.sum(example_probs)
+        else:
+            log_likelihood = float(jnp.sum(log_norm))
+            effective_n = float(n)
 
         component_masses = jnp.sum(responsibilities, axis=0)
-        weights_new = component_masses / n
+        weights_new = component_masses / effective_n
         weights_new = jnp.maximum(weights_new, _WEIGHT_FLOOR)
         weights_new = weights_new / jnp.sum(weights_new)
 

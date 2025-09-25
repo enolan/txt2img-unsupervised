@@ -432,5 +432,80 @@ class TestNumericalStability:
         assert mu_hat.dtype == dtype
 
 
+class TestWeightedFit:
+    """Test weighted fitting functionality."""
+
+    def test_uniform_weights_equals_unweighted(self):
+        """Test that uniform weights give same result as no weights."""
+        dim = 5
+        n_samples = 200
+        key = random.PRNGKey(123)
+
+        true_mu = jnp.array([1.0, 0.0, 0.0, 0.0, 0.0])
+        true_kappa = 5.0
+
+        samples = sample(key, true_mu, true_kappa, n_samples)
+
+        # Uniform weights (should give same result as no weights)
+        uniform_weights = jnp.zeros(n_samples)  # log(1) = 0 for all
+
+        mu_unweighted, kappa_unweighted = fit(samples)
+        mu_weighted, kappa_weighted = fit(samples, weights=uniform_weights)
+
+        # Should be very close (allowing for numerical differences)
+        assert jnp.allclose(mu_unweighted, mu_weighted, rtol=1e-6)
+        assert jnp.allclose(kappa_unweighted, kappa_weighted, rtol=1e-6)
+
+    def test_extreme_weights(self):
+        """Test that extreme weights work correctly."""
+        dim = 3
+        n_samples = 100
+        key = random.PRNGKey(456)
+
+        # Create mixed samples
+        mu1 = jnp.array([1.0, 0.0, 0.0])
+        mu2 = jnp.array([0.0, 1.0, 0.0])
+
+        key1, key2 = random.split(key)
+        samples1 = sample(key1, mu1, 10.0, n_samples // 2)
+        samples2 = sample(key2, mu2, 10.0, n_samples // 2)
+
+        all_samples = jnp.vstack([samples1, samples2])
+
+        # Weight heavily toward first group
+        weights = jnp.concatenate(
+            [
+                jnp.ones(n_samples // 2) * 10.0,  # High weight
+                jnp.ones(n_samples // 2) * (-10.0),  # Very low weight
+            ]
+        )
+
+        mu_weighted, kappa_weighted = fit(all_samples, weights=weights)
+
+        # With extreme weights (difference of 20), mu_weighted should be nearly identical to mu1
+        # The softmax of [10, -10] gives approximately [0.99995, 0.00005] probabilities
+        dot_product = jnp.dot(mu_weighted, mu1)
+        assert (
+            dot_product > 0.99
+        ), f"Expected mu_weighted to be nearly identical to mu1, got dot product {dot_product}"
+
+    def test_input_validation(self):
+        """Test input validation for weights."""
+        dim = 3
+        n_samples = 10
+        key = random.PRNGKey(789)
+
+        samples = sample(key, jnp.array([1.0, 0.0, 0.0]), 1.0, n_samples)
+
+        # Wrong shape
+        with pytest.raises(ValueError, match="weights must have shape"):
+            fit(samples, weights=jnp.ones(n_samples + 1))
+
+        # Non-finite weights
+        bad_weights = jnp.ones(n_samples).at[0].set(jnp.inf)
+        with pytest.raises(ValueError, match="weights must be finite"):
+            fit(samples, weights=bad_weights)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

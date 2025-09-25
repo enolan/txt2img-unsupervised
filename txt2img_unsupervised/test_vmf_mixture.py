@@ -160,5 +160,91 @@ class TestFit:
         assert jnp.all(mixture.kappas <= 250.0 + 1e-3)
 
 
+class TestWeightedFit:
+    """Test weighted fitting functionality for vMF mixture."""
+
+    def test_uniform_weights_equals_unweighted(self):
+        """Test that uniform weights give same result as no weights."""
+        key_data, key_fit1, key_fit2 = random.split(random.PRNGKey(12345), 3)
+
+        # Create simple 2-component mixture
+        mu1 = jnp.array([1.0, 0.0, 0.0])
+        mu2 = jnp.array([0.0, 1.0, 0.0])
+        true_mixture = vmf_mixture.VmfMixture(
+            weights=jnp.array([0.6, 0.4]),
+            mus=jnp.stack([mu1, mu2]),
+            kappas=jnp.array([5.0, 3.0]),
+        )
+
+        samples = vmf_mixture.sample(key_data, true_mixture, 400)
+
+        # Uniform weights (log(1) = 0 for all)
+        uniform_weights = jnp.zeros(samples.shape[0])
+
+        mixture_unweighted, _ = vmf_mixture.fit(samples, n_components=2, key=key_fit1)
+        mixture_weighted, _ = vmf_mixture.fit(
+            samples, n_components=2, key=key_fit2, weights=uniform_weights
+        )
+
+        # Results should be very similar (allowing for random initialization differences)
+        # We can't expect exact equality due to random initialization, but log-likelihoods should be close
+        ll_unweighted = vmf_mixture.log_prob(samples, mixture_unweighted)
+        ll_weighted = vmf_mixture.log_prob(samples, mixture_weighted)
+
+        mean_ll_unweighted = jnp.mean(ll_unweighted)
+        mean_ll_weighted = jnp.mean(ll_weighted)
+
+        # Should be reasonably close
+        assert jnp.abs(mean_ll_unweighted - mean_ll_weighted) < 0.1
+
+    def test_extreme_weights_bias_toward_subset(self):
+        """Test that extreme weights bias fitting toward heavily weighted subset."""
+        key_data, key_fit = random.split(random.PRNGKey(67890), 2)
+
+        # Create two distinct clusters
+        mu1 = jnp.array([1.0, 0.0, 0.0])
+        mu2 = jnp.array([0.0, 0.0, 1.0])
+
+        key1, key2 = random.split(key_data)
+        samples1 = vmf.sample(key1, mu1, 10.0, 200)
+        samples2 = vmf.sample(key2, mu2, 10.0, 200)
+
+        all_samples = jnp.vstack([samples1, samples2])
+
+        # Weight heavily toward first cluster
+        weights = jnp.concatenate(
+            [
+                jnp.ones(200) * 5.0,  # High weight for first cluster
+                jnp.ones(200) * (-5.0),  # Very low weight for second cluster
+            ]
+        )
+
+        mixture, _ = vmf_mixture.fit(
+            all_samples, n_components=1, key=key_fit, weights=weights
+        )
+
+        # With extreme weights (difference of 10), fitted mu should be nearly identical to mu1
+        # The softmax of [5, -5] gives approximately [0.9933, 0.0067] probabilities
+        fitted_mu = mixture.mus[0]
+        dot_product = jnp.dot(fitted_mu, mu1)
+        assert (
+            dot_product > 0.98
+        ), f"Expected fitted mu to be nearly identical to mu1, got dot product {dot_product}"
+
+    def test_input_validation(self):
+        """Test input validation for weights in mixture fitting."""
+        key = random.PRNGKey(555)
+        samples = vmf.sample(key, jnp.array([1.0, 0.0, 0.0]), 1.0, 50)
+
+        # Wrong shape
+        with pytest.raises(ValueError, match="weights must have shape"):
+            vmf_mixture.fit(samples, n_components=2, key=key, weights=jnp.ones(51))
+
+        # Non-finite weights
+        bad_weights = jnp.ones(50).at[0].set(jnp.nan)
+        with pytest.raises(ValueError, match="weights must be finite"):
+            vmf_mixture.fit(samples, n_components=2, key=key, weights=bad_weights)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
