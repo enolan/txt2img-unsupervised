@@ -598,6 +598,7 @@ def two_stage_sample_loop(
                     n_backward_samples=32,
                     n_forward_samples=4 * n_samples_for_cap,  # 4x rule of thumb
                     batch_size=flow_batch_size_effective,
+                    vmf_mixture_components=4,
                 )
 
                 if samples.shape[0] < n_samples_for_cap:

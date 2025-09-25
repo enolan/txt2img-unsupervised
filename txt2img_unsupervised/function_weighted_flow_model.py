@@ -13,6 +13,8 @@ import numpy as np
 import pytest
 
 from . import flow_matching
+from . import vmf
+from . import vmf_mixture
 from .cap_sampling import (
     LogitsTable,
     process_d_max_dist,
@@ -1900,6 +1902,7 @@ def sample_from_cap_backwards_forwards(
     n_backward_samples: int = 32,
     n_forward_samples: int = 128,
     batch_size: int = None,
+    vmf_mixture_components: int = 1,
 ) -> Tuple[jax.Array, jax.Array]:
     """
     Sample from a cap-conditioned distribution using CNF backwards-forwards method.
@@ -1908,8 +1911,8 @@ def sample_from_cap_backwards_forwards(
     cap-conditioned sampling by:
     1. Sampling points uniformly from the target cap
     2. Finding their pre-image points via reverse CNF integration
-    3. Fitting a vMF distribution to the pre-image points
-    4. Sampling from the vMF and flowing forward through the CNF
+    3. Fitting a vMF distribution (or mixture) to the pre-image points
+    4. Sampling from the fitted proposal and flowing forward through the CNF
     5. Resampling with importance weights and rejecting points outside the cap
 
     Args:
@@ -1920,6 +1923,7 @@ def sample_from_cap_backwards_forwards(
         n_backward_samples: Number of samples to draw from cap for fitting vMF
         n_forward_samples: Number of samples to draw forward. Some will be rejected.
         batch_size: Batch size for processing (if None, uses n_cap_samples)
+        vmf_mixture_components: Number of mixture components for the proposal (1 = single vMF)
 
     Returns:
         - samples: Array of shape (n_in_cap_samples, domain_dim) containing samples from
@@ -1941,8 +1945,13 @@ def sample_from_cap_backwards_forwards(
     if batch_size is None:
         batch_size = min(n_backward_samples, 256)
 
+    if vmf_mixture_components < 1:
+        raise ValueError("vmf_mixture_components must be at least 1")
+
     # Step 1: Sample points uniformly from the cap
-    cap_rng, reverse_rng, vmf_rng, forward_rng, resample_rng = jax.random.split(rng, 5)
+    cap_rng, reverse_rng, proposal_rng, forward_rng, resample_rng = jax.random.split(
+        rng, 5
+    )
 
     if tbl is None:
         tbl = LogitsTable(model.domain_dim - 1, 8192)
@@ -1984,21 +1993,38 @@ def sample_from_cap_backwards_forwards(
     pre_image_points = jnp.concatenate(pre_image_points, axis=0)
     assert pre_image_points.shape == (n_backward_samples, model.domain_dim)
 
-    # Step 3: Fit vMF distribution to pre-image points
-    vmf_mu, vmf_kappa = stats.vonmises_fisher.fit(jax.device_get(pre_image_points))
-    fitted_vmf = stats.vonmises_fisher(vmf_mu, vmf_kappa)
-    print(f"Fitted vMF kappa: {vmf_kappa}")
+    # Step 3: Fit proposal distribution to pre-image points
+    if vmf_mixture_components <= 1:
+        vmf_mu, vmf_kappa = vmf.fit(pre_image_points)
+        pre_image_log_probs = vmf.log_prob(pre_image_points, vmf_mu, vmf_kappa)
+        pre_image_nll = -jnp.mean(pre_image_log_probs)
+        print(
+            f"Fitted vMF kappa: {float(vmf_kappa):.6f}; "
+            f"pre-image NLL: {float(pre_image_nll):.6f}"
+        )
+        proposal_samples = vmf.sample(
+            proposal_rng, vmf_mu, vmf_kappa, n_forward_samples
+        )
+        proposal_log_densities = vmf.log_prob(proposal_samples, vmf_mu, vmf_kappa)
+    else:
+        fit_rng, sample_rng = jax.random.split(proposal_rng)
+        mixture, _ = vmf_mixture.fit(
+            pre_image_points, n_components=vmf_mixture_components, key=fit_rng
+        )
+        kappas_str = ", ".join(f"{float(k):.6f}" for k in np.asarray(mixture.kappas))
+        weights_str = ", ".join(f"{float(w):.6f}" for w in np.asarray(mixture.weights))
+        pre_image_log_probs = vmf_mixture.log_prob(pre_image_points, mixture)
+        pre_image_nll = -jnp.mean(pre_image_log_probs)
+        print(
+            "Fitted vMF mixture kappas: "
+            f"[{kappas_str}] weights: [{weights_str}]; "
+            f"pre-image NLL: {float(pre_image_nll):.6f}"
+        )
+        proposal_samples = vmf_mixture.sample(sample_rng, mixture, n_forward_samples)
+        proposal_log_densities = vmf_mixture.log_prob(proposal_samples, mixture)
 
-    # Step 4: Sample from vMF and flow forward
-
-    vmf_samples = fitted_vmf.rvs(
-        size=n_forward_samples,
-        random_state=np.random.default_rng(
-            int(jax.random.randint(vmf_rng, (), 0, 2**31 - 1))
-        ),
-    )
-    assert vmf_samples.shape == (n_forward_samples, model.domain_dim)
-    vmf_samples = jax.device_put(vmf_samples)
+    assert proposal_samples.shape == (n_forward_samples, model.domain_dim)
+    assert proposal_log_densities.shape == (n_forward_samples,)
 
     # Flow samples forward through CNF in batches
     forward_samples = []
@@ -2006,7 +2032,7 @@ def sample_from_cap_backwards_forwards(
     with tqdm(total=n_forward_samples, desc="Flowing forward", unit="sample") as pbar:
         for i in range(0, n_forward_samples, batch_size):
             end_idx = min(i + batch_size, n_forward_samples)
-            batch_vmf_samples = vmf_samples[i:end_idx]
+            batch_proposal_samples = proposal_samples[i:end_idx]
 
             batch_forward_rng, forward_rng = jax.random.split(forward_rng)
 
@@ -2020,7 +2046,7 @@ def sample_from_cap_backwards_forwards(
                 params,
                 weighting_function_params,
                 model.domain_dim,
-                initial_x0=batch_vmf_samples,
+                initial_x0=batch_proposal_samples,
             )
 
             forward_samples.append(batch_forward_samples)
@@ -2031,15 +2057,11 @@ def sample_from_cap_backwards_forwards(
 
     # Step 5: Importance sampling and rejection
 
-    proposal_log_densities = jax.device_put(
-        fitted_vmf.logpdf(jax.device_get(vmf_samples))
-    )
-    assert proposal_log_densities.shape == (n_forward_samples,)
-
     # Check which samples are in the cap
     cos_similarities = jnp.dot(forward_samples, cap_center)
     cos_distances = 1 - cos_similarities
     in_cap_mask = cos_distances <= cap_d_max
+    print(f"In cap: {jnp.sum(in_cap_mask)} / {n_forward_samples}")
 
     # Importance weights. Target is the pushforward density weighted by an in cap indicator
     # function, proposal is the pushforward density weighted by our vMF applied to the noise points.
@@ -2096,7 +2118,7 @@ def test_cap_conditioned_cnf_sampling():
 
     # Test the algorithm
     test_rng = jax.random.PRNGKey(123)
-    samples = sample_from_cap_backwards_forwards(
+    samples, ess = sample_from_cap_backwards_forwards(
         model=model,
         params=params,
         cap_center=cap_center,
