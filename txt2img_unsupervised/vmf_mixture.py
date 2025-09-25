@@ -78,7 +78,14 @@ def log_prob(x: Array, mixture: VmfMixture) -> Array:
     stacked = jnp.stack(component_terms, axis=0)
 
     log_weights = jnp.log(mixture.weights + _WEIGHT_FLOOR)
-    return jsp.logsumexp(stacked + log_weights[:, None], axis=0)
+
+    # Handle both single point (1D) and batch (2D) cases
+    if x.ndim == 1:
+        # For single point: stacked is (n_components,), log_weights is (n_components,)
+        return jsp.logsumexp(stacked + log_weights, axis=0)
+    else:
+        # For batch: stacked is (n_components, n_points), log_weights needs broadcasting
+        return jsp.logsumexp(stacked + log_weights[:, None], axis=0)
 
 
 def sample(key: random.PRNGKey, mixture: VmfMixture, n_samples: int) -> Array:

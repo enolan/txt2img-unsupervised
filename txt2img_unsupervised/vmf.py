@@ -305,8 +305,6 @@ def _solve_kappa_mle(
         kappa_val = float(kappa)
         if kappa_val <= 0.0:
             return 0.0
-        if kappa_val > 100.0:
-            return 1.0 - nu_lower / (2.0 * kappa_val)
         log_upper = _log_modified_bessel_i(nu_upper, kappa_val)
         log_lower = _log_modified_bessel_i(nu_lower, kappa_val)
         return float(jnp.exp(log_upper - log_lower))
