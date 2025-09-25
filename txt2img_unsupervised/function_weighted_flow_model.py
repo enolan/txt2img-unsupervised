@@ -2384,13 +2384,36 @@ def _iterative_proposal_sampling(
     current_samples = pre_image_points
     current_weights = None  # No weights for initial fit
 
+    # Historical samples for pooling across iterations
+    historical_samples = []
+    historical_weights = []
+
     tqdm.write(f"Iterative improvement with {n_improvement_iterations} iterations")
 
     # Iterative improvement loop
     for iteration in range(n_improvement_iterations):
         tqdm.write(f"Improvement iteration {iteration + 1}/{n_improvement_iterations}")
 
-        # Fit proposal to current samples with current weights
+        # Pool all historical samples and weights for fitting
+        if len(historical_samples) > 0:
+            all_samples = jnp.concatenate(
+                [current_samples] + historical_samples, axis=0
+            )
+            all_weights = (
+                jnp.concatenate([current_weights] + historical_weights, axis=0)
+                if current_weights is not None
+                else None
+            )
+            fit_samples = all_samples
+            fit_weights = all_weights
+            tqdm.write(
+                f"  Fitting to {len(historical_samples) + 1} pooled sample sets ({fit_samples.shape[0]} total samples)"
+            )
+        else:
+            fit_samples = current_samples
+            fit_weights = current_weights
+
+        # Fit proposal to pooled samples with pooled weights
         proposal_rng, fit_rng = jax.random.split(proposal_rng)
 
         if proposal_distribution == ProposalDistribution.VMF:
@@ -2399,14 +2422,14 @@ def _iterative_proposal_sampling(
                 proposal_log_densities,
                 fitted_params,
             ) = _fit_and_sample_vmf_proposal(
-                current_samples,
+                fit_samples,
                 fit_rng,
                 improvement_sample_size,
                 proposal_params,
-                current_weights,
+                fit_weights,
             )
             pre_image_log_probs = _compute_vmf_proposal_log_density(
-                current_samples, fitted_params
+                fit_samples, fitted_params
             )
             vmf_mu, vmf_kappa = fitted_params
             fit_summary = f"Fitted vMF kappa: {float(vmf_kappa):.6f}"
@@ -2416,14 +2439,14 @@ def _iterative_proposal_sampling(
                 proposal_log_densities,
                 fitted_params,
             ) = _fit_and_sample_vmf_mixture_proposal(
-                current_samples,
+                fit_samples,
                 fit_rng,
                 improvement_sample_size,
                 proposal_params,
-                current_weights,
+                fit_weights,
             )
             pre_image_log_probs = _compute_vmf_mixture_proposal_log_density(
-                current_samples, fitted_params
+                fit_samples, fitted_params
             )
             kappas_str = ", ".join(
                 f"{float(k):.6f}" for k in np.asarray(fitted_params.kappas)
@@ -2436,9 +2459,9 @@ def _iterative_proposal_sampling(
             )
 
         # Compute NLL consistent with the fitting weights
-        if current_weights is not None:
+        if fit_weights is not None:
             # Weighted fit: compute weighted NLL
-            probs = jax.nn.softmax(current_weights)
+            probs = jax.nn.softmax(fit_weights)
             pre_image_nll = -jnp.sum(probs * pre_image_log_probs)
         else:
             # Unweighted fit: compute unweighted NLL
@@ -2488,6 +2511,16 @@ def _iterative_proposal_sampling(
             tqdm.write("  Warning: No samples in cap for this iteration")
             continue
 
+        # Add previous current_samples/weights to history before updating
+        if current_samples is not None:
+            historical_samples.append(current_samples)
+            if current_weights is not None:
+                historical_weights.append(current_weights)
+            else:
+                # First iteration has no weights, use uniform weights
+                uniform_weights = jnp.zeros(current_samples.shape[0])
+                historical_weights.append(uniform_weights)
+
         # Update for next iteration (or final sampling)
         current_samples = in_cap_samples
         current_weights = log_importance_weights
@@ -2504,17 +2537,33 @@ def _iterative_proposal_sampling(
     tqdm.write("Final sampling phase")
     proposal_rng, final_rng = jax.random.split(proposal_rng)
 
+    # Add final current_samples to history for final fitting
+    if current_samples is not None:
+        historical_samples.append(current_samples)
+        if current_weights is not None:
+            historical_weights.append(current_weights)
+        else:
+            uniform_weights = jnp.zeros(current_samples.shape[0])
+            historical_weights.append(uniform_weights)
+
+    # Pool all historical samples for final fitting
+    final_fit_samples = jnp.concatenate(historical_samples, axis=0)
+    final_fit_weights = jnp.concatenate(historical_weights, axis=0)
+    tqdm.write(
+        f"Final fit using {len(historical_samples)} sample sets ({final_fit_samples.shape[0]} total samples)"
+    )
+
     if proposal_distribution == ProposalDistribution.VMF:
         (
             final_proposal_samples,
             final_proposal_log_densities,
             final_fitted_params,
         ) = _fit_and_sample_vmf_proposal(
-            current_samples,
+            final_fit_samples,
             final_rng,
             n_forward_samples,
             proposal_params,
-            current_weights,
+            final_fit_weights,
         )
         fit_summary = f"Final vMF kappa: {float(final_fitted_params[1]):.6f}"
     elif proposal_distribution == ProposalDistribution.VMF_MIXTURE:
@@ -2523,11 +2572,11 @@ def _iterative_proposal_sampling(
             final_proposal_log_densities,
             final_fitted_params,
         ) = _fit_and_sample_vmf_mixture_proposal(
-            current_samples,
+            final_fit_samples,
             final_rng,
             n_forward_samples,
             proposal_params,
-            current_weights,
+            final_fit_weights,
         )
         kappas_str = ", ".join(
             f"{float(k):.6f}" for k in np.asarray(final_fitted_params.kappas)
