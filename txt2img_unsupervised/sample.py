@@ -494,6 +494,7 @@ def two_stage_sample_loop(
     temperature=1.0,
     force_f32=True,
     n_flow_steps=100,
+    flow_batch_size=None,
 ):
     """Two-stage sampling pipeline that uses a function-weighted flow model to generate CLIP
     embeddings constrained to caps, then uses an image model to generate codes, then decodes with an
@@ -506,7 +507,7 @@ def two_stage_sample_loop(
         flow_params: Parameters for the FunctionWeightedFlowModel (on CPU)
         ae_mdl: LDMAutoencoder instance
         ae_params: Parameters for the LDMAutoencoder (on CPU)
-        batch_size: Batch size for processing
+        batch_size: Batch size for transformer and autoencoder stages
         cap_centers: Array of cap centers [n_imgs, 768]
         max_cos_distances: Array of max cosine distances [n_imgs]
         rng: JAX random key
@@ -515,6 +516,7 @@ def two_stage_sample_loop(
         temperature: Temperature for transformer sampling
         force_f32: Whether to force float32 precision for transformer
         n_flow_steps: Number of ODE integration steps for flow model
+        flow_batch_size: Batch size for flow model sampling (defaults to batch_size)
 
     Returns:
         List of PIL images
@@ -539,6 +541,11 @@ def two_stage_sample_loop(
 
     # Stage 1: Generate CLIP embeddings using flow model
     print("Stage 1: Generating CLIP embeddings with flow model...")
+
+    # Determine effective flow batch size
+    flow_batch_size_effective = (
+        batch_size if flow_batch_size is None else flow_batch_size
+    )
 
     # Put flow model parameters on GPU
     devices = mesh_utils.create_device_mesh((jax.device_count(),))
@@ -590,7 +597,7 @@ def two_stage_sample_loop(
                     cap_keys[cap_idx],
                     n_backward_samples=32,
                     n_forward_samples=4 * n_samples_for_cap,  # 4x rule of thumb
-                    batch_size=batch_size,  # Internal processing batch size
+                    batch_size=flow_batch_size_effective,
                 )
 
                 if samples.shape[0] < n_samples_for_cap:
@@ -602,7 +609,7 @@ def two_stage_sample_loop(
                 for i, img_idx in enumerate(img_indices):
                     generated_clip_embeddings[img_idx] = jax.device_get(samples[i])
 
-                print(f"Cap {cap_idx} ESS: {float(ess):.1f}")
+                tqdm.write(f"Cap {cap_idx} ESS: {float(ess):.1f}")
                 pbar.set_postfix(
                     {"n_imgs": n_samples_for_cap, "ESS": f"{float(ess):.1f}"}
                 )
@@ -612,8 +619,8 @@ def two_stage_sample_loop(
         # Use standard flow matching with cap info as weighting function params
         print("Using flow matching with CAP_INDICATOR weighting function")
 
-        # Process in batches
-        batches = batches_split(batch_size, n_imgs)
+        # Process in batches for flow model
+        batches = batches_split(flow_batch_size_effective, n_imgs)
 
         with tqdm(total=n_imgs, desc="flow sampling", unit="img") as pbar:
             ctr = 0
@@ -782,6 +789,12 @@ def main():
         type=int,
         default=100,
         help="Number of ODE integration steps for flow model",
+    )
+    parser.add_argument(
+        "--flow-batch-size",
+        type=int,
+        default=None,
+        help="Batch size for flow model sampling (defaults to --batch-size)",
     )
     parser.add_argument("transformer_checkpoint_dir", type=Path)
     parser.add_argument("autoencoder_checkpoint", type=Path)
@@ -996,6 +1009,7 @@ def main():
             ae_mdl=ae_mdl,
             ae_params=ae_params,
             batch_size=args.batch_size,
+            flow_batch_size=args.flow_batch_size,
             cap_centers=cap_centers,
             max_cos_distances=max_cos_distances,
             rng=rng,
