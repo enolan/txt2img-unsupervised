@@ -1,0 +1,172 @@
+
+\documentclass{article} % For LaTeX2e
+\usepackage{iclr2026_conference,times}
+
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{graphicx}
+
+
+\title{TODO FIX TITLE: Text-to-Image Models Need Not Train on Text}
+
+% Authors must not appear in the submitted version. They should be hidden
+% as long as the \iclrfinalcopy macro remains commented out below.
+% Non-anonymous submissions will be rejected without review.
+
+\author{Echo Nolan \\
+Independent Researcher \\
+\texttt{https://echonolan.net} \\
+\texttt{echo@echonolan.net} \\
+}
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to \LaTeX{} to determine where to break
+% the lines. Using \AND forces a linebreak at that point. So, if \LaTeX{}
+% puts 3 of 4 authors names on the first line, and the last on the second
+% line, try using \AND instead of \And before the third author name.
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+%\iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
+\begin{document}
+
+
+\maketitle
+
+\begin{abstract}
+We introduce Embedding Guided Content Generation (EGCG), a method for generating content in a domain
+using geometric constraints in embedding space rather than paired labeled data. EGCG combines a CNF
+that generates embeddings, a method of sampling from CNFs constrained to spherical caps - i.e.
+sampling from $P(x \mid x \cdot \mu \geq \cos(\theta))$ where $\mu$ and $\theta$ are chosen at
+inference time - and a model that generates content conditioned on those embeddings. When paired
+with CLIP, this enables training a text-to-image system using only images and their CLIP embeddings.
+At inference time, we compute CLIP text embeddings and use them as $\mu$ when sampling for our
+embedding generator, generating image embeddings near the text embedding. The embedding generator
+bridges the gap between the text and image embeddings' distributions, ensures embeddings fed to the
+content generator are always in-distribution, and allows for controlling diversity by adjusting the
+size of the spherical cap. Our key technical contribution is "backwards-forwards" sampling, a method
+of sampling from CNFs constrained to arbitrary regions that is practical in high dimensions such as
+CLIP's 768-dimensional embedding space.
+\end{abstract}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.8\textwidth]{star figure}
+\caption{The EGCG inference pipeline: target cap $\rightarrow$ image embeddings $\rightarrow$ images.}
+\label{fig:star}
+\end{figure}
+
+\section{Introduction}
+
+Text to image models are dope and cool. You gotta have labeled data to train them though. Except,
+psych, you don't! We introduce Embedding Guided Content Generation (EGCG), a kickass way to generate
+content in any domain for which you have useful embeddings. When applied to the domain of images,
+using a multimodal embedding model like CLIP \citep{radford2021learning}, this allows you to train a
+text-to-image model using only images and their embeddings. Without EGCG, you're either restricted
+to labeled data, or you're forced to use synthetic captions. Synthetic captions have led to great
+results, but have some theoretical disadvantages compared to EGCG, which we detail in
+Section~\ref{sec:syntheticcaptions}. We leave an empirical comparison to future work. This paper
+focuses on establishing the feasibility of EGCG and detailing the technical contributions.
+
+TODO: existing text-to-image models that don't use text in training data. CLIP guided diffusion?
+
+The inference pipeline is shown in Figure \ref{fig:star}. Our system is composed of two models. The
+first is an embedding generator - a flow matching model on $S^{767}$, trained on the embeddings of
+the images\footnote{EGCG is general to any domain for which there exist useful embeddings. For
+simplicity we mostly refer to images and CLIP in this paper, but you can mentally substitute any
+domain and embedding model you're interested in.} in our dataset. This is an unconditioned model
+trained on the full distribution of image embeddings. We use a special sampling procedure
+("backwards-forwards" importance sampling) to sample from the distribution constrained to a
+spherical cap, i.e. from $P(x \mid x \cdot \mu \geq \cos(\theta))$. Second is an image generator - a
+decoder-only AR transformer paired with a VQGAN codebook, trained on images conditioned on their
+embeddings. Spherical flow matching and backwards-forwards importance sampling are the core technical
+contributions of this paper, the image generator includes nothing novel.
+
+Inference proceeds by first choosing a CLIP embedding to use as $\mu$. CLIP's multimodal embedding
+design puts images' embeddings and the embedings of captions those images are likely to have close
+together as measured by cosine similarity. Since cosine similarity is the metric, we can normalize
+all embeddings to unit norm without losing information, and since CLIP's embedding dimension is 768,
+our normalized embeddings lie on $S^{767}$. For text-to-image prompting, $\mu$ is the text embedding
+of our prompt.\footnote{Image-to-image prompting is also possible, using the embedding of an image
+prompt.} $\theta$ is the radius of spherical cap, and controls the diversity of outputs - larger
+$\theta$ means the generated embeddings don't have to match the prompt as well. Once we've chosen
+$\mu$ and $\theta$, we sample from the embedding generator using backwards-forwards, then sample
+from the image generator conditioned on the generated embedding.
+
+TODO cite transformer and VQGAN. I think it's taming transformers?
+
+The closest comparison to this pipeline is unCLIP
+\citep{ramesh2022hierarchicaltextconditionalimagegeneration}. unCLIP's pipeline also involves two
+models, with the first generating image embeddings and the second generating images from image
+embeddings. However, in unCLIP, the first model generates image embeddings conditioned on text
+embeddings (TODO check details), and is trained on paired text and image embeddings, whereas our
+first model generates image embeddings conditioned only on their location on the sphere.
+
+\section{Why you need an embedding generator}
+
+The distribution of image embeddings is substantially different from the distribution of text
+embeddings. The embedding generator acts as an adapter between the two distributions. It also allows
+for "broadening", while holding output embeddings in-distribution. TODO: show that using text
+embeddings directly sux0rz and using image embeddings directly is over-precise.
+
+\section{The Embedding Generator}
+Our embedding generator is a flow matching\citep{lipman2023flowmatchinggenerativemodeling} model on
+$S^{767}$.\footnote{Or, for other embedding functions with a cosine similarity metric, $S^{d-1}$
+where $d$ is the embedding dimension. Embeddings with other metrics would use different kinds of
+CNFs, but backwards-forwards should work with minor modifications.} TODO describe flow matching,
+extending it to the sphere, cite the riemannian flow matching paper.
+
+\subsection{Flow Matching on $S^n$}
+
+Geodesics yo. Also the model architecture.
+
+\subsection{Backwards-Forwards Importance Sampling}
+
+Back dat function up!
+
+\section{Experiments}
+
+\subsection{Embedding Generator}
+TODO
+
+\subsection{Image Generator}
+TODO
+
+\subsection{Ablation Studies}
+TODO
+
+\section{Discussion}
+
+TODO
+
+\section{Synthetic Captions}
+\label{sec:syntheticcaptions}
+
+TODO
+
+\section{Conclusion}
+
+Lorem ipsum summarizing contributions and impact.
+
+\subsubsection*{Acknowledgments}
+My cat is nice.
+
+\subsubsection*{LLM Usage}
+This work, especially the math, would not have been possible without the help of LLMs. TODO more
+detail.
+
+\bibliography{text_to_image_no_text}
+\bibliographystyle{text_to_image_no_text}
+
+\appendix
+\section{Appendix}
+You may include other additional sections here.
+
+
+\end{document}

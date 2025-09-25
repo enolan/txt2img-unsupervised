@@ -9,3 +9,4 @@ __pycache__/
 /test-images/examples-100.pq
 /wandb/
 /.infinidata_tmp
+/paper/build/
