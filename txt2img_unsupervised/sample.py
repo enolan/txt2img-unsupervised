@@ -30,6 +30,9 @@ from typing import List, Tuple, Union
 from . import flow_matching, ldm_autoencoder
 from .function_weighted_flow_model import (
     FunctionWeightedFlowModel,
+    ProposalDistribution,
+    VmfProposalParams,
+    VmfMixtureProposalParams,
     WeightingFunction,
     sample_from_cap_backwards_forwards,
 )
@@ -598,7 +601,8 @@ def two_stage_sample_loop(
                     n_backward_samples=32,
                     n_forward_samples=4 * n_samples_for_cap,  # 4x rule of thumb
                     batch_size=flow_batch_size_effective,
-                    vmf_mixture_components=4,
+                    proposal_distribution=ProposalDistribution.VMF_MIXTURE,
+                    proposal_params=VmfMixtureProposalParams(),
                 )
 
                 if samples.shape[0] < n_samples_for_cap:

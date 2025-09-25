@@ -77,6 +77,30 @@ class WeightingFunction(Enum):
     """
 
 
+class ProposalDistribution(Enum):
+    """The family of proposal distributions for backwards-forwards sampling."""
+
+    VMF = "vmf"
+    """Single von Mises-Fisher distribution fitted to pre-image points."""
+
+    VMF_MIXTURE = "vmf_mixture"
+    """Mixture of von Mises-Fisher distributions fitted to pre-image points."""
+
+
+@dataclass(frozen=True)
+class VmfProposalParams:
+    """Parameters for single vMF proposal distribution."""
+
+    pass
+
+
+@dataclass(frozen=True)
+class VmfMixtureProposalParams:
+    """Parameters for vMF mixture proposal distribution."""
+
+    n_components: int
+
+
 @dataclass(frozen=True)
 class CapIndicatorExtraParams:
     """
@@ -1892,6 +1916,62 @@ def compute_nll(
     )
 
 
+def _fit_and_sample_vmf_proposal(
+    pre_image_points: jax.Array,
+    proposal_rng: jax.Array,
+    n_forward_samples: int,
+    params: VmfProposalParams,
+) -> Tuple[jax.Array, jax.Array, Tuple[jax.Array, float]]:
+    """Fit single vMF proposal and sample from it.
+
+    Returns:
+        Tuple of (proposal_samples, proposal_log_densities, fitted_params)
+        where fitted_params is (mu, kappa)
+    """
+    vmf_mu, vmf_kappa = vmf.fit(pre_image_points)
+    fitted_params = (vmf_mu, vmf_kappa)
+    proposal_samples = vmf.sample(proposal_rng, vmf_mu, vmf_kappa, n_forward_samples)
+    proposal_log_densities = _compute_vmf_proposal_log_density(proposal_samples, fitted_params)
+    return proposal_samples, proposal_log_densities, fitted_params
+
+
+def _fit_and_sample_vmf_mixture_proposal(
+    pre_image_points: jax.Array,
+    proposal_rng: jax.Array,
+    n_forward_samples: int,
+    params: VmfMixtureProposalParams,
+) -> Tuple[jax.Array, jax.Array, vmf_mixture.VmfMixture]:
+    """Fit vMF mixture proposal and sample from it.
+
+    Returns:
+        Tuple of (proposal_samples, proposal_log_densities, fitted_mixture)
+    """
+    fit_rng, sample_rng = jax.random.split(proposal_rng)
+    mixture, _ = vmf_mixture.fit(
+        pre_image_points, n_components=params.n_components, key=fit_rng
+    )
+    kappas_str = ", ".join(f"{float(k):.6f}" for k in np.asarray(mixture.kappas))
+    weights_str = ", ".join(f"{float(w):.6f}" for w in np.asarray(mixture.weights))
+    proposal_samples = vmf_mixture.sample(sample_rng, mixture, n_forward_samples)
+    proposal_log_densities = _compute_vmf_mixture_proposal_log_density(proposal_samples, mixture)
+    return proposal_samples, proposal_log_densities, mixture
+
+
+def _compute_vmf_proposal_log_density(
+    samples: jax.Array, fitted_params: Tuple[jax.Array, float]
+) -> jax.Array:
+    """Compute log density of samples under fitted vMF proposal."""
+    vmf_mu, vmf_kappa = fitted_params
+    return vmf.log_prob(samples, vmf_mu, vmf_kappa)
+
+
+def _compute_vmf_mixture_proposal_log_density(
+    samples: jax.Array, fitted_mixture: vmf_mixture.VmfMixture
+) -> jax.Array:
+    """Compute log density of samples under fitted vMF mixture proposal."""
+    return vmf_mixture.log_prob(samples, fitted_mixture)
+
+
 def sample_from_cap_backwards_forwards(
     model,
     params,
@@ -1902,7 +1982,8 @@ def sample_from_cap_backwards_forwards(
     n_backward_samples: int = 32,
     n_forward_samples: int = 128,
     batch_size: int = None,
-    vmf_mixture_components: int = 1,
+    proposal_distribution: ProposalDistribution = ProposalDistribution.VMF,
+    proposal_params: Union[VmfProposalParams, VmfMixtureProposalParams] = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """
     Sample from a cap-conditioned distribution using CNF backwards-forwards method.
@@ -1911,7 +1992,7 @@ def sample_from_cap_backwards_forwards(
     cap-conditioned sampling by:
     1. Sampling points uniformly from the target cap
     2. Finding their pre-image points via reverse CNF integration
-    3. Fitting a vMF distribution (or mixture) to the pre-image points
+    3. Fitting a proposal distribution to the pre-image points
     4. Sampling from the fitted proposal and flowing forward through the CNF
     5. Resampling with importance weights and rejecting points outside the cap
 
@@ -1920,10 +2001,11 @@ def sample_from_cap_backwards_forwards(
         params: Model parameters
         cap_center: Unit vector defining cap center, shape (domain_dim,)
         cap_d_max: Maximum cosine distance for the cap (0 to 2)
-        n_backward_samples: Number of samples to draw from cap for fitting vMF
+        n_backward_samples: Number of samples to draw from cap for fitting proposal
         n_forward_samples: Number of samples to draw forward. Some will be rejected.
-        batch_size: Batch size for processing (if None, uses n_cap_samples)
-        vmf_mixture_components: Number of mixture components for the proposal (1 = single vMF)
+        batch_size: Batch size for processing (if None, uses n_backward_samples)
+        proposal_distribution: Family of proposal distribution to use
+        proposal_params: Parameters for the proposal distribution family
 
     Returns:
         - samples: Array of shape (n_in_cap_samples, domain_dim) containing samples from
@@ -1945,8 +2027,27 @@ def sample_from_cap_backwards_forwards(
     if batch_size is None:
         batch_size = min(n_backward_samples, 256)
 
-    if vmf_mixture_components < 1:
-        raise ValueError("vmf_mixture_components must be at least 1")
+    # Set default proposal parameters
+    if proposal_params is None:
+        if proposal_distribution == ProposalDistribution.VMF:
+            proposal_params = VmfProposalParams()
+        elif proposal_distribution == ProposalDistribution.VMF_MIXTURE:
+            proposal_params = VmfMixtureProposalParams(n_components=2)
+        else:
+            raise ValueError(f"Unknown proposal distribution: {proposal_distribution}")
+
+    # Validate proposal_params matches proposal_distribution
+    if proposal_distribution == ProposalDistribution.VMF and not isinstance(
+        proposal_params, VmfProposalParams
+    ):
+        raise ValueError("proposal_distribution VMF requires VmfProposalParams")
+    elif (
+        proposal_distribution == ProposalDistribution.VMF_MIXTURE
+        and not isinstance(proposal_params, VmfMixtureProposalParams)
+    ):
+        raise ValueError(
+            "proposal_distribution VMF_MIXTURE requires VmfMixtureProposalParams"
+        )
 
     # Step 1: Sample points uniformly from the cap
     cap_rng, reverse_rng, proposal_rng, forward_rng, resample_rng = jax.random.split(
@@ -1994,37 +2095,48 @@ def sample_from_cap_backwards_forwards(
     assert pre_image_points.shape == (n_backward_samples, model.domain_dim)
 
     # Step 3: Fit proposal distribution to pre-image points
-    if vmf_mixture_components <= 1:
-        vmf_mu, vmf_kappa = vmf.fit(pre_image_points)
-        pre_image_log_probs = vmf.log_prob(pre_image_points, vmf_mu, vmf_kappa)
-        pre_image_nll = -jnp.mean(pre_image_log_probs)
-        print(
-            f"Fitted vMF kappa: {float(vmf_kappa):.6f}; "
-            f"pre-image NLL: {float(pre_image_nll):.6f}"
+    if proposal_distribution == ProposalDistribution.VMF:
+        (
+            proposal_samples,
+            proposal_log_densities,
+            fitted_params,
+        ) = _fit_and_sample_vmf_proposal(
+            pre_image_points, proposal_rng, n_forward_samples, proposal_params
         )
-        proposal_samples = vmf.sample(
-            proposal_rng, vmf_mu, vmf_kappa, n_forward_samples
+        pre_image_log_probs = _compute_vmf_proposal_log_density(
+            pre_image_points, fitted_params
         )
-        proposal_log_densities = vmf.log_prob(proposal_samples, vmf_mu, vmf_kappa)
-    else:
-        fit_rng, sample_rng = jax.random.split(proposal_rng)
-        mixture, _ = vmf_mixture.fit(
-            pre_image_points, n_components=vmf_mixture_components, key=fit_rng
+        vmf_mu, vmf_kappa = fitted_params
+        fit_summary = f"Fitted vMF kappa: {float(vmf_kappa):.6f}"
+    elif proposal_distribution == ProposalDistribution.VMF_MIXTURE:
+        (
+            proposal_samples,
+            proposal_log_densities,
+            fitted_params,
+        ) = _fit_and_sample_vmf_mixture_proposal(
+            pre_image_points, proposal_rng, n_forward_samples, proposal_params
         )
-        kappas_str = ", ".join(f"{float(k):.6f}" for k in np.asarray(mixture.kappas))
-        weights_str = ", ".join(f"{float(w):.6f}" for w in np.asarray(mixture.weights))
-        pre_image_log_probs = vmf_mixture.log_prob(pre_image_points, mixture)
-        pre_image_nll = -jnp.mean(pre_image_log_probs)
-        print(
+        pre_image_log_probs = _compute_vmf_mixture_proposal_log_density(
+            pre_image_points, fitted_params
+        )
+        kappas_str = ", ".join(
+            f"{float(k):.6f}" for k in np.asarray(fitted_params.kappas)
+        )
+        weights_str = ", ".join(
+            f"{float(w):.6f}" for w in np.asarray(fitted_params.weights)
+        )
+        fit_summary = (
             "Fitted vMF mixture kappas: "
-            f"[{kappas_str}] weights: [{weights_str}]; "
-            f"pre-image NLL: {float(pre_image_nll):.6f}"
+            f"[{kappas_str}] weights: [{weights_str}]"
         )
-        proposal_samples = vmf_mixture.sample(sample_rng, mixture, n_forward_samples)
-        proposal_log_densities = vmf_mixture.log_prob(proposal_samples, mixture)
+    else:
+        raise ValueError(f"Unknown proposal distribution: {proposal_distribution}")
 
     assert proposal_samples.shape == (n_forward_samples, model.domain_dim)
     assert proposal_log_densities.shape == (n_forward_samples,)
+
+    pre_image_nll = -jnp.mean(pre_image_log_probs)
+    print(f"{fit_summary}; pre-image NLL: {float(pre_image_nll):.6f}")
 
     # Flow samples forward through CNF in batches
     forward_samples = []
@@ -2208,6 +2320,73 @@ def test_cap_conditioned_cnf_sampling_edge_cases():
         print(
             f"Small cap test: generated {small_cap_samples.shape[0]} samples, avg distance: {jnp.mean(cos_distances):.4f}"
         )
+
+
+@pytest.mark.usefixtures("starts_with_progressbar")
+def test_cap_conditioned_cnf_sampling_new_interface():
+    """Test the new proposal distribution interface for cap-conditioned sampling."""
+    # Create a simple model
+    model = FunctionWeightedFlowModel(
+        domain_dim=3,
+        reference_directions=None,
+        time_dim=16,
+        use_pre_mlp_projection=True,
+        n_layers=2,
+        d_model=64,
+        mlp_expansion_factor=2,
+        mlp_dropout_rate=None,
+        input_dropout_rate=None,
+        weighting_function=WeightingFunction.CONSTANT,
+        weighting_function_extra_params=None,
+        base_distribution=BaseDistribution.SPHERE,
+    )
+
+    rng = jax.random.PRNGKey(42)
+    params = model.init(rng, *model.dummy_inputs())
+
+    cap_center = jnp.array([1.0, 0.0, 0.0])
+    cap_d_max = 0.5
+
+    # Test VMF proposal distribution explicitly
+    vmf_samples, vmf_ess = sample_from_cap_backwards_forwards(
+        model=model,
+        params=params,
+        cap_center=cap_center,
+        cap_d_max=cap_d_max,
+        n_backward_samples=30,
+        n_forward_samples=50,
+        rng=jax.random.PRNGKey(123),
+        proposal_distribution=ProposalDistribution.VMF,
+        proposal_params=VmfProposalParams(),
+    )
+
+    assert vmf_samples.shape[1] == 3
+    assert vmf_samples.shape[0] > 0
+    cos_distances_vmf = 1 - jnp.dot(vmf_samples, cap_center)
+    assert jnp.all(cos_distances_vmf <= cap_d_max + 1e-6)
+
+    # Test VMF mixture proposal distribution
+    vmf_mixture_samples, vmf_mixture_ess = sample_from_cap_backwards_forwards(
+        model=model,
+        params=params,
+        cap_center=cap_center,
+        cap_d_max=cap_d_max,
+        n_backward_samples=30,
+        n_forward_samples=50,
+        rng=jax.random.PRNGKey(456),
+        proposal_distribution=ProposalDistribution.VMF_MIXTURE,
+        proposal_params=VmfMixtureProposalParams(n_components=2),
+    )
+
+    assert vmf_mixture_samples.shape[1] == 3
+    assert vmf_mixture_samples.shape[0] > 0
+    cos_distances_mixture = 1 - jnp.dot(vmf_mixture_samples, cap_center)
+    assert jnp.all(cos_distances_mixture <= cap_d_max + 1e-6)
+
+    print(f"VMF: {vmf_samples.shape[0]} samples, ESS: {float(vmf_ess):.1f}")
+    print(
+        f"VMF mixture: {vmf_mixture_samples.shape[0]} samples, ESS: {float(vmf_mixture_ess):.1f}"
+    )
 
 
 # Create FunctionWeightedFlowModel-specific training loop using partial application
