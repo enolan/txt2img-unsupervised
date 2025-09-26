@@ -2420,6 +2420,7 @@ class Tsit5Settings:
     # Shrinking batch optimization
     enable_shrinking_batch: bool = True  # Enable batch size reduction optimization
     min_batch_size: int = 32  # Don't reduce batch size below this threshold
+    min_shrink_iters: int = 10  # Minimum iterations between batch size shrinks
     reuse_divergence_start: bool = True  # Reuse divergence at interval boundaries
 
 
@@ -2594,6 +2595,7 @@ def _tsit5_integrate_core(
     max_iters = settings.max_iterations
     iter_executed = 0  # Total work units
     actual_iterations = 0  # Actual iteration count
+    iterations_since_last_shrink = 0  # iterations since last batch size shrink
 
     # Progress tracking
     current_extreme_t = 0.0 if forward else 1.0
@@ -2646,6 +2648,7 @@ def _tsit5_integrate_core(
             )
             iter_executed += current_batch_size
             actual_iterations += 1
+            iterations_since_last_shrink += 1
 
             # Update per-trajectory iteration counts for all trajectories in current batch
             # We do computational work for all trajectories in the batch, not just live ones
@@ -2659,12 +2662,20 @@ def _tsit5_integrate_core(
             )
             new_extreme_t = min_t if forward else max_t
 
-            # Shrink to live count rounded up to next multiple of 128 (respecting minimum)
-            # Only shrink if shrinking batch optimization is enabled
-            residue = live_count % 128
-            if settings.enable_shrinking_batch:
+            # Shrinking the batch size is a relatively expensive operation: it involves a potential
+            # recompile and filtering the data down. But it also speeds progress up substantially
+            # by reducing wasted work on trajectories that are already complete. So we try to
+            # balance the two by:
+            # * shrink to live count rounded up to next multiple of 32 (respecting minimum)
+            # * only shrinking if shrinking batch optimization is enabled and minimum iterations
+            # have passed
+            residue = live_count % 32
+            if (
+                settings.enable_shrinking_batch
+                and iterations_since_last_shrink >= settings.min_shrink_iters
+            ):
                 new_batch_size = max(
-                    live_count + (128 - residue if residue > 0 else 0)
+                    live_count + (32 - residue if residue > 0 else 0)
                     if live_count > 0
                     else settings.min_batch_size,
                     settings.min_batch_size,
@@ -2744,6 +2755,7 @@ def _tsit5_integrate_core(
                     )
 
                 current_batch_size = new_batch_size
+                iterations_since_last_shrink = 0
 
             # Update progress bar based on slowest sample
             if forward:
