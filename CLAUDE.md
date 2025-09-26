@@ -50,8 +50,8 @@ model that generates embeddings is a spherical flow matching model with optimal 
   ```
   notice how the second version gives you exactly the same information as the first, but it's one
   line shorter.
-- NEVER write comments that only explain changes. The purpose of comments is to explain the code as
-  it is, not explain changes that the reader can't even see.
+- Comments should be "timeless". They should describe the code as it is, and never refer anything
+  as "new" or "old". Remember, your code may be read years in the future.
 - NEVER silently ignore exceptions. If there's no valid reason for an exception to be thrown - e.g.
   if the exception indicates a bug in the code that throws the exception, or some unrecoverable
   broken state - then it should NOT be caught, and allowed to propagate up and end program
@@ -78,6 +78,10 @@ model that generates embeddings is a spherical flow matching model with optimal 
   fallback code that shouldn't ever run. If whatever it is doesn't exist, allow the code to throw
   an exception or otherwise error out. "Defensive" programming that only serves to hide bugs is
   bullshit. This principle applies in general, not just to exceptions or missing keys or attributes.
+  This includes numerical issues. If a function expects a value to be within some range, and passing
+  a value outside that range is a bug, we should NOT clamp. It is correct for the code that
+  *produces* a value to clamp, if it could end up out of range due to numerics, but not for code
+  that recevives a value from a caller.
 - Prefer functional code with minimal state. Small, independent functions that have a clear purpose
   are easier to understand and test.
 - When state is necessary, use classes to manage it. Use dataclasses where they make sense.
@@ -153,9 +157,10 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
   - Run all tests in a file: `poetry run pytest -vs txt2img_unsupervised/path/to/file.py`.
     Potentially pretty slow depending on the file.
   - Run all tests: `./test.sh`. Very slow!
-- Running code with the `python` interpreter:
-  - `poetry run python txt2img_unsupervised/path/to/file.py`
-  - `poetry run python -m txt2img_unsupervised.path.to.file`
+- Running code with the `python` interpreter: if you try to use the `python` interpreter directly,
+  you won't have access to the dependencies! Always use `poetry run`:
+  - `poetry run python path/to/file.py`
+  - `poetry run python -m txt2img_unsupervised.module_name`
   - `poetry run python -c 'print("Hello, Claude!")'`
 - Code formatting: `poetry run black *.py txt2img_unsupervised/*.py`
 
