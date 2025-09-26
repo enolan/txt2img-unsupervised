@@ -202,6 +202,11 @@ class FunctionWeightedFlowModel(nn.Module):
     # Base distribution type for sampling x0
     base_distribution: BaseDistribution = BaseDistribution.SPHERE
 
+    # Encoding method for cap conditioning: if true use the direction of the cap center from x, the
+    # distance from x to the cap center, and the half angle of the cap. If false, use the absolute
+    # position of the cap center and d_max.
+    relative_cap_encoding: bool = False
+
     @property
     def conditioning_dim(self) -> int:
         if self.weighting_function == WeightingFunction.CONSTANT:
@@ -210,11 +215,20 @@ class FunctionWeightedFlowModel(nn.Module):
             WeightingFunction.CAP_INDICATOR,
             WeightingFunction.SMOOTHED_CAP_INDICATOR,
         ]:
-            return (
-                self.reference_directions
-                if self.reference_directions
-                else self.domain_dim
-            ) + 1
+            if self.relative_cap_encoding:
+                # direction (domain_dim or reference_directions) + distance (1) + half_angle (1)
+                return (
+                    self.reference_directions
+                    if self.reference_directions
+                    else self.domain_dim
+                ) + 2
+            else:
+                # cap_center (domain_dim or reference_directions) + d_max (1)
+                return (
+                    self.reference_directions
+                    if self.reference_directions
+                    else self.domain_dim
+                ) + 1
         elif self.weighting_function == WeightingFunction.VMF_DENSITY:
             return NotImplementedError(
                 "VMF density weighting function not implemented yet."
@@ -413,7 +427,7 @@ class FunctionWeightedFlowModel(nn.Module):
         return self.mk_vector_field().scale_lr(lr)
 
     def process_weighting_function_params(
-        self, cond_vecs: jax.Array, cond_scalars: jax.Array
+        self, cond_vecs: jax.Array, cond_scalars: jax.Array, x: jax.Array
     ) -> jax.Array:
         """
         Convert weighting-function parameters to the model's conditioning vector. In principle,
@@ -423,6 +437,7 @@ class FunctionWeightedFlowModel(nn.Module):
         Args:
             cond_vecs: Unit vectors in R^{domain_dim} (cap center / direction parameter).
             cond_scalars: Scalars in [0, 2] representing d_max (maximum cosine distance).
+            x: Current position vectors in R^{domain_dim}.
 
         Returns:
             Conditioning vectors of shape `(batch, conditioning_dim)` with approximately mean 0 and
@@ -442,39 +457,133 @@ class FunctionWeightedFlowModel(nn.Module):
             WeightingFunction.SMOOTHED_CAP_INDICATOR,
         ], f"process_weighting_function_params called with unsupported weighting function: {self.weighting_function}"
 
-        # Encode the direction parameter to match how inputs are encoded, then scale to unit variance.
-        # - If using reference directions, project onto them and scale by sqrt(domain_dim) so that
-        #   each component has variance ~1 for isotropic inputs.
-        # - Otherwise, pass through coordinates scaled by sqrt(domain_dim).
-        if self.reference_directions is not None:
-            # [ref_dirs, domain_dim] <- reference vectors; produce [ref_dirs]
-            dir_features = (
-                cond_vecs @ self.vector_field.reference_vectors.T
-            ) * jnp.sqrt(self.domain_dim)
+        assert x.shape == (batch_size, self.domain_dim), f"x.shape: {x.shape}"
+
+        if self.relative_cap_encoding:
+            # Relative encoding: direction from x toward cap center, distance from x to cap center,
+            # cap half angle.
+
+            def taylor_arccos(x: jax.Array) -> jax.Array:
+                # 7th order Taylor approximation of arccos. Actual arccos's derivative goes to
+                # infinity at x = ±1, which breaks divergence calculation and makes integration
+                # hard in general. This keeps the derivative finite and of reasonable magnitude.
+                # It's close to actual arccos across most of the range and isomorphic to it, so it
+                # should be basically as good.
+                x2 = x * x
+                x3 = x2 * x
+                x5 = x3 * x2
+                x7 = x5 * x2
+                return (
+                    jnp.pi / 2 - x - x3 / 6.0 - (3.0 / 40.0) * x5 - (5.0 / 112.0) * x7
+                )
+
+            # Compute direction from x toward cap center (cap_center - x is wrong for sphere)
+            # On sphere, we want the tangent direction at x pointing toward cap_center
+            # This is: cap_center - (x · cap_center) * x (unnormalized to avoid singularity)
+            dot_product = jnp.sum(x * cond_vecs, axis=1, keepdims=True)
+            direction_to_cap = cond_vecs - dot_product * x
+
+            # Compute geodesic distance from x to cap center
+            cosine_similarity = jnp.clip(dot_product[:, 0], -1.0, 1.0)
+            geodesic_distance = taylor_arccos(cosine_similarity)
+
+            # Compute cap half angle from d_max
+            half_angle = taylor_arccos(1.0 - cond_scalars)
+            assert half_angle.shape == (batch_size,)
+
+            if self.reference_directions is not None:
+                dir_features = (
+                    direction_to_cap @ self.vector_field.reference_vectors.T
+                ) * jnp.sqrt(self.domain_dim)
+            else:
+                dir_features = direction_to_cap * jnp.sqrt(self.domain_dim)
+            assert dir_features.shape == (
+                batch_size,
+                self.reference_directions
+                if self.reference_directions
+                else self.domain_dim,
+            )
+
+            # Normalize the scalar features to be vaguely unit scale. Probably good enough.
+            # Assume (incorrectly) that distances are drawn from U[0, pi]
+            # for correct normalization this should take into account d_max_dist
+            uniform_0_pi_mean = jnp.pi / 2
+            uniform_0_pi_var = jnp.pi**2 / 12
+            distance_features = (geodesic_distance - uniform_0_pi_mean) / jnp.sqrt(
+                uniform_0_pi_var
+            )
+            assert distance_features.shape == (batch_size,)
+
+            # Assume (also incorrectly) that half angles are drawn from U[0, pi]
+            # for correct normalization this should take into account domain_dim and the base
+            # distribution.
+            half_angle_features = (half_angle - uniform_0_pi_mean) / jnp.sqrt(
+                uniform_0_pi_var
+            )
+            assert half_angle_features.shape == (batch_size,)
+
+            processed_cond_vecs = jnp.concatenate(
+                [
+                    dir_features,
+                    distance_features[:, None],
+                    half_angle_features[:, None],
+                ],
+                axis=1,
+            )
+            expected_shape = (
+                batch_size,
+                (
+                    self.reference_directions
+                    if self.reference_directions
+                    else self.domain_dim
+                )
+                + 2,
+            )
         else:
-            dir_features = cond_vecs * jnp.sqrt(self.domain_dim)
-        assert dir_features.shape == (
-            batch_size,
-            self.conditioning_dim - 1,
-        ), f"dir_features.shape: {dir_features.shape}"
+            # Absolute encoding: cap center + d_max
+            # Encode the direction parameter to match how inputs are encoded, then scale to unit variance.
+            # - If using reference directions, project onto them and scale by sqrt(domain_dim) so that
+            #   each component has variance ~1 for isotropic inputs.
+            # - Otherwise, pass through coordinates scaled by sqrt(domain_dim).
+            if self.reference_directions is not None:
+                # [ref_dirs, domain_dim] <- reference vectors; produce [ref_dirs]
+                dir_features = (
+                    cond_vecs @ self.vector_field.reference_vectors.T
+                ) * jnp.sqrt(self.domain_dim)
+            else:
+                dir_features = cond_vecs * jnp.sqrt(self.domain_dim)
 
-        # Normalize d_max scalars using the training distribution specified by d_max_dist
-        weights, range_starts, range_ends = process_d_max_dist(
-            self.weighting_function_extra_params.d_max_dist
-        )
-        component_means = (range_starts + range_ends) / 2.0
-        component_vars = (range_ends - range_starts) ** 2 / 12.0
-        mixture_mean = jnp.sum(weights * component_means)
-        mixture_var = jnp.sum(
-            weights * (component_vars + (component_means - mixture_mean) ** 2)
-        )
-        mixture_std = jnp.sqrt(mixture_var)
+            # Normalize d_max scalars using the training distribution specified by d_max_dist
+            weights, range_starts, range_ends = process_d_max_dist(
+                self.weighting_function_extra_params.d_max_dist
+            )
+            component_means = (range_starts + range_ends) / 2.0
+            component_vars = (range_ends - range_starts) ** 2 / 12.0
+            mixture_mean = jnp.sum(weights * component_means)
+            mixture_var = jnp.sum(
+                weights * (component_vars + (component_means - mixture_mean) ** 2)
+            )
+            mixture_std = jnp.sqrt(mixture_var)
 
-        scalar_features = (cond_scalars - mixture_mean) / mixture_std
-        scalar_features = scalar_features[:, None]
-        assert scalar_features.shape == (batch_size, 1)
+            scalar_features = (cond_scalars - mixture_mean) / mixture_std
+            scalar_features = scalar_features[:, None]
 
-        processed_cond_vecs = jnp.concatenate([dir_features, scalar_features], axis=1)
+            processed_cond_vecs = jnp.concatenate(
+                [dir_features, scalar_features], axis=1
+            )
+            expected_shape = (
+                batch_size,
+                (
+                    self.reference_directions
+                    if self.reference_directions
+                    else self.domain_dim
+                )
+                + 1,
+            )
+
+        assert (
+            processed_cond_vecs.shape == expected_shape
+        ), f"processed_cond_vecs.shape: {processed_cond_vecs.shape}, expected: {expected_shape}"
         assert processed_cond_vecs.shape == (batch_size, self.conditioning_dim)
         return processed_cond_vecs
 
@@ -497,7 +606,7 @@ class FunctionWeightedFlowModel(nn.Module):
             assert cond_scalars.shape == (batch_size,)
 
             cond_vecs_for_inner_model = self.process_weighting_function_params(
-                cond_vecs, cond_scalars
+                cond_vecs, cond_scalars, x
             )
             assert cond_vecs_for_inner_model.shape == (
                 batch_size,
@@ -842,8 +951,9 @@ def test_fwfm_base_distribution_sampling(base_distribution, domain_dim):
         [(0.45, 0.8), (0.45, 1.2), (0.1, 2.0)],  # Triangular distribution
     ],
 )
+@pytest.mark.parametrize("relative_cap_encoding", [False, True])
 def test_process_weighting_function_params(
-    domain_dim, reference_directions, d_max_dist
+    domain_dim, reference_directions, d_max_dist, relative_cap_encoding
 ):
     "Verify that process_weighting_function_params returns normalized vectors of the right shape."
 
@@ -867,13 +977,13 @@ def test_process_weighting_function_params(
         input_dropout_rate=None,
         weighting_function=WeightingFunction.CAP_INDICATOR,
         weighting_function_extra_params=extra_params,
+        relative_cap_encoding=relative_cap_encoding,
     )
 
     params = model.init(jax.random.PRNGKey(0), *model.dummy_inputs())
 
     # Generate a batch of unit vectors and d_max values, the former uniformly distributed and the
     # latter from the same d_max training distribution used by the model.
-    table = LogitsTable(2, 8192)
     n = 8192
     rng = jax.random.PRNGKey(20250820)
     d_max_rng, unit_vec_rng = jax.random.split(rng, 2)
@@ -892,9 +1002,16 @@ def test_process_weighting_function_params(
 
     unit_vecs = sample_sphere(unit_vec_rng, n, model.domain_dim)
 
+    # Generate x positions for relative encoding test
+    x_positions = sample_sphere(jax.random.PRNGKey(0), n, model.domain_dim)
+
     # Process to conditioning vectors
     processed = model.apply(
-        params, unit_vecs, d_maxes, method=model.process_weighting_function_params
+        params,
+        unit_vecs,
+        d_maxes,
+        x_positions,
+        method=model.process_weighting_function_params,
     )
     assert processed.shape == (n, model.conditioning_dim)
 
@@ -903,8 +1020,16 @@ def test_process_weighting_function_params(
     stds = processed_np.std(axis=0)
 
     # Check approximately zero-mean and unit-std per component
-    np.testing.assert_allclose(means, 0.0, atol=0.05, rtol=0)
-    np.testing.assert_allclose(stds, 1.0, atol=0.05, rtol=0)
+    if relative_cap_encoding:
+        # For relative encoding, normalization is inexact.
+        assert jnp.all(jnp.abs(means) < 1.0), f"Means too large: {means}"
+        assert jnp.all(stds > 0.25) and jnp.all(
+            stds < 1.5
+        ), f"Stds out of reasonable range: {stds}"
+    else:
+        # Original encoding should have proper statistical normalization
+        np.testing.assert_allclose(means, 0.0, atol=0.05, rtol=0)
+        np.testing.assert_allclose(stds, 1.0, atol=0.05, rtol=0)
 
 
 def generate_samples(
