@@ -481,7 +481,9 @@ class FunctionWeightedFlowModel(nn.Module):
             dot_product = jnp.sum(x * cond_vecs, axis=1, keepdims=True)
             direction_to_cap = cond_vecs - dot_product * x
             assert direction_to_cap.shape == (batch_size, self.domain_dim)
-            direction_to_cap = direction_to_cap / (jnp.linalg.norm(direction_to_cap, axis=1, keepdims=True) + 0.01)
+            direction_to_cap = direction_to_cap / (
+                jnp.linalg.norm(direction_to_cap, axis=1, keepdims=True) + 0.01
+            )
 
             # Compute geodesic distance from x to cap center
             cosine_similarity = jnp.clip(dot_product[:, 0], -1.0, 1.0)
