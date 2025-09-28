@@ -477,11 +477,11 @@ class FunctionWeightedFlowModel(nn.Module):
                     jnp.pi / 2 - x - x3 / 6.0 - (3.0 / 40.0) * x5 - (5.0 / 112.0) * x7
                 )
 
-            # Compute direction from x toward cap center (cap_center - x is wrong for sphere)
-            # On sphere, we want the tangent direction at x pointing toward cap_center
-            # This is: cap_center - (x · cap_center) * x (unnormalized to avoid singularity)
+            # Compute direction from x toward cap center
             dot_product = jnp.sum(x * cond_vecs, axis=1, keepdims=True)
             direction_to_cap = cond_vecs - dot_product * x
+            assert direction_to_cap.shape == (batch_size, self.domain_dim)
+            direction_to_cap = direction_to_cap / (jnp.linalg.norm(direction_to_cap, axis=1, keepdims=True) + 0.01)
 
             # Compute geodesic distance from x to cap center
             cosine_similarity = jnp.clip(dot_product[:, 0], -1.0, 1.0)
