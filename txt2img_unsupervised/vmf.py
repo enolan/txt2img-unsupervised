@@ -1,5 +1,6 @@
 """von Mises-Fisher distributions in JAX."""
 
+from functools import partial
 from typing import Optional, Tuple
 
 import jax
@@ -115,6 +116,7 @@ def log_prob(x: Array, mu: Array, kappa: float) -> Array:
     return log_c + kappa * dot_product
 
 
+@partial(jax.jit, static_argnames=("n_samples",), inline=True)
 def sample(key: random.PRNGKey, mu: Array, kappa: float, n_samples: int) -> Array:
     """Sample from von Mises-Fisher distribution using Wood's algorithm.
 
@@ -127,16 +129,23 @@ def sample(key: random.PRNGKey, mu: Array, kappa: float, n_samples: int) -> Arra
     Returns:
         Samples from vMF distribution, shape (n_samples, d)
     """
+    assert jnp.issubdtype(
+        mu.dtype, jnp.floating
+    ), f"mu must have float dtype, got {mu.dtype}"
+    assert jnp.issubdtype(
+        kappa, jnp.floating
+    ), f"kappa must have float dtype, got {kappa.dtype}"
+
     dim = mu.shape[-1]
 
     # Ensure mu is unit vector
     mu = mu / jnp.linalg.norm(mu)
 
-    if kappa == 0.0:
-        # Uniform distribution on sphere
-        return _sample_uniform_sphere(key, dim, n_samples)
-
-    return _sample_wood(key, mu, kappa, n_samples)
+    return jax.lax.cond(
+        kappa == 0.0,
+        lambda: _sample_uniform_sphere(key, dim, n_samples),
+        lambda: _sample_wood(key, mu, kappa, n_samples),
+    )
 
 
 def _sample_uniform_sphere(key: random.PRNGKey, dim: int, n_samples: int) -> Array:
@@ -186,9 +195,9 @@ def _sample_w_wood(
         kappa_arr = jnp.asarray(kappa)
         dim_arr = jnp.asarray(dim, dtype=kappa_arr.dtype)
         alpha = 0.5 * (dim_arr - 1.0)
-        b = (
-            -2.0 * kappa_arr + jnp.sqrt(4.0 * kappa_arr**2 + (dim_arr - 1.0) ** 2)
-        ) / (dim_arr - 1.0)
+        b = (dim_arr - 1.0) / (
+            jnp.sqrt(4.0 * kappa_arr**2 + (dim_arr - 1.0) ** 2) + 2.0 * kappa_arr
+        )
         x0 = (1.0 - b) / (1.0 + b)
         c = kappa_arr * x0 + (dim_arr - 1.0) * jnp.log(1.0 - x0 * x0)
 
