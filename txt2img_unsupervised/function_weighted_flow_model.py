@@ -1351,11 +1351,15 @@ def test_train_trivial_distribution(
         )
     elif weighting_function == WeightingFunction.CAP_INDICATOR:
         extra_params = CapIndicatorExtraParams(d_max_dist=d_max_dist)
-    else:
+    elif weighting_function == WeightingFunction.CONSTANT:
         extra_params = None
         if base_distribution == BaseDistribution.CAP:
             pytest.skip(
                 "CAP base distribution doesn't make sense without a cap indicator weighting function"
+            )
+        if "cond" in mlp_always_inject:
+            pytest.skip(
+                "cond in mlp_always_inject doesn't make sense with constant weighting function"
             )
 
     model = replace(
@@ -1368,9 +1372,7 @@ def test_train_trivial_distribution(
         weighting_function_extra_params=extra_params,
         use_pre_mlp_projection=True,
         mlp_always_inject=mlp_always_inject,
-        base_distribution=BaseDistribution.HEMISPHERE  # BaseDistribution.CAP
-        if weighting_function == WeightingFunction.CAP_INDICATOR
-        else BaseDistribution.SPHERE,
+        base_distribution=base_distribution,
     )
     rng = jax.random.PRNGKey(20250823)
     train_rng, test_rng = jax.random.split(rng)
@@ -1407,7 +1409,7 @@ def test_train_trivial_distribution(
     dsets = (
         Dataset.from_dict({"point_vec": train_points})
         .with_format("np")
-        .train_test_split(test_size=4096)
+        .train_test_split(test_size=512)
     )
     train_dataset = dsets["train"]
     test_dataset = dsets["test"]

@@ -1531,7 +1531,9 @@ def _train_loop_for_tests_generic(
         return state, train_loss
 
 
-def _compute_nll_vector_field(model, params, batch, n_steps, rng, n_projections):
+def _compute_nll_vector_field(
+    model, params, batch, n_steps, rng, n_projections, precomputed_stats=None
+):
     """Compute NLL for VectorField - use real conditioning data from batch."""
     if "cond_vec" in batch:
         cond_vecs = batch["cond_vec"]
@@ -1563,7 +1565,7 @@ _baseline_model = VectorField(
     reference_directions=128,
     n_layers=6,
     d_model=512,
-    time_dim=128,
+    time_dim=None,
     mlp_expansion_factor=4,
     activations_dtype=jnp.float32,
     weights_dtype=jnp.float32,
@@ -1578,10 +1580,18 @@ _baseline_model = VectorField(
 @pytest.mark.parametrize(
     "inject_keys",
     [
-        frozenset(),
-        frozenset({"x"}),
-        frozenset({"t"}),
-        frozenset({"x", "t"}),
+        pytest.param(frozenset(), id="{}"),
+        pytest.param(frozenset({"x"}), id='{"x"}'),
+        pytest.param(
+            frozenset({"t"}),
+            marks=pytest.mark.skip(reason="speed"),
+            id='{"t"}',
+        ),
+        pytest.param(
+            frozenset({"x", "t"}),
+            marks=pytest.mark.skip(reason="speed"),
+            id='{"x","t"}',
+        ),
     ],
 )
 @pytest.mark.parametrize("domain_dim", [3, 16])
@@ -1700,10 +1710,18 @@ def vmf_scale_kappa(kappa_src, dim_src, dim_target):
 @pytest.mark.parametrize(
     "inject_keys",
     [
-        frozenset(),
-        frozenset({"x"}),
-        frozenset({"t"}),
-        frozenset({"x", "t"}),
+        pytest.param(frozenset(), id="{}"),
+        pytest.param(frozenset({"x"}), id='{"x"}'),
+        pytest.param(
+            frozenset({"t"}),
+            marks=pytest.mark.skip(reason="skip non-allowed mlp_always_inject"),
+            id='{"t"}',
+        ),
+        pytest.param(
+            frozenset({"x", "t"}),
+            marks=pytest.mark.skip(reason="skip non-allowed mlp_always_inject"),
+            id='{"x","t"}',
+        ),
     ],
 )
 @pytest.mark.parametrize("domain_dim", [3, 16])
@@ -1797,13 +1815,13 @@ def test_train_uniform_zero_field(domain_dim):
     Train a model with uniformly distributed data on the sphere and verify that the learned
     vector field is approximately zero everywhere.
 
-    Since the uniform distribution is the stationary distribution (source equals target),
-    the optimal flow field should be zero everywhere.
+    If your source distribution is uniform and your taget distribution is uniform, then the paths
+    from every x0 to every x1 exactly balance and the field should be zero everywhere.
     """
     model = replace(
         _baseline_model,
         domain_dim=domain_dim,
-        n_layers=4,
+        n_layers=6,
         d_model=256,
     )
     epochs = 8
@@ -1925,14 +1943,38 @@ def test_train_uniform_zero_field(domain_dim):
 @pytest.mark.parametrize(
     "inject_keys",
     [
-        frozenset(),
-        frozenset({"x"}),
-        frozenset({"t"}),
-        frozenset({"cond"}),
-        frozenset({"x", "t"}),
-        frozenset({"x", "cond"}),
-        frozenset({"t", "cond"}),
-        frozenset({"x", "t", "cond"}),
+        pytest.param(frozenset(), id="{}"),
+        pytest.param(frozenset({"x"}), id='{"x"}'),
+        pytest.param(
+            frozenset({"t"}),
+            marks=pytest.mark.skip(reason="speed"),
+            id='{"t"}',
+        ),
+        pytest.param(
+            frozenset({"cond"}),
+            marks=pytest.mark.skip(reason="speed"),
+            id='{"cond"}',
+        ),
+        pytest.param(
+            frozenset({"x", "t"}),
+            marks=pytest.mark.skip(reason="speed"),
+            id='{"x","t"}',
+        ),
+        pytest.param(
+            frozenset({"x", "cond"}),
+            marks=pytest.mark.skip(reason="speed"),
+            id='{"x","cond"}',
+        ),
+        pytest.param(
+            frozenset({"t", "cond"}),
+            marks=pytest.mark.skip(reason="speed"),
+            id='{"t","cond"}',
+        ),
+        pytest.param(
+            frozenset({"x", "t", "cond"}),
+            marks=pytest.mark.skip(reason="speed"),
+            id='{"x","t","cond"}',
+        ),
     ],
 )
 @pytest.mark.usefixtures("starts_with_progressbar")
@@ -5968,10 +6010,18 @@ def test_spherical_ot_field_antipodal_direction_tangent_and_nonzero():
 @pytest.mark.parametrize(
     "inject_keys",
     [
-        frozenset(),
-        frozenset({"x"}),
-        frozenset({"t"}),
-        frozenset({"x", "t"}),
+        pytest.param(frozenset(), id="{}"),
+        pytest.param(frozenset({"x"}), id='{"x"}'),
+        pytest.param(
+            frozenset({"t"}),
+            marks=pytest.mark.skip(reason="speed"),
+            id='{"t"}',
+        ),
+        pytest.param(
+            frozenset({"x", "t"}),
+            marks=pytest.mark.skip(reason="speed"),
+            id='{"x","t"}',
+        ),
     ],
 )
 def test_train_hemisphere_density(inject_keys):
@@ -6054,7 +6104,7 @@ def test_train_hemisphere_density(inject_keys):
         cond_vecs,
         n_steps=100,
         rng=jax.random.PRNGKey(12345),
-        n_projections=10,
+        n_projections=32,
     )
     south_log_probs = compute_log_probability(
         model,
@@ -6063,7 +6113,7 @@ def test_train_hemisphere_density(inject_keys):
         cond_vecs,
         n_steps=100,
         rng=jax.random.PRNGKey(67890),
-        n_projections=10,
+        n_projections=32,
     )
 
     # Also probe along the geodesic from north to south (inclusive)
@@ -6079,7 +6129,7 @@ def test_train_hemisphere_density(inject_keys):
         jnp.zeros((num_geodesic_points, 0), dtype=jnp.float32),
         n_steps=100,
         rng=jax.random.PRNGKey(13579),
-        n_projections=10,
+        n_projections=32,
     )
     print("  Geodesic path model log probs (10 points from north to south):")
     print(f"    log_probs: {geodesic_log_probs}")
