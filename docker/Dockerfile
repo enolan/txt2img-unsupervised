@@ -22,7 +22,7 @@ RUN pyenv install 3.11.13 && pyenv global 3.11.13
 
 ADD fish-pyenv.fish /root/.config/fish/conf.d/fish-pyenv.fish
 
-RUN pip install poetry
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 ADD setup-repo.sh /root/setup-repo.sh
 ADD get-dataset.sh /root/get-dataset.sh

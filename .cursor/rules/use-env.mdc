@@ -1,0 +1,9 @@
+---
+alwaysApply: true
+description: How to use the proper environment when running commands.
+globs:
+---
+In order to run commands with access to installed Python packages and CUDA, you need to use a Nix
+virtual environment and possibly uv.
+Run all commands with: nix run /home/enolan/mystuff/code/pip-shell-flake -- $COMMAND
+Run commands that need Python stuff with: nix run /home/enolan/mystuff/code/pip-shell-flake -- uv run $COMMAND

@@ -149,20 +149,20 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
   * `txt2img_unsupervised/training_infra.py`. Common infrastructure code for training models.
 
 ## Build/Test/Lint Commands
-- Setup: `poetry sync --with dev,cuda`
+- Setup: `uv sync --group dev --group cuda`
 - Tests:
   - This is a machine learning project, which means there are lots of slow tests. Try to run only
     the tests that could be affected by your changes.
-  - Run a single test: `poetry run pytest -vs txt2img_unsupervised/path/to/test.py::test_function`
-  - Run all tests in a file: `poetry run pytest -vs txt2img_unsupervised/path/to/file.py`.
+  - Run a single test: `uv run pytest -vs txt2img_unsupervised/path/to/test.py::test_function`
+  - Run all tests in a file: `uv run pytest -vs txt2img_unsupervised/path/to/file.py`.
     Potentially pretty slow depending on the file.
   - Run all tests: `./test.sh`. Very slow!
 - Running code with the `python` interpreter: if you try to use the `python` interpreter directly,
-  you won't have access to the dependencies! Always use `poetry run`:
-  - `poetry run python path/to/file.py`
-  - `poetry run python -m txt2img_unsupervised.module_name`
-  - `poetry run python -c 'print("Hello, Claude!")'`
-- Code formatting: `poetry run black *.py txt2img_unsupervised/*.py`
+  you won't have access to the dependencies! Always use `uv run`:
+  - `uv run python path/to/file.py`
+  - `uv run python -m txt2img_unsupervised.module_name`
+  - `uv run python -c 'print("Hello, Claude!")'`
+- Code formatting: `uv run black *.py txt2img_unsupervised/*.py`
 
 ## JAX-specific reminders
 - Pay attention to the special requirements for traced JAX functions:
