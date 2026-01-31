@@ -117,13 +117,18 @@ def log_prob(x: Array, mu: Array, kappa: float) -> Array:
 
 
 @partial(jax.jit, static_argnames=("n_samples",), inline=True)
-def sample(key: random.PRNGKey, mu: Array, kappa: float, n_samples: int) -> Array:
+def sample(key: random.PRNGKey, mu: Array, kappa, n_samples: int) -> Array:
     """Sample from von Mises-Fisher distribution using Wood's algorithm.
+
+    Supports two modes:
+    - Unbatched: mu shape (d,), kappa scalar -> (n_samples, d) samples from single distribution
+    - Batched: mu shape (n_samples, d), kappa shape (n_samples,) -> (n_samples, d) samples,
+      one from each distribution
 
     Args:
         key: JAX random key
-        mu: Mean direction on unit sphere, shape (d,)
-        kappa: Concentration parameter (>= 0)
+        mu: Mean direction(s) on unit sphere, shape (d,) or (n_samples, d)
+        kappa: Concentration parameter(s) (>= 0), scalar or shape (n_samples,)
         n_samples: Number of samples to generate
 
     Returns:
@@ -132,119 +137,128 @@ def sample(key: random.PRNGKey, mu: Array, kappa: float, n_samples: int) -> Arra
     assert jnp.issubdtype(
         mu.dtype, jnp.floating
     ), f"mu must have float dtype, got {mu.dtype}"
-    assert jnp.issubdtype(
-        kappa, jnp.floating
-    ), f"kappa must have float dtype, got {kappa.dtype}"
 
-    dim = mu.shape[-1]
+    if mu.ndim == 1:
+        # Unbatched: broadcast to batched format
+        dim = mu.shape[0]
+        mu = mu / jnp.linalg.norm(mu)
+        mu = jnp.broadcast_to(mu, (n_samples, dim))
+        kappa = jnp.full((n_samples,), kappa)
+    elif mu.ndim == 2:
+        # Batched case: n_samples (mu, kappa) pairs
+        batch_size, dim = mu.shape
+        kappa = jnp.asarray(kappa)
+        assert batch_size == n_samples, (
+            f"mu batch size ({batch_size}) must match n_samples ({n_samples})"
+        )
+        assert kappa.shape == (n_samples,), (
+            f"kappa must have shape ({n_samples},), got {kappa.shape}"
+        )
+        mu = mu / jnp.linalg.norm(mu, axis=1, keepdims=True)
+    else:
+        raise ValueError(f"mu must be 1D or 2D, got {mu.ndim}D")
 
-    # Ensure mu is unit vector
-    mu = mu / jnp.linalg.norm(mu)
+    return _sample_wood_batched(key, mu, kappa, dim)
 
-    return jax.lax.cond(
-        kappa == 0.0,
-        lambda: _sample_uniform_sphere(key, dim, n_samples),
-        lambda: _sample_wood(key, mu, kappa, n_samples),
+
+def _sample_wood_batched(
+    key: random.PRNGKey, mu: Array, kappa: Array, dim: int
+) -> Array:
+    """Sample from batched vMF distributions (one sample per distribution).
+
+    Args:
+        key: JAX random key
+        mu: Mean directions, shape (n, d), assumed already normalized
+        kappa: Concentration parameters, shape (n,)
+        dim: Dimension of the sphere
+
+    Returns:
+        Samples, shape (n, d)
+    """
+    n = mu.shape[0]
+
+    key_w, key_v = random.split(key)
+    keys_w = random.split(key_w, n)
+
+    # Sample w for each (key, kappa) pair
+    w = jax.vmap(lambda k, kap: _sample_w_single(k, kap, dim))(keys_w, kappa)
+
+    # Sample v and project perpendicular to each mu
+    v_full = random.normal(key_v, (n, dim))
+    mu_component = jnp.sum(v_full * mu, axis=1, keepdims=True)
+    v_orthogonal = v_full - mu_component * mu
+    v_orthogonal = v_orthogonal / jnp.maximum(
+        jnp.linalg.norm(v_orthogonal, axis=1, keepdims=True), 1e-8
     )
 
-
-def _sample_uniform_sphere(key: random.PRNGKey, dim: int, n_samples: int) -> Array:
-    """Sample uniformly from unit sphere."""
-    # Sample from standard normal and normalize
-    samples = random.normal(key, (n_samples, dim))
-    norms = jnp.linalg.norm(samples, axis=-1, keepdims=True)
-    return samples / norms
-
-
-def _sample_wood(key: random.PRNGKey, mu: Array, kappa: float, n_samples: int) -> Array:
-    """Sample using Wood's algorithm for vMF distribution."""
-    dim = mu.shape[-1]
-
-    key1, key2 = random.split(key)
-
-    # Sample w from the marginal distribution on [-1, 1]
-    w = _sample_w_wood(key1, kappa, dim, n_samples)
-
-    # Sample v uniformly from S^(d-2) and embed in orthogonal subspace to mu
-    # Generate random vector in full space
-    v_full = random.normal(key2, (n_samples, dim))
-
-    # Project out mu component and normalize
-    mu_component = jnp.sum(v_full * mu[None, :], axis=1, keepdims=True)
-    v_orthogonal = v_full - mu_component * mu[None, :]
-    v_orthogonal_norms = jnp.linalg.norm(v_orthogonal, axis=1, keepdims=True)
-    v_orthogonal = v_orthogonal / jnp.maximum(v_orthogonal_norms, 1e-8)
-
-    # Construct final samples: x = w * mu + sqrt(1 - w^2) * v_orthogonal
+    # Combine: x = w * mu + sqrt(1-w^2) * v_orthogonal
     sqrt_term = jnp.sqrt(jnp.maximum(1 - w**2, 0.0))
-    samples = w[..., None] * mu[None, :] + sqrt_term[..., None] * v_orthogonal
+    samples = w[:, None] * mu + sqrt_term[:, None] * v_orthogonal
 
-    # Normalize to ensure unit vectors (should already be close)
-    norms = jnp.linalg.norm(samples, axis=-1, keepdims=True)
-    return samples / jnp.maximum(norms, 1e-8)
+    # Normalize (should already be close to unit norm)
+    return samples / jnp.maximum(jnp.linalg.norm(samples, axis=1, keepdims=True), 1e-8)
 
 
-def _sample_w_wood(
-    key: random.PRNGKey, kappa: float, dim: int, n_samples: int
-) -> Array:
-    """Sample the longitudinal component using Wood's rejection sampler."""
+def _sample_w_single(key: random.PRNGKey, kappa: Array, dim: int) -> Array:
+    """Sample a single w value using Wood's rejection sampler.
 
-    keys = random.split(key, n_samples)
+    Args:
+        key: JAX random key
+        kappa: Concentration parameter (scalar array)
+        dim: Dimension of the sphere
 
-    def sample_single(single_key: random.PRNGKey) -> Array:
-        kappa_arr = jnp.asarray(kappa)
-        dim_arr = jnp.asarray(dim, dtype=kappa_arr.dtype)
-        alpha = 0.5 * (dim_arr - 1.0)
-        b = (dim_arr - 1.0) / (
-            jnp.sqrt(4.0 * kappa_arr**2 + (dim_arr - 1.0) ** 2) + 2.0 * kappa_arr
+    Returns:
+        Single w value in [-1, 1]
+    """
+    dim_arr = jnp.asarray(dim, dtype=kappa.dtype)
+    alpha = 0.5 * (dim_arr - 1.0)
+    b = (dim_arr - 1.0) / (
+        jnp.sqrt(4.0 * kappa**2 + (dim_arr - 1.0) ** 2) + 2.0 * kappa
+    )
+    x0 = (1.0 - b) / (1.0 + b)
+    c = kappa * x0 + (dim_arr - 1.0) * jnp.log(1.0 - x0 * x0)
+
+    def cond(state):
+        _, _, accepted, iterations, _ = state
+        not_finished = jnp.logical_not(accepted)
+        below_cap = iterations < _WOOD_MAX_ITERS
+        return jnp.logical_and(not_finished, below_cap)
+
+    def body(state):
+        key_inner, w_current, accepted, iterations, last_candidate = state
+        key_inner, key_z, key_u = random.split(key_inner, 3)
+        z = random.beta(key_z, alpha, alpha)
+        w_candidate = (1.0 - (1.0 + b) * z) / (1.0 - (1.0 - b) * z)
+        log_accept = (
+            kappa * w_candidate
+            + (dim_arr - 1.0) * jnp.log(1.0 - x0 * w_candidate)
+            - c
         )
-        x0 = (1.0 - b) / (1.0 + b)
-        c = kappa_arr * x0 + (dim_arr - 1.0) * jnp.log(1.0 - x0 * x0)
-
-        def cond(state):
-            _, _, accepted, iterations, _ = state
-            not_finished = jnp.logical_not(accepted)
-            below_cap = iterations < _WOOD_MAX_ITERS
-            return jnp.logical_and(not_finished, below_cap)
-
-        def body(state):
-            key_inner, w_current, accepted, iterations, last_candidate = state
-            key_inner, key_z, key_u = random.split(key_inner, 3)
-            z = random.beta(key_z, alpha, alpha)
-            w_candidate = (1.0 - (1.0 + b) * z) / (1.0 - (1.0 - b) * z)
-            log_accept = (
-                kappa_arr * w_candidate
-                + (dim_arr - 1.0) * jnp.log(1.0 - x0 * w_candidate)
-                - c
-            )
-            log_u = jnp.log(random.uniform(key_u))
-            accept = log_u <= log_accept
-            w_next = jnp.where(accept, w_candidate, w_current)
-            accepted_next = jnp.logical_or(accepted, accept)
-            return (
-                key_inner,
-                w_next,
-                accepted_next,
-                iterations + 1,
-                w_candidate,
-            )
-
-        dtype = jnp.asarray(kappa).dtype
-        init_state = (
-            single_key,
-            jnp.array(1.0, dtype=dtype),
-            jnp.array(False),
-            jnp.array(0, dtype=jnp.int32),
-            jnp.array(1.0, dtype=dtype),
+        log_u = jnp.log(random.uniform(key_u))
+        accept = log_u <= log_accept
+        w_next = jnp.where(accept, w_candidate, w_current)
+        accepted_next = jnp.logical_or(accepted, accept)
+        return (
+            key_inner,
+            w_next,
+            accepted_next,
+            iterations + 1,
+            w_candidate,
         )
 
-        _, w_final, accepted_final, _, last_candidate = jax.lax.while_loop(
-            cond, body, init_state
-        )
+    init_state = (
+        key,
+        jnp.array(1.0, dtype=kappa.dtype),
+        jnp.array(False),
+        jnp.array(0, dtype=jnp.int32),
+        jnp.array(1.0, dtype=kappa.dtype),
+    )
 
-        return jnp.where(accepted_final, w_final, last_candidate)
+    _, w_final, accepted_final, _, last_candidate = jax.lax.while_loop(
+        cond, body, init_state
+    )
 
-    return jax.vmap(sample_single)(keys)
+    return jnp.where(accepted_final, w_final, last_candidate)
 
 
 def fit(

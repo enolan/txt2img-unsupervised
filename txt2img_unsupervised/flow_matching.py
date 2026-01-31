@@ -1358,6 +1358,8 @@ def _train_loop_for_tests_generic(
     test_dataset=None,
     compute_nll_fn=None,
     precompute_test_stats_fn=None,
+    train_step_fn=None,
+    compute_batch_loss_fn=None,
 ):
     """
     Generic training loop for unit tests.
@@ -1372,12 +1374,20 @@ def _train_loop_for_tests_generic(
         compute_nll_fn: Function (model, params, batch, n_steps, rng, n_projections, precomputed_stats=None) -> nlls
         precompute_test_stats_fn: Optional function (model, params, rng, n_steps, n_projections) -> precomputed_stats
                                   Called once before test evaluation to compute expensive global statistics
+        train_step_fn: Function (model, state, batch, rng) -> (state, loss, grad_norm, rng).
+                       Defaults to flow_matching.train_step.
+        compute_batch_loss_fn: Function (model, params, batch, rng) -> loss.
+                               Defaults to flow_matching.compute_batch_loss.
 
     Returns:
         state: Final training state
         train_loss: Final training loss
         test_loss: Final test loss (if test_dataset provided)
     """
+    if train_step_fn is None:
+        train_step_fn = train_step
+    if compute_batch_loss_fn is None:
+        compute_batch_loss_fn = compute_batch_loss
     params_rng, step_rng = jax.random.split(jax.random.PRNGKey(7357), 2)
 
     # Calculate total number of steps
@@ -1417,7 +1427,7 @@ def _train_loop_for_tests_generic(
                 norms = jnp.linalg.norm(batch["point_vec"], axis=1, keepdims=True)
                 np.testing.assert_allclose(np.asarray(norms), 1.0, rtol=0, atol=1e-6)
 
-                state, train_loss, grad_norm, step_rng = train_step(
+                state, train_loss, grad_norm, step_rng = train_step_fn(
                     model, state, batch, step_rng
                 )
                 jax.tree.map(lambda x: x.copy_to_host_async(), (train_loss, grad_norm))
@@ -1426,9 +1436,8 @@ def _train_loop_for_tests_generic(
                 current_lr = cosine_schedule(step_count)
 
                 # Only compute NLL once per epoch (at the beginning) or on first step
-                if first_step or (i == 0):
+                if compute_nll_fn is not None and (first_step or (i == 0)):
                     step_rng, nll_rng = jax.random.split(step_rng)
-                    # Use model-specific function to compute NLL
                     train_nlls = compute_nll_fn(
                         model,
                         state.params,
@@ -1445,9 +1454,14 @@ def _train_loop_for_tests_generic(
                     epoch_train_nll = jax.device_get(epoch_train_nll)
 
                 if first_step:
-                    tqdm.write(
-                        f"First step loss: {train_loss:.6f}, grad norm: {grad_norm:.6f}, lr: {current_lr:.6f}, nll: {epoch_train_nll:.6f}"
-                    )
+                    if epoch_train_nll is not None:
+                        tqdm.write(
+                            f"First step loss: {train_loss:.6f}, grad norm: {grad_norm:.6f}, lr: {current_lr:.6f}, nll: {epoch_train_nll:.6f}"
+                        )
+                    else:
+                        tqdm.write(
+                            f"First step loss: {train_loss:.6f}, grad norm: {grad_norm:.6f}, lr: {current_lr:.6f}"
+                        )
                     first_step = False
                 pbar.set_postfix(
                     {
@@ -1482,37 +1496,41 @@ def _train_loop_for_tests_generic(
                         test_rng, 3
                     )
 
-                    batch_test_loss = compute_batch_loss(
+                    batch_test_loss = compute_batch_loss_fn(
                         model, state.params, test_batch, test_batch_rng
                     )
 
                     test_losses.append(batch_test_loss)
 
-                    # Use model-specific function to compute NLL
-                    test_nlls.append(
-                        compute_nll_fn(
-                            model,
-                            state.params,
-                            test_batch,
-                            n_steps=nll_steps,
-                            rng=test_nll_rng,
-                            n_projections=n_projections,
-                            precomputed_stats=precomputed_stats,
+                    if compute_nll_fn is not None:
+                        test_nlls.append(
+                            compute_nll_fn(
+                                model,
+                                state.params,
+                                test_batch,
+                                n_steps=nll_steps,
+                                rng=test_nll_rng,
+                                n_projections=n_projections,
+                                precomputed_stats=precomputed_stats,
+                            )
                         )
-                    )
 
                 if len(test_losses) > 0:
                     test_losses = jnp.asarray(test_losses)
                     avg_test_loss = jax.device_get(jnp.mean(test_losses))
                     final_test_loss = avg_test_loss
 
-                    test_nlls = jnp.concatenate(test_nlls)
-                    avg_test_nll = jax.device_get(jnp.mean(test_nlls))
-                    final_test_nll = avg_test_nll
-
-                    tqdm.write(
-                        f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Train NLL: {epoch_train_nll:.6f}, Grad Norm: {grad_norm:.6f}, Test Loss: {avg_test_loss:.6f}, Test NLL: {avg_test_nll:.6f}"
-                    )
+                    if len(test_nlls) > 0:
+                        test_nlls = jnp.concatenate(test_nlls)
+                        avg_test_nll = jax.device_get(jnp.mean(test_nlls))
+                        final_test_nll = avg_test_nll
+                        tqdm.write(
+                            f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Train NLL: {epoch_train_nll:.6f}, Grad Norm: {grad_norm:.6f}, Test Loss: {avg_test_loss:.6f}, Test NLL: {avg_test_nll:.6f}"
+                        )
+                    else:
+                        tqdm.write(
+                            f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Grad Norm: {grad_norm:.6f}, Test Loss: {avg_test_loss:.6f}"
+                        )
                 else:
                     tqdm.write(
                         f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Grad Norm: {grad_norm:.6f}, No test batches"
@@ -1526,7 +1544,10 @@ def _train_loop_for_tests_generic(
             dataset.shuffle(generator=np_rng)
 
     if test_dataset is not None:
-        return state, train_loss, final_test_loss, final_test_nll
+        if compute_nll_fn is not None:
+            return state, train_loss, final_test_loss, final_test_nll
+        else:
+            return state, train_loss, final_test_loss
     else:
         return state, train_loss
 
