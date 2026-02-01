@@ -7,14 +7,14 @@ This implementation adapts denoising diffusion models to the unit sphere using v
 
 ### Forward Process
 The forward process is Brownian motion on the sphere starting from clean data. At time t, the
-conditional distribution p_t(x|x_0) is approximately vMF centered at x_0 with concentration
+conditional distribution p_t(x|x_1) is approximately vMF centered at x_1 with concentration
 κ(t) = 1/σ²(t). (The true heat kernel on the sphere isn't exactly vMF, but vMF is a good
 approximation, especially at high concentration.)
 
 ### Score Function
-The score of the vMF distribution is ∇log p_t(x|x_0) = κ(t) · P_x(x_0), where P_x denotes
-projection onto the tangent space at x. This points toward x_0 along the geodesic, with magnitude
-κ(t) * sin(θ) where θ is the angle between x and x_0. Note: the magnitude is zero both at the mode
+The score of the vMF distribution is ∇log p_t(x|x_1) = κ(t) · P_x(x_1), where P_x denotes
+projection onto the tangent space at x. This points toward x_1 along the geodesic, with magnitude
+κ(t) * sin(θ) where θ is the angle between x and x_1. Note: the magnitude is zero both at the mode
 (θ=0) and at the antipode (θ=π), peaking at θ=π/2.
 
 ### Time Convention
@@ -109,28 +109,28 @@ def ode_coefficient(t: Array, schedule: NoiseSchedule) -> Array:
 
 
 def sample_noisy_point(
-    rng: Array, x_0: Array, t: Array, schedule: NoiseSchedule
+    rng: Array, x_1: Array, t: Array, schedule: NoiseSchedule
 ) -> Array:
-    """Sample x_t ~ vMF(x_0, κ(t)) for each (x_0, t) pair.
+    """Sample x_t ~ vMF(x_1, κ(t)) for each (x_1, t) pair.
 
     Args:
         rng: JAX random key
-        x_0: Clean data points [batch_size, dim]
+        x_1: Clean data points [batch_size, dim]
         t: Time values [batch_size]
         schedule: Noise schedule configuration
 
     Returns:
         Noisy samples x_t [batch_size, dim]
     """
-    assert x_0.ndim == 2
+    assert x_1.ndim == 2
     assert t.ndim == 1
-    assert x_0.shape[0] == t.shape[0]
+    assert x_1.shape[0] == t.shape[0]
 
-    batch_size = x_0.shape[0]
+    batch_size = x_1.shape[0]
     kappa_values = kappa(t, schedule)
 
     # Use vmf.sample's batched mode: mu (n, d), kappa (n,) -> (n, d)
-    return vmf.sample(rng, x_0, kappa_values, n_samples=batch_size)
+    return vmf.sample(rng, x_1, kappa_values, n_samples=batch_size)
 
 
 def tangent_projection(x: Array, v: Array) -> Array:
@@ -148,16 +148,16 @@ def tangent_projection(x: Array, v: Array) -> Array:
 
 
 def compute_target_score(
-    x_t: Array, x_0: Array, t: Array, schedule: NoiseSchedule
+    x_t: Array, x_1: Array, t: Array, schedule: NoiseSchedule
 ) -> Array:
-    """Compute the ground-truth score: κ(t) * P_{x_t}(x_0).
+    """Compute the ground-truth score: κ(t) * P_{x_t}(x_1).
 
-    The score of the vMF distribution p_t(x|x_0) is the gradient of log p_t with respect to x,
-    constrained to the tangent space. For vMF(μ=x_0, κ), this is κ * P_x(x_0).
+    The score of the vMF distribution p_t(x|x_1) is the gradient of log p_t with respect to x,
+    constrained to the tangent space. For vMF(μ=x_1, κ), this is κ * P_x(x_1).
 
     Args:
         x_t: Noisy points [batch_size, dim]
-        x_0: Clean data points [batch_size, dim]
+        x_1: Clean data points [batch_size, dim]
         t: Time values [batch_size]
         schedule: Noise schedule configuration
 
@@ -165,14 +165,14 @@ def compute_target_score(
         Target score vectors [batch_size, dim]
     """
     kappa_values = kappa(t, schedule)
-    projected = tangent_projection(x_t, x_0)
+    projected = tangent_projection(x_t, x_1)
     return kappa_values[:, None] * projected
 
 
 def denoising_score_matching_loss(
     model: VectorField,
     params,
-    x_0: Array,
+    x_1: Array,
     x_t: Array,
     t: Array,
     conditioning_data: Array,
@@ -181,16 +181,16 @@ def denoising_score_matching_loss(
 ) -> Array:
     """Compute MSE loss between predicted and target scaled score.
 
-    We train the network to predict the "scaled score" σ²(t) * s(x,t) = P_x(x_0),
+    We train the network to predict the "scaled score" σ²(t) * s(x,t) = P_x(x_1),
     which is bounded (magnitude ≤ 1) regardless of t. This avoids the issue where
-    the raw score κ(t) * P_x(x_0) can be very large when t→1.
+    the raw score κ(t) * P_x(x_1) can be very large when t→1.
 
     At sampling time, we recover the actual score by dividing by σ²(t).
 
     Args:
         model: Vector field model (outputs scaled score estimate)
         params: Model parameters
-        x_0: Clean data [batch_size, dim]
+        x_1: Clean data [batch_size, dim]
         x_t: Noisy samples [batch_size, dim]
         t: Times [batch_size]
         conditioning_data: Conditioning vectors [batch_size, cond_dim]
@@ -200,9 +200,9 @@ def denoising_score_matching_loss(
     Returns:
         Scalar loss value
     """
-    # Target is the scaled score: σ²(t) * score = σ²(t) * κ(t) * P_x(x_0) = P_x(x_0)
+    # Target is the scaled score: σ²(t) * score = σ²(t) * κ(t) * P_x(x_1) = P_x(x_1)
     # This is just the tangent projection, bounded in [-1, 1]
-    target_scaled_score = tangent_projection(x_t, x_0)
+    target_scaled_score = tangent_projection(x_t, x_1)
 
     rngs_dict = {"dropout": rng} if rng is not None else {}
     predicted_scaled_score = model.apply(
@@ -233,18 +233,18 @@ def compute_batch_loss(
     Returns:
         The computed loss value
     """
-    x_0 = batch["point_vec"]
-    batch_size = x_0.shape[0]
+    x_1 = batch["point_vec"]
+    batch_size = x_1.shape[0]
 
     noise_rng, time_rng = jax.random.split(rng)
 
     conditioning_data = batch.get("cond_vec", jnp.zeros((batch_size, 0)))
 
     t = jax.random.uniform(time_rng, (batch_size,))
-    x_t = sample_noisy_point(noise_rng, x_0, t, schedule)
+    x_t = sample_noisy_point(noise_rng, x_1, t, schedule)
 
     return denoising_score_matching_loss(
-        model, params, x_0, x_t, t, conditioning_data, schedule
+        model, params, x_1, x_t, t, conditioning_data, schedule
     )
 
 
@@ -424,41 +424,41 @@ def test_noise_schedule():
 
 
 def test_target_score_at_mode():
-    """Test that score is zero when x_t = x_0 (at the mode)."""
+    """Test that score is zero when x_t = x_1 (at the mode)."""
     schedule = NoiseSchedule()
 
-    # When x_t = x_0, the tangent projection P_{x_t}(x_0) = x_0 - (x_0·x_0)x_0 = 0
+    # When x_t = x_1, the tangent projection P_{x_t}(x_1) = x_1 - (x_1·x_1)x_1 = 0
     batch_size = 10
     dim = 3
     rng = jax.random.PRNGKey(42)
 
-    x_0 = sample_sphere(rng, batch_size, dim)
-    x_t = x_0  # Same point
+    x_1 = sample_sphere(rng, batch_size, dim)
+    x_t = x_1  # Same point
     t = jax.random.uniform(rng, (batch_size,))
 
-    target = compute_target_score(x_t, x_0, t, schedule)
+    target = compute_target_score(x_t, x_1, t, schedule)
 
     # Score should be zero (within numerical precision)
     np.testing.assert_allclose(target, 0.0, atol=1e-5)
 
 
 def test_target_score_direction():
-    """Test that score points toward x_0 in tangent space."""
+    """Test that score points toward x_1 in tangent space."""
     schedule = NoiseSchedule()
 
     batch_size = 100
     dim = 16
 
     key1, key2 = jax.random.split(jax.random.PRNGKey(123))
-    x_0 = sample_sphere(key1, batch_size, dim)
+    x_1 = sample_sphere(key1, batch_size, dim)
 
     t = jnp.full((batch_size,), 0.5)
-    x_t = sample_noisy_point(key2, x_0, t, schedule)
+    x_t = sample_noisy_point(key2, x_1, t, schedule)
 
-    target = compute_target_score(x_t, x_0, t, schedule)
+    target = compute_target_score(x_t, x_1, t, schedule)
 
-    # The geodesic direction from x_t toward x_0 is P_{x_t}(x_0) / ||P_{x_t}(x_0)||
-    geodesic_dir = tangent_projection(x_t, x_0)
+    # The geodesic direction from x_t toward x_1 is P_{x_t}(x_1) / ||P_{x_t}(x_1)||
+    geodesic_dir = tangent_projection(x_t, x_1)
     geodesic_dir_norm = jnp.linalg.norm(geodesic_dir, axis=1, keepdims=True)
 
     # For non-coincident points, check alignment
@@ -471,7 +471,7 @@ def test_target_score_direction():
 
         # Dot product should be positive (pointing in same direction)
         alignment = jnp.sum(geodesic_dir_unit * target_unit, axis=1)
-        assert jnp.all(alignment[nonzero_mask] > 0.99), "Score should point toward x_0"
+        assert jnp.all(alignment[nonzero_mask] > 0.99), "Score should point toward x_1"
 
 
 def test_sample_noisy_point():
@@ -482,28 +482,28 @@ def test_sample_noisy_point():
     dim = 3
 
     key1, key2, key3 = jax.random.split(jax.random.PRNGKey(456), 3)
-    x_0 = sample_sphere(key1, batch_size, dim)
+    x_1 = sample_sphere(key1, batch_size, dim)
     # With linear schedule: σ²(0.95) ≈ 0.1, so κ(0.95) ≈ 10
     t = jnp.full((batch_size,), 0.95)
 
-    x_t = sample_noisy_point(key2, x_0, t, schedule)
+    x_t = sample_noisy_point(key2, x_1, t, schedule)
 
     norms = jnp.linalg.norm(x_t, axis=1)
     np.testing.assert_allclose(norms, 1.0, rtol=1e-5)
 
-    similarities = jnp.sum(x_t * x_0, axis=1)
+    similarities = jnp.sum(x_t * x_1, axis=1)
     mean_similarity = jnp.mean(similarities)
     assert mean_similarity > 0.8, f"Mean similarity {mean_similarity} should be > 0.8"
 
     # Higher t = higher κ = more concentrated samples
     t_high = jnp.full((batch_size,), 0.99)
-    x_t_high = sample_noisy_point(key3, x_0, t_high, schedule)
-    similarities_high = jnp.sum(x_t_high * x_0, axis=1)
+    x_t_high = sample_noisy_point(key3, x_1, t_high, schedule)
+    similarities_high = jnp.sum(x_t_high * x_1, axis=1)
     mean_similarity_high = jnp.mean(similarities_high)
 
     assert (
         mean_similarity_high > mean_similarity
-    ), "Higher κ should give samples closer to x_0"
+    ), "Higher κ should give samples closer to x_1"
 
 
 def _train_loop_for_tests(
