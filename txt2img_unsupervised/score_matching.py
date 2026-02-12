@@ -110,6 +110,34 @@ def ode_coefficient(t: Array, schedule: NoiseSchedule) -> Array:
     return 0.5 * (schedule.sigma_sq_max - schedule.sigma_sq_min)
 
 
+def sample_t_log_uniform_kappa(
+    rng: Array, shape: tuple, schedule: NoiseSchedule
+) -> Array:
+    """Sample t so that κ(t) is log-uniformly distributed, giving density p(t) ∝ 1/σ²(t).
+
+    This partially compensates for the σ⁴(t) bias that the scaled score parameterization
+    introduces, without being as aggressive as full κ²-weighting (which concentrates
+    almost all training at t→1 where gradient signal is tiny).
+
+    Samples log(κ) ~ U[log(κ_min), log(κ_max)] where κ_min = 1/σ²_max and
+    κ_max = 1/σ²_min, then inverts to get t.
+
+    Args:
+        rng: JAX random key
+        shape: Shape of the output array
+        schedule: Noise schedule configuration
+
+    Returns:
+        Sampled t values with the given shape, in [0, 1]
+    """
+    u = jax.random.uniform(rng, shape)
+    s_min = schedule.sigma_sq_min
+    s_max = schedule.sigma_sq_max
+    # log(κ) ~ U[log(1/s_max), log(1/s_min)], so σ² = 1/κ is log-uniform on [s_min, s_max]
+    sigma_sq = s_min * (s_max / s_min) ** u
+    return (s_max - sigma_sq) / (s_max - s_min)
+
+
 def sample_noisy_point(
     rng: Array, x_1: Array, t: Array, schedule: NoiseSchedule
 ) -> Array:
@@ -244,7 +272,7 @@ def compute_batch_loss(
 
     conditioning_data = batch.get("cond_vec", jnp.zeros((batch_size, 0)))
 
-    t = jax.random.uniform(time_rng, (batch_size,))
+    t = sample_t_log_uniform_kappa(time_rng, (batch_size,), schedule)
     x_t = sample_noisy_point(noise_rng, x_1, t, schedule)
 
     return denoising_score_matching_loss(
@@ -516,6 +544,34 @@ def test_noise_schedule():
     # All coefficients should be equal to the expected constant
     np.testing.assert_allclose(coeffs, expected_coeff, rtol=1e-6)
     assert jnp.all(coeffs > 0), "ODE coefficient should be positive"
+
+
+def test_sample_t_log_uniform_kappa():
+    """Test that sample_t_log_uniform_kappa produces a log-uniform distribution over κ."""
+    schedule = NoiseSchedule(sigma_sq_min=0.01, sigma_sq_max=2.0)
+    n = 100_000
+    samples = sample_t_log_uniform_kappa(jax.random.PRNGKey(0), (n,), schedule)
+
+    # Output should be in [0, 1]
+    assert jnp.all(samples >= 0.0)
+    assert jnp.all(samples <= 1.0)
+
+    # CDF: F(t) = log(σ²_max / σ²(t)) / log(σ²_max / σ²_min)
+    # (equivalently, log(κ(t) / κ_min) / log(κ_max / κ_min))
+    s_min, s_max = schedule.sigma_sq_min, schedule.sigma_sq_max
+    log_ratio = jnp.log(s_max / s_min)
+    cdf = lambda t: jnp.log(s_max / sigma_squared(t, schedule)) / log_ratio
+    np.testing.assert_allclose(float(cdf(0.0)), 0.0, atol=1e-10)
+    np.testing.assert_allclose(float(cdf(1.0)), 1.0, atol=1e-10)
+
+    # KS test: compare empirical samples against the theoretical CDF
+    ks_stat, p_value = stats.kstest(
+        np.array(samples), lambda t: np.array(cdf(jnp.array(t)))
+    )
+    assert p_value > 0.01, f"KS test failed: stat={ks_stat:.4f}, p={p_value:.4f}"
+
+    # Samples should be skewed toward t=1 (low noise), but less extremely than κ²
+    assert jnp.mean(samples) > 0.5, "Samples should be skewed toward t=1"
 
 
 def test_target_score_at_mode():
@@ -805,8 +861,13 @@ def test_zero_init_uniform_nll(domain_dim):
     batch = {"point_vec": points}
 
     test_nlls = compute_nll(
-        model, state.params, batch, schedule,
-        n_steps=256, rng=jax.random.PRNGKey(99), n_projections=32,
+        model,
+        state.params,
+        batch,
+        schedule,
+        n_steps=256,
+        rng=jax.random.PRNGKey(99),
+        n_projections=32,
     )
     model_nll = float(jnp.mean(test_nlls))
     uniform_entropy = float(-sphere_log_inverse_surface_area(domain_dim))
