@@ -514,7 +514,7 @@ class VectorField(nn.Module):
             features=self.domain_dim,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
-            kernel_init=nn.initializers.normal(stddev=jnp.sqrt(hidden_init_variance)),
+            kernel_init=nn.initializers.zeros_init(),
         )
 
         # Used to encode the input unit vectors as a vector of dot products
@@ -677,10 +677,11 @@ class VectorField(nn.Module):
         tangent_outputs = points_out - dot_products * x
         assert tangent_outputs.shape == (batch_size, self.domain_dim)
 
-        # At initialization, we want the mean magnitude of our output vectors to be pi/2, since the
-        # average geodesic distance between 2 uniform random points on a sphere is pi/2. This should
-        # make our initial loss values reasonable. Without scaling, the initial loss values are
-        # gigantic - ~766 for 768d model. With it they're ~5.
+        # The output layer kernel is zero-initialized so the model starts by predicting zero
+        # velocity/score everywhere, implying a uniform distribution on the sphere. This gives
+        # optimal initial NLL and near-optimal initial MSE loss. The domain_scale_factor controls
+        # the gain of the output layer once training moves the kernel away from zero.
+        #
         # The tangent space projection of a d-dimensional Gaussian has magnitude following a chi
         # distribution with (d-1) degrees of freedom. The expectation is:
         # E[chi(k)] = sqrt(2) * Gamma((k+1)/2) / Gamma(k/2)
@@ -1844,134 +1845,24 @@ def test_train_vmf(domain_dim, inject_keys):
 
 
 @pytest.mark.parametrize("domain_dim", [3, 16])
-def test_train_uniform_zero_field(domain_dim):
-    """
-    Train a model with uniformly distributed data on the sphere and verify that the learned
-    vector field is approximately zero everywhere.
+def test_zero_init_uniform_nll(domain_dim):
+    """Verify that a freshly initialized model (zero-init output) gives correct uniform NLL."""
+    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2, d_model=32)
 
-    If your source distribution is uniform and your taget distribution is uniform, then the paths
-    from every x0 to every x1 exactly balance and the field should be zero everywhere.
-    """
-    model = replace(
-        _baseline_model,
-        domain_dim=domain_dim,
-        n_layers=6,
-        d_model=256,
+    params_rng, data_rng = jax.random.split(jax.random.PRNGKey(12345))
+    state = create_train_state(params_rng, model, 1e-3)
+
+    points = sample_sphere(data_rng, 256, domain_dim)
+    cond_vecs = jnp.zeros((256, 0))
+
+    log_probs = compute_log_probability(
+        model, state.params, points, cond_vecs,
+        n_steps=128, rng=jax.random.PRNGKey(99), n_projections=32,
     )
-    epochs = 8
-
-    batch_size = 512
-    n_samples = 50000
-
-    # Generate uniformly distributed points on the sphere
-    rng = jax.random.PRNGKey(12345)
-    data_rng, eval_rng, params_rng = jax.random.split(rng, 3)
-
-    points = sample_sphere(data_rng, n_samples, domain_dim)
-    dsets = (
-        Dataset.from_dict({"point_vec": points})
-        .with_format("np")
-        .train_test_split(test_size=512)
-    )
-    train_dset = dsets["train"]
-    test_dset = dsets["test"]
-
-    # Set up test points for evaluation (same for pre- and post-training)
-    n_test_points = 1000
-    test_rng, eval_rng = jax.random.split(eval_rng)
-    test_points = sample_sphere(eval_rng, n_test_points, domain_dim)
-    test_times = jax.random.uniform(
-        test_rng, (n_test_points,)
-    )  # Random times in [0, 1]
-    test_cond_vecs = jnp.zeros((n_test_points, 0))
-
-    def compute_and_print_field_stats(params, label):
-        field_values = model.apply(params, test_points, test_times, test_cond_vecs)
-        field_magnitudes = jnp.linalg.norm(field_values, axis=1)
-        mean_magnitude = jnp.mean(field_magnitudes)
-        std_magnitude = jnp.std(field_magnitudes)
-        max_magnitude = jnp.max(field_magnitudes)
-
-        print(f"{label} vector field statistics:")
-        print(f"  Mean magnitude: {mean_magnitude:.6f}")
-        print(f"  Std magnitude: {std_magnitude:.6f}")
-        print(f"  Max magnitude: {max_magnitude:.6f}")
-
-        return (
-            field_values,
-            field_magnitudes,
-            mean_magnitude,
-            std_magnitude,
-            max_magnitude,
-        )
-
-    # Initialize model and evaluate pre-training vector field
-    pre_train_state = create_train_state(params_rng, model, 1e-3)
-
-    # Pre-training evaluation
-    (
-        pre_field_values,
-        pre_field_magnitudes,
-        pre_mean_magnitude,
-        pre_std_magnitude,
-        pre_max_magnitude,
-    ) = compute_and_print_field_stats(pre_train_state.params, "Pre-training")
-
-    # Train the model (note: _train_loop_for_tests creates its own training state)
-    state, train_loss, test_loss, test_nll = _train_loop_for_tests(
-        model, train_dset, batch_size, 1e-3, epochs, test_dset
-    )
-
-    expected_nll = -sphere_log_inverse_surface_area(domain_dim)
-    print(
-        f"Final train loss: {train_loss:.6f}, final test loss: {test_loss:.6f}, final test nll: {test_nll:.6f}, expected nll: {expected_nll:.6f}"
-    )
-    np.testing.assert_allclose(test_nll, expected_nll, atol=1e-2, rtol=0)
-
-    # Post-training evaluation (same test points as pre-training)
-    (
-        post_field_values,
-        post_field_magnitudes,
-        post_mean_magnitude,
-        post_std_magnitude,
-        post_max_magnitude,
-    ) = compute_and_print_field_stats(state.params, "Post-training")
-    print(f"  Expected: ~0.0 (uniform distribution should have zero flow)")
-
-    # Compare pre- and post-training
-    fmt_delta = (
-        lambda label, pre, post: f"  {label} change: {pre:.6f} -> {post:.6f} (Δ = {post - pre:.6f})"
-    )
-    print(f"Training effect:")
-    print(fmt_delta("Mean magnitude", pre_mean_magnitude, post_mean_magnitude))
-    print(fmt_delta("Std magnitude", pre_std_magnitude, post_std_magnitude))
-    print(fmt_delta("Max magnitude", pre_max_magnitude, post_max_magnitude))
-
-    # Print some example field values
-    print(f"\nExample post-training field values at test points:")
-    for i in range(min(5, n_test_points)):
-        point = test_points[i]
-        field = post_field_values[i]
-        magnitude = post_field_magnitudes[i]
-
-        if domain_dim == 3:
-            point_str = f"[{point[0]:7.4f}, {point[1]:7.4f}, {point[2]:7.4f}]"
-            field_str = f"[{field[0]:7.4f}, {field[1]:7.4f}, {field[2]:7.4f}]"
-        else:
-            point_str = f"[{point[0]:7.4f}, {point[1]:7.4f}, {point[2]:7.4f}, ...]"
-            field_str = f"[{field[0]:7.4f}, {field[1]:7.4f}, {field[2]:7.4f}, ...]"
-
-        print(f"  Point: {point_str} -> Field: {field_str}, Magnitude: {magnitude:.6f}")
-
-    assert post_mean_magnitude < 0.1, (
-        f"Mean field magnitude {post_mean_magnitude:.6f} too large for uniform distribution "
-        f"(should be < 0.1)"
-    )
-
-    assert post_std_magnitude < 0.05, (
-        f"Std field magnitude {post_std_magnitude:.6f} too large for uniform distribution "
-        f"(should be < 0.05)"
-    )
+    model_nll = float(-jnp.mean(log_probs))
+    uniform_entropy = float(-sphere_log_inverse_surface_area(domain_dim))
+    print(f"Model NLL: {model_nll:.4f}, uniform entropy: {uniform_entropy:.4f}")
+    np.testing.assert_allclose(model_nll, uniform_entropy, atol=1e-2, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -4848,115 +4739,6 @@ def create_mollweide_projection_figure(samples, title=None):
     if title is not None:
         ax.set_title(title)
     return fig
-
-
-@pytest.mark.parametrize("domain_dim", [2, 3, 8, 16, 32, 768])
-def test_vector_field_output_magnitude_statistics(domain_dim):
-    """
-    Test that measures the magnitude statistics of VectorField outputs.
-
-    Initializes a VectorField, generates random input data, computes output vector magnitudes,
-    and prints the mean and standard deviation of those magnitudes.
-    """
-    rng = jax.random.PRNGKey(20250602)
-
-    # Create a VectorField model
-    model = VectorField(
-        activations_dtype=jnp.float32,
-        weights_dtype=jnp.float32,
-        domain_dim=domain_dim,
-        conditioning_dim=0,
-        time_dim=32,
-        reference_directions=64,
-        n_layers=4,
-        d_model=256,
-        mlp_expansion_factor=4,
-        mlp_dropout_rate=None,
-        input_dropout_rate=None,
-        use_pre_mlp_projection=True,
-    )
-
-    # Initialize model parameters
-    params_rng, data_rng = jax.random.split(rng)
-    params = model.init(params_rng, *model.dummy_inputs())
-
-    # Generate random input data
-    n_samples = 1_000_000
-    batch_size = 8192
-    keys = jax.random.split(data_rng, 3)
-
-    # Generate points uniformly on the sphere
-    x = sample_sphere(keys[0], n_samples, domain_dim)
-
-    # Generate random times in [0, 1]
-    t = jax.random.uniform(keys[1], (n_samples,))
-
-    # Generate conditioning vectors (empty since conditioning_dim=0)
-    cond_vec = jnp.zeros((n_samples, 0))
-
-    # Compute model outputs in batches
-    jitted_apply = jax.jit(
-        lambda x_batch, t_batch, cond_batch: model.apply(
-            params, x_batch, t_batch, cond_batch
-        )
-    )
-
-    all_magnitudes = []
-    all_dot_products = []
-
-    n_batches = (n_samples + batch_size - 1) // batch_size
-    for i in tqdm(range(n_batches), desc=f"Processing batches (dim={domain_dim})"):
-        start_idx = i * batch_size
-        end_idx = min((i + 1) * batch_size, n_samples)
-
-        x_batch = x[start_idx:end_idx]
-        t_batch = t[start_idx:end_idx]
-        cond_batch = cond_vec[start_idx:end_idx]
-
-        # Compute model outputs for this batch
-        output_vectors_batch = jitted_apply(x_batch, t_batch, cond_batch)
-
-        # Compute magnitudes for this batch
-        magnitudes_batch = jnp.linalg.norm(output_vectors_batch, axis=1)
-        all_magnitudes.append(magnitudes_batch)
-
-        # Compute dot products for this batch
-        dot_products_batch = jnp.sum(output_vectors_batch * x_batch, axis=1)
-        all_dot_products.append(dot_products_batch)
-
-    # Concatenate all results
-    magnitudes = jnp.concatenate(all_magnitudes, axis=0)
-    dot_products = jnp.concatenate(all_dot_products, axis=0)
-    assert magnitudes.shape == dot_products.shape == (n_samples,)
-
-    # Calculate statistics
-    mean_magnitude = jnp.mean(magnitudes)
-    std_magnitude = jnp.std(magnitudes)
-    min_magnitude = jnp.min(magnitudes)
-    max_magnitude = jnp.max(magnitudes)
-
-    # Print results
-    print(f"\nVectorField Output Magnitude Statistics (domain_dim={domain_dim}):")
-    print(f"Number of samples: {n_samples}")
-    print(f"Mean magnitude: {mean_magnitude:.6f}")
-    print(f"Std magnitude: {std_magnitude:.6f}")
-    print(f"Min magnitude: {min_magnitude:.6f}")
-    print(f"Max magnitude: {max_magnitude:.6f}")
-
-    # Verify outputs are tangent to the sphere (should have zero dot product with input points)
-    max_dot_product = jnp.max(jnp.abs(dot_products))
-    print(f"Max |dot product| with input points: {max_dot_product:.8f} (should be ~0)")
-
-    # For low dimensionality, there's more variance in magnitudes due to the smaller number of
-    # weights. I think that's why anyway.
-    np.testing.assert_allclose(
-        mean_magnitude, jnp.pi / 2, atol=0.1 if domain_dim > 3 else 0.5
-    )
-    np.testing.assert_allclose(max_dot_product, 0.0, atol=1e-5)
-
-    # Basic sanity check that magnitudes are non-negative and finite
-    assert jnp.all(magnitudes >= 0), "All magnitudes should be non-negative"
-    assert jnp.all(jnp.isfinite(magnitudes)), "All magnitudes should be finite"
 
 
 class SamplingAlgorithm(Enum):

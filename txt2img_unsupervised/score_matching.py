@@ -792,65 +792,21 @@ def test_train_vmf(domain_dim):
     ), f"Model NLL {model_nll:.4f} too high compared to entropy {differential_entropy:.4f}"
 
 
-@pytest.mark.usefixtures("starts_with_progressbar")
 @pytest.mark.parametrize("domain_dim", [3, 16])
-def test_train_uniform_zero_score(domain_dim):
-    """Train a model with uniformly distributed data and verify learned score is ~zero."""
-    # We're literally learning a constant function, our model can be tiny.
+def test_zero_init_uniform_nll(domain_dim):
+    """Verify that a freshly initialized model (zero-init output) gives correct uniform NLL."""
     model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2, d_model=32)
     schedule = NoiseSchedule(sigma_sq_min=0.01)
 
-    batch_size = 256
-    n_samples = 32768
+    params_rng, data_rng = jax.random.split(jax.random.PRNGKey(12345))
+    state = create_train_state(params_rng, model, 1e-3)
 
-    data_rng, eval_rng = jax.random.split(jax.random.PRNGKey(12345))
+    points = sample_sphere(data_rng, 256, domain_dim)
+    batch = {"point_vec": points}
 
-    points = sample_sphere(data_rng, n_samples, domain_dim)
-    dsets = (
-        Dataset.from_dict({"point_vec": points})
-        .with_format("np")
-        .train_test_split(test_size=256, seed=12345)
-    )
-    train_dset = dsets["train"]
-    test_dset = dsets["test"]
-
-    epochs = 6 if domain_dim == 3 else 8
-    state, train_loss = _train_loop_for_tests(
-        model,
-        train_dset,
-        batch_size,
-        learning_rate=1e-3,
-        epochs=epochs,
-        schedule=schedule,
-    )
-
-    n_test_points = 1000
-    test_rng, eval_rng = jax.random.split(eval_rng)
-    test_points = sample_sphere(eval_rng, n_test_points, domain_dim)
-    test_times = jax.random.uniform(test_rng, (n_test_points,))
-    test_cond = jnp.zeros((n_test_points, 0))
-
-    predicted_scores = model.apply(state.params, test_points, test_times, test_cond)
-    score_magnitudes = jnp.linalg.norm(predicted_scores, axis=1)
-
-    mean_magnitude = jnp.mean(score_magnitudes)
-    std_magnitude = jnp.std(score_magnitudes)
-
-    print(f"Score magnitude - Mean: {mean_magnitude:.6f}, Std: {std_magnitude:.6f}")
-    print(f"Expected: ~0 (uniform distribution has zero score)")
-
-    assert mean_magnitude < 0.2, f"Mean score magnitude {mean_magnitude:.6f} too large"
-    assert std_magnitude < 0.1, f"Score magnitude std {std_magnitude:.6f} too large"
-
-    # Compare model NLL to uniform sphere entropy (computed post-hoc)
     test_nlls = compute_nll(
-        model,
-        state.params,
-        dict(test_dset[:]),
-        schedule,
-        n_steps=256,
-        rng=jax.random.PRNGKey(99),
-        n_projections=32,
+        model, state.params, batch, schedule,
+        n_steps=256, rng=jax.random.PRNGKey(99), n_projections=32,
     )
     model_nll = float(jnp.mean(test_nlls))
     uniform_entropy = float(-sphere_log_inverse_surface_area(domain_dim))

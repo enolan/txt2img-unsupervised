@@ -306,9 +306,9 @@ class FlowMatchingModelConfig(VectorFieldConfig):
 
     @property
     def alpha_output(self) -> float:
-        # The domain_scale_factor in VectorField normalizes the initial output magnitude to π/2,
-        # which matches the average geodesic distance between two uniform random points on the sphere
-        # — the expected target magnitude for flow matching. No additional correction needed.
+        # The domain_scale_factor in VectorField scales outputs relative to π/2 (the average
+        # geodesic distance between two uniform random points on the sphere). alpha_output=1.0
+        # means the gain matches the expected flow matching target magnitude.
         return 1.0
 
     @property
@@ -453,10 +453,9 @@ class ScoreMatchingModelConfig(VectorFieldConfig):
 
     @property
     def alpha_output(self) -> float:
-        # The domain_scale_factor in VectorField normalizes the initial output magnitude to π/2.
-        # For score matching, the target is the scaled score P_{x_t}(x_1), whose magnitude is
-        # sin(θ) ∈ [0, 1]. Multiplying by 2/π brings the initial output magnitude down to ~1,
-        # matching the maximum target magnitude.
+        # The domain_scale_factor in VectorField scales outputs relative to π/2. For score
+        # matching, the target is the scaled score P_{x_t}(x_1), whose magnitude is sin(θ) ∈
+        # [0, 1]. Multiplying by 2/π sets the gain to match the maximum target magnitude.
         return 2.0 / math.pi
 
     @property
