@@ -10,3 +10,6 @@ __pycache__/
 /wandb/
 /.infinidata_tmp
 /paper/build/
+/.vscode/
+/.claude/settings.local.json
+/diag-img-prompts/
