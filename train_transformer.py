@@ -173,7 +173,7 @@ def get_clip_text_embeddings_to_sample(n: int, clip_mdl, clip_processor) -> jax.
         "my favorite art car from Burning Man 2018",
     ]
     assert n <= len(prompts), "write more prompts?"
-    text_tokens = clip_processor(prompts, return_tensors="jax", padding=True)
+    text_tokens = clip_processor(text=prompts, return_tensors="jax", padding=True)
     text_features = clip_mdl.get_text_features(**text_tokens)
     text_embeds = text_features / jnp.linalg.norm(text_features, axis=1, keepdims=True)
     assert text_embeds.shape == (len(prompts), 768)

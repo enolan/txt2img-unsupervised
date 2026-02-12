@@ -69,7 +69,7 @@ def main():
     print("Computing CLIP embedding...")
     if args.caption:
         text = args.caption
-        inputs = clip_processor(text, return_tensors="np", padding=True)
+        inputs = clip_processor(text=text, return_tensors="np", padding=True)
         features = clip_mdl.get_text_features(**inputs)
     else:
         image = PIL.Image.open(args.image)
