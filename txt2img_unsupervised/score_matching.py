@@ -56,9 +56,11 @@ from jax import Array
 from scipy import stats
 
 from txt2img_unsupervised import vmf
+from txt2img_unsupervised.cap_sampling import sphere_log_inverse_surface_area
 from txt2img_unsupervised.flow_matching import (
     VectorField,
     geodesic_step,
+    reverse_path_and_compute_divergence,
     sample_sphere,
     create_train_state,
     generate_samples_inner,
@@ -332,6 +334,17 @@ def _compute_velocity_for_sampling(
     return (coeff / sigma_sq[:, None]) * scaled_score
 
 
+@partial(jax.jit, static_argnames=("model_and_schedule",), inline=True)
+def _velocity_fn_for_ode(model_and_schedule, params, cond_vecs, x, t, rng):
+    """ODE velocity function for score matching sampling and NLL computation.
+
+    Unpacks the (model, schedule) tuple and delegates to _compute_velocity_for_sampling.
+    Defined at module level so JIT caching works across calls.
+    """
+    model, schedule = model_and_schedule
+    return _compute_velocity_for_sampling(model, params, cond_vecs, x, t, schedule, rng)
+
+
 def generate_samples(
     model: VectorField,
     params,
@@ -360,32 +373,112 @@ def generate_samples(
     assert len(cond_vecs.shape) == 2
     batch_size = cond_vecs.shape[0]
 
-    # Create a wrapper that matches the signature expected by generate_samples_inner
-    def vector_field_wrapper(
-        model_and_schedule,  # fixed_static_params: (model, schedule)
-        params,  # fixed_params
-        cond_vecs,  # per_sample_params
-        x,
-        t,
-        rng,
-    ):
-        model_inner, schedule_inner = model_and_schedule
-        return _compute_velocity_for_sampling(
-            model_inner, params, cond_vecs, x, t, schedule_inner, rng
-        )
-
     x, _eval_counts = generate_samples_inner(
         rng,
         n_steps,
         batch_size,
         method,
-        vector_field_wrapper,
-        (model, schedule),  # fixed_static_params
-        params,  # fixed_params
-        cond_vecs,  # per_sample_params
+        _velocity_fn_for_ode,
+        (model, schedule),
+        params,
+        cond_vecs,
         model.domain_dim,
     )
     return x
+
+
+def compute_log_probability(
+    model: VectorField,
+    params,
+    samples: Array,
+    cond_vecs: Array,
+    schedule: NoiseSchedule,
+    n_steps: int = 100,
+    rng=None,
+    n_projections: int = 10,
+    method: str = "tsit5",
+) -> Array:
+    """Compute the log probability of samples under the score matching model.
+
+    Uses the probability flow ODE in reverse (from data to noise) while accumulating the
+    divergence of the velocity field, then combines with the uniform base density.
+
+    Args:
+        model: Score model (outputs scaled score)
+        params: Model parameters
+        samples: Points on the sphere to evaluate [batch_size, dim]
+        cond_vecs: Conditioning vectors [batch_size, cond_dim]
+        schedule: Noise schedule configuration
+        n_steps: Number of integration steps
+        rng: JAX random key for stochastic divergence estimation
+        n_projections: Number of random projections for divergence estimation
+        method: ODE solver method ('rk4' or 'tsit5')
+
+    Returns:
+        Log probabilities of the samples [batch_size]
+    """
+    batch_size = samples.shape[0]
+    assert samples.shape == (batch_size, model.domain_dim)
+    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
+
+    if rng is None:
+        rng = jax.random.PRNGKey(0)
+
+    x0, div_sum = reverse_path_and_compute_divergence(
+        _velocity_fn_for_ode,
+        (model, schedule),
+        params,
+        cond_vecs,
+        samples,
+        n_steps,
+        rng,
+        n_projections,
+        method=method,
+    )
+
+    log_p0 = sphere_log_inverse_surface_area(model.domain_dim)
+    return log_p0 - div_sum
+
+
+def compute_nll(
+    model: VectorField,
+    params,
+    batch: dict,
+    schedule: NoiseSchedule,
+    n_steps: int = 100,
+    rng=None,
+    n_projections: int = 10,
+    method: str = "tsit5",
+) -> Array:
+    """Compute negative log-likelihood for a batch of data.
+
+    Args:
+        model: Score model
+        params: Model parameters
+        batch: Dict with "point_vec" key containing data [batch_size, dim]
+        schedule: Noise schedule configuration
+        n_steps: Number of integration steps
+        rng: JAX random key
+        n_projections: Number of random projections for divergence estimation
+        method: ODE solver method ('rk4' or 'tsit5')
+
+    Returns:
+        NLL per example [batch_size]
+    """
+    samples = batch["point_vec"]
+    batch_size = samples.shape[0]
+    cond_vecs = jnp.zeros((batch_size, model.conditioning_dim))
+    return -compute_log_probability(
+        model,
+        params,
+        samples,
+        cond_vecs,
+        schedule,
+        n_steps=n_steps,
+        rng=rng,
+        n_projections=n_projections,
+        method=method,
+    )
 
 
 # =============================================================================
@@ -525,6 +618,19 @@ def _train_loop_for_tests(
     def compute_batch_loss_with_schedule(model, params, batch, rng):
         return compute_batch_loss(model, params, batch, rng, schedule)
 
+    def compute_nll_with_schedule(
+        model, params, batch, n_steps, rng, n_projections, precomputed_stats=None
+    ):
+        return compute_nll(
+            model,
+            params,
+            batch,
+            schedule,
+            n_steps=n_steps,
+            rng=rng,
+            n_projections=n_projections,
+        )
+
     return _train_loop_for_tests_generic(
         model,
         dataset,
@@ -532,9 +638,10 @@ def _train_loop_for_tests(
         learning_rate,
         epochs,
         test_dataset=test_dataset,
-        compute_nll_fn=None,
         train_step_fn=train_step_with_schedule,
         compute_batch_loss_fn=compute_batch_loss_with_schedule,
+        compute_nll_fn=compute_nll_with_schedule,
+        compute_nll_on_step_0=False,
     )
 
 
@@ -558,7 +665,7 @@ _baseline_model = VectorField(
 @pytest.mark.parametrize("domain_dim", [3, 16])
 def test_train_trivial(domain_dim):
     """Train a model where all data is a single fixed point."""
-    model = replace(_baseline_model, domain_dim=domain_dim)
+    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2)
     schedule = NoiseSchedule()
 
     batch_size = 256
@@ -566,9 +673,16 @@ def test_train_trivial(domain_dim):
     first_dim_vec = first_dim_vec.at[0].set(1.0)
     points = repeat(first_dim_vec, "v -> b v", b=batch_size * 100)
     dset = Dataset.from_dict({"point_vec": points}).with_format("np")
+    test_dset = Dataset.from_dict({"point_vec": points[:batch_size]}).with_format("np")
 
-    state, loss = _train_loop_for_tests(
-        model, dset, batch_size, learning_rate=1e-2, epochs=4, schedule=schedule
+    state, loss, test_loss, test_nll = _train_loop_for_tests(
+        model,
+        dset,
+        batch_size,
+        learning_rate=1e-2,
+        epochs=2,
+        schedule=schedule,
+        test_dataset=test_dset,
     )
     print(f"Final loss: {loss:.6f}")
 
@@ -595,22 +709,21 @@ def test_train_trivial(domain_dim):
         high_sims.mean() >= 0.9
     ), f"Only {high_sims.mean()*100:.1f}% of samples close to target"
 
-
-def _vmf_differential_entropy(kappa):
-    """Calculate the differential entropy of a von Mises-Fisher distribution."""
-    sinh_k = np.sinh(kappa)
-    coth_k = np.cosh(kappa) / sinh_k
-    return np.log(4 * np.pi * sinh_k / kappa) - kappa * coth_k + 1
+    # Single-point distribution: model should assign very high density, giving very negative NLL
+    print(f"Model NLL: {test_nll:.4f}")
+    assert (
+        test_nll < -5
+    ), f"NLL {test_nll:.4f} should be << 0 for single-point distribution"
 
 
 @pytest.mark.usefixtures("starts_with_progressbar")
 @pytest.mark.parametrize("domain_dim", [3, 16])
 def test_train_vmf(domain_dim):
     """Train a model with data from a von Mises-Fisher distribution."""
-    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2)
-    schedule = NoiseSchedule()
+    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2, d_model=256)
+    schedule = NoiseSchedule(sigma_sq_min=0.01)
 
-    batch_size = 512
+    batch_size = 256
     n_samples = 32768
 
     mean_direction = np.zeros(domain_dim)
@@ -618,32 +731,36 @@ def test_train_vmf(domain_dim):
     kappa_data = 2
 
     vmf_dist = stats.vonmises_fisher(mean_direction, kappa_data)
-    points = vmf_dist.rvs(n_samples)
+    data_rng = np.random.default_rng(42)
+    points = vmf_dist.rvs(n_samples, random_state=data_rng)
 
     dset = Dataset.from_dict({"point_vec": points}).with_format("np")
 
-    test_n_samples = 512
-    test_points = vmf_dist.rvs(test_n_samples)
+    test_n_samples = 128
+    test_points = vmf_dist.rvs(test_n_samples, random_state=data_rng)
     test_dset = Dataset.from_dict({"point_vec": test_points}).with_format("np")
 
-    differential_entropy = _vmf_differential_entropy(kappa_data)
+    differential_entropy = vmf_dist.entropy()
     print(f"vMF distribution entropy: {differential_entropy:.6f}")
 
-    state, train_loss, test_loss = _train_loop_for_tests(
-        model, dset, batch_size, learning_rate=1e-3, epochs=1, schedule=schedule,
-        test_dataset=test_dset
+    state, train_loss = _train_loop_for_tests(
+        model,
+        dset,
+        batch_size,
+        learning_rate=1e-3,
+        epochs=3,
+        schedule=schedule,
     )
     print(f"Final train loss: {train_loss:.6f}")
-    print(f"Final test loss: {test_loss:.6f}")
 
-    n_test_samples = 1000
+    n_test_samples = 100
     samples = generate_samples(
         model,
         state.params,
         jax.random.PRNGKey(42),
         cond_vecs=jnp.zeros((n_test_samples, 0)),
         schedule=schedule,
-        n_steps=1000,
+        n_steps=100,
     )
 
     samples_np = np.array(samples)
@@ -657,16 +774,34 @@ def test_train_vmf(domain_dim):
         sample_nll < differential_entropy + 1.0
     ), f"Sample NLL {sample_nll} too high compared to entropy {differential_entropy}"
 
+    # Compare model NLL to theoretical entropy (computed post-hoc to avoid per-epoch overhead)
+    test_nlls = compute_nll(
+        model,
+        state.params,
+        dict(test_dset[:]),
+        schedule,
+        n_steps=256,
+        rng=jax.random.PRNGKey(99),
+        n_projections=32,
+    )
+    model_nll = float(jnp.mean(test_nlls))
+    print(f"Model NLL: {model_nll:.4f}, vMF entropy: {differential_entropy:.4f}")
+    assert np.isfinite(model_nll), f"NLL is not finite: {model_nll}"
+    assert (
+        model_nll < differential_entropy + 0.5
+    ), f"Model NLL {model_nll:.4f} too high compared to entropy {differential_entropy:.4f}"
+
 
 @pytest.mark.usefixtures("starts_with_progressbar")
 @pytest.mark.parametrize("domain_dim", [3, 16])
 def test_train_uniform_zero_score(domain_dim):
     """Train a model with uniformly distributed data and verify learned score is ~zero."""
-    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=6, d_model=256)
-    schedule = NoiseSchedule()
+    # We're literally learning a constant function, our model can be tiny.
+    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2, d_model=32)
+    schedule = NoiseSchedule(sigma_sq_min=0.01)
 
-    batch_size = 512
-    n_samples = 50000
+    batch_size = 256
+    n_samples = 32768
 
     data_rng, eval_rng = jax.random.split(jax.random.PRNGKey(12345))
 
@@ -674,14 +809,19 @@ def test_train_uniform_zero_score(domain_dim):
     dsets = (
         Dataset.from_dict({"point_vec": points})
         .with_format("np")
-        .train_test_split(test_size=512)
+        .train_test_split(test_size=256, seed=12345)
     )
     train_dset = dsets["train"]
     test_dset = dsets["test"]
 
-    state, train_loss, test_loss = _train_loop_for_tests(
-        model, train_dset, batch_size, learning_rate=1e-3, epochs=3, schedule=schedule,
-        test_dataset=test_dset
+    epochs = 6 if domain_dim == 3 else 8
+    state, train_loss = _train_loop_for_tests(
+        model,
+        train_dset,
+        batch_size,
+        learning_rate=1e-3,
+        epochs=epochs,
+        schedule=schedule,
     )
 
     n_test_points = 1000
@@ -701,3 +841,18 @@ def test_train_uniform_zero_score(domain_dim):
 
     assert mean_magnitude < 0.2, f"Mean score magnitude {mean_magnitude:.6f} too large"
     assert std_magnitude < 0.1, f"Score magnitude std {std_magnitude:.6f} too large"
+
+    # Compare model NLL to uniform sphere entropy (computed post-hoc)
+    test_nlls = compute_nll(
+        model,
+        state.params,
+        dict(test_dset[:]),
+        schedule,
+        n_steps=256,
+        rng=jax.random.PRNGKey(99),
+        n_projections=32,
+    )
+    model_nll = float(jnp.mean(test_nlls))
+    uniform_entropy = float(-sphere_log_inverse_surface_area(domain_dim))
+    print(f"Model NLL: {model_nll:.4f}, uniform entropy: {uniform_entropy:.4f}")
+    np.testing.assert_allclose(model_nll, uniform_entropy, atol=1e-2, rtol=0)

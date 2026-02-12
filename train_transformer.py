@@ -36,6 +36,7 @@ from txt2img_unsupervised.config import (
 from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
 from txt2img_unsupervised.train_data_loading import get_batch
 from txt2img_unsupervised.training_infra import (
+    fast_post_step_hook,
     init_common_train_state,
     init_wandb_training,
     IntervalTimer,
@@ -645,39 +646,6 @@ def loss_fn(params, batch, rng, mdl=None):
     )
 
 
-# Fast path hook that runs operations that don't need the full train state
-def fast_post_step_hook(loss, metrics, global_step, norm):
-    to_log = {
-        "train/loss": loss,
-        "grad_global_norm": norm,
-        "global_step": global_step,
-    }
-
-    # Add metrics that were copied before donation
-    if "notfinite_count" in metrics:
-        to_log["debug/notfinite_count"] = metrics["notfinite_count"]
-    if "clip_count" in metrics:
-        to_log["debug/clipped_updates"] = metrics["clip_count"]
-    else:
-        to_log["debug/clipped_updates"] = 0
-
-    # Log warnings based on metrics
-    if not np.isfinite(loss):
-        tqdm.write(f"Loss nonfinite 😢 ({loss})")
-
-    if metrics.get("notfinite_count", 0) > 50:
-        tqdm.write(f"Too many nonfinite values in gradients, giving up")
-        exit(1)
-
-    if metrics.get("clipped_last", False):
-        tqdm.write(f"Clipped update due to large gradient norm: {norm}")
-
-    # Log to wandb - this will materialize the JAX arrays, but that's OK
-    # because we've already enqueued the next step
-    wandb.log(to_log)
-
-
-# Slow path hook that runs operations that need the full train state
 def slow_post_step_hook(loss, state, global_step, norm):
     if signal_handler.exit_requested:
         tqdm.write("Saving checkpoint and exiting early")
@@ -920,7 +888,6 @@ if __name__ == "__main__":
             )
         ),
         loss_fn=jitted_loss_fn,
-        post_step_hook_fn=None,  # Not used with async implementation
         post_epoch_hook_fn=post_epoch_hook,
         fast_post_step_hook_fn=fast_post_step_hook,
         slow_post_step_hook_fn=slow_post_step_hook,

@@ -24,9 +24,11 @@ from .config import (
     BaseModelConfig,
     FlowMatchingModelConfig,
     LearningRateSchedule,
+    ScoreMatchingModelConfig,
     TrainingConfig,
     TransformerModelConfig,
 )
+from .flow_matching import VectorField
 from .function_weighted_flow_model import FunctionWeightedFlowModel
 from .muon import muon
 from .transformer_model import ImageModel
@@ -447,6 +449,19 @@ class FlowMatchingTrainState(BaseTrainState):
         return FunctionWeightedFlowModel(**model_cfg.__dict__)
 
 
+class ScoreMatchingTrainState(BaseTrainState):
+    """Train state specific to score matching models."""
+
+    @classmethod
+    def _create_model_from_config(cls, model_cfg):
+        """Create a score matching model (VectorField) instance from configuration."""
+        if not isinstance(model_cfg, ScoreMatchingModelConfig):
+            raise ValueError(
+                f"Expected ScoreMatchingModelConfig, got {type(model_cfg)}"
+            )
+        return VectorField(**model_cfg.vector_field_kwargs())
+
+
 def mk_checkpoint_manager(
     checkpoint_dir: Path,
     checkpoint_manager_options: Optional[ocp.CheckpointManagerOptions] = None,
@@ -476,6 +491,8 @@ def get_model_from_checkpoint(checkpoint_dir: Path):
         return model_cfg, TransformerTrainState._create_model_from_config(model_cfg)
     elif isinstance(model_cfg, FlowMatchingModelConfig):
         return model_cfg, FlowMatchingTrainState._create_model_from_config(model_cfg)
+    elif isinstance(model_cfg, ScoreMatchingModelConfig):
+        return model_cfg, ScoreMatchingTrainState._create_model_from_config(model_cfg)
     else:
         raise ValueError(f"Unknown model type: {type(model_cfg)}")
 
@@ -612,6 +629,11 @@ def setup_checkpoint_manager_and_initial_state(
     elif isinstance(model_cfg, FlowMatchingModelConfig):
         mdl = FlowMatchingTrainState._create_model_from_config(model_cfg)
         initial_state = FlowMatchingTrainState.new(
+            rng, mdl, training_cfg, batches_total
+        )
+    elif isinstance(model_cfg, ScoreMatchingModelConfig):
+        mdl = ScoreMatchingTrainState._create_model_from_config(model_cfg)
+        initial_state = ScoreMatchingTrainState.new(
             rng, mdl, training_cfg, batches_total
         )
     else:

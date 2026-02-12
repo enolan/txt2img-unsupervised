@@ -1360,6 +1360,7 @@ def _train_loop_for_tests_generic(
     precompute_test_stats_fn=None,
     train_step_fn=None,
     compute_batch_loss_fn=None,
+    compute_nll_on_step_0=True,
 ):
     """
     Generic training loop for unit tests.
@@ -1378,6 +1379,9 @@ def _train_loop_for_tests_generic(
                        Defaults to flow_matching.train_step.
         compute_batch_loss_fn: Function (model, params, batch, rng) -> loss.
                                Defaults to flow_matching.compute_batch_loss.
+        compute_nll_on_step_0: Whether to compute NLL on the first training step (before any
+                               training has occurred). Set to False to skip this, e.g. when the
+                               ODE integration is very slow on an untrained model.
 
     Returns:
         state: Final training state
@@ -1435,8 +1439,12 @@ def _train_loop_for_tests_generic(
                 step_count += 1
                 current_lr = cosine_schedule(step_count)
 
-                # Only compute NLL once per epoch (at the beginning) or on first step
-                if compute_nll_fn is not None and (first_step or (i == 0)):
+                # Compute NLL once per epoch (at the beginning), optionally skipping step 0
+                if (
+                    compute_nll_fn is not None
+                    and i == 0
+                    and (not first_step or compute_nll_on_step_0)
+                ):
                     step_rng, nll_rng = jax.random.split(step_rng)
                     train_nlls = compute_nll_fn(
                         model,
@@ -1524,8 +1532,13 @@ def _train_loop_for_tests_generic(
                         test_nlls = jnp.concatenate(test_nlls)
                         avg_test_nll = jax.device_get(jnp.mean(test_nlls))
                         final_test_nll = avg_test_nll
+                        train_nll_str = (
+                            f", Train NLL: {epoch_train_nll:.6f}"
+                            if epoch_train_nll is not None
+                            else ""
+                        )
                         tqdm.write(
-                            f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Train NLL: {epoch_train_nll:.6f}, Grad Norm: {grad_norm:.6f}, Test Loss: {avg_test_loss:.6f}, Test NLL: {avg_test_nll:.6f}"
+                            f"Epoch {epoch}, Train Loss: {train_loss:.6f}{train_nll_str}, Grad Norm: {grad_norm:.6f}, Test Loss: {avg_test_loss:.6f}, Test NLL: {avg_test_nll:.6f}"
                         )
                     else:
                         tqdm.write(
@@ -2477,7 +2490,7 @@ class Tsit5Settings:
 
     # Integration control
     initial_dt: Optional[float] = None  # If None, auto-estimate from tolerances
-    max_iterations: int = 1000
+    max_iterations: int = 2000
     auto_dt_estimation: bool = True  # Enable automatic initial step size estimation
 
     # Shrinking batch optimization
@@ -3485,7 +3498,10 @@ def generate_samples_inner(
         n_steps: Number of integration steps
         batch_size: Number of samples to generate
         method: ODE solver method ('euler', 'rk4', or 'tsit5')
-        vector_field_fn: Function that computes the tangent vector field
+        vector_field_fn: Function that computes the tangent vector field. Note this MUST be declared
+            at the top level for jit caching to work. If you define it inside a function, it won't hash to the
+            same value across different invocations of that outer function and caching will not
+            happen and performance will be awful.
         vector_field_fn_fixed_static_params: Parameters to pass to vector_field_fn that are constant
             across all samples and may be marked static to jax.jit. (separate parameter so
             static_argnums will work.)
@@ -4020,6 +4036,10 @@ def reverse_path_and_compute_divergence(
     Compute the reverse path and integrate the divergence.
 
     Supports fixed-step RK4 (jitted) and adaptive Tsitouras 5/4.
+
+    NOTE: vector_field_fn MUST be defined at the top level for jit caching to work. If you define it
+    inside a function, it won't hash to the same value across different invocations of that outer
+    function and caching will not happen and performance will be awful.
     """
     if method == "rk4":
         if tsit5_settings is not None:

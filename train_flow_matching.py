@@ -7,18 +7,13 @@ import os
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
 
 import argparse
-import datetime
 import jax
-import jax.numpy as jnp
-import numpy as np
 import wandb
 import matplotlib.pyplot as plt
 from distutils.util import strtobool
 from functools import partial
 from jax.sharding import NamedSharding, PartitionSpec
-from math import ceil
 from pathlib import Path
-from tqdm import tqdm, trange
 from typing import Optional
 
 from txt2img_unsupervised.checkpoint import FlowMatchingTrainState
@@ -44,17 +39,19 @@ from txt2img_unsupervised.function_weighted_flow_model import (
 )
 from txt2img_unsupervised.train_data_loading import get_batch
 from txt2img_unsupervised.training_infra import (
+    fast_post_step_hook,
     init_common_train_state,
     init_wandb_training,
-    IntervalTimer,
     load_dataset,
+    log_test_set_mean_cosine_similarity,
+    make_checkpoint_hooks,
+    mean_cosine_similarity,
     plan_steps,
-    save_checkpoint,
+    save_checkpoint_and_evaluate_vector_model,
     setup_common_arguments,
     setup_jax_for_training,
     setup_profiling_server,
     setup_sharding,
-    SignalHandler,
     train_loop,
 )
 
@@ -193,19 +190,6 @@ def init_train_state(
     )
 
 
-def mean_cosine_similarity(points: jnp.ndarray) -> float:
-    "Compute the mean cosine similarity between all pairs of unit vectors"
-    # Compute n x n matrix of singularities. Diagonal is self-similarity (all ones), matrix is
-    # symmetric across the diagonal.
-    similarities = points @ points.T
-    # Set the diagonal to 0.
-    similarities = similarities.at[
-        jnp.arange(points.shape[0]), jnp.arange(points.shape[0])
-    ].set(0)
-    # Compute the mean of the off-diagonal elements.
-    return jnp.mean(similarities)
-
-
 def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_steps=100):
     """
     Generate samples from the model and visualize them using a Mollweide projection.
@@ -265,245 +249,6 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_ste
     )
 
     plt.close(fig)
-
-
-def save_checkpoint_and_evaluate(
-    my_train_state,
-    global_step: int,
-    skip_saving: bool,
-    test_dataset,
-    training_cfg,
-    examples_sharding,
-    mdl,
-    logits_table,
-    vector_column: str = "clip_embedding",
-    viz_samples: int = 100,
-    viz_batch_size: int = 2048,
-    integration_steps: int = 100,
-    nll_n_projections: int = 32,
-    nll_batch_size: Optional[int] = None,
-    max_nll_examples: int = 1000,
-) -> None:
-    """Save checkpoint and evaluate on test dataset."""
-    save_checkpoint(my_train_state, checkpoint_manager, global_step, skip_saving)
-
-    eval_params = my_train_state.get_eval_params()
-
-    # Generate and visualize samples if domain_dim is 3
-    if mdl.domain_dim == 3:
-        viz_rng = jax.random.PRNGKey(
-            global_step
-        )  # Use step as seed for reproducibility
-        visualize_model_samples(
-            mdl,
-            eval_params,
-            viz_samples,
-            viz_batch_size,
-            viz_rng,
-            global_step,
-            n_steps=integration_steps,
-        )
-
-    losses = []
-    nlls = []
-    test_rng = jax.random.PRNGKey(7357)
-
-    for batch_idx in trange(
-        len(test_dataset) // training_cfg.batch_size,
-        desc="test loss batches",
-    ):
-        test_rng, batch_rng = jax.random.split(test_rng, 2)
-
-        batch = get_batch(
-            test_dataset,
-            training_cfg.batch_size,
-            batch_idx,
-            fields=[vector_column],
-            sharding=examples_sharding,
-        )
-
-        test_batch = {"point_vec": batch[vector_column]}
-        loss = compute_batch_loss(
-            mdl,
-            eval_params,
-            test_batch,
-            batch_rng,
-        )
-        losses.append(loss)
-
-    # Computing NLL is slow so we only do a limited number of examples.
-    hemisphere_rng, nll_rng = jax.random.split(test_rng)
-    nll_precomputed_stats = compute_hemisphere_masses(
-        mdl, eval_params, hemisphere_rng, integration_steps, nll_n_projections
-    )
-    # Plan batches up to a hard cap of nll_batch_size examples, truncating the last batch if needed
-    eval_batch_size = nll_batch_size or training_cfg.batch_size
-    extra_examples = len(test_dataset) % eval_batch_size
-    effective_dataset_size = len(test_dataset) - extra_examples
-    example_limit = min(max_nll_examples, effective_dataset_size)
-    full_batches = example_limit // eval_batch_size
-    remainder = example_limit - full_batches * eval_batch_size
-
-    for batch_idx in trange(full_batches, desc="test nll batches"):
-        nll_rng, nll_batch_rng = jax.random.split(nll_rng)
-
-        nll_batch = get_batch(
-            test_dataset,
-            eval_batch_size,
-            batch_idx,
-            fields=[vector_column],
-            sharding=examples_sharding,
-        )
-        batch_for_nll = {"point_vec": nll_batch[vector_column]}
-
-        nll_values = compute_nll(
-            mdl,
-            eval_params,
-            batch_for_nll,
-            n_steps=integration_steps,
-            rng=nll_batch_rng,
-            n_projections=nll_n_projections,
-            precomputed_stats=nll_precomputed_stats,
-        )
-        nlls.append(jnp.mean(nll_values))
-
-    # Handle truncated final batch if needed
-    if remainder > 0:
-        nll_rng, nll_batch_rng = jax.random.split(nll_rng)
-        nll_batch = get_batch(
-            test_dataset,
-            eval_batch_size,
-            full_batches,
-            fields=[vector_column],
-            sharding=examples_sharding,
-        )
-        truncated_vecs = nll_batch[vector_column][:remainder]
-        batch_for_nll = {"point_vec": truncated_vecs}
-
-        nll_values = compute_nll(
-            mdl,
-            eval_params,
-            batch_for_nll,
-            n_steps=integration_steps,
-            rng=nll_batch_rng,
-            n_projections=nll_n_projections,
-            precomputed_stats=nll_precomputed_stats,
-        )
-        nlls.append(jnp.mean(nll_values))
-
-    test_loss = jnp.mean(jnp.stack(losses))
-    test_nll = jnp.mean(jnp.stack(nlls))
-
-    wandb.log(
-        {
-            "global_step": global_step,
-            "test/loss": test_loss,
-            "test/nll": test_nll,
-        }
-    )
-    tqdm.write(
-        f"Test loss at step {global_step}: {test_loss:.4f}, Test NLL: {test_nll:.4f}"
-    )
-
-
-# Fast path hook that runs operations that don't need the full train state
-def fast_post_step_hook(loss, metrics, global_step, norm):
-    to_log = {
-        "train/loss": loss,
-        "grad_global_norm": norm,
-        "global_step": global_step,
-    }
-
-    if "notfinite_count" in metrics:
-        to_log["debug/notfinite_count"] = metrics["notfinite_count"]
-    if "clip_count" in metrics:
-        to_log["debug/clipped_updates"] = metrics["clip_count"]
-    else:
-        to_log["debug/clipped_updates"] = 0
-
-    if "gradient_noise_scale" in metrics:
-        to_log["train/gradient_noise_scale"] = metrics["gradient_noise_scale"]
-
-    # Log warnings based on metrics
-    if not np.isfinite(loss):
-        tqdm.write(f"Loss nonfinite 😢 ({loss})")
-
-    if metrics.get("notfinite_count", 0) > 50:
-        tqdm.write(f"Too many nonfinite values in gradients, giving up")
-        exit(1)
-
-    if metrics.get("clipped_last", False):
-        tqdm.write(f"Clipped update due to large gradient norm: {norm}")
-
-    wandb.log(to_log)
-
-
-# Slow path hook that runs operations that need the full train state
-def slow_post_step_hook(loss, state, global_step, norm):
-    if signal_handler.exit_requested:
-        tqdm.write("Saving checkpoint and exiting early")
-        save_checkpoint_and_evaluate(
-            state,
-            global_step,
-            skip_saving=args.skip_saving,
-            test_dataset=test_dataset,
-            training_cfg=training_cfg,
-            examples_sharding=examples_sharding,
-            mdl=mdl,
-            logits_table=cap_logits_table,
-            vector_column=args.vector_column,
-            viz_samples=args.viz_samples,
-            viz_batch_size=args.viz_batch_size,
-            integration_steps=args.integration_steps,
-            nll_n_projections=args.nll_n_projections,
-        )
-        exit(0)
-
-    # If we got a signal to save a checkpoint, do so. If we didn't, save a checkpoint only if it's
-    # time.
-    if signal_handler.early_checkpoint_requested:
-        checkpoint_timer.run_and_reset(
-            state,
-            global_step,
-            test_dataset=test_dataset,
-            training_cfg=training_cfg,
-            examples_sharding=examples_sharding,
-            mdl=mdl,
-            logits_table=cap_logits_table,
-        )
-        signal_handler.reset_checkpoint_flag()
-    else:
-        checkpoint_timer.check_and_run(state, global_step)
-
-    # Always continue training unless explicitly exited above
-    return False
-
-
-# Function to determine if we need to run the slow path
-def slow_path_condition(global_step):
-    if signal_handler.exit_requested or signal_handler.early_checkpoint_requested:
-        return True
-    if checkpoint_timer.check_if_should_run():
-        return True
-    return False
-
-
-def post_epoch_hook(state, epoch_idx, global_step):
-    checkpoint_timer.run_and_reset(
-        state,
-        global_step,
-        test_dataset=test_dataset,
-        training_cfg=training_cfg,
-        examples_sharding=examples_sharding,
-        mdl=mdl,
-        logits_table=cap_logits_table,
-    )
-
-
-def log_test_set_mean_cosine_similarity(test_dataset, vector_column):
-    vecs = test_dataset[vector_column]
-    mean_sim = mean_cosine_similarity(jax.device_put(vecs))
-    wandb.log({"test/mean_cosine_similarity": mean_sim})
 
 
 if __name__ == "__main__":
@@ -570,31 +315,62 @@ if __name__ == "__main__":
     train_state = train_state.replicate_for_multi_gpu(mesh)
     examples_sharding = NamedSharding(mesh, PartitionSpec("dev"))
 
-    checkpoint_timer = IntervalTimer(
-        datetime.timedelta(minutes=30),
-        lambda state, step, **kwargs: save_checkpoint_and_evaluate(
-            state,
+    def _compute_loss(eval_params, test_batch, rng):
+        return compute_batch_loss(mdl, eval_params, test_batch, rng)
+
+    def _visualize(eval_params, step):
+        viz_rng = jax.random.PRNGKey(step)
+        visualize_model_samples(
+            mdl,
+            eval_params,
+            args.viz_samples,
+            args.viz_batch_size,
+            viz_rng,
             step,
-            skip_saving=kwargs.get("skip_saving", args.skip_saving),
-            test_dataset=kwargs.get("test_dataset", test_dataset),
-            training_cfg=kwargs.get("training_cfg", training_cfg),
-            examples_sharding=kwargs.get("examples_sharding", examples_sharding),
-            mdl=kwargs.get("mdl", mdl),
-            logits_table=kwargs.get("logits_table", cap_logits_table),
-            vector_column=kwargs.get("vector_column", args.vector_column),
-            viz_samples=kwargs.get("viz_samples", args.viz_samples),
-            viz_batch_size=kwargs.get("viz_batch_size", args.viz_batch_size),
-            integration_steps=kwargs.get("integration_steps", args.integration_steps),
-            nll_n_projections=kwargs.get("nll_n_projections", args.nll_n_projections),
-            nll_batch_size=kwargs.get("nll_batch_size", args.nll_batch_size),
-            max_nll_examples=kwargs.get("max_nll_examples", args.max_nll_examples),
-        ),
+            n_steps=args.integration_steps,
+        )
+
+    def _nll_setup(eval_params, rng):
+        return compute_hemisphere_masses(
+            mdl,
+            eval_params,
+            rng,
+            args.integration_steps,
+            args.nll_n_projections,
+        )
+
+    def _compute_nll(eval_params, test_batch, rng, precomputed_stats):
+        return compute_nll(
+            mdl,
+            eval_params,
+            test_batch,
+            n_steps=args.integration_steps,
+            rng=rng,
+            n_projections=args.nll_n_projections,
+            precomputed_stats=precomputed_stats,
+        )
+
+    save_eval_kwargs = {
+        "skip_saving": args.skip_saving,
+        "checkpoint_manager": checkpoint_manager,
+        "test_dataset": test_dataset,
+        "training_cfg": training_cfg,
+        "examples_sharding": examples_sharding,
+        "vector_column": args.vector_column,
+        "compute_loss_fn": _compute_loss,
+        "visualize_fn": _visualize,
+        "compute_nll_fn": _compute_nll,
+        "nll_setup_fn": _nll_setup,
+        "nll_batch_size": args.nll_batch_size,
+        "max_nll_examples": args.max_nll_examples,
+    }
+
+    slow_path_condition, slow_post_step_hook, post_epoch_hook = make_checkpoint_hooks(
+        save_checkpoint_and_evaluate_vector_model, save_eval_kwargs
     )
-    signal_handler = SignalHandler()
 
     @partial(jax.jit, static_argnames=("mdl"))
     def loss_fn(params, batch, rng, mdl=None, logits_table=None):
-        # The loss function expects a batch with 'point_vec' key
         vecs = batch[args.vector_column]
         flow_batch = {"point_vec": vecs}
         return compute_batch_loss(mdl, params, flow_batch, rng)
@@ -619,29 +395,13 @@ if __name__ == "__main__":
             )
         ),
         loss_fn=partial(loss_fn, mdl=mdl, logits_table=cap_logits_table),
-        post_step_hook_fn=None,  # Not used with async implementation
         post_epoch_hook_fn=post_epoch_hook,
         fast_post_step_hook_fn=fast_post_step_hook,
         slow_post_step_hook_fn=slow_post_step_hook,
         slow_path_condition_fn=slow_path_condition,
     )
 
-    # Only save a final checkpoint if not at an epoch boundary
     if global_step % steps_per_epoch != 0:
-        save_checkpoint_and_evaluate(
-            train_state,
-            global_step,
-            skip_saving=args.skip_saving,
-            test_dataset=test_dataset,
-            training_cfg=training_cfg,
-            examples_sharding=examples_sharding,
-            mdl=mdl,
-            logits_table=cap_logits_table,
-            vector_column=args.vector_column,
-            viz_samples=args.viz_samples,
-            viz_batch_size=args.viz_batch_size,
-            integration_steps=args.integration_steps,
-            nll_n_projections=args.nll_n_projections,
-            nll_batch_size=args.nll_batch_size,
-            max_nll_examples=args.max_nll_examples,
+        save_checkpoint_and_evaluate_vector_model(
+            train_state, global_step, **save_eval_kwargs
         )

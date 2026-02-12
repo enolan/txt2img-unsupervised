@@ -8,6 +8,7 @@ import importlib.util
 import jax
 import jax.numpy as jnp
 import json
+import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import signal
@@ -894,9 +895,6 @@ def train_loop(
     slow_post_step_hook_fn: Callable[[float, BaseTrainState, int, float], bool],
     slow_path_condition_fn: Callable[[int], bool],
     post_epoch_hook_fn: Optional[Callable[[BaseTrainState, int, int], None]] = None,
-    post_step_hook_fn: Optional[
-        Callable[[float, Any, int, float], bool]
-    ] = None,  # Kept for API compatibility but not used
 ) -> Tuple[Any, int]:
     """
     Entry point for asynchronous training loop that maximizes GPU utilization.
@@ -919,7 +917,6 @@ def train_loop(
         slow_path_condition_fn: Function that determines if slow path should run.
                                 Takes (step: int) -> should_run_slow_path: bool.
         post_epoch_hook_fn: Optional function called after each epoch. Takes (state: BaseTrainState, epoch_idx: int, global_step: int).
-        post_step_hook_fn: Legacy parameter, not used but kept for API compatibility.
 
     Returns:
         A tuple containing the final training state and the final step number (the number of steps completed).
@@ -1009,3 +1006,239 @@ class IntervalTimer:
         now = datetime.datetime.now()
         self.callback_fn(*args, **kwargs)
         self.last_trigger_time = now
+
+
+def mean_cosine_similarity(points: jnp.ndarray) -> float:
+    """Compute the mean cosine similarity between all pairs of unit vectors."""
+    # Compute n x n matrix of similarities. Diagonal is self-similarity (all ones), matrix is
+    # symmetric across the diagonal.
+    n = points.shape[0]
+    similarities = points @ points.T
+    # Exclude self-similarities: zero the diagonal, then divide by the number of off-diagonal
+    # elements rather than the total number of elements.
+    similarities = similarities.at[jnp.arange(n), jnp.arange(n)].set(0)
+    return jnp.sum(similarities) / (n * (n - 1))
+
+
+def log_test_set_mean_cosine_similarity(test_dataset, vector_column: str):
+    """Log the mean cosine similarity of the test set to wandb."""
+    vecs = test_dataset[vector_column]
+    mean_sim = mean_cosine_similarity(jax.device_put(vecs))
+    wandb.log({"test/mean_cosine_similarity": mean_sim})
+
+
+def fast_post_step_hook(loss, metrics, global_step, norm):
+    """Fast path hook that runs operations that don't need the full train state."""
+    to_log = {
+        "train/loss": loss,
+        "grad_global_norm": norm,
+        "global_step": global_step,
+    }
+
+    if "notfinite_count" in metrics:
+        to_log["debug/notfinite_count"] = metrics["notfinite_count"]
+    if "clip_count" in metrics:
+        to_log["debug/clipped_updates"] = metrics["clip_count"]
+    else:
+        to_log["debug/clipped_updates"] = 0
+
+    if "gradient_noise_scale" in metrics:
+        to_log["train/gradient_noise_scale"] = metrics["gradient_noise_scale"]
+
+    if not np.isfinite(loss):
+        tqdm.write(f"Loss nonfinite 😢 ({loss})")
+
+    if metrics.get("notfinite_count", 0) > 50:
+        tqdm.write("Too many nonfinite values in gradients, giving up")
+        exit(1)
+
+    if metrics.get("clipped_last", False):
+        tqdm.write(f"Clipped update due to large gradient norm: {norm}")
+
+    wandb.log(to_log)
+
+
+def make_checkpoint_hooks(
+    save_and_eval_fn: Callable,
+    save_and_eval_kwargs: Dict[str, Any],
+) -> Tuple[
+    Callable[[int], bool],
+    Callable[[float, BaseTrainState, int, float], bool],
+    Callable[[BaseTrainState, int, int], None],
+]:
+    """Create checkpoint/signal hooks for training.
+
+    Sets up a SignalHandler, a 30-minute IntervalTimer, and returns the three
+    hook functions expected by train_loop.
+
+    Args:
+        save_and_eval_fn: Function to save checkpoint and evaluate.
+            Signature: (train_state, global_step, **kwargs) -> None
+        save_and_eval_kwargs: Kwargs forwarded to save_and_eval_fn.
+
+    Returns:
+        (slow_path_condition_fn, slow_post_step_hook_fn, post_epoch_hook_fn)
+    """
+    signal_handler = SignalHandler()
+    checkpoint_timer = IntervalTimer(
+        datetime.timedelta(minutes=30),
+        lambda state, step: save_and_eval_fn(state, step, **save_and_eval_kwargs),
+    )
+
+    def slow_path_condition(global_step):
+        if signal_handler.exit_requested or signal_handler.early_checkpoint_requested:
+            return True
+        if checkpoint_timer.check_if_should_run():
+            return True
+        return False
+
+    def slow_post_step_hook(loss, state, global_step, norm):
+        if signal_handler.exit_requested:
+            tqdm.write("Saving checkpoint and exiting early")
+            save_and_eval_fn(state, global_step, **save_and_eval_kwargs)
+            exit(0)
+
+        if signal_handler.early_checkpoint_requested:
+            checkpoint_timer.run_and_reset(state, global_step)
+            signal_handler.reset_checkpoint_flag()
+        else:
+            checkpoint_timer.check_and_run(state, global_step)
+
+        return False
+
+    def post_epoch_hook(state, epoch_idx, global_step):
+        checkpoint_timer.run_and_reset(state, global_step)
+
+    return slow_path_condition, slow_post_step_hook, post_epoch_hook
+
+
+def save_checkpoint_and_evaluate_vector_model(
+    my_train_state,
+    global_step: int,
+    skip_saving: bool,
+    checkpoint_manager,
+    test_dataset,
+    training_cfg,
+    examples_sharding,
+    vector_column: str,
+    compute_loss_fn: Callable[[dict, dict, jax.random.PRNGKey], float],
+    visualize_fn: Callable[[dict, int], None],
+    compute_nll_fn: Callable[[dict, dict, jax.random.PRNGKey, Any], jax.Array],
+    nll_setup_fn: Callable[[dict, jax.random.PRNGKey], Any],
+    nll_batch_size: Optional[int] = None,
+    max_nll_examples: int = 1000,
+) -> None:
+    """Save checkpoint and evaluate on test dataset.
+
+    This is the shared evaluation function used by both flow matching and score matching
+    training scripts.
+
+    Args:
+        my_train_state: Training state with get_eval_params() method
+        global_step: Current training step
+        skip_saving: Whether to skip saving the checkpoint
+        checkpoint_manager: Orbax checkpoint manager
+        test_dataset: Test dataset
+        training_cfg: Training configuration (used for batch_size)
+        examples_sharding: Sharding specification for batches
+        vector_column: Name of the vector column in the dataset
+        compute_loss_fn: Computes test loss for a batch.
+            Signature: (eval_params, test_batch, rng) -> loss
+        visualize_fn: Visualization callback.
+            Signature: (eval_params, global_step) -> None
+        compute_nll_fn: Computes NLL for a batch.
+            Signature: (eval_params, test_batch, rng, nll_precomputed) -> nll_per_example
+        nll_setup_fn: Setup callback called once before NLL batches.
+            Signature: (eval_params, rng) -> nll_precomputed
+        nll_batch_size: Batch size for NLL evaluation (defaults to training batch size)
+        max_nll_examples: Maximum number of examples to evaluate NLL on
+    """
+    save_checkpoint(my_train_state, checkpoint_manager, global_step, skip_saving)
+
+    eval_params = my_train_state.get_eval_params()
+
+    visualize_fn(eval_params, global_step)
+
+    # Compute test loss over all batches
+    losses = []
+    test_rng = jax.random.PRNGKey(7357)
+
+    for batch_idx in trange(
+        len(test_dataset) // training_cfg.batch_size,
+        desc="test loss batches",
+    ):
+        test_rng, batch_rng = jax.random.split(test_rng, 2)
+
+        batch = get_batch(
+            test_dataset,
+            training_cfg.batch_size,
+            batch_idx,
+            fields=[vector_column],
+            sharding=examples_sharding,
+        )
+
+        test_batch = {"point_vec": batch[vector_column]}
+        loss = compute_loss_fn(eval_params, test_batch, batch_rng)
+        losses.append(loss)
+
+    test_loss = jnp.mean(jnp.stack(losses))
+    log_dict = {
+        "global_step": global_step,
+        "test/loss": test_loss,
+    }
+
+    # Compute NLL
+    nlls = []
+    hemisphere_rng, nll_rng = jax.random.split(test_rng)
+
+    nll_precomputed = nll_setup_fn(eval_params, hemisphere_rng)
+
+    eval_batch_size = nll_batch_size or training_cfg.batch_size
+    extra_examples = len(test_dataset) % eval_batch_size
+    effective_dataset_size = len(test_dataset) - extra_examples
+    example_limit = min(max_nll_examples, effective_dataset_size)
+    full_batches = example_limit // eval_batch_size
+    remainder = example_limit - full_batches * eval_batch_size
+
+    for batch_idx in trange(full_batches, desc="test nll batches"):
+        nll_rng, nll_batch_rng = jax.random.split(nll_rng)
+
+        nll_batch = get_batch(
+            test_dataset,
+            eval_batch_size,
+            batch_idx,
+            fields=[vector_column],
+            sharding=examples_sharding,
+        )
+        batch_for_nll = {"point_vec": nll_batch[vector_column]}
+
+        nll_values = compute_nll_fn(
+            eval_params, batch_for_nll, nll_batch_rng, nll_precomputed
+        )
+        nlls.append(jnp.mean(nll_values))
+
+    # Handle truncated final batch
+    if remainder > 0:
+        nll_rng, nll_batch_rng = jax.random.split(nll_rng)
+        nll_batch = get_batch(
+            test_dataset,
+            eval_batch_size,
+            full_batches,
+            fields=[vector_column],
+            sharding=examples_sharding,
+        )
+        truncated_vecs = nll_batch[vector_column][:remainder]
+        batch_for_nll = {"point_vec": truncated_vecs}
+
+        nll_values = compute_nll_fn(
+            eval_params, batch_for_nll, nll_batch_rng, nll_precomputed
+        )
+        nlls.append(jnp.mean(nll_values))
+
+    test_nll = jnp.mean(jnp.stack(nlls))
+    log_dict["test/nll"] = test_nll
+    tqdm.write(
+        f"Test loss at step {global_step}: {test_loss:.4f}, Test NLL: {test_nll:.4f}"
+    )
+
+    wandb.log(log_dict)

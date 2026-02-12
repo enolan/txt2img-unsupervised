@@ -1,14 +1,17 @@
 """Serializable configuration for the model and training parameters."""
 import argparse
 import importlib
+import math
+
 import dacite
 import jax
 import jax.numpy as jnp
 import json
 import pytest
+from abc import abstractmethod
 from copy import copy
 from enum import Enum
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import (
     Any,
     Callable,
@@ -45,6 +48,7 @@ class BaseModelConfig:
             subclass_map = {
                 "transformer": TransformerModelConfig,
                 "flow_matching": FlowMatchingModelConfig,
+                "score_matching": ScoreMatchingModelConfig,
             }
 
             if model_type in subclass_map:
@@ -169,10 +173,9 @@ class TransformerModelConfig(BaseModelConfig):
 
 
 @dataclass
-class FlowMatchingModelConfig(BaseModelConfig):
-    """Configuration for flow matching models."""
+class VectorFieldConfig(BaseModelConfig):
+    """Shared configuration for models built on VectorField (flow matching & score matching)."""
 
-    # Required parameters first
     n_layers: int
     domain_dim: int
     reference_directions: Optional[int]
@@ -185,22 +188,128 @@ class FlowMatchingModelConfig(BaseModelConfig):
     mlp_always_inject: FrozenSet[Literal["x", "t", "cond"]] = field(
         default_factory=frozenset
     )
-
-    # Optional parameters with defaults
     activations_dtype: jnp.dtype = jnp.float32
     weights_dtype: jnp.dtype = jnp.float32
     d_model_base: int = 512
     variance_base: float = 1 / 512
     alpha_input: float = 1.0
-    alpha_output: float = 1.0
+
+    @property
+    @abstractmethod
+    def alpha_output(self) -> float:
+        """Output scaling factor."""
+        ...
+
+    @property
+    @abstractmethod
+    def conditioning_dim(self) -> int:
+        """Dimension of the conditioning vector."""
+        ...
+
+    def vector_field_kwargs(self) -> dict[str, Any]:
+        """Return the dict of fields needed to construct a VectorField."""
+        vf_field_names = {f.name for f in fields(VectorFieldConfig)}
+        result = {k: v for k, v in self.__dict__.items() if k in vf_field_names}
+        result["conditioning_dim"] = self.conditioning_dim
+        result["alpha_output"] = self.alpha_output
+        return result
+
+    @classmethod
+    def _parse_vf_json_fields(cls, d: dict[str, Any]) -> dict[str, Any]:
+        """Parse the shared VectorField JSON fields from a dict. Returns a modified copy."""
+        out = copy(d)
+
+        if "activations_dtype" in d:
+            out["activations_dtype"] = str_to_x_or_valueerror(
+                d["activations_dtype"], str_to_dtype, "activations dtype"
+            )
+
+        if "weights_dtype" not in d:
+            out["weights_dtype"] = jnp.float32
+        else:
+            out["weights_dtype"] = str_to_x_or_valueerror(
+                d["weights_dtype"], str_to_dtype, "weights dtype"
+            )
+
+        if "mlp_always_inject" in d and d["mlp_always_inject"] is not None:
+            out["mlp_always_inject"] = frozenset(d["mlp_always_inject"])
+
+        return out
+
+    def _vf_to_json_dict(self) -> dict[str, Any]:
+        """Serialize the shared VectorField fields to a JSON-compatible dict."""
+        out = copy(self.__dict__)
+        out["model_type"] = self.model_type
+        out["activations_dtype"] = x_to_str_or_valueerror(
+            self.activations_dtype, dtype_to_str, "dtype"
+        )
+        out["weights_dtype"] = x_to_str_or_valueerror(
+            self.weights_dtype, dtype_to_str, "dtype"
+        )
+        out["mlp_always_inject"] = sorted(self.mlp_always_inject)
+        return out
+
+    def _validate_vf(self, conditioning_dim: int):
+        """Validate the shared VectorField fields."""
+        if self.activations_dtype == jnp.float32 and self.weights_dtype != jnp.float32:
+            raise ValueError(
+                "It doesn't make sense to use float32 activations with float16 or bfloat16 weights"
+            )
+
+        if self.time_dim is not None and self.time_dim % 2 != 0:
+            raise ValueError("Time dimension must be even")
+
+        if not self.use_pre_mlp_projection:
+            time_dim = 1 if self.time_dim is None else self.time_dim
+            total_input_dim = (
+                (
+                    self.reference_directions
+                    if self.reference_directions is not None
+                    else self.domain_dim
+                )
+                + conditioning_dim
+                + time_dim
+            )
+            if total_input_dim > self.d_model:
+                raise ValueError(
+                    f"Input dimensions ({total_input_dim}) exceed d_model ({self.d_model}). "
+                    f"Increase d_model or reduce input dimensions."
+                )
+
+        if not isinstance(self.mlp_always_inject, frozenset):
+            raise ValueError(
+                "mlp_always_inject must be a frozenset of {'x','t','cond'}"
+            )
+
+        allowed = {"x", "t", "cond"}
+        unknown = set(self.mlp_always_inject) - allowed
+        if unknown:
+            raise ValueError(f"Unknown mlp_always_inject items: {sorted(unknown)}")
+
+        if "cond" in self.mlp_always_inject and conditioning_dim == 0:
+            raise ValueError(
+                "'cond' specified in mlp_always_inject but conditioning_dim == 0"
+            )
+
+
+@dataclass
+class FlowMatchingModelConfig(VectorFieldConfig):
+    """Configuration for flow matching models."""
+
     weighting_function: WeightingFunction = WeightingFunction.CONSTANT
     weighting_function_extra_params: Optional[
         Union[CapIndicatorExtraParams, SmoothedCapIndicatorExtraParams]
     ] = None
     base_distribution: BaseDistribution = BaseDistribution.SPHERE
 
-    # Class variable to store the model type
     model_type: ClassVar[str] = "flow_matching"
+
+    @property
+    def alpha_output(self) -> float:
+        # The domain_scale_factor in VectorField normalizes the initial output magnitude to π/2,
+        # which matches the average geodesic distance between two uniform random points on the sphere
+        # — the expected target magnitude for flow matching. No additional correction needed.
+        return 1.0
 
     @property
     def conditioning_dim(self) -> int:
@@ -225,22 +334,7 @@ class FlowMatchingModelConfig(BaseModelConfig):
     @classmethod
     def from_json_dict(cls, dict: dict[str, Any]) -> "FlowMatchingModelConfig":
         """Convert a dictionary parsed from JSON to a FlowMatchingModelConfig object."""
-        out = copy(dict)
-
-        if "activations_dtype" in dict:
-            out["activations_dtype"] = str_to_x_or_valueerror(
-                dict["activations_dtype"], str_to_dtype, "activations dtype"
-            )
-
-        if "weights_dtype" not in dict:
-            out["weights_dtype"] = jnp.float32
-        else:
-            out["weights_dtype"] = str_to_x_or_valueerror(
-                dict["weights_dtype"], str_to_dtype, "weights dtype"
-            )
-
-        if "mlp_always_inject" in dict and dict["mlp_always_inject"] is not None:
-            out["mlp_always_inject"] = frozenset(dict["mlp_always_inject"])
+        out = cls._parse_vf_json_fields(dict)
 
         if "weighting_function" in dict:
             out["weighting_function"] = str_to_x_or_valueerror(
@@ -291,20 +385,8 @@ class FlowMatchingModelConfig(BaseModelConfig):
 
     def to_json_dict(self) -> dict[str, Any]:
         """Convert a FlowMatchingModelConfig object to a dictionary that can be serialized to JSON."""
-        out = copy(self.__dict__)
+        out = self._vf_to_json_dict()
 
-        # Add model type to identify this config
-        out["model_type"] = self.model_type
-
-        # Convert dtypes to strings
-        out["activations_dtype"] = x_to_str_or_valueerror(
-            self.activations_dtype, dtype_to_str, "dtype"
-        )
-        out["weights_dtype"] = x_to_str_or_valueerror(
-            self.weights_dtype, dtype_to_str, "dtype"
-        )
-
-        out["mlp_always_inject"] = sorted(self.mlp_always_inject)
         # We have to use the dictionaries to turn the enums into strings for json, otherwise we'd
         # get the all caps CAP_INDICATOR instead of the lowercase in the dict
         out["base_distribution"] = x_to_str_or_valueerror(
@@ -326,47 +408,7 @@ class FlowMatchingModelConfig(BaseModelConfig):
 
     def validate(self):
         """Validate flow matching specific configuration."""
-        # Common validation for flow matching models
-        if self.activations_dtype == jnp.float32 and self.weights_dtype != jnp.float32:
-            raise ValueError(
-                "It doesn't make sense to use float32 activations with float16 or bfloat16 weights"
-            )
-
-        # Flow matching specific validation
-        if self.time_dim is not None and self.time_dim % 2 != 0:
-            raise ValueError("Time dimension must be even")
-
-        if not self.use_pre_mlp_projection:
-            time_dim = 1 if self.time_dim is None else self.time_dim
-            total_input_dim = (
-                (
-                    self.reference_directions
-                    if self.reference_directions is not None
-                    else self.domain_dim
-                )
-                + self.conditioning_dim
-                + time_dim
-            )
-            if total_input_dim > self.d_model:
-                raise ValueError(
-                    f"Input dimensions ({total_input_dim}) exceed d_model ({self.d_model}). "
-                    f"Increase d_model or reduce input dimensions."
-                )
-
-        if not isinstance(self.mlp_always_inject, frozenset):
-            raise ValueError(
-                "mlp_always_inject must be a frozenset of {'x','t','cond'}"
-            )
-
-        allowed = {"x", "t", "cond"}
-        unknown = set(self.mlp_always_inject) - allowed
-        if unknown:
-            raise ValueError(f"Unknown mlp_always_inject items: {sorted(unknown)}")
-
-        if "cond" in self.mlp_always_inject and self.conditioning_dim == 0:
-            raise ValueError(
-                "'cond' specified in mlp_always_inject but conditioning_dim == 0"
-            )
+        self._validate_vf(self.conditioning_dim)
 
         if (
             self.base_distribution == BaseDistribution.CAP
@@ -395,6 +437,54 @@ class FlowMatchingModelConfig(BaseModelConfig):
             raise ValueError(
                 "weighting_function_extra_params should not be provided for CONSTANT weighting"
             )
+
+
+@dataclass
+class ScoreMatchingModelConfig(VectorFieldConfig):
+    """Configuration for score matching models.
+
+    Adds noise schedule parameters on top of the shared VectorField config.
+    """
+
+    sigma_sq_min: float = 1e-4
+    sigma_sq_max: float = 2.0
+
+    model_type: ClassVar[str] = "score_matching"
+
+    @property
+    def alpha_output(self) -> float:
+        # The domain_scale_factor in VectorField normalizes the initial output magnitude to π/2.
+        # For score matching, the target is the scaled score P_{x_t}(x_1), whose magnitude is
+        # sin(θ) ∈ [0, 1]. Multiplying by 2/π brings the initial output magnitude down to ~1,
+        # matching the maximum target magnitude.
+        return 2.0 / math.pi
+
+    @property
+    def conditioning_dim(self) -> int:
+        return 0
+
+    @classmethod
+    def from_json_dict(cls, dict: dict[str, Any]) -> "ScoreMatchingModelConfig":
+        """Convert a dictionary parsed from JSON to a ScoreMatchingModelConfig object."""
+        out = cls._parse_vf_json_fields(dict)
+        out = dacite.from_dict(
+            data_class=cls, data=out, config=dacite.Config(check_types=False)
+        )
+        out.validate()
+        return out
+
+    def to_json_dict(self) -> dict[str, Any]:
+        """Convert to a dictionary that can be serialized to JSON."""
+        return self._vf_to_json_dict()
+
+    def validate(self):
+        """Validate score matching specific configuration."""
+        self._validate_vf(self.conditioning_dim)
+
+        if self.sigma_sq_min <= 0:
+            raise ValueError("sigma_sq_min must be positive")
+        if self.sigma_sq_max <= self.sigma_sq_min:
+            raise ValueError("sigma_sq_max must be greater than sigma_sq_min")
 
 
 def invert_dict(d: dict[Any, Any]) -> dict[Any, Any]:
@@ -543,7 +633,6 @@ def test_flow_matching_config_roundtrip_from_object() -> None:
         d_model_base=1024,
         variance_base=1 / 1024,
         alpha_input=0.7,
-        alpha_output=1.3,
         weighting_function=WeightingFunction.SMOOTHED_CAP_INDICATOR,
         weighting_function_extra_params=SmoothedCapIndicatorExtraParams(
             boundary_width=0.2
@@ -600,7 +689,6 @@ def test_flow_matching_config_roundtrip_from_json() -> None:
         "d_model_base": 256,
         "variance_base": 1 / 256,
         "alpha_input": 0.9,
-        "alpha_output": 1.1,
         "weighting_function": "cap_indicator",
         "weighting_function_extra_params": {"d_max_dist": [[0.8, 1.0], [0.2, 1.5]]},
         "base_distribution": "sphere",
