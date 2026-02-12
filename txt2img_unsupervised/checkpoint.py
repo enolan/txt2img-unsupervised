@@ -60,18 +60,6 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
         and hasattr(mdl, "scale_lr")
     )
 
-    # Determine learning rates for Adam and Muon
-    adam_lr = (
-        training_cfg.adam_learning_rate
-        if training_cfg.adam_learning_rate is not None
-        else training_cfg.learning_rate
-    )
-    muon_lr = (
-        training_cfg.muon_learning_rate
-        if training_cfg.muon_learning_rate is not None
-        else training_cfg.learning_rate
-    )
-
     # Create learning rate schedules
     def create_lr_schedule(base_lr):
         if training_cfg.learning_rate_schedule == LearningRateSchedule.CONSTANT:
@@ -125,14 +113,14 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
 
         if use_mup_scaling:
             opt_fixed_lr = optax.contrib.schedule_free_adamw(
-                learning_rate=adam_lr,
+                learning_rate=training_cfg.learning_rate,
                 warmup_steps=training_cfg.warmup_steps,
                 b1=training_cfg.schedule_free_beta1,
                 b2=training_cfg.adam_beta2,
                 weight_decay=training_cfg.weight_decay,
             )
             opt_scaled_lr = optax.contrib.schedule_free_adamw(
-                learning_rate=mdl.scale_lr(adam_lr),
+                learning_rate=mdl.scale_lr(training_cfg.learning_rate),
                 warmup_steps=training_cfg.warmup_steps,
                 b1=training_cfg.schedule_free_beta1,
                 b2=training_cfg.adam_beta2,
@@ -144,7 +132,7 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
             )
         else:
             opt = optax.contrib.schedule_free_adamw(
-                learning_rate=adam_lr,
+                learning_rate=training_cfg.learning_rate,
                 warmup_steps=training_cfg.warmup_steps,
                 b1=training_cfg.schedule_free_beta1,
                 b2=training_cfg.adam_beta2,
@@ -152,8 +140,7 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
             )
     else:
         # Handle regular optimizers (Adam, Muon, or mixed)
-        adam_lr_schedule = create_lr_schedule(adam_lr)
-        muon_lr_schedule = create_lr_schedule(muon_lr)
+        lr_schedule = create_lr_schedule(training_cfg.learning_rate)
 
         # Common Adam parameters
         adam_params = {
@@ -163,31 +150,22 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
 
         if training_cfg.use_muon:
             # Mixed Muon/Adam optimization with muP scaling (always enabled for Muon)
-            if callable(adam_lr_schedule):
-                adam_scaled_lr_schedule = lambda step: mdl.scale_lr(
-                    adam_lr_schedule(step)
-                )
+            if callable(lr_schedule):
+                scaled_lr_schedule = lambda step: mdl.scale_lr(lr_schedule(step))
             else:
-                adam_scaled_lr_schedule = mdl.scale_lr(adam_lr_schedule)
-
-            if callable(muon_lr_schedule):
-                muon_scaled_lr_schedule = lambda step: mdl.scale_lr(
-                    muon_lr_schedule(step)
-                )
-            else:
-                muon_scaled_lr_schedule = mdl.scale_lr(muon_lr_schedule)
+                scaled_lr_schedule = mdl.scale_lr(lr_schedule)
 
             # Create optimizers for each group
-            adam_fixed_opt = optax.adamw(learning_rate=adam_lr_schedule, **adam_params)
+            adam_fixed_opt = optax.adamw(learning_rate=lr_schedule, **adam_params)
             adam_scaled_opt = optax.adamw(
-                learning_rate=adam_scaled_lr_schedule, **adam_params
+                learning_rate=scaled_lr_schedule, **adam_params
             )
             muon_params = {
                 "beta": training_cfg.muon_beta,
                 "weight_decay": training_cfg.weight_decay,
             }
-            muon_fixed_opt = muon(muon_lr_schedule, **muon_params)
-            muon_scaled_opt = muon(muon_scaled_lr_schedule, **muon_params)
+            muon_fixed_opt = muon(lr_schedule, **muon_params)
+            muon_scaled_opt = muon(scaled_lr_schedule, **muon_params)
 
             opt = optax.transforms.partition(
                 {
@@ -201,16 +179,13 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
         else:
             # Pure Adam optimization
             if use_mup_scaling:
-                # For function schedules, we need to create a wrapper function for scaling
-                if callable(adam_lr_schedule):
-                    scaled_lr_schedule = lambda step: mdl.scale_lr(
-                        adam_lr_schedule(step)
-                    )
+                if callable(lr_schedule):
+                    scaled_lr_schedule = lambda step: mdl.scale_lr(lr_schedule(step))
                 else:
-                    scaled_lr_schedule = mdl.scale_lr(adam_lr_schedule)
+                    scaled_lr_schedule = mdl.scale_lr(lr_schedule)
 
                 opt_fixed_lr = optax.adamw(
-                    learning_rate=adam_lr_schedule, **adam_params
+                    learning_rate=lr_schedule, **adam_params
                 )
                 opt_scaled_lr = optax.adamw(
                     learning_rate=scaled_lr_schedule, **adam_params
@@ -221,7 +196,7 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
                     mdl.mk_partition_map(use_muon=False),
                 )
             else:
-                opt = optax.adamw(learning_rate=adam_lr_schedule, **adam_params)
+                opt = optax.adamw(learning_rate=lr_schedule, **adam_params)
 
     if training_cfg.gradient_accumulation_steps > 1:
         opt = optax.MultiSteps(

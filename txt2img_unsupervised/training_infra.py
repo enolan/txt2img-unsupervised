@@ -215,16 +215,6 @@ def setup_common_arguments(parser: argparse.ArgumentParser) -> argparse.Argument
         default=0.95,
         help="Momentum parameter for Muon optimizer",
     )
-    parser.add_argument(
-        "--muon-learning-rate",
-        type=float,
-        help="Learning rate for Muon parameters (if None, uses learning_rate)",
-    )
-    parser.add_argument(
-        "--adam-learning-rate",
-        type=float,
-        help="Learning rate for Adam parameters when using Muon (if None, uses learning_rate)",
-    )
     return parser
 
 

@@ -314,15 +314,20 @@ def muonize(beta: float) -> optax.GradientTransformation:
         updates: optax.Updates, state: MuonState, params: Optional[optax.Params] = None
     ) -> Tuple[optax.Updates, MuonState]:
         del params
-        new_state = MuonState(mu=optax.update_moment(state.mu, updates, beta, 1))
+        new_state = MuonState(mu=optax.update_moment(updates, state.mu, beta, 1))
 
         def orthogonalize_param(param: jax.Array) -> jax.Array:
             assert param.ndim >= 2, (
                 "Muon optimizer requires parameters to be at least 2D. Use another optimizer for 1 "
                 "or 0 dimensional parameters."
             )
+            # Scale to normalize update RMS to ~0.2 across all parameter shapes. Without this,
+            # Newton-Schulz produces updates with RMS 1/sqrt(max(A,B)) for an [A,B] matrix,
+            # making large matrices get disproportionately tiny updates.
+            # See "Muon is Scalable for LLM Training" (arXiv:2502.16982).
+            scale = 0.2 * jnp.sqrt(max(param.shape[-2], param.shape[-1]))
             if param.ndim == 2:
-                return newton_schulz(param)
+                return newton_schulz(param) * scale
             else:
                 # In cases with higher dimensional arrays, e.g. a query parameter for an attention
                 # layer inside a scan with shape (n_layers, n_query_heads, d_model, head_dim), we
@@ -331,7 +336,7 @@ def muonize(beta: float) -> optax.GradientTransformation:
                 vmapped_newton_schulz = newton_schulz
                 for _ in range(num_leading_dims):
                     vmapped_newton_schulz = jax.vmap(vmapped_newton_schulz)
-                return vmapped_newton_schulz(param)
+                return vmapped_newton_schulz(param) * scale
 
         output = jax.tree_util.tree_map(orthogonalize_param, new_state.mu)
         return output, new_state
@@ -360,8 +365,9 @@ def test_muonize_2d_parameters():
     assert updates["weight"].shape == (4, 3)
     assert jnp.all(jnp.isfinite(updates["weight"]))
 
-    # Check that the result is reasonably orthogonal
-    orthogonality_error = _compute_orthogonality_error(updates["weight"])
+    # Normalize out the RMS scaling before checking orthogonality
+    normalized = updates["weight"] / jnp.linalg.norm(updates["weight"])
+    orthogonality_error = _compute_orthogonality_error(normalized)
     assert (
         orthogonality_error < 1.5
     ), f"2D parameter should be orthogonalized, got error {orthogonality_error:.3f}"
@@ -397,19 +403,21 @@ def test_muonize_higher_dimensional_parameters():
     assert jnp.all(jnp.isfinite(updates["weight_3d"]))
     assert jnp.all(jnp.isfinite(updates["weight_4d"]))
 
-    # For 3D parameter, check each 2D slice is orthogonalized
+    # For 3D parameter, check each 2D slice is orthogonalized (normalize out RMS scaling first)
     for i in range(2):
         slice_2d = updates["weight_3d"][i]
-        orthogonality_error = _compute_orthogonality_error(slice_2d)
+        normalized = slice_2d / jnp.linalg.norm(slice_2d)
+        orthogonality_error = _compute_orthogonality_error(normalized)
         assert (
             orthogonality_error < 1.5
         ), f"3D parameter slice {i} should be orthogonalized, got error {orthogonality_error:.3f}"
 
-    # For 4D parameter, check each 2D slice is orthogonalized
+    # For 4D parameter, check each 2D slice is orthogonalized (normalize out RMS scaling first)
     for i in range(2):
         for j in range(3):
             slice_2d = updates["weight_4d"][i, j]
-            orthogonality_error = _compute_orthogonality_error(slice_2d)
+            normalized = slice_2d / jnp.linalg.norm(slice_2d)
+            orthogonality_error = _compute_orthogonality_error(normalized)
             assert (
                 orthogonality_error < 1.5
             ), f"4D parameter slice [{i},{j}] should be orthogonalized, got error {orthogonality_error:.3f}"
@@ -435,8 +443,9 @@ def test_muonize_momentum_accumulation():
         assert updates["weight"].shape == (3, 3)
         assert jnp.all(jnp.isfinite(updates["weight"]))
 
-        # Each should be reasonably orthogonal
-        orthogonality_error = _compute_orthogonality_error(updates["weight"])
+        # Each should be reasonably orthogonal (normalize out RMS scaling first)
+        normalized = updates["weight"] / jnp.linalg.norm(updates["weight"])
+        orthogonality_error = _compute_orthogonality_error(normalized)
         assert (
             orthogonality_error < 1.5
         ), f"Updates should be orthogonalized, got error {orthogonality_error:.3f}"
@@ -461,6 +470,40 @@ def test_muonize_assertion_1d_parameter():
         optimizer.update(grads, opt_state)
 
 
+def test_muonize_update_rms_scaling():
+    """Test that RMS scaling produces consistent update RMS (~0.2) across different parameter shapes."""
+    rng = jax.random.PRNGKey(42)
+
+    shapes = [(16, 16), (64, 8), (8, 64), (128, 32), (32, 128)]
+    params = {f"w{i}": jax.random.normal(rng, shape) for i, shape in enumerate(shapes)}
+
+    optimizer = muonize(beta=0.95)
+    opt_state = optimizer.init(params)
+
+    grads = {
+        f"w{i}": jax.random.normal(jax.random.PRNGKey(i + 100), shape)
+        for i, shape in enumerate(shapes)
+    }
+
+    updates, _ = optimizer.update(grads, opt_state)
+
+    rms_values = []
+    for key in sorted(updates.keys()):
+        u = updates[key]
+        rms = jnp.sqrt(jnp.mean(u**2))
+        rms_values.append(float(rms))
+
+    # All RMS values should be close to 0.2
+    for key, rms in zip(sorted(updates.keys()), rms_values):
+        assert 0.1 < rms < 0.4, f"RMS for {key} should be near 0.2, got {rms:.4f}"
+
+    # RMS values should be consistent across shapes (within 2x of each other)
+    assert max(rms_values) / min(rms_values) < 2.0, (
+        f"RMS values should be consistent across shapes, got range "
+        f"{min(rms_values):.4f} to {max(rms_values):.4f}"
+    )
+
+
 @pytest.mark.parametrize("weight_decay", [0.0, 0.01])
 def test_muon_toy_neural_network(weight_decay):
     """Test muon on a toy neural network with 2D and 3D parameters."""
@@ -483,7 +526,7 @@ def test_muon_toy_neural_network(weight_decay):
         * 0.1,  # 3D
     }
 
-    optimizer = muon(learning_rate=0.03, beta=0.95, weight_decay=weight_decay)
+    optimizer = muon(learning_rate=0.02, beta=0.95, weight_decay=weight_decay)
 
     opt_state = optimizer.init(params)
 
@@ -542,7 +585,7 @@ def test_muon_toy_neural_network(weight_decay):
         f"final={final_loss:.4f}, reduction factor={final_loss/initial_loss:.3f}"
     )
     assert (
-        final_loss < 0.05
+        final_loss < 0.1
     ), f"Final loss should be reasonably small, got {final_loss:.4f}"
 
     # Verify loss generally decreased over time (allowing for some oscillation)

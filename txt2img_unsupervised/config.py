@@ -789,12 +789,6 @@ class TrainingConfig:
     # Muon optimizer settings
     use_muon: bool = False
     muon_beta: float = 0.95  # Momentum parameter for Muon optimizer
-    muon_learning_rate: Optional[
-        float
-    ] = None  # Learning rate for Muon parameters (if None, uses learning_rate)
-    adam_learning_rate: Optional[
-        float
-    ] = None  # Learning rate for Adam parameters when using Muon (if None, uses learning_rate)
 
     @staticmethod
     def from_json_dict(dict: dict[str, Any]) -> "TrainingConfig":
@@ -1000,10 +994,9 @@ _test_json_strs = [
         "adaptive_gradient_clip": false,
         "weight_decay": 0.0,
         "adam_beta2": 0.999,
+        "learning_rate": 1e-3,
         "use_muon": true,
-        "muon_beta": 0.95,
-        "muon_learning_rate": 1e-2,
-        "adam_learning_rate": 1e-3
+        "muon_beta": 0.95
         }""",
     """{
         "batch_size": 8,
@@ -1053,8 +1046,6 @@ def test_trainingconfig_muon_validation():
         gradient_clipping=None,
         use_muon=True,
         muon_beta=0.95,
-        muon_learning_rate=2e-3,
-        adam_learning_rate=1e-3,
     )
     # Should not raise
     valid_muon_cfg.validate()
