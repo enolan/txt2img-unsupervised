@@ -608,9 +608,7 @@ if __name__ == "__main__":
         initial_step=global_step,
         initial_train_state=train_state,
         get_batch_fn=lambda step: (
-            lambda b: {
-                args.vector_column: b[args.vector_column],
-            }
+            lambda b: {args.vector_column: b[args.vector_column]}
         )(
             get_batch(
                 train_dataset,

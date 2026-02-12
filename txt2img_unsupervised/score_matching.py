@@ -209,7 +209,9 @@ def denoising_score_matching_loss(
         params, x_t, t, conditioning_data, rngs=rngs_dict
     )
 
-    per_sample_loss = jnp.sum((predicted_scaled_score - target_scaled_score) ** 2, axis=1)
+    per_sample_loss = jnp.sum(
+        (predicted_scaled_score - target_scaled_score) ** 2, axis=1
+    )
     return jnp.mean(per_sample_loss)
 
 

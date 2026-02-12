@@ -148,12 +148,12 @@ def sample(key: random.PRNGKey, mu: Array, kappa, n_samples: int) -> Array:
         # Batched case: n_samples (mu, kappa) pairs
         batch_size, dim = mu.shape
         kappa = jnp.asarray(kappa)
-        assert batch_size == n_samples, (
-            f"mu batch size ({batch_size}) must match n_samples ({n_samples})"
-        )
-        assert kappa.shape == (n_samples,), (
-            f"kappa must have shape ({n_samples},), got {kappa.shape}"
-        )
+        assert (
+            batch_size == n_samples
+        ), f"mu batch size ({batch_size}) must match n_samples ({n_samples})"
+        assert kappa.shape == (
+            n_samples,
+        ), f"kappa must have shape ({n_samples},), got {kappa.shape}"
         mu = mu / jnp.linalg.norm(mu, axis=1, keepdims=True)
     else:
         raise ValueError(f"mu must be 1D or 2D, got {mu.ndim}D")
@@ -230,9 +230,7 @@ def _sample_w_single(key: random.PRNGKey, kappa: Array, dim: int) -> Array:
         z = random.beta(key_z, alpha, alpha)
         w_candidate = (1.0 - (1.0 + b) * z) / (1.0 - (1.0 - b) * z)
         log_accept = (
-            kappa * w_candidate
-            + (dim_arr - 1.0) * jnp.log(1.0 - x0 * w_candidate)
-            - c
+            kappa * w_candidate + (dim_arr - 1.0) * jnp.log(1.0 - x0 * w_candidate) - c
         )
         log_u = jnp.log(random.uniform(key_u))
         accept = log_u <= log_accept
