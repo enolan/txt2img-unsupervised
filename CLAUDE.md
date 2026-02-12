@@ -15,112 +15,168 @@ would be trained on the images conditioned on their embeddings. This is in progr
 allow much better prompt following and image quality.
 
 The image generation model is an autoregressive transformer using a VQGAN for the image tokens. The
-model that generates embeddings is a spherical flow matching model with optimal transport paths.
+model that generates embeddings is a spherical flow matching model with optimal transport paths, or
+a score matching model.
 
 ## Code Style Guidelines
-- Your goal is to write code that is easy to understand and maintain. Take pride in your work. Don't
-  make the next person to look at this code spend a lot of effort figuring out what it does. When
-  you write code, ask yourself the following question:
-  * "Is this easy to understand? If I was reading this code for the first time, how long would it
-    take me to understand what's going on?"
-  * "Is this code written in a way that makes it more likely to be correct? Less likely?"
-  Do your best to write code such that the answers to those questions are "yes", "not too long",
-  "yes", and "no".
-- Code should communicate well. That means not including any extraneous information while including
-  all necessary information to understand the code and why it is the way it is. Ceteris paribus,
-  concise code is clearer.
-- In terms of comments, the best code is code where it's obvious what it does and why, without
-  needing any comments. Second best is code where that's not obvious, but the comments make it
-  clear. Third is code where it's obvious and there are redundant comments that tell you nothing you
-  don't already know from reading the code. And I suppose fourth best is code where the comments are
-  wrong. Always do one of the first two, preferably the first where possible. Never the third or
-  fourth.
-- When the code is doing something that isn't obvious, or is doing something for a reason that
-  isn't obvious, add comments to explain it.
-- NEVER write comments that are just repeating what the code does. If a comment wouldn't give the
-  reader any information that reading the code wouldn't already provide, do not include it. For
-  example:
-  ```python
-  # Bad:
-  # Get the current time
-  current_time = time.time()
 
-  # Good:
-  current_time = time.time()
-  ```
-  notice how the second version gives you exactly the same information as the first, but it's one
-  line shorter.
-- Comments should be "timeless". They should describe the code as it is, and never refer anything
-  as "new" or "old". Remember, your code may be read years in the future.
-- NEVER silently ignore exceptions. If there's no valid reason for an exception to be thrown - e.g.
-  if the exception indicates a bug in the code that throws the exception, or some unrecoverable
-  broken state - then it should NOT be caught, and allowed to propagate up and end program
-  execution. We want to know when things are broken, NOT hide that fact! If there's a valid reason
-  for an exception to be thrown (e.g. the caller has a bug, or the user passed a path to a file that
-  doesn't exist etc), then it may make sense to catch it and reraise with a better message or
-  recover. When in doubt, err on the side of allowing the program to crash.
-- NEVER silently ignore errors. In particular, the following patterns are wrong:
-  ```python
-  # Checking for keys you know should exist
-  if 'key' in my_dict:
-    # do something with my_dict['key']
-  else:
-    # fallback code that should never run
-  ```
-  ```python
-  # Same pattern for attributes
-  if hasattr(my_obj, 'prop'):
-    # do something with my_obj.prop
-  else:
-    # fallback code that should never run
-  ```
-  If you know something should exist, simply access it. Don't check for its presence and write
-  fallback code that shouldn't ever run. If whatever it is doesn't exist, allow the code to throw
-  an exception or otherwise error out. "Defensive" programming that only serves to hide bugs is
-  bullshit. This principle applies in general, not just to exceptions or missing keys or attributes.
-  This includes numerical issues. If a function expects a value to be within some range, and passing
-  a value outside that range is a bug, we should NOT clamp. It is correct for the code that
-  *produces* a value to clamp, if it could end up out of range due to numerics, but not for code
-  that recevives a value from a caller.
-- Prefer functional code with minimal state. Small, independent functions that have a clear purpose
-  are easier to understand and test.
-- When state is necessary, use classes to manage it. Use dataclasses where they make sense.
-- Avoid repeating yourself. Use the abstractions available to you to make your code clear and
-  concise.
-- When dispatching on an enum, check for all possible values explicitly. Throw an exception if the
-  enum value isn't valid.
-  ```python
-  # BAD
-  if foo == SomeEnum.A:
-    # do stuff
-  elif foo == SomeEnum.B:
-    # do other stuff
-  else:
-    # do stuff for SomeEnum.C, no explicit check for other values
+Please keep these guidelines in mind when you're writing code. In addition, after you're done
+making changes and before returning control to the user, double check that everything is nice,
+clean, and clear as described below.
 
-  # GOOD
-  if foo == SomeEnum.A:
-    # do stuff
-  elif foo == SomeEnum.B:
-    # do other stuff
-  elif foo == SomeEnum.C:
-    # do stuff for SomeEnum.C
-  else:
-    raise ValueError(f"Invalid enum value: {foo}")
-  ```
-- Use Python 3.11+ features including type hints
-- Format code with Black
-- Use dataclasses for configuration objects
-- Follow PEP 8 naming conventions:
-  - snake_case for functions and variables
-  - CamelCase for classes
-  - UPPER_CASE for constants
-- Import order: external libraries, then local, both in alphabetical order. Always at the top of a
+### Clarity and maintainability
+
+Code should communicate well. Your goal is to write code that is easy to understand and maintain.
+Take pride in your work. Don't make the next person to look at this code spend a lot of effort
+figuring out what it does. When you write code, ask yourself the following question:
+* "Is this easy to understand? If I was reading this code for the first time, how long would it
+   take me to understand what's going on?"
+* "Is this code written in a way that makes it more likely to be correct? Less likely?"
+
+Do your best to write code such that the answers to those questions are "yes", "not too long",
+"yes", and "no". This is the guiding principle for all code you write. Various specifics follow. In
+cases where the specific advice is in conflict with the guiding principle, the guiding principle
+overrides.
+
+#### Be concise
+
+Ceteris paribus, concise code is clearer. If there are two equally effective ways to write
+something, use the shorter version so long as that doesn't sacrifice clarity in some other way.
+
+#### On comments
+
+Write docstrings for all functions and classes. Write inline comments when that contributes to
+clarity. The best code is code where it's obvious what it does and why, without needing any
+comments. Second best is code where that's not obvious, but the comments make it clear. Third is
+code where it's obvious and there are redundant comments that tell you nothing you don't already
+know from reading the code. And fourth best is code where the comments are wrong. Always do one of
+the first two, preferably the first where possible. Never the third or fourth.
+
+Again, NEVER write comments that are just repeating what the code does. If a comment wouldn't give
+the reader any information that reading the code wouldn't already provide, do not include it. For
+example:
+
+```python
+# Bad:
+# Get the current time
+current_time = time.time()
+
+# Good:
+current_time = time.time()
+```
+notice how the second version gives you exactly the same information as the first, but it's one line
+shorter.
+
+Comments should also be "timeless". They should describe the code as it is, and never refer to
+anything as "new" or "old". Remember, your code may be read years in the future.
+
+#### Duplication
+
+Avoid duplicating code. We should never have two copies of a function or class. If there are
+multiple functions or classes that are very similar, they should probably be merged into one that
+works in each situation. If there are repeated sections in a single function or across multiple
+functions, they should probably be abstracted out too. There are necessarily judgement calls
+involved here, abstracting doesn't always make things clearer. You'll have to figure out how to
+balance those concerns.
+
+### Error handling
+
+Some errors should be surfaced to the caller of the code where the error occurs, some should be
+handled internally, and some indicate a bug which should cause the program to crash. It's important
+to make the right error handling choice depending on the situation. That third category is important
+- if there's a bug in the code, we want to fail fast so we can fix it and so we don't waste time
+thinking something works when it's actually broken. We DON'T want to hide bugs.
+
+#### Exceptions
+
+NEVER silently ignore exceptions. If there's no valid reason for an exception to be thrown - e.g. if
+the exception indicates a bug in the code that throws the exception, or some unrecoverable broken
+state - then it should NOT be caught, and allowed to propagate up and end program execution. If
+there's a valid reason for an exception to be thrown (e.g. the caller has a bug, or the user passed
+a path to a file that doesn't exist etc), then it may make sense to catch it and reraise with a
+better message or recover. When in doubt, err on the side of allowing the program to crash.
+
+#### Missing dictionary values or object properties
+
+The following two patterns are wrong:
+
+```python
+# Checking for keys you know should exist
+if 'key' in my_dict:
+  # do something with my_dict['key']
+else:
+  # fallback code that should never run
+```
+
+```python
+# Same pattern for attributes
+if hasattr(my_obj, 'prop'):
+  # do something with my_obj.prop
+else:
+  # fallback code that should never run
+```
+
+If you know something should exist, simply access it. Don't check for its presence and write
+fallback code that shouldn't ever run. If whatever it is doesn't exist, allow the code to throw an
+exception or otherwise error out. Don't interpret this to mean that using `in` or `hasattr` are
+*always* wrong - if it's valid for the dictionary/object to have the key/attribute or not, then
+checking is perfectly fine.
+
+#### Numerics
+
+If a function expects a parameter to be within some range, and passing a value outside that range is
+a bug, we should NOT clamp in the code that takes the parameter. It is correct for the code that
+*produces* a value to clamp, if it could end up out of range due to numerics, but not for code that
+receives a value from a caller. For example, a function which takes a cosine similarity as a
+parameter should not clamp to [-1.0, 1.0], but a function that computes a cosine similarity should.
+
+
+## General design
+
+Prefer functional code with minimal state. Small, independent functions that have a clear purpose
+are easier to understand and test. When state is necessary, use classes to manage it. Use
+dataclasses where they make sense. Use type hints.
+
+## Formatting
+
+* Follow PEP 8 naming conventions
+* Format code with Black
+* Import order: external libraries, then local, both in alphabetical order. Always at the top of a
   source file, after any docstrings. Never put imports inside functions or classes.
-- Prefer explicit error handling with descriptive error messages
-- Document functions with docstrings ("""description""")
-- Use pytest for testing with descriptive test names (test_function_does_x)
-- Use custom pytest markers for tests with special requirements
+
+## Testing
+
+Write automated tests where they make sense. The ideal is that if a person read the tests alone,
+without seeing any implementation code, and saw that the tests pass, they would be confident the
+code is correct.
+
+Use pytest. Use descriptive test names. When testing something that has multiple code paths, use
+pytest.mark.parametrize to exercise each one.
+
+## Enums
+
+When dispatching on an enum, check for all possible values explicitly. Throw an exception if the
+enum value isn't valid.
+
+```python
+# BAD
+if foo == SomeEnum.A:
+  # do stuff
+elif foo == SomeEnum.B:
+  # do other stuff
+else:
+  # do stuff for SomeEnum.C, no explicit check for other values
+
+# GOOD
+if foo == SomeEnum.A:
+  # do stuff
+elif foo == SomeEnum.B:
+  # do other stuff
+elif foo == SomeEnum.C:
+  # do stuff for SomeEnum.C
+else:
+  raise ValueError(f"Invalid enum value: {foo}")
+```
 
 ## Files
 
@@ -142,7 +198,7 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
   * `txt2img_unsupervised/cap_sampling.py`. Functions for sampling spherical caps and sampling
     points inside them.
   * `txt2img_unsupervised/transformer_model.py`. The transformer-based image generation model.
-  * `txt2img_unsupervised/checkpoint.py`. Functions for loading and saving checkpoints and managin
+  * `txt2img_unsupervised/checkpoint.py`. Functions for loading and saving checkpoints and managing
     training states.
   * `txt2img_unsupervised/config.py`. Configuration objects for models and training.
   * `txt2img_unsupervised/train_data_loading.py`. Functions for loading training data.
