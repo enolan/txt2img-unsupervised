@@ -1,0 +1,12 @@
+{
+    "n_layers": 8,
+    "domain_dim": 768,
+    "reference_directions": null,
+    "time_dim": null,
+    "use_pre_mlp_projection": true,
+    "d_model": 1024,
+    "mlp_expansion_factor": 4,
+    "weighting_function": "constant",
+    "weighting_function_extra_params": null,
+    "base_distribution": "sphere"
+}

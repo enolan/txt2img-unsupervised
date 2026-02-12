@@ -1,0 +1,17 @@
+{
+  "activation_function": "gelu",
+  "activations_dtype": "float32",
+  "clip_caps": false,
+  "clip_conditioning": true,
+  "corrected_cap_projections": true,
+  "norm_clip_embeddings": true,
+  "d_model": 768,
+  "dropout": null,
+  "ff_dim": 3072,
+  "image_dropout": 0.1,
+  "image_tokens": 1024,
+  "n_layers": 12,
+  "num_heads": 12,
+  "pre_norm": true,
+  "use_biases": true
+}
