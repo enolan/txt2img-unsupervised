@@ -17,6 +17,8 @@ from . import vmf
 from . import vmf_mixture
 from .cap_sampling import (
     LogitsTable,
+    cap_conditioning_dim,
+    encode_cap_params,
     process_d_max_dist,
     random_pt_with_cosine_similarity,
     sample_cap,
@@ -215,20 +217,11 @@ class FunctionWeightedFlowModel(nn.Module):
             WeightingFunction.CAP_INDICATOR,
             WeightingFunction.SMOOTHED_CAP_INDICATOR,
         ]:
-            if self.relative_cap_encoding:
-                # direction (domain_dim or reference_directions) + distance (1) + half_angle (1)
-                return (
-                    self.reference_directions
-                    if self.reference_directions
-                    else self.domain_dim
-                ) + 2
-            else:
-                # cap_center (domain_dim or reference_directions) + d_max (1)
-                return (
-                    self.reference_directions
-                    if self.reference_directions
-                    else self.domain_dim
-                ) + 1
+            return cap_conditioning_dim(
+                self.domain_dim,
+                self.reference_directions,
+                self.relative_cap_encoding,
+            )
         elif self.weighting_function == WeightingFunction.VMF_DENSITY:
             return NotImplementedError(
                 "VMF density weighting function not implemented yet."
@@ -429,10 +422,9 @@ class FunctionWeightedFlowModel(nn.Module):
     def process_weighting_function_params(
         self, cond_vecs: jax.Array, cond_scalars: jax.Array, x: jax.Array
     ) -> jax.Array:
-        """
-        Convert weighting-function parameters to the model's conditioning vector. In principle,
-        there could be other shapes of inference-time weighting function parameters, but ATM all our
-        (non-constant) weighting functions take a single vector and scalar.
+        """Convert weighting-function parameters to the model's conditioning vector.
+
+        Delegates to the standalone encode_cap_params function in cap_sampling.py.
 
         Args:
             cond_vecs: Unit vectors in R^{domain_dim} (cap center / direction parameter).
@@ -456,136 +448,22 @@ class FunctionWeightedFlowModel(nn.Module):
             WeightingFunction.CAP_INDICATOR,
             WeightingFunction.SMOOTHED_CAP_INDICATOR,
         ], f"process_weighting_function_params called with unsupported weighting function: {self.weighting_function}"
-
         assert x.shape == (batch_size, self.domain_dim), f"x.shape: {x.shape}"
 
-        if self.relative_cap_encoding:
-            # Relative encoding: direction from x toward cap center, distance from x to cap center,
-            # cap half angle.
+        processed_cond_vecs = encode_cap_params(
+            cap_center=cond_vecs,
+            d_max=cond_scalars,
+            x=x,
+            reference_vectors=(
+                self.vector_field.reference_vectors
+                if self.reference_directions is not None
+                else None
+            ),
+            d_max_dist=self.weighting_function_extra_params.d_max_dist,
+            domain_dim=self.domain_dim,
+            relative=self.relative_cap_encoding,
+        )
 
-            def taylor_arccos(x: jax.Array) -> jax.Array:
-                # 7th order Taylor approximation of arccos. Actual arccos's derivative goes to
-                # infinity at x = ±1, which breaks divergence calculation and makes integration
-                # hard in general. This keeps the derivative finite and of reasonable magnitude.
-                # It's close to actual arccos across most of the range and isomorphic to it, so it
-                # should be basically as good.
-                x2 = x * x
-                x3 = x2 * x
-                x5 = x3 * x2
-                x7 = x5 * x2
-                return (
-                    jnp.pi / 2 - x - x3 / 6.0 - (3.0 / 40.0) * x5 - (5.0 / 112.0) * x7
-                )
-
-            # Compute direction from x toward cap center
-            dot_product = jnp.sum(x * cond_vecs, axis=1, keepdims=True)
-            direction_to_cap = cond_vecs - dot_product * x
-            assert direction_to_cap.shape == (batch_size, self.domain_dim)
-            direction_to_cap = direction_to_cap / (
-                jnp.linalg.norm(direction_to_cap, axis=1, keepdims=True) + 0.01
-            )
-
-            # Compute geodesic distance from x to cap center
-            cosine_similarity = jnp.clip(dot_product[:, 0], -1.0, 1.0)
-            geodesic_distance = taylor_arccos(cosine_similarity)
-
-            # Compute cap half angle from d_max
-            half_angle = taylor_arccos(1.0 - cond_scalars)
-            assert half_angle.shape == (batch_size,)
-
-            if self.reference_directions is not None:
-                dir_features = (
-                    direction_to_cap @ self.vector_field.reference_vectors.T
-                ) * jnp.sqrt(self.domain_dim)
-            else:
-                dir_features = direction_to_cap * jnp.sqrt(self.domain_dim)
-            assert dir_features.shape == (
-                batch_size,
-                self.reference_directions
-                if self.reference_directions
-                else self.domain_dim,
-            )
-
-            # Normalize the scalar features to be vaguely unit scale. Probably good enough.
-            # Assume (incorrectly) that distances are drawn from U[0, pi]
-            # for correct normalization this should take into account d_max_dist
-            uniform_0_pi_mean = jnp.pi / 2
-            uniform_0_pi_var = jnp.pi**2 / 12
-            distance_features = (geodesic_distance - uniform_0_pi_mean) / jnp.sqrt(
-                uniform_0_pi_var
-            )
-            assert distance_features.shape == (batch_size,)
-
-            # Assume (also incorrectly) that half angles are drawn from U[0, pi]
-            # for correct normalization this should take into account domain_dim and the base
-            # distribution.
-            half_angle_features = (half_angle - uniform_0_pi_mean) / jnp.sqrt(
-                uniform_0_pi_var
-            )
-            assert half_angle_features.shape == (batch_size,)
-
-            processed_cond_vecs = jnp.concatenate(
-                [
-                    dir_features,
-                    distance_features[:, None],
-                    half_angle_features[:, None],
-                ],
-                axis=1,
-            )
-            expected_shape = (
-                batch_size,
-                (
-                    self.reference_directions
-                    if self.reference_directions
-                    else self.domain_dim
-                )
-                + 2,
-            )
-        else:
-            # Absolute encoding: cap center + d_max
-            # Encode the direction parameter to match how inputs are encoded, then scale to unit variance.
-            # - If using reference directions, project onto them and scale by sqrt(domain_dim) so that
-            #   each component has variance ~1 for isotropic inputs.
-            # - Otherwise, pass through coordinates scaled by sqrt(domain_dim).
-            if self.reference_directions is not None:
-                # [ref_dirs, domain_dim] <- reference vectors; produce [ref_dirs]
-                dir_features = (
-                    cond_vecs @ self.vector_field.reference_vectors.T
-                ) * jnp.sqrt(self.domain_dim)
-            else:
-                dir_features = cond_vecs * jnp.sqrt(self.domain_dim)
-
-            # Normalize d_max scalars using the training distribution specified by d_max_dist
-            weights, range_starts, range_ends = process_d_max_dist(
-                self.weighting_function_extra_params.d_max_dist
-            )
-            component_means = (range_starts + range_ends) / 2.0
-            component_vars = (range_ends - range_starts) ** 2 / 12.0
-            mixture_mean = jnp.sum(weights * component_means)
-            mixture_var = jnp.sum(
-                weights * (component_vars + (component_means - mixture_mean) ** 2)
-            )
-            mixture_std = jnp.sqrt(mixture_var)
-
-            scalar_features = (cond_scalars - mixture_mean) / mixture_std
-            scalar_features = scalar_features[:, None]
-
-            processed_cond_vecs = jnp.concatenate(
-                [dir_features, scalar_features], axis=1
-            )
-            expected_shape = (
-                batch_size,
-                (
-                    self.reference_directions
-                    if self.reference_directions
-                    else self.domain_dim
-                )
-                + 1,
-            )
-
-        assert (
-            processed_cond_vecs.shape == expected_shape
-        ), f"processed_cond_vecs.shape: {processed_cond_vecs.shape}, expected: {expected_shape}"
         assert processed_cond_vecs.shape == (batch_size, self.conditioning_dim)
         return processed_cond_vecs
 

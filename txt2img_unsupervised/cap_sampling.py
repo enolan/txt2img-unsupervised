@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from functools import partial
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 @jax.tree_util.register_pytree_node_class
@@ -567,6 +567,201 @@ def test_sample_from_cap():
         )
         dists = 1 - jnp.dot(samples, vectors[i])
         assert jnp.all(dists <= max_cos_distances[i])
+
+
+def cap_conditioning_dim(
+    domain_dim: int,
+    reference_directions: Optional[int],
+    relative: bool,
+) -> int:
+    """Compute the output dimension of cap conditioning vectors.
+
+    Args:
+        domain_dim: Dimension of the ambient space (e.g. 768 for CLIP).
+        reference_directions: Number of reference directions to project onto, or None to
+            use raw coordinates.
+        relative: If True, use relative encoding (direction + distance + half_angle);
+            if False, use absolute encoding (cap center + d_max).
+    """
+    feature_dim = (
+        reference_directions if reference_directions is not None else domain_dim
+    )
+    return feature_dim + 2 if relative else feature_dim + 1
+
+
+def taylor_arccos(x: jax.Array) -> jax.Array:
+    """7th-order Taylor approximation of arccos around 0.
+
+    Real arccos has infinite derivatives at x = +/-1, which breaks divergence calculation
+    and makes ODE integration hard. This keeps the derivative finite and of reasonable
+    magnitude while being close to actual arccos across most of the range.
+    """
+    x2 = x * x
+    x3 = x2 * x
+    x5 = x3 * x2
+    x7 = x5 * x2
+    return jnp.pi / 2 - x - x3 / 6.0 - (3.0 / 40.0) * x5 - (5.0 / 112.0) * x7
+
+
+def encode_cap_params(
+    cap_center: jax.Array,
+    d_max: jax.Array,
+    x: jax.Array,
+    reference_vectors: Optional[jax.Array],
+    d_max_dist: Optional[Tuple[Tuple[float, float], ...]],
+    domain_dim: int,
+    relative: bool = False,
+) -> jax.Array:
+    """Encode spherical cap parameters into a conditioning vector for a neural network.
+
+    The output has approximately zero mean and unit variance per component when inputs
+    are drawn from the training distribution.
+
+    Args:
+        cap_center: Unit vectors specifying cap centers, shape (batch, domain_dim).
+        d_max: Maximum cosine distances, shape (batch,).
+        x: Current position vectors, shape (batch, domain_dim). Used only in relative mode.
+        reference_vectors: Reference direction matrix of shape (n_ref, domain_dim), or None
+            to use raw coordinates.
+        d_max_dist: Training distribution of d_max values (passed to process_d_max_dist).
+        domain_dim: Dimension of the ambient space.
+        relative: If True, encode direction from x toward cap center, geodesic distance,
+            and cap half angle. If False, encode absolute cap center and normalized d_max.
+
+    Returns:
+        Conditioning vectors of shape (batch, cap_conditioning_dim(domain_dim,
+        reference_directions, relative)) with approximately zero mean and unit variance
+        per component.
+    """
+    batch_size = cap_center.shape[0]
+
+    if relative:
+        # Direction from x toward cap center in the tangent space of x
+        dot_product = jnp.sum(x * cap_center, axis=1, keepdims=True)
+        direction_to_cap = cap_center - dot_product * x
+        direction_to_cap = direction_to_cap / (
+            jnp.linalg.norm(direction_to_cap, axis=1, keepdims=True) + 0.01
+        )
+
+        cosine_similarity = jnp.clip(dot_product[:, 0], -1.0, 1.0)
+        geodesic_distance = taylor_arccos(cosine_similarity)
+        half_angle = taylor_arccos(1.0 - d_max)
+
+        if reference_vectors is not None:
+            dir_features = (direction_to_cap @ reference_vectors.T) * jnp.sqrt(
+                domain_dim
+            )
+        else:
+            dir_features = direction_to_cap * jnp.sqrt(domain_dim)
+
+        # Normalize scalar features assuming U[0, pi] (inexact but reasonable)
+        uniform_0_pi_mean = jnp.pi / 2
+        uniform_0_pi_var = jnp.pi**2 / 12
+        distance_features = (geodesic_distance - uniform_0_pi_mean) / jnp.sqrt(
+            uniform_0_pi_var
+        )
+        half_angle_features = (half_angle - uniform_0_pi_mean) / jnp.sqrt(
+            uniform_0_pi_var
+        )
+
+        return jnp.concatenate(
+            [dir_features, distance_features[:, None], half_angle_features[:, None]],
+            axis=1,
+        )
+    else:
+        # Absolute encoding: projected (or raw) cap center + normalized d_max
+        if reference_vectors is not None:
+            dir_features = (cap_center @ reference_vectors.T) * jnp.sqrt(domain_dim)
+        else:
+            dir_features = cap_center * jnp.sqrt(domain_dim)
+
+        # Normalize d_max using training distribution statistics
+        weights, range_starts, range_ends = process_d_max_dist(d_max_dist)
+        component_means = (range_starts + range_ends) / 2.0
+        component_vars = (range_ends - range_starts) ** 2 / 12.0
+        mixture_mean = jnp.sum(weights * component_means)
+        mixture_var = jnp.sum(
+            weights * (component_vars + (component_means - mixture_mean) ** 2)
+        )
+        mixture_std = jnp.sqrt(mixture_var)
+
+        scalar_features = ((d_max - mixture_mean) / mixture_std)[:, None]
+
+        return jnp.concatenate([dir_features, scalar_features], axis=1)
+
+
+@pytest.mark.parametrize("domain_dim", [3, 16, 768])
+@pytest.mark.parametrize("reference_directions", [None, 8])
+@pytest.mark.parametrize(
+    "d_max_dist",
+    [
+        None,
+        [(1.0, 2.0)],
+        [(0.95, 1.0), (0.05, 2.0)],
+        [(0.45, 0.8), (0.45, 1.2), (0.1, 2.0)],
+    ],
+)
+@pytest.mark.parametrize("relative", [False, True])
+def test_encode_cap_params(domain_dim, reference_directions, d_max_dist, relative):
+    """Verify encode_cap_params returns normalized vectors of the right shape."""
+    from .flow_matching import sample_sphere
+
+    n = 8192
+    rng = jax.random.PRNGKey(20250212)
+    cap_rng, dmax_rng, x_rng, ref_rng = jax.random.split(rng, 4)
+
+    cap_centers = sample_sphere(cap_rng, n, domain_dim)
+    x_positions = sample_sphere(x_rng, n, domain_dim)
+
+    # Sample d_max from the specified distribution
+    weights, range_starts, range_ends = process_d_max_dist(
+        tuple(tuple(p) for p in d_max_dist) if d_max_dist is not None else None
+    )
+    comp_rng, val_rng = jax.random.split(dmax_rng)
+    comp_idxs = jax.random.categorical(comp_rng, jnp.log(weights), shape=(n,))
+    d_maxes = jax.random.uniform(
+        val_rng,
+        minval=range_starts[comp_idxs],
+        maxval=range_ends[comp_idxs],
+        shape=(n,),
+    )
+
+    if reference_directions is not None:
+        ref_vecs = sample_sphere(ref_rng, reference_directions, domain_dim)
+    else:
+        ref_vecs = None
+
+    result = encode_cap_params(
+        cap_centers,
+        d_maxes,
+        x_positions,
+        ref_vecs,
+        tuple(tuple(p) for p in d_max_dist) if d_max_dist is not None else None,
+        domain_dim,
+        relative=relative,
+    )
+
+    expected_dim = cap_conditioning_dim(domain_dim, reference_directions, relative)
+    assert result.shape == (n, expected_dim)
+
+    result_np = jax.device_get(result)
+    means = result_np.mean(axis=0)
+    stds = result_np.std(axis=0)
+
+    if relative:
+        # Normalization is inexact for relative encoding. The direction features (all but
+        # last 2) should be well-scaled, but the distance and half_angle features can have
+        # very low variance in high dimensions due to concentration of measure (uniform
+        # random points on a high-dimensional sphere are nearly orthogonal).
+        dir_stds = stds[:-2]
+        assert np.all(np.abs(means) < 1.0), f"Means too large: {means}"
+        assert np.all(dir_stds > 0.25) and np.all(
+            dir_stds < 1.5
+        ), f"Direction stds out of reasonable range: {dir_stds}"
+        assert np.all(stds[-2:] < 1.5), f"Scalar stds too large: {stds[-2:]}"
+    else:
+        np.testing.assert_allclose(means, 0.0, atol=0.05, rtol=0)
+        np.testing.assert_allclose(stds, 1.0, atol=0.05, rtol=0)
 
 
 def sphere_log_inverse_surface_area(d):

@@ -184,9 +184,7 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
                 else:
                     scaled_lr_schedule = mdl.scale_lr(lr_schedule)
 
-                opt_fixed_lr = optax.adamw(
-                    learning_rate=lr_schedule, **adam_params
-                )
+                opt_fixed_lr = optax.adamw(learning_rate=lr_schedule, **adam_params)
                 opt_scaled_lr = optax.adamw(
                     learning_rate=scaled_lr_schedule, **adam_params
                 )

@@ -1856,8 +1856,13 @@ def test_zero_init_uniform_nll(domain_dim):
     cond_vecs = jnp.zeros((256, 0))
 
     log_probs = compute_log_probability(
-        model, state.params, points, cond_vecs,
-        n_steps=128, rng=jax.random.PRNGKey(99), n_projections=32,
+        model,
+        state.params,
+        points,
+        cond_vecs,
+        n_steps=128,
+        rng=jax.random.PRNGKey(99),
+        n_projections=32,
     )
     model_nll = float(-jnp.mean(log_probs))
     uniform_entropy = float(-sphere_log_inverse_surface_area(domain_dim))
