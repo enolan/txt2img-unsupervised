@@ -28,8 +28,8 @@ from .config import (
     TrainingConfig,
     TransformerModelConfig,
 )
-from .flow_matching import VectorField
 from .function_weighted_flow_model import FunctionWeightedFlowModel
+from .score_matching import NoiseSchedule, ScoreMatchingModel
 from .muon import muon
 from .transformer_model import ImageModel
 from .triangle_schedule import triangle_schedule
@@ -427,12 +427,23 @@ class ScoreMatchingTrainState(BaseTrainState):
 
     @classmethod
     def _create_model_from_config(cls, model_cfg):
-        """Create a score matching model (VectorField) instance from configuration."""
+        """Create a ScoreMatchingModel instance from configuration."""
         if not isinstance(model_cfg, ScoreMatchingModelConfig):
             raise ValueError(
                 f"Expected ScoreMatchingModelConfig, got {type(model_cfg)}"
             )
-        return VectorField(**model_cfg.vector_field_kwargs())
+        vf_kwargs = model_cfg.vector_field_kwargs()
+        # conditioning_dim is a computed property in ScoreMatchingModel, not a field
+        vf_kwargs.pop("conditioning_dim")
+        return ScoreMatchingModel(
+            **vf_kwargs,
+            schedule=NoiseSchedule(
+                sigma_sq_min=model_cfg.sigma_sq_min,
+                sigma_sq_max=model_cfg.sigma_sq_max,
+            ),
+            cap_conditioning=model_cfg.cap_conditioning,
+            relative_cap_encoding=model_cfg.relative_cap_encoding,
+        )
 
 
 def mk_checkpoint_manager(

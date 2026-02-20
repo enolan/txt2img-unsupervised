@@ -41,10 +41,13 @@ We reuse the VectorField class from flow_matching.py since estimating a score (t
 has the same shape as estimating a velocity field.
 """
 
-from dataclasses import dataclass, replace
-from functools import partial
-from typing import Optional
+import math
 
+from dataclasses import dataclass, field, replace
+from functools import partial
+from typing import FrozenSet, Literal, Optional
+
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -56,7 +59,11 @@ from jax import Array
 from scipy import stats
 
 from txt2img_unsupervised import vmf
-from txt2img_unsupervised.cap_sampling import sphere_log_inverse_surface_area
+from txt2img_unsupervised.cap_sampling import (
+    cap_conditioning_dim,
+    sphere_log_inverse_surface_area,
+)
+from txt2img_unsupervised.config import CapConditioningMode
 from txt2img_unsupervised.flow_matching import (
     VectorField,
     geodesic_step,
@@ -82,6 +89,107 @@ class NoiseSchedule:
 
     sigma_sq_min: float = 1e-4
     sigma_sq_max: float = 2.0
+
+
+class ScoreMatchingModel(nn.Module):
+    """Score matching model bundling a VectorField with noise schedule and conditioning mode.
+
+    Wraps a VectorField submodule. Currently __call__ forwards directly to the VectorField,
+    but will eventually preprocess cap specifications into conditioning vectors for
+    CONDITIONED_SCORE mode.
+    """
+
+    # VectorField hyperparameters
+    domain_dim: int
+    reference_directions: Optional[int]
+    time_dim: Optional[int]
+    use_pre_mlp_projection: bool
+    n_layers: int
+    d_model: int
+    mlp_expansion_factor: int
+    mlp_dropout_rate: Optional[float]
+    input_dropout_rate: Optional[float]
+    mlp_always_inject: FrozenSet[Literal["x", "t", "cond"]] = field(
+        default_factory=frozenset
+    )
+    activations_dtype: jnp.dtype = jnp.float32
+    weights_dtype: jnp.dtype = jnp.float32
+    d_model_base: int = 512
+    variance_base: float = 1 / 512
+    alpha_input: float = 1.0
+    alpha_output: float = 2.0 / math.pi
+
+    # Score matching specific
+    schedule: NoiseSchedule = NoiseSchedule()
+    cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
+    relative_cap_encoding: bool = False
+
+    @property
+    def conditioning_dim(self) -> int:
+        if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
+            return 0
+        elif self.cap_conditioning == CapConditioningMode.CONDITIONED_SCORE:
+            return cap_conditioning_dim(
+                self.domain_dim, self.reference_directions, self.relative_cap_encoding
+            )
+        elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
+            return 0
+        else:
+            raise ValueError(f"Unknown cap conditioning mode: {self.cap_conditioning}")
+
+    @nn.nowrap
+    def mk_vector_field(self) -> VectorField:
+        """Create a VectorField with parameters derived from this model's config."""
+        return VectorField(
+            domain_dim=self.domain_dim,
+            reference_directions=self.reference_directions,
+            conditioning_dim=self.conditioning_dim,
+            time_dim=self.time_dim,
+            use_pre_mlp_projection=self.use_pre_mlp_projection,
+            n_layers=self.n_layers,
+            d_model=self.d_model,
+            mlp_expansion_factor=self.mlp_expansion_factor,
+            mlp_dropout_rate=self.mlp_dropout_rate,
+            input_dropout_rate=self.input_dropout_rate,
+            mlp_always_inject=self.mlp_always_inject,
+            activations_dtype=self.activations_dtype,
+            weights_dtype=self.weights_dtype,
+            d_model_base=self.d_model_base,
+            variance_base=self.variance_base,
+            alpha_input=self.alpha_input,
+            alpha_output=self.alpha_output,
+        )
+
+    def setup(self):
+        if self.cap_conditioning != CapConditioningMode.UNCONDITIONED:
+            raise NotImplementedError(
+                f"Cap conditioning mode {self.cap_conditioning} is not yet implemented"
+            )
+        self.vector_field = self.mk_vector_field()
+
+    @nn.nowrap
+    def dummy_inputs(self):
+        """Create dummy inputs for model initialization."""
+        return self.mk_vector_field().dummy_inputs()
+
+    @nn.nowrap
+    def mk_partition_map(self, use_muon: bool):
+        """Create a partition map for optimizer configuration with muP scaling."""
+        return {
+            "params": {
+                "vector_field": self.mk_vector_field().mk_partition_map(use_muon)[
+                    "params"
+                ]
+            }
+        }
+
+    @nn.nowrap
+    def scale_lr(self, lr: float) -> float:
+        """Scaled learning rate for hidden layers."""
+        return self.mk_vector_field().scale_lr(lr)
+
+    def __call__(self, x, t, cond_vec):
+        return self.vector_field(x, t, cond_vec)
 
 
 def sigma_squared(t: Array, schedule: NoiseSchedule) -> Array:
@@ -200,13 +308,12 @@ def compute_target_score(
 
 
 def denoising_score_matching_loss(
-    model: VectorField,
+    model: ScoreMatchingModel,
     params,
     x_1: Array,
     x_t: Array,
     t: Array,
     conditioning_data: Array,
-    schedule: NoiseSchedule,
     rng: Optional[Array] = None,
 ) -> Array:
     """Compute MSE loss between predicted and target scaled score.
@@ -218,13 +325,12 @@ def denoising_score_matching_loss(
     At sampling time, we recover the actual score by dividing by σ²(t).
 
     Args:
-        model: Vector field model (outputs scaled score estimate)
+        model: Score matching model
         params: Model parameters
         x_1: Clean data [batch_size, dim]
         x_t: Noisy samples [batch_size, dim]
         t: Times [batch_size]
         conditioning_data: Conditioning vectors [batch_size, cond_dim]
-        schedule: Noise schedule configuration
         rng: Random key for dropout (if model uses it)
 
     Returns:
@@ -245,22 +351,20 @@ def denoising_score_matching_loss(
     return jnp.mean(per_sample_loss)
 
 
-@partial(jax.jit, static_argnames=("model", "schedule"))
+@partial(jax.jit, static_argnames=("model",))
 def compute_batch_loss(
-    model: VectorField,
+    model: ScoreMatchingModel,
     params,
     batch: dict,
     rng: Array,
-    schedule: NoiseSchedule,
 ) -> Array:
     """Extract data from batch, sample t and x_t, compute loss.
 
     Args:
-        model: The score model
+        model: Score matching model
         params: Model parameters
         batch: Batch of data containing "point_vec" and optionally "cond_vec"
         rng: JAX random key
-        schedule: Noise schedule configuration
 
     Returns:
         The computed loss value
@@ -272,28 +376,21 @@ def compute_batch_loss(
 
     conditioning_data = batch.get("cond_vec", jnp.zeros((batch_size, 0)))
 
-    t = sample_t_log_uniform_kappa(time_rng, (batch_size,), schedule)
-    x_t = sample_noisy_point(noise_rng, x_1, t, schedule)
+    t = sample_t_log_uniform_kappa(time_rng, (batch_size,), model.schedule)
+    x_t = sample_noisy_point(noise_rng, x_1, t, model.schedule)
 
-    return denoising_score_matching_loss(
-        model, params, x_1, x_t, t, conditioning_data, schedule
-    )
+    return denoising_score_matching_loss(model, params, x_1, x_t, t, conditioning_data)
 
 
-@partial(
-    jax.jit, static_argnames=("model", "schedule"), donate_argnames=("state", "rng")
-)
-def train_step(
-    model: VectorField, state, batch: dict, rng: Array, schedule: NoiseSchedule
-):
+@partial(jax.jit, static_argnames=("model",), donate_argnames=("state", "rng"))
+def train_step(model: ScoreMatchingModel, state, batch: dict, rng: Array):
     """Train for a single step.
 
     Args:
-        model: The score model
+        model: Score matching model
         state: Training state
         batch: Batch of data
         rng: JAX random key
-        schedule: Noise schedule configuration
 
     Returns:
         Updated state, loss value, gradient norm, and updated random key
@@ -301,7 +398,7 @@ def train_step(
     rng, next_rng = jax.random.split(rng)
 
     def loss_fn(params):
-        return compute_batch_loss(model, params, batch, rng, schedule)
+        return compute_batch_loss(model, params, batch, rng)
 
     grad_fn = jax.value_and_grad(loss_fn)
     loss, grads = grad_fn(state.params)
@@ -312,14 +409,13 @@ def train_step(
     return state, loss, grad_norm, next_rng
 
 
-@partial(jax.jit, inline=True, static_argnames=("model", "schedule"))
+@partial(jax.jit, inline=True, static_argnames=("model",))
 def _compute_velocity_for_sampling(
-    model: VectorField,
+    model: ScoreMatchingModel,
     params,
     cond_vecs: Array,
     x: Array,
     t,
-    schedule: NoiseSchedule,
     rng: Optional[Array] = None,
 ) -> Array:
     """Compute ODE velocity for sampling.
@@ -329,12 +425,11 @@ def _compute_velocity_for_sampling(
     The ODE velocity is: coeff * s(x, t) = coeff / σ²(t) * network_output.
 
     Args:
-        model: Score model (outputs scaled score)
+        model: Score matching model
         params: Model parameters
         cond_vecs: Conditioning vectors [batch_size, cond_dim]
         x: Current points [batch_size, dim]
         t: Current time (scalar or [batch_size])
-        schedule: Noise schedule configuration
         rng: Random key for dropout
 
     Returns:
@@ -357,28 +452,26 @@ def _compute_velocity_for_sampling(
     scaled_score = model.apply(params, x, t_vec, cond_vecs, rngs=rngs_dict)
 
     # ODE velocity = coeff * s = coeff * (scaled_score / σ²) = (coeff / σ²) * scaled_score
-    coeff = ode_coefficient(t_vec, schedule)
-    sigma_sq = sigma_squared(t_vec, schedule)
+    coeff = ode_coefficient(t_vec, model.schedule)
+    sigma_sq = sigma_squared(t_vec, model.schedule)
     return (coeff / sigma_sq[:, None]) * scaled_score
 
 
-@partial(jax.jit, static_argnames=("model_and_schedule",), inline=True)
-def _velocity_fn_for_ode(model_and_schedule, params, cond_vecs, x, t, rng):
+@partial(jax.jit, static_argnames=("model",), inline=True)
+def _velocity_fn_for_ode(model, params, cond_vecs, x, t, rng):
     """ODE velocity function for score matching sampling and NLL computation.
 
-    Unpacks the (model, schedule) tuple and delegates to _compute_velocity_for_sampling.
-    Defined at module level so JIT caching works across calls.
+    Delegates to _compute_velocity_for_sampling. Defined at module level so JIT
+    caching works across calls.
     """
-    model, schedule = model_and_schedule
-    return _compute_velocity_for_sampling(model, params, cond_vecs, x, t, schedule, rng)
+    return _compute_velocity_for_sampling(model, params, cond_vecs, x, t, rng)
 
 
 def generate_samples(
-    model: VectorField,
+    model: ScoreMatchingModel,
     params,
     rng: Array,
     cond_vecs: Array,
-    schedule: NoiseSchedule,
     n_steps: int = 100,
     method: str = "tsit5",
 ) -> Array:
@@ -387,11 +480,10 @@ def generate_samples(
     Integrates dx/dt = ode_coefficient(t) * s_θ(x, t) from t=0 (noise) to t=1 (data).
 
     Args:
-        model: Score model
+        model: Score matching model
         params: Model parameters
         rng: JAX random key
         cond_vecs: Conditioning vectors [batch_size, cond_dim]
-        schedule: Noise schedule configuration
         n_steps: Number of integration steps
         method: ODE solver method
 
@@ -407,7 +499,7 @@ def generate_samples(
         batch_size,
         method,
         _velocity_fn_for_ode,
-        (model, schedule),
+        model,
         params,
         cond_vecs,
         model.domain_dim,
@@ -416,11 +508,10 @@ def generate_samples(
 
 
 def compute_log_probability(
-    model: VectorField,
+    model: ScoreMatchingModel,
     params,
     samples: Array,
     cond_vecs: Array,
-    schedule: NoiseSchedule,
     n_steps: int = 100,
     rng=None,
     n_projections: int = 10,
@@ -432,11 +523,10 @@ def compute_log_probability(
     divergence of the velocity field, then combines with the uniform base density.
 
     Args:
-        model: Score model (outputs scaled score)
+        model: Score matching model
         params: Model parameters
         samples: Points on the sphere to evaluate [batch_size, dim]
         cond_vecs: Conditioning vectors [batch_size, cond_dim]
-        schedule: Noise schedule configuration
         n_steps: Number of integration steps
         rng: JAX random key for stochastic divergence estimation
         n_projections: Number of random projections for divergence estimation
@@ -454,7 +544,7 @@ def compute_log_probability(
 
     x0, div_sum = reverse_path_and_compute_divergence(
         _velocity_fn_for_ode,
-        (model, schedule),
+        model,
         params,
         cond_vecs,
         samples,
@@ -469,10 +559,9 @@ def compute_log_probability(
 
 
 def compute_nll(
-    model: VectorField,
+    model: ScoreMatchingModel,
     params,
     batch: dict,
-    schedule: NoiseSchedule,
     n_steps: int = 100,
     rng=None,
     n_projections: int = 10,
@@ -481,10 +570,9 @@ def compute_nll(
     """Compute negative log-likelihood for a batch of data.
 
     Args:
-        model: Score model
+        model: Score matching model
         params: Model parameters
         batch: Dict with "point_vec" key containing data [batch_size, dim]
-        schedule: Noise schedule configuration
         n_steps: Number of integration steps
         rng: JAX random key
         n_projections: Number of random projections for divergence estimation
@@ -501,7 +589,6 @@ def compute_nll(
         params,
         samples,
         cond_vecs,
-        schedule,
         n_steps=n_steps,
         rng=rng,
         n_projections=n_projections,
@@ -658,30 +745,22 @@ def test_sample_noisy_point():
 
 
 def _train_loop_for_tests(
-    model: VectorField,
+    model: ScoreMatchingModel,
     dataset,
     batch_size: int,
     learning_rate: float,
     epochs: int,
-    schedule: NoiseSchedule,
     test_dataset=None,
 ):
     """Training loop for score matching tests. Wraps the generic flow_matching loop."""
 
-    def train_step_with_schedule(model, state, batch, rng):
-        return train_step(model, state, batch, rng, schedule)
-
-    def compute_batch_loss_with_schedule(model, params, batch, rng):
-        return compute_batch_loss(model, params, batch, rng, schedule)
-
-    def compute_nll_with_schedule(
+    def compute_nll_wrapper(
         model, params, batch, n_steps, rng, n_projections, precomputed_stats=None
     ):
         return compute_nll(
             model,
             params,
             batch,
-            schedule,
             n_steps=n_steps,
             rng=rng,
             n_projections=n_projections,
@@ -694,23 +773,20 @@ def _train_loop_for_tests(
         learning_rate,
         epochs,
         test_dataset=test_dataset,
-        train_step_fn=train_step_with_schedule,
-        compute_batch_loss_fn=compute_batch_loss_with_schedule,
-        compute_nll_fn=compute_nll_with_schedule,
+        train_step_fn=train_step,
+        compute_batch_loss_fn=compute_batch_loss,
+        compute_nll_fn=compute_nll_wrapper,
         compute_nll_on_step_0=False,
     )
 
 
-_baseline_model = VectorField(
+_baseline_model = ScoreMatchingModel(
     domain_dim=3,
     reference_directions=128,
     n_layers=6,
     d_model=512,
     time_dim=None,
     mlp_expansion_factor=4,
-    activations_dtype=jnp.float32,
-    weights_dtype=jnp.float32,
-    conditioning_dim=0,
     input_dropout_rate=None,
     mlp_dropout_rate=None,
     use_pre_mlp_projection=True,
@@ -722,7 +798,6 @@ _baseline_model = VectorField(
 def test_train_trivial(domain_dim):
     """Train a model where all data is a single fixed point."""
     model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2)
-    schedule = NoiseSchedule()
 
     batch_size = 256
     first_dim_vec = jnp.zeros(domain_dim)
@@ -737,7 +812,6 @@ def test_train_trivial(domain_dim):
         batch_size,
         learning_rate=1e-2,
         epochs=2,
-        schedule=schedule,
         test_dataset=test_dset,
     )
     print(f"Final loss: {loss:.6f}")
@@ -747,7 +821,6 @@ def test_train_trivial(domain_dim):
         state.params,
         jax.random.PRNGKey(0),
         cond_vecs=jnp.zeros((20, 0)),
-        schedule=schedule,
         n_steps=1000,
     )
     cos_sims = samples @ points[0]
@@ -776,8 +849,13 @@ def test_train_trivial(domain_dim):
 @pytest.mark.parametrize("domain_dim", [3, 16])
 def test_train_vmf(domain_dim):
     """Train a model with data from a von Mises-Fisher distribution."""
-    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2, d_model=256)
-    schedule = NoiseSchedule(sigma_sq_min=0.01)
+    model = replace(
+        _baseline_model,
+        domain_dim=domain_dim,
+        n_layers=2,
+        d_model=256,
+        schedule=NoiseSchedule(sigma_sq_min=0.01),
+    )
 
     batch_size = 256
     n_samples = 32768
@@ -805,7 +883,6 @@ def test_train_vmf(domain_dim):
         batch_size,
         learning_rate=1e-3,
         epochs=3,
-        schedule=schedule,
     )
     print(f"Final train loss: {train_loss:.6f}")
 
@@ -815,7 +892,6 @@ def test_train_vmf(domain_dim):
         state.params,
         jax.random.PRNGKey(42),
         cond_vecs=jnp.zeros((n_test_samples, 0)),
-        schedule=schedule,
         n_steps=100,
     )
 
@@ -835,7 +911,6 @@ def test_train_vmf(domain_dim):
         model,
         state.params,
         dict(test_dset[:]),
-        schedule,
         n_steps=256,
         rng=jax.random.PRNGKey(99),
         n_projections=32,
@@ -851,8 +926,13 @@ def test_train_vmf(domain_dim):
 @pytest.mark.parametrize("domain_dim", [3, 16])
 def test_zero_init_uniform_nll(domain_dim):
     """Verify that a freshly initialized model (zero-init output) gives correct uniform NLL."""
-    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2, d_model=32)
-    schedule = NoiseSchedule(sigma_sq_min=0.01)
+    model = replace(
+        _baseline_model,
+        domain_dim=domain_dim,
+        n_layers=2,
+        d_model=32,
+        schedule=NoiseSchedule(sigma_sq_min=0.01),
+    )
 
     params_rng, data_rng = jax.random.split(jax.random.PRNGKey(12345))
     state = create_train_state(params_rng, model, 1e-3)
@@ -864,7 +944,6 @@ def test_zero_init_uniform_nll(domain_dim):
         model,
         state.params,
         batch,
-        schedule,
         n_steps=256,
         rng=jax.random.PRNGKey(99),
         n_projections=32,
