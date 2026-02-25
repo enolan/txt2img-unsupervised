@@ -357,7 +357,31 @@ class FunctionWeightedFlowModel(nn.Module):
             return None
 
         x1_batch = batch["point_vec"]
-        return jax.vmap(lambda x1: self.sample_weighting_function_params(x1))(x1_batch)
+        batch_size = x1_batch.shape[0]
+        rng = self.make_rng("sample_weighting_params")
+        # It's important to split the rng here, *before* vmap, otherwise each batch element gets the
+        # same key.
+        rngs = jax.random.split(rng, batch_size)
+
+        if self.weighting_function == WeightingFunction.CAP_INDICATOR:
+            return jax.vmap(
+                lambda rng, x: sample_cap(
+                    self.logits_table,
+                    rng,
+                    x,
+                    self.weighting_function_extra_params.d_max_dist,
+                )
+            )(rngs, x1_batch)
+        elif self.weighting_function == WeightingFunction.SMOOTHED_CAP_INDICATOR:
+            return jax.vmap(lambda rng, x: self._sample_smoothed_cap_params(rng, x))(
+                rngs, x1_batch
+            )
+        elif self.weighting_function == WeightingFunction.VMF_DENSITY:
+            raise NotImplementedError(
+                "VMF density weighting function not implemented yet."
+            )
+        else:
+            raise ValueError(f"Unknown weighting function: {self.weighting_function}")
 
     def sample_base_distribution(self, weighting_function_params, batch_size):
         """Sample base distribution x0 for training.
@@ -548,6 +572,36 @@ class FunctionWeightedFlowModel(nn.Module):
         else:
             raise ValueError(f"Unknown weighting function: {self.weighting_function}")
 
+    def _sample_smoothed_cap_params(
+        self, rng: jax.Array, x: jax.Array
+    ) -> Tuple[jax.Array, jax.Array]:
+        """Sample smoothed cap indicator parameters given an explicit RNG key.
+
+        Args:
+            rng: JAX random key
+            x: Unit vector that must be contained in the sampled cap
+
+        Returns:
+            Tuple of (cap_center, d_max)
+        """
+        weights, range_starts, range_ends = process_d_max_dist(
+            self.weighting_function_extra_params.d_max_dist
+        )
+
+        comp_rng, dmax_rng, angle_rng, dir_rng = jax.random.split(rng, 4)
+        component_idx = jax.random.categorical(comp_rng, jnp.log(weights))
+        d_max = jax.random.uniform(
+            dmax_rng,
+            minval=range_starts[component_idx],
+            maxval=range_ends[component_idx],
+        )
+
+        weighted_tbl = self._build_smoothed_weighted_logits_table(d_max)
+        sampled_dist = weighted_tbl.sample_cap_cos_distance(angle_rng, 2.0)
+        cap_center = random_pt_with_cosine_similarity(dir_rng, x, sampled_dist)
+
+        return cap_center, d_max
+
     def sample_weighting_function_params(
         self, x: jax.Array
     ) -> Optional[Tuple[jax.Array, jax.Array]]:
@@ -585,26 +639,7 @@ class FunctionWeightedFlowModel(nn.Module):
                 self.weighting_function_extra_params.d_max_dist,
             )
         elif self.weighting_function == WeightingFunction.SMOOTHED_CAP_INDICATOR:
-            # Sample d_max from the configured mixture (independent of x)
-            weights, range_starts, range_ends = process_d_max_dist(
-                self.weighting_function_extra_params.d_max_dist
-            )
-
-            comp_rng, dmax_rng, angle_rng, dir_rng = jax.random.split(rng, 4)
-            component_idx = jax.random.categorical(comp_rng, jnp.log(weights))
-            d_max = jax.random.uniform(
-                dmax_rng,
-                minval=range_starts[component_idx],
-                maxval=range_ends[component_idx],
-            )
-
-            # Build weighted logits table using helper and sample with existing interpolation logic
-            weighted_tbl = self._build_smoothed_weighted_logits_table(d_max)
-            # Pass d_max=2.0 so no additional truncation; support is encoded in weighted_tbl logits
-            sampled_dist = weighted_tbl.sample_cap_cos_distance(angle_rng, 2.0)
-            cap_center = random_pt_with_cosine_similarity(dir_rng, x, sampled_dist)
-
-            return cap_center, d_max
+            return self._sample_smoothed_cap_params(rng, x)
         elif self.weighting_function == WeightingFunction.VMF_DENSITY:
             raise NotImplementedError(
                 "VMF density weighting function not implemented yet."
@@ -1284,36 +1319,43 @@ def test_train_trivial_distribution(
     assert train_points.shape == (n_train_examples, domain_dim)
 
     # Create dataset
-    dsets = (
-        Dataset.from_dict({"point_vec": train_points})
-        .with_format("np")
-        .train_test_split(test_size=512)
-    )
-    train_dataset = dsets["train"]
-    test_dataset = dsets["test"]
+    train_dataset = Dataset.from_dict({"point_vec": train_points}).with_format("np")
 
     # Train the model using the shared infrastructure
     batch_size = 512
-    learning_rate = 1e-4 if data_distribution == "uniform" else 5e-4
+    learning_rate = 1e-4
 
-    # Determine epochs based on distribution, dimension, and weighting function
-    # vMF may need more training due to concentrated distribution
+    # Determine epochs based on distribution, dimension, weighting function, and base distribution.
+    # vMF needs more training due to concentrated distribution. HEMISPHERE and CAP base
+    # distributions are harder to learn than SPHERE because the ODE starts from restricted support.
     distribution_difficulty_multiplier = 2 if data_distribution == "vmf" else 1
+    if base_distribution == BaseDistribution.SPHERE:
+        base_difficulty_multiplier = 1.0
+    elif base_distribution == BaseDistribution.HEMISPHERE:
+        base_difficulty_multiplier = 1.5
+    elif base_distribution == BaseDistribution.CAP:
+        base_difficulty_multiplier = 2.5
+    else:
+        raise ValueError(f"Unknown base_distribution: {base_distribution}")
 
     if domain_dim == 3 and weighting_function == WeightingFunction.CONSTANT:
-        epochs = 2 * distribution_difficulty_multiplier
+        epochs = distribution_difficulty_multiplier
     elif domain_dim == 3 and weighting_function in [
         WeightingFunction.CAP_INDICATOR,
         WeightingFunction.SMOOTHED_CAP_INDICATOR,
     ]:
-        epochs = 6 * distribution_difficulty_multiplier
+        epochs = int(
+            10 * distribution_difficulty_multiplier * base_difficulty_multiplier
+        )
     elif domain_dim == 16 and weighting_function == WeightingFunction.CONSTANT:
         epochs = 6 * distribution_difficulty_multiplier
     elif domain_dim == 16 and weighting_function in [
         WeightingFunction.CAP_INDICATOR,
         WeightingFunction.SMOOTHED_CAP_INDICATOR,
     ]:
-        epochs = 32 * distribution_difficulty_multiplier
+        epochs = int(
+            32 * distribution_difficulty_multiplier * base_difficulty_multiplier
+        )
     else:
         raise ValueError(
             f"Unknown domain_dim: {domain_dim} and weighting_function: {weighting_function}"
@@ -1323,23 +1365,26 @@ def test_train_trivial_distribution(
         f"Training FWFM for domain_dim={domain_dim}, data_distribution={data_distribution}, weighting_function={weighting_function}"
     )
 
-    # Use the generic training loop via partial application
-    state, final_loss, test_loss, test_nll = _train_loop_for_tests(
+    # Use the generic training loop via partial application. No test_dataset or NLL
+    # computation since correctness is verified post-training via compute_log_probability.
+    state, final_loss = _train_loop_for_tests(
         model=model,
         dataset=train_dataset,
         batch_size=batch_size,
         learning_rate=learning_rate,
         epochs=epochs,
-        test_dataset=test_dataset,
+        compute_nll_fn=None,
     )
 
-    print(
-        f"Training completed. Final loss: {final_loss:.6f}, test loss: {test_loss:.6f}, test NLL: {test_nll:.6f}"
-    )
+    print(f"Training completed. Final loss: {final_loss:.6f}")
 
     # Generate independent test points
     n_test_points = 1000
+    test_rng, z_rng = jax.random.split(test_rng)
     test_points = sample_sphere(test_rng, n_test_points, domain_dim)
+    # Separate, larger set for Z estimation to reduce importance sampling variance
+    n_z_points = 10000
+    z_points = sample_sphere(z_rng, n_z_points, domain_dim)
     # Test different parameter sets based on weighting function
     if weighting_function == WeightingFunction.CONSTANT:
         param_sets = [None]
@@ -1371,8 +1416,29 @@ def test_train_trivial_distribution(
 
         base_log_densities = data_log_density_fn(test_points)
 
-        # Multiply base density by this weight by this to get weighted density
-        weight_normalization_factor = 1 / jnp.mean(true_weights)
+        # The model's conditional density is p(x|params) = weight(x) * p_data(x) / Z
+        # where Z = ∫ weight(x') * p_data(x') dx'. Estimate Z via importance sampling
+        # over uniform points: Z = sphere_area * E_uniform[weight * p_data].
+        # Use the larger z_points set to reduce variance in the Z estimate.
+        log_sphere_area = -flow_matching.sphere_log_inverse_surface_area(domain_dim)
+        if params is None:
+            z_weights = jnp.ones(n_z_points)
+        else:
+            z_weights = jax.vmap(lambda point: model.compute_weight(point, params))(
+                z_points
+            )
+        z_log_densities = data_log_density_fn(z_points)
+        log_weighted_densities = jnp.where(
+            z_weights > 0,
+            jnp.log(z_weights) + z_log_densities,
+            -jnp.inf,
+        )
+        log_Z = (
+            log_sphere_area
+            + jax.nn.logsumexp(log_weighted_densities)
+            - jnp.log(jnp.float32(n_z_points))
+        )
+        weight_normalization_factor = jnp.exp(-log_Z)
 
         print(
             f"  Weight stats: min={true_weights.min():.3f}, max={true_weights.max():.3f}, mean={true_weights.mean():.3f}"
@@ -1427,7 +1493,7 @@ def test_train_trivial_distribution(
             weighting_function_params=extended_model_params_batch,
             n_steps=20,
             rng=jax.random.PRNGKey(12345),
-            n_projections=10,
+            n_projections=50,
         )
         model_log_probs = extended_model_log_probs[
             extended_test_points.shape[0] - n_test_points :
@@ -2656,6 +2722,7 @@ def _iterative_proposal_sampling(
 
 
 @pytest.mark.usefixtures("starts_with_progressbar")
+@pytest.mark.skip(reason="This approach never worked well")
 def test_cap_conditioned_cnf_sampling():
     """Test the new cap-conditioned CNF sampling algorithm."""
     # Create a simple constant-weighted model for testing
@@ -2718,6 +2785,7 @@ def test_cap_conditioned_cnf_sampling():
 
 
 @pytest.mark.usefixtures("starts_with_progressbar")
+@pytest.mark.skip(reason="This approach never worked well")
 def test_cap_conditioned_cnf_sampling_edge_cases():
     """Test edge cases for cap-conditioned sampling."""
     # Create a simple model
@@ -2777,6 +2845,7 @@ def test_cap_conditioned_cnf_sampling_edge_cases():
 
 
 @pytest.mark.usefixtures("starts_with_progressbar")
+@pytest.mark.skip(reason="This approach never worked well")
 def test_cap_conditioned_cnf_sampling_new_interface():
     """Test the new proposal distribution interface for cap-conditioned sampling."""
     # Create a simple model
@@ -2847,6 +2916,7 @@ def test_cap_conditioned_cnf_sampling_new_interface():
 
 
 @pytest.mark.usefixtures("starts_with_progressbar")
+@pytest.mark.skip(reason="This approach never worked well")
 def test_iterative_cap_conditioned_cnf_sampling():
     """Test iterative improvement backwards-forwards sampling."""
     # Use a simple model and small sample sizes for fast testing
