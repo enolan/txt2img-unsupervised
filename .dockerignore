@@ -1,0 +1,6 @@
+*
+!.python-version
+!docker/vq-f4.zip
+!docker/setup-repo.sh
+!docker/get-dataset.sh
+!docker/tmux.conf
