@@ -3132,7 +3132,7 @@ def divergence_step_callback(
     denom_floor = jnp.array(1e-2, dtype=denom.dtype)
     stat_denom = jnp.maximum(denom, denom_floor)
     statistical_ratio = (delta5_stderr * statistical_multiplier) / stat_denom
-    # Ensure numeric stability when delta5_stderr == 0.
+    # Handle undefined and degenerate stderr values in the statistical term.
     statistical_ratio = jnp.nan_to_num(
         statistical_ratio, nan=0.0, posinf=jnp.inf, neginf=jnp.inf
     )
@@ -3589,7 +3589,13 @@ def hutchinson_estimator(
 ):
     """
     Estimate the divergence of a vector field on a spherical manifold using Hutchinson's trace
-    estimator. Properly handles the (d-1)-dimensional tangent space of the d-dimensional sphere.
+    estimator with orthogonal projections. Properly handles the (d-1)-dimensional tangent space of
+    the d-dimensional sphere.
+
+    Uses orthonormal random vectors (via QR decomposition of a Gaussian matrix) instead of i.i.d.
+    Rademacher vectors. For a complete orthonormal basis (n_projections >= dim), the trace is exact
+    with zero estimator variance. Since more than dim projections cannot improve accuracy, the
+    effective number of projections is capped at dim.
 
     Args:
         vector_field_fn: Vector field function
@@ -3603,14 +3609,15 @@ def hutchinson_estimator(
         x: Current points on the sphere [batch_size, dim]
         t: Current time
         step_rng: JAX random key for this step
-        n_projections: Number of random projections to use
+        n_projections: Number of random projections to use (capped at dim)
 
     Returns:
         Tuple containing:
             divergence estimate [batch_size]
-            standard error of the estimate [batch_size]
+            standard error of the estimate [batch_size], NaN when n_projections == 1
     """
     batch_size, dim = x.shape
+    effective_projections = min(n_projections, dim)
     # Allow scalar t or per-sample vector t
     if isinstance(t, jax.Array):
         if t.ndim == 0:
@@ -3658,39 +3665,42 @@ def hutchinson_estimator(
                 dropout_rng,
             )[0]
 
-        # Generate random projection vectors (Rademacher distribution)
-        projection_keys = jax.random.split(projection_rng, n_projections)
-        v_samples = jax.vmap(
-            lambda key: jax.random.rademacher(key, (dim,), dtype=x_i.dtype)
-        )(projection_keys)
+        # Generate orthonormal projection vectors via QR of a random Gaussian matrix.
+        # Scaled by sqrt(dim) so each v^T J v has expectation tr(J), matching the
+        # Rademacher convention. For a (dim, k) input, QR produces k orthonormal columns.
+        gaussian = jax.random.normal(
+            projection_rng, (dim, effective_projections), dtype=x_i.dtype
+        )
+        q, _ = jnp.linalg.qr(gaussian)
+        v_samples = q.T * jnp.sqrt(jnp.asarray(dim, dtype=x_i.dtype))
 
-        # Compute v^T * J * v for each random vector v
+        # Compute v^T * J * v for each projection vector v
         def vjp_fn(v):
             _, vjp = jax.vjp(f, x_i)
             return jnp.dot(v, vjp(v)[0])
 
         trace_estimates = jax.vmap(vjp_fn)(v_samples)
         trace_estimate = jnp.mean(trace_estimates)
-        samples_dtype = trace_estimates.dtype
-        n_proj = jnp.array(float(n_projections), dtype=samples_dtype)
-        # Population variance estimate (dividing by n) so sum_sq = var * n
-        sample_variance = jnp.var(trace_estimates, dtype=samples_dtype)
-        second_moment = jnp.mean(jnp.square(trace_estimates))
 
-        # Bayesian shrinkage toward a prior second moment to keep variance non-zero with tiny n.
-        # We treat the variance as Inverse-Gamma(alpha0, beta0) with weak strength and set beta0
-        # from the empirical second moment. Observing n_proj samples updates the posterior to
-        # Inverse-Gamma(alpha0 + n/2, beta0 + (n/2)*sample_variance). The posterior mean beta/(
-        # alpha-1) gives a conservative variance estimate that never collapses to zero even when
-        # n_proj is 1, avoiding pathological step-size growth from underestimated uncertainty.
-        alpha0 = jnp.array(1.0, dtype=samples_dtype)
-        beta0 = 0.5 * second_moment
-        alpha_post = alpha0 + 0.5 * n_proj
-        beta_post = beta0 + 0.5 * sample_variance * n_proj
-        posterior_var = beta_post / jnp.maximum(
-            alpha_post - 1.0, jnp.finfo(samples_dtype).tiny
-        )
-        trace_stderr = jnp.sqrt(posterior_var / n_proj)
+        # Compute stderr of the orthogonal-projection mean estimator.
+        #
+        # The projection values are sampled without replacement from an orthonormal basis,
+        # so we use a finite-population correction. For a full basis (k == dim) the trace
+        # estimate is exact, giving zero standard error.
+        #
+        # With only one projection, a sample-variance-based stderr is undefined.
+        samples_dtype = trace_estimates.dtype
+        if effective_projections == dim:
+            trace_stderr = jnp.zeros((), dtype=samples_dtype)
+        elif effective_projections == 1:
+            trace_stderr = jnp.full((), jnp.nan, dtype=samples_dtype)
+        else:
+            n_proj = jnp.array(float(effective_projections), dtype=samples_dtype)
+            dim_float = jnp.array(float(dim), dtype=samples_dtype)
+            sample_variance = jnp.var(trace_estimates, ddof=1, dtype=samples_dtype)
+            finite_population_correction = (dim_float - n_proj) / (dim_float - 1.0)
+            mean_variance = finite_population_correction * sample_variance / n_proj
+            trace_stderr = jnp.sqrt(jnp.maximum(mean_variance, 0.0))
 
         # Compute the curvature correction term: x^T J x
         # We can compute this exactly using forward-mode autodiff
@@ -4034,6 +4044,12 @@ class _DummyModel:
             raise ValueError(f"Unknown field: {self.field}")
 
 
+def _linear_test_vector_field(_static, matrix, _per_sample, x, t, rng):
+    """Linear vector field used by divergence tests."""
+    del _static, _per_sample, t, rng
+    return x @ matrix.T
+
+
 @pytest.mark.parametrize(
     "divergence_fn,n_projections,field",
     [
@@ -4112,6 +4128,124 @@ def test_divergence_estimate(divergence_fn, n_projections, field):
         ), f"Hutchinson estimator not calculating correct divergence: got {mean_error}, expected {expected_divergence}"
         if div_std is not None:
             assert jnp.all(div_std >= 0)
+
+
+def test_hutchinson_estimator_full_basis_has_zero_stderr():
+    """Using at least dim projections should make the orthogonal trace estimate exact."""
+    rng = jax.random.PRNGKey(0)
+    batch_size = 128
+    dim = 5
+    x = jax.random.normal(rng, (batch_size, dim))
+    x = x / jnp.linalg.norm(x, axis=1, keepdims=True)
+    matrix = jax.random.normal(jax.random.PRNGKey(1), (dim, dim))
+
+    div_estimate, div_stderr = hutchinson_estimator(
+        _linear_test_vector_field,
+        None,
+        matrix,
+        None,
+        x,
+        0.5,
+        rng,
+        n_projections=dim + 3,
+    )
+    div_exact = exact_divergence(
+        _linear_test_vector_field,
+        None,
+        matrix,
+        None,
+        x,
+        0.5,
+        rng,
+        n_projections=None,
+    )
+
+    np.testing.assert_allclose(div_estimate, div_exact, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        div_stderr, jnp.zeros_like(div_stderr), rtol=0.0, atol=0.0
+    )
+
+
+def test_hutchinson_estimator_single_projection_stderr_is_nan():
+    """Sample-variance stderr is undefined when only one projection is available."""
+    rng = jax.random.PRNGKey(0)
+    batch_size = 16
+    dim = 6
+    x = jax.random.normal(rng, (batch_size, dim))
+    x = x / jnp.linalg.norm(x, axis=1, keepdims=True)
+    matrix = jax.random.normal(jax.random.PRNGKey(2), (dim, dim))
+
+    div_estimate, div_stderr = hutchinson_estimator(
+        _linear_test_vector_field,
+        None,
+        matrix,
+        None,
+        x,
+        0.25,
+        rng,
+        n_projections=1,
+    )
+
+    assert jnp.all(jnp.isfinite(div_estimate))
+    assert jnp.all(jnp.isnan(div_stderr))
+
+
+@pytest.mark.parametrize("n_projections", [2, 4])
+def test_hutchinson_estimator_stochastic_regime_mean_and_stderr(n_projections):
+    """In the stochastic regime, mean estimates and reported stderr should be calibrated."""
+    rng = jax.random.PRNGKey(0)
+    batch_size = 64
+    dim = 12
+    n_trials = 256
+    key_x, key_matrix, key_trials = jax.random.split(rng, 3)
+
+    x = jax.random.normal(key_x, (batch_size, dim))
+    x = x / jnp.linalg.norm(x, axis=1, keepdims=True)
+    matrix = jax.random.normal(key_matrix, (dim, dim))
+    exact_divergence_estimate = exact_divergence(
+        _linear_test_vector_field,
+        None,
+        matrix,
+        None,
+        x,
+        0.5,
+        key_x,
+        n_projections=None,
+    )
+    trial_keys = jax.random.split(key_trials, n_trials)
+
+    def one_trial(trial_rng):
+        """Run one stochastic Hutchinson estimate for all batch elements."""
+        return hutchinson_estimator(
+            _linear_test_vector_field,
+            None,
+            matrix,
+            None,
+            x,
+            0.5,
+            trial_rng,
+            n_projections=n_projections,
+        )
+
+    divergence_trials, stderr_trials = jax.vmap(one_trial)(trial_keys)
+    assert jnp.all(jnp.isfinite(stderr_trials))
+    assert jnp.all(stderr_trials >= 0.0)
+
+    empirical_mean = jnp.mean(divergence_trials, axis=0)
+    empirical_var = jnp.var(divergence_trials, axis=0, ddof=1)
+    rmse_bias = jnp.sqrt(
+        jnp.mean(jnp.square(empirical_mean - exact_divergence_estimate))
+    )
+    expected_rmse = jnp.sqrt(jnp.mean(empirical_var / n_trials))
+    assert rmse_bias <= 2.5 * expected_rmse + 1e-7
+
+    reported_var = jnp.mean(jnp.square(stderr_trials), axis=0)
+    mean_empirical_var = jnp.mean(empirical_var)
+    mean_reported_var = jnp.mean(reported_var)
+    rel_var_error = jnp.abs(mean_empirical_var - mean_reported_var) / jnp.maximum(
+        mean_empirical_var, jnp.finfo(mean_empirical_var.dtype).tiny
+    )
+    assert rel_var_error < 0.25
 
 
 def test_vector_field_evaluation():
