@@ -150,6 +150,13 @@ Write automated tests where they make sense. The ideal is that if a person read 
 without seeing any implementation code, and saw that the tests pass, they would be confident the
 code is correct.
 
+Many tests will be numerical, testing to a tolerance or that a result is above a threshold value.
+For example we might train a classifier and assert that accuracy is above 95%. Choosing the
+tolerances/thresholds well is very important! When choosing, think about what level you would expect
+if the implementation were correct and use that. Resist the urge to loosen your constraints if the
+test fails, this can hide bugs. Remember, your goal is to prove the code is correct, not simply make
+the tests pass.
+
 Use pytest. Use descriptive test names. When testing something that has multiple code paths, use
 pytest.mark.parametrize to exercise each one.
 
@@ -213,6 +220,13 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
   - Run all tests in a file: `uv run pytest -vs txt2img_unsupervised/path/to/file.py`.
     Potentially pretty slow depending on the file.
   - Run all tests: `./test.sh`. Very slow!
+- **GPU locking**: Multiple agents may be running concurrently in this project. Any command that
+  uses the GPU (tests, training, inference) MUST be wrapped with `flock` to avoid conflicts:
+  ```
+  flock /run/user/$UID/claude-gpu-lock uv run pytest -vs ...
+  ```
+  The lock is held for the duration of the command and released automatically when it finishes.
+  Non-GPU work (reading files, editing code, thinking) does not need the lock.
 - Running code with the `python` interpreter: if you try to use the `python` interpreter directly,
   you won't have access to the dependencies! Always use `uv run`:
   - `uv run python path/to/file.py`
