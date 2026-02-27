@@ -54,7 +54,6 @@ def create_rotating_animation(
         model_config = {
             "domain_dim": 3,  # Only support 3D for sphere rotation
             "conditioning_dim": 0,
-            "time_dim": 16,
             "n_layers": 2,
             "d_model": 32,
             "mlp_expansion_factor": 4,
@@ -340,13 +339,6 @@ def parse_arguments():
         help="Whether to use a learnable projection before the MLP",
     )
     parser.add_argument(
-        "--time-dim",
-        type=int,
-        default=16,
-        help="Dimension of the time encoding (must be even)",
-    )
-
-    parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
     )
 
@@ -359,7 +351,6 @@ if __name__ == "__main__":
     model_config = {
         "domain_dim": 3,  # Always 3D for sphere
         "conditioning_dim": 0,
-        "time_dim": args.time_dim,
         "n_layers": args.n_layers,
         "d_model": args.d_model,
         "mlp_expansion_factor": args.expansion_factor,

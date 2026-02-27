@@ -177,8 +177,6 @@ class FunctionWeightedFlowModel(nn.Module):
 
     # Hyperparameters for the underlying VectorField
     domain_dim: int
-    reference_directions: Optional[int]
-    time_dim: Optional[int]
     use_pre_mlp_projection: bool
     n_layers: int
     d_model: int
@@ -217,11 +215,7 @@ class FunctionWeightedFlowModel(nn.Module):
             WeightingFunction.CAP_INDICATOR,
             WeightingFunction.SMOOTHED_CAP_INDICATOR,
         ]:
-            return cap_conditioning_dim(
-                self.domain_dim,
-                self.reference_directions,
-                self.relative_cap_encoding,
-            )
+            return cap_conditioning_dim(self.domain_dim, self.relative_cap_encoding)
         elif self.weighting_function == WeightingFunction.VMF_DENSITY:
             return NotImplementedError(
                 "VMF density weighting function not implemented yet."
@@ -237,9 +231,7 @@ class FunctionWeightedFlowModel(nn.Module):
         # many as we feel like and they'll all be identical.
         return VectorField(
             domain_dim=self.domain_dim,
-            reference_directions=self.reference_directions,
             conditioning_dim=self.conditioning_dim,
-            time_dim=self.time_dim,
             use_pre_mlp_projection=self.use_pre_mlp_projection,
             n_layers=self.n_layers,
             d_model=self.d_model,
@@ -478,11 +470,6 @@ class FunctionWeightedFlowModel(nn.Module):
             cap_center=cond_vecs,
             d_max=cond_scalars,
             x=x,
-            reference_vectors=(
-                self.vector_field.reference_vectors
-                if self.reference_directions is not None
-                else None
-            ),
             d_max_dist=self.weighting_function_extra_params.d_max_dist,
             domain_dim=self.domain_dim,
             relative=self.relative_cap_encoding,
@@ -672,8 +659,6 @@ def test_compute_weight(weighting_function, domain_dim):
 
     model = FunctionWeightedFlowModel(
         domain_dim=domain_dim,
-        time_dim=16,
-        reference_directions=8,
         n_layers=1,
         d_model=32,
         mlp_expansion_factor=2,
@@ -804,8 +789,6 @@ def test_fwfm_base_distribution_sampling(base_distribution, domain_dim):
 
     model = FunctionWeightedFlowModel(
         domain_dim=domain_dim,
-        reference_directions=None,
-        time_dim=16,
         use_pre_mlp_projection=True,
         n_layers=1,
         d_model=32,
@@ -856,7 +839,6 @@ def test_fwfm_base_distribution_sampling(base_distribution, domain_dim):
 
 
 @pytest.mark.parametrize("domain_dim", [3, 8, 16])
-@pytest.mark.parametrize("reference_directions", [None, 8, 16])
 @pytest.mark.parametrize(
     "d_max_dist",
     [
@@ -868,7 +850,7 @@ def test_fwfm_base_distribution_sampling(base_distribution, domain_dim):
 )
 @pytest.mark.parametrize("relative_cap_encoding", [False, True])
 def test_process_weighting_function_params(
-    domain_dim, reference_directions, d_max_dist, relative_cap_encoding
+    domain_dim, d_max_dist, relative_cap_encoding
 ):
     "Verify that process_weighting_function_params returns normalized vectors of the right shape."
 
@@ -882,8 +864,6 @@ def test_process_weighting_function_params(
 
     model = FunctionWeightedFlowModel(
         domain_dim=domain_dim,
-        reference_directions=reference_directions,
-        time_dim=16,
         use_pre_mlp_projection=False,
         n_layers=1,
         d_model=128,
@@ -1178,8 +1158,6 @@ def _compute_vector_field(model, params, weighting_function_params, x, t, rng=No
 # Baseline configuration used for tests
 _baseline_model = FunctionWeightedFlowModel(
     domain_dim=3,
-    reference_directions=None,
-    time_dim=128,
     use_pre_mlp_projection=True,
     n_layers=4,
     d_model=256,
@@ -1280,7 +1258,6 @@ def test_train_trivial_distribution(
         domain_dim=domain_dim,
         d_model=384,
         n_layers=8,
-        time_dim=None,
         weighting_function=weighting_function,
         weighting_function_extra_params=extra_params,
         use_pre_mlp_projection=True,
@@ -2742,8 +2719,6 @@ def test_cap_conditioned_cnf_sampling():
     # Create a simple constant-weighted model for testing
     model = FunctionWeightedFlowModel(
         domain_dim=3,
-        reference_directions=None,
-        time_dim=16,
         use_pre_mlp_projection=True,
         n_layers=2,
         d_model=64,
@@ -2805,8 +2780,6 @@ def test_cap_conditioned_cnf_sampling_edge_cases():
     # Create a simple model
     model = FunctionWeightedFlowModel(
         domain_dim=3,
-        reference_directions=None,
-        time_dim=8,
         use_pre_mlp_projection=True,
         n_layers=1,
         d_model=32,
@@ -2865,8 +2838,6 @@ def test_cap_conditioned_cnf_sampling_new_interface():
     # Create a simple model
     model = FunctionWeightedFlowModel(
         domain_dim=3,
-        reference_directions=None,
-        time_dim=16,
         use_pre_mlp_projection=True,
         n_layers=2,
         d_model=64,
@@ -2936,8 +2907,6 @@ def test_iterative_cap_conditioned_cnf_sampling():
     # Use a simple model and small sample sizes for fast testing
     model = FunctionWeightedFlowModel(
         domain_dim=3,
-        reference_directions=None,
-        time_dim=32,
         use_pre_mlp_projection=True,
         n_layers=2,
         d_model=64,
@@ -3298,8 +3267,6 @@ def test_cap_conditioned_cnf_sampling_backwards_forwards_mcmc():
     domain_dim = 3
     model = FunctionWeightedFlowModel(
         domain_dim=domain_dim,
-        reference_directions=None,
-        time_dim=16,
         use_pre_mlp_projection=False,
         n_layers=2,
         d_model=32,

@@ -101,8 +101,6 @@ class ScoreMatchingModel(nn.Module):
 
     # VectorField hyperparameters
     domain_dim: int
-    reference_directions: Optional[int]
-    time_dim: Optional[int]
     use_pre_mlp_projection: bool
     n_layers: int
     d_model: int
@@ -129,9 +127,7 @@ class ScoreMatchingModel(nn.Module):
         if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
             return 0
         elif self.cap_conditioning == CapConditioningMode.CONDITIONED_SCORE:
-            return cap_conditioning_dim(
-                self.domain_dim, self.reference_directions, self.relative_cap_encoding
-            )
+            return cap_conditioning_dim(self.domain_dim, self.relative_cap_encoding)
         elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
             return 0
         else:
@@ -142,9 +138,7 @@ class ScoreMatchingModel(nn.Module):
         """Create a VectorField with parameters derived from this model's config."""
         return VectorField(
             domain_dim=self.domain_dim,
-            reference_directions=self.reference_directions,
             conditioning_dim=self.conditioning_dim,
-            time_dim=self.time_dim,
             use_pre_mlp_projection=self.use_pre_mlp_projection,
             n_layers=self.n_layers,
             d_model=self.d_model,
@@ -782,10 +776,8 @@ def _train_loop_for_tests(
 
 _baseline_model = ScoreMatchingModel(
     domain_dim=3,
-    reference_directions=128,
     n_layers=6,
     d_model=512,
-    time_dim=None,
     mlp_expansion_factor=4,
     input_dropout_rate=None,
     mlp_dropout_rate=None,

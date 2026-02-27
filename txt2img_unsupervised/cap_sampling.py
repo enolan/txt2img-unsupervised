@@ -569,24 +569,15 @@ def test_sample_from_cap():
         assert jnp.all(dists <= max_cos_distances[i])
 
 
-def cap_conditioning_dim(
-    domain_dim: int,
-    reference_directions: Optional[int],
-    relative: bool,
-) -> int:
+def cap_conditioning_dim(domain_dim: int, relative: bool) -> int:
     """Compute the output dimension of cap conditioning vectors.
 
     Args:
         domain_dim: Dimension of the ambient space (e.g. 768 for CLIP).
-        reference_directions: Number of reference directions to project onto, or None to
-            use raw coordinates.
         relative: If True, use relative encoding (direction + distance + half_angle);
             if False, use absolute encoding (cap center + d_max).
     """
-    feature_dim = (
-        reference_directions if reference_directions is not None else domain_dim
-    )
-    return feature_dim + 2 if relative else feature_dim + 1
+    return domain_dim + 2 if relative else domain_dim + 1
 
 
 def taylor_arccos(x: jax.Array) -> jax.Array:
@@ -607,7 +598,6 @@ def encode_cap_params(
     cap_center: jax.Array,
     d_max: jax.Array,
     x: jax.Array,
-    reference_vectors: Optional[jax.Array],
     d_max_dist: Optional[Tuple[Tuple[float, float], ...]],
     domain_dim: int,
     relative: bool = False,
@@ -621,20 +611,15 @@ def encode_cap_params(
         cap_center: Unit vectors specifying cap centers, shape (batch, domain_dim).
         d_max: Maximum cosine distances, shape (batch,).
         x: Current position vectors, shape (batch, domain_dim). Used only in relative mode.
-        reference_vectors: Reference direction matrix of shape (n_ref, domain_dim), or None
-            to use raw coordinates.
         d_max_dist: Training distribution of d_max values (passed to process_d_max_dist).
         domain_dim: Dimension of the ambient space.
         relative: If True, encode direction from x toward cap center, geodesic distance,
             and cap half angle. If False, encode absolute cap center and normalized d_max.
 
     Returns:
-        Conditioning vectors of shape (batch, cap_conditioning_dim(domain_dim,
-        reference_directions, relative)) with approximately zero mean and unit variance
-        per component.
+        Conditioning vectors of shape (batch, cap_conditioning_dim(domain_dim, relative))
+        with approximately zero mean and unit variance per component.
     """
-    batch_size = cap_center.shape[0]
-
     if relative:
         # Direction from x toward cap center in the tangent space of x
         dot_product = jnp.sum(x * cap_center, axis=1, keepdims=True)
@@ -647,12 +632,7 @@ def encode_cap_params(
         geodesic_distance = taylor_arccos(cosine_similarity)
         half_angle = taylor_arccos(1.0 - d_max)
 
-        if reference_vectors is not None:
-            dir_features = (direction_to_cap @ reference_vectors.T) * jnp.sqrt(
-                domain_dim
-            )
-        else:
-            dir_features = direction_to_cap * jnp.sqrt(domain_dim)
+        dir_features = direction_to_cap * jnp.sqrt(domain_dim)
 
         # Normalize scalar features assuming U[0, pi] (inexact but reasonable)
         uniform_0_pi_mean = jnp.pi / 2
@@ -669,11 +649,8 @@ def encode_cap_params(
             axis=1,
         )
     else:
-        # Absolute encoding: projected (or raw) cap center + normalized d_max
-        if reference_vectors is not None:
-            dir_features = (cap_center @ reference_vectors.T) * jnp.sqrt(domain_dim)
-        else:
-            dir_features = cap_center * jnp.sqrt(domain_dim)
+        # Absolute encoding: cap center scaled for unit variance + normalized d_max
+        dir_features = cap_center * jnp.sqrt(domain_dim)
 
         # Normalize d_max using training distribution statistics
         weights, range_starts, range_ends = process_d_max_dist(d_max_dist)
@@ -691,7 +668,6 @@ def encode_cap_params(
 
 
 @pytest.mark.parametrize("domain_dim", [3, 16, 768])
-@pytest.mark.parametrize("reference_directions", [None, 8])
 @pytest.mark.parametrize(
     "d_max_dist",
     [
@@ -702,7 +678,7 @@ def encode_cap_params(
     ],
 )
 @pytest.mark.parametrize("relative", [False, True])
-def test_encode_cap_params(domain_dim, reference_directions, d_max_dist, relative):
+def test_encode_cap_params(domain_dim, d_max_dist, relative):
     """Verify encode_cap_params returns normalized vectors of the right shape."""
     from .flow_matching import sample_sphere
 
@@ -726,22 +702,16 @@ def test_encode_cap_params(domain_dim, reference_directions, d_max_dist, relativ
         shape=(n,),
     )
 
-    if reference_directions is not None:
-        ref_vecs = sample_sphere(ref_rng, reference_directions, domain_dim)
-    else:
-        ref_vecs = None
-
     result = encode_cap_params(
         cap_centers,
         d_maxes,
         x_positions,
-        ref_vecs,
         tuple(tuple(p) for p in d_max_dist) if d_max_dist is not None else None,
         domain_dim,
         relative=relative,
     )
 
-    expected_dim = cap_conditioning_dim(domain_dim, reference_directions, relative)
+    expected_dim = cap_conditioning_dim(domain_dim, relative)
     assert result.shape == (n, expected_dim)
 
     result_np = jax.device_get(result)
