@@ -323,7 +323,7 @@ class FlowMatchingModelConfig(VectorFieldConfig):
             WeightingFunction.CAP_INDICATOR,
             WeightingFunction.SMOOTHED_CAP_INDICATOR,
         ):
-            return cap_conditioning_dim(self.domain_dim, relative=False)
+            return cap_conditioning_dim(self.domain_dim)
         if self.weighting_function == WeightingFunction.VMF_DENSITY:
             raise NotImplementedError(
                 "VMF density weighting function not implemented yet."
@@ -451,7 +451,6 @@ class ScoreMatchingModelConfig(VectorFieldConfig):
 
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
     d_max_dist: Optional[Tuple[Tuple[float, float], ...]] = None
-    relative_cap_encoding: bool = False
 
     model_type: ClassVar[str] = "score_matching"
 
@@ -467,7 +466,7 @@ class ScoreMatchingModelConfig(VectorFieldConfig):
         if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
             return 0
         elif self.cap_conditioning == CapConditioningMode.CONDITIONED_SCORE:
-            return cap_conditioning_dim(self.domain_dim, self.relative_cap_encoding)
+            return cap_conditioning_dim(self.domain_dim)
         elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
             return 0
         else:
@@ -518,10 +517,6 @@ class ScoreMatchingModelConfig(VectorFieldConfig):
                 raise ValueError(
                     "d_max_dist should not be set for unconditioned models"
                 )
-            if self.relative_cap_encoding:
-                raise ValueError(
-                    "relative_cap_encoding should not be set for unconditioned models"
-                )
         elif self.cap_conditioning == CapConditioningMode.CONDITIONED_SCORE:
             if self.d_max_dist is None:
                 raise ValueError(
@@ -531,10 +526,6 @@ class ScoreMatchingModelConfig(VectorFieldConfig):
             if self.d_max_dist is not None:
                 raise ValueError(
                     "d_max_dist should not be set for classifier_guidance models"
-                )
-            if self.relative_cap_encoding:
-                raise ValueError(
-                    "relative_cap_encoding should not be set for classifier_guidance models"
                 )
         else:
             raise ValueError(f"Unknown cap conditioning mode: {self.cap_conditioning}")
@@ -813,12 +804,11 @@ def test_score_matching_config_roundtrip_conditioned_score() -> None:
         sigma_sq_min=0.01,
         cap_conditioning=CapConditioningMode.CONDITIONED_SCORE,
         d_max_dist=((0.95, 1.0), (0.05, 2.0)),
-        relative_cap_encoding=True,
     )
     json_str = json.dumps(cfg.to_json_dict())
     regenerated = ScoreMatchingModelConfig.from_json_dict(json.loads(json_str))
     assert regenerated == cfg
-    assert regenerated.conditioning_dim == cap_conditioning_dim(768, True)
+    assert regenerated.conditioning_dim == cap_conditioning_dim(768)
 
 
 def test_score_matching_config_validation_unconditioned_rejects_d_max_dist() -> None:
@@ -833,21 +823,6 @@ def test_score_matching_config_validation_unconditioned_rejects_d_max_dist() -> 
             mlp_dropout_rate=None,
             input_dropout_rate=None,
             d_max_dist=((1.0, 2.0),),
-        ).validate()
-
-
-def test_score_matching_config_validation_unconditioned_rejects_relative() -> None:
-    """Unconditioned config rejects relative_cap_encoding."""
-    with pytest.raises(ValueError, match="relative_cap_encoding should not be set"):
-        ScoreMatchingModelConfig(
-            n_layers=2,
-            domain_dim=3,
-            use_pre_mlp_projection=False,
-            d_model=32,
-            mlp_expansion_factor=2,
-            mlp_dropout_rate=None,
-            input_dropout_rate=None,
-            relative_cap_encoding=True,
         ).validate()
 
 

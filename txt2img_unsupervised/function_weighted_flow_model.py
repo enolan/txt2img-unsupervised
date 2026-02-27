@@ -202,11 +202,6 @@ class FunctionWeightedFlowModel(nn.Module):
     # Base distribution type for sampling x0
     base_distribution: BaseDistribution = BaseDistribution.SPHERE
 
-    # Encoding method for cap conditioning: if true use the direction of the cap center from x, the
-    # distance from x to the cap center, and the half angle of the cap. If false, use the absolute
-    # position of the cap center and d_max.
-    relative_cap_encoding: bool = False
-
     @property
     def conditioning_dim(self) -> int:
         if self.weighting_function == WeightingFunction.CONSTANT:
@@ -215,7 +210,7 @@ class FunctionWeightedFlowModel(nn.Module):
             WeightingFunction.CAP_INDICATOR,
             WeightingFunction.SMOOTHED_CAP_INDICATOR,
         ]:
-            return cap_conditioning_dim(self.domain_dim, self.relative_cap_encoding)
+            return cap_conditioning_dim(self.domain_dim)
         elif self.weighting_function == WeightingFunction.VMF_DENSITY:
             return NotImplementedError(
                 "VMF density weighting function not implemented yet."
@@ -445,7 +440,7 @@ class FunctionWeightedFlowModel(nn.Module):
         Args:
             cond_vecs: Unit vectors in R^{domain_dim} (cap center / direction parameter).
             cond_scalars: Scalars in [0, 2] representing d_max (maximum cosine distance).
-            x: Current position vectors in R^{domain_dim}.
+            x: Current position vectors in R^{domain_dim}. Unused, kept for call-site compatibility.
 
         Returns:
             Conditioning vectors of shape `(batch, conditioning_dim)` with approximately mean 0 and
@@ -464,15 +459,12 @@ class FunctionWeightedFlowModel(nn.Module):
             WeightingFunction.CAP_INDICATOR,
             WeightingFunction.SMOOTHED_CAP_INDICATOR,
         ], f"process_weighting_function_params called with unsupported weighting function: {self.weighting_function}"
-        assert x.shape == (batch_size, self.domain_dim), f"x.shape: {x.shape}"
 
         processed_cond_vecs = encode_cap_params(
             cap_center=cond_vecs,
             d_max=cond_scalars,
-            x=x,
             d_max_dist=self.weighting_function_extra_params.d_max_dist,
             domain_dim=self.domain_dim,
-            relative=self.relative_cap_encoding,
         )
 
         assert processed_cond_vecs.shape == (batch_size, self.conditioning_dim)
@@ -848,10 +840,7 @@ def test_fwfm_base_distribution_sampling(base_distribution, domain_dim):
         [(0.45, 0.8), (0.45, 1.2), (0.1, 2.0)],  # Triangular distribution
     ],
 )
-@pytest.mark.parametrize("relative_cap_encoding", [False, True])
-def test_process_weighting_function_params(
-    domain_dim, d_max_dist, relative_cap_encoding
-):
+def test_process_weighting_function_params(domain_dim, d_max_dist):
     "Verify that process_weighting_function_params returns normalized vectors of the right shape."
 
     # Create CapIndicatorExtraParams with the specified d_max_dist
@@ -872,7 +861,6 @@ def test_process_weighting_function_params(
         input_dropout_rate=None,
         weighting_function=WeightingFunction.CAP_INDICATOR,
         weighting_function_extra_params=extra_params,
-        relative_cap_encoding=relative_cap_encoding,
     )
 
     params = model.init(jax.random.PRNGKey(0), *model.dummy_inputs())
@@ -897,7 +885,6 @@ def test_process_weighting_function_params(
 
     unit_vecs = sample_sphere(unit_vec_rng, n, model.domain_dim)
 
-    # Generate x positions for relative encoding test
     x_positions = sample_sphere(jax.random.PRNGKey(0), n, model.domain_dim)
 
     # Process to conditioning vectors
@@ -914,17 +901,8 @@ def test_process_weighting_function_params(
     means = processed_np.mean(axis=0)
     stds = processed_np.std(axis=0)
 
-    # Check approximately zero-mean and unit-std per component
-    if relative_cap_encoding:
-        # For relative encoding, normalization is inexact.
-        assert jnp.all(jnp.abs(means) < 1.0), f"Means too large: {means}"
-        assert jnp.all(stds > 0.25) and jnp.all(
-            stds < 1.5
-        ), f"Stds out of reasonable range: {stds}"
-    else:
-        # Original encoding should have proper statistical normalization
-        np.testing.assert_allclose(means, 0.0, atol=0.05, rtol=0)
-        np.testing.assert_allclose(stds, 1.0, atol=0.05, rtol=0)
+    np.testing.assert_allclose(means, 0.0, atol=0.05, rtol=0)
+    np.testing.assert_allclose(stds, 1.0, atol=0.05, rtol=0)
 
 
 def generate_samples(

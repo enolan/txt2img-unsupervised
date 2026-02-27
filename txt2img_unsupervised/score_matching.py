@@ -120,14 +120,13 @@ class ScoreMatchingModel(nn.Module):
     # Score matching specific
     schedule: NoiseSchedule = NoiseSchedule()
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
-    relative_cap_encoding: bool = False
 
     @property
     def conditioning_dim(self) -> int:
         if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
             return 0
         elif self.cap_conditioning == CapConditioningMode.CONDITIONED_SCORE:
-            return cap_conditioning_dim(self.domain_dim, self.relative_cap_encoding)
+            return cap_conditioning_dim(self.domain_dim)
         elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
             return 0
         else:
