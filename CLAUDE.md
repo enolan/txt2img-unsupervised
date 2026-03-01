@@ -220,6 +220,12 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
   - Run all tests in a file: `uv run pytest -vs txt2img_unsupervised/path/to/file.py`.
     Potentially pretty slow depending on the file.
   - Run all tests: `./test.sh`. Very slow!
+  - Many tests use progress bars which can update thousands or even tens of thousands of times per
+    test, or otherwise do very verbose logging. Reading that output directly will pollute or exhaust
+    your context window. If you are running a test that might produce tons of output, send its
+    output to a file. You can efficiently read the relevant data from the log file with tools like
+    `grep`, or by invoking a subagent. Never directly read thousands of lines of logging output when
+    there's a more efficient option.
 - **GPU locking**: Multiple agents may be running concurrently in this project. Any command that
   uses the GPU (tests, training, inference) MUST be wrapped with `flock` to avoid conflicts:
   ```
