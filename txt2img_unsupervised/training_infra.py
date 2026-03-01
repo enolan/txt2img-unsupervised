@@ -14,6 +14,7 @@ import orbax.checkpoint as ocp
 import signal
 import wandb
 from copy import copy
+from dataclasses import dataclass
 from datasets import Dataset
 from distutils.util import strtobool
 from functools import partial
@@ -32,6 +33,7 @@ from txt2img_unsupervised.checkpoint import (
     get_model_from_checkpoint,
     mk_checkpoint_manager,
     setup_checkpoint_manager_and_initial_state,
+    setup_optimizer,
 )
 from txt2img_unsupervised.config import (
     BaseModelConfig,
@@ -1232,3 +1234,183 @@ def save_checkpoint_and_evaluate_vector_model(
     )
 
     wandb.log(log_dict)
+
+
+@dataclass
+class TrainResult:
+    """Result of train_for_tests."""
+
+    state: BaseTrainState
+    step: int
+    test_loss: Optional[float] = None
+    test_nll: Optional[float] = None
+
+
+def train_for_tests(
+    model,
+    dataset: Dataset,
+    batch_size: int,
+    learning_rate: float,
+    loss_fn: Callable,
+    fields: List[str],
+    epochs: int = 0,
+    steps: int = 0,
+    weight_decay: float = 0.001,
+    warmup_steps: Optional[int] = None,
+    gradient_clipping: Optional[float] = None,
+    schedule_free_beta1: Optional[float] = None,
+    adam_beta2: float = 0.999,
+    rng_seed: int = 7357,
+    test_dataset: Optional[Dataset] = None,
+    nll_fn: Optional[Callable] = None,
+    nll_eval_fields: Optional[List[str]] = None,
+) -> TrainResult:
+    """Convenience wrapper around the production train_loop for use in tests.
+
+    Creates a TrainingConfig + BaseTrainState with sensible defaults, wires up no-op hooks,
+    and delegates to the production train_loop.
+
+    Args:
+        model: The model to train.
+        dataset: Training dataset (HuggingFace Dataset).
+        batch_size: Batch size.
+        learning_rate: Peak learning rate.
+        loss_fn: Loss function with signature (params, batch_dict, rng) -> loss.
+        fields: Dataset columns to fetch for each batch.
+        epochs: Number of epochs to train for.
+        steps: Number of extra steps to train for.
+        weight_decay: Weight decay for AdamW.
+        warmup_steps: Warmup steps (defaults to 10% of total steps).
+        gradient_clipping: Optional gradient clipping norm.
+        schedule_free_beta1: If set, use schedule-free AdamW with this beta1.
+        adam_beta2: Adam beta2 parameter.
+        rng_seed: Random seed for parameter initialization and training RNG.
+        test_dataset: Optional test dataset for per-epoch evaluation.
+        nll_fn: Optional NLL function with signature
+            (model, eval_params, batch_dict, rng) -> nll_per_example.
+            If provided along with test_dataset, NLL is computed and printed after each epoch.
+        nll_eval_fields: Dataset columns to fetch for NLL evaluation batches.
+            Defaults to fields if not provided.
+
+    Returns:
+        TrainResult with state, step, and optionally test_loss and test_nll from
+        the last epoch (when test_dataset is provided).
+    """
+    (
+        steps_per_epoch,
+        total_steps,
+        complete_epochs,
+        total_epochs,
+        steps_in_partial_epoch,
+    ) = plan_steps(len(dataset), batch_size, epochs=epochs, steps=steps)
+
+    if warmup_steps is None:
+        warmup_steps = total_steps // 10
+
+    if schedule_free_beta1 is not None:
+        lr_schedule = LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE
+    else:
+        lr_schedule = LearningRateSchedule.WARMUP_PLUS_COSINE
+
+    training_cfg = TrainingConfig(
+        batch_size=batch_size,
+        epochs=epochs,
+        learning_rate_schedule=lr_schedule,
+        gradient_accumulation_steps=1,
+        gradient_clipping=gradient_clipping,
+        learning_rate=learning_rate,
+        warmup_steps=warmup_steps,
+        weight_decay=weight_decay,
+        schedule_free_beta1=schedule_free_beta1,
+        adam_beta2=adam_beta2,
+    )
+
+    rng = jax.random.PRNGKey(rng_seed)
+    params = jax.jit(model.init)(rng, *model.dummy_inputs())
+
+    beta2_in_dtype = jnp.astype(adam_beta2, model.weights_dtype)
+    if beta2_in_dtype >= 1.0:
+        raise ValueError(
+            f"Adam beta2 {adam_beta2} is too large for {model.weights_dtype}"
+        )
+
+    opt = setup_optimizer(training_cfg, total_steps, mdl=model)
+    state = BaseTrainState.create(
+        apply_fn=model.apply,
+        params=params,
+        tx=opt,
+        rng=rng,
+    )
+
+    def get_batch_fn(step):
+        return get_batch(dataset, batch_size, step, fields)
+
+    def noop_fast_hook(loss, metrics, step, norm):
+        pass
+
+    # Mutable container for the post-epoch hook to store test stats from the last epoch.
+    last_epoch_stats = {}
+
+    if test_dataset is not None:
+        eval_fields = nll_eval_fields or fields
+        eval_batch_size = min(batch_size, len(test_dataset))
+        n_test_batches = len(test_dataset) // eval_batch_size
+
+        def post_epoch_hook(state, epoch_idx, global_step):
+            eval_params = state.get_eval_params()
+            test_losses = []
+            for i in trange(n_test_batches, desc="test loss", leave=False):
+                batch = get_batch(test_dataset, eval_batch_size, i, eval_fields)
+                test_losses.append(
+                    loss_fn(eval_params, batch, jax.random.PRNGKey(global_step + i))
+                )
+            mean_test_loss = float(jnp.mean(jnp.array(test_losses)))
+            last_epoch_stats["test_loss"] = mean_test_loss
+            if nll_fn is not None:
+                nlls = []
+                for i in trange(n_test_batches, desc="test NLL", leave=False):
+                    batch = get_batch(test_dataset, eval_batch_size, i, eval_fields)
+                    nlls.append(
+                        nll_fn(
+                            model,
+                            eval_params,
+                            batch,
+                            jax.random.PRNGKey(global_step + i),
+                        )
+                    )
+                mean_nll = float(jnp.mean(jnp.concatenate(nlls)))
+                last_epoch_stats["test_nll"] = mean_nll
+                print(
+                    f"Epoch {epoch_idx + 1}: test loss = {mean_test_loss:.4f}, test NLL = {mean_nll:.4f}"
+                )
+            else:
+                print(f"Epoch {epoch_idx + 1}: test loss = {mean_test_loss:.4f}")
+
+    else:
+        post_epoch_hook = None
+
+    def noop_slow_hook(loss, state, step, norm):
+        return False
+
+    final_state, final_step = train_loop(
+        steps_per_epoch=steps_per_epoch,
+        total_steps=total_steps,
+        complete_epochs=complete_epochs,
+        total_epochs=total_epochs,
+        steps_in_partial_epoch=steps_in_partial_epoch,
+        initial_step=0,
+        initial_train_state=state,
+        get_batch_fn=get_batch_fn,
+        loss_fn=loss_fn,
+        fast_post_step_hook_fn=noop_fast_hook,
+        slow_post_step_hook_fn=noop_slow_hook,
+        slow_path_condition_fn=lambda step: False,
+        post_epoch_hook_fn=post_epoch_hook,
+    )
+
+    return TrainResult(
+        state=final_state,
+        step=final_step,
+        test_loss=last_epoch_stats.get("test_loss"),
+        test_nll=last_epoch_stats.get("test_nll"),
+    )

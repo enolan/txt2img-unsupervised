@@ -442,7 +442,6 @@ class ScoreMatchingTrainState(BaseTrainState):
                 sigma_sq_max=model_cfg.sigma_sq_max,
             ),
             cap_conditioning=model_cfg.cap_conditioning,
-            relative_cap_encoding=model_cfg.relative_cap_encoding,
         )
 
 

@@ -178,18 +178,6 @@ def init_model_params(model, init_key):
     return model.init(init_key, *model.dummy_inputs())
 
 
-def parse_time_dim(value):
-    """Parse time_dim argument - accepts 'none' or an integer."""
-    if value.lower() == "none":
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"time_dim must be 'none' or an integer, got '{value}'"
-        )
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -216,15 +204,6 @@ def main():
     )
     parser.add_argument("--d-model-low", type=int, required=True)
     parser.add_argument("--d-model-high", type=int, required=True)
-    parser.add_argument(
-        "--reference-directions", type=int, required=False, default=None
-    )
-    parser.add_argument(
-        "--time-dim",
-        type=parse_time_dim,
-        required=True,
-        help="Time dimension for encoding (integer) or 'none' for scalar encoding",
-    )
     parser.add_argument("--use-pre-mlp-projection", type=bool, required=True)
     parser.add_argument("--n-layers", type=int, required=True)
     parser.add_argument("--mlp-expansion-factor", type=int, required=False, default=4)
@@ -438,8 +417,6 @@ def main():
 
             model = FunctionWeightedFlowModel(
                 domain_dim=domain_dim,
-                reference_directions=args.reference_directions,
-                time_dim=args.time_dim,
                 use_pre_mlp_projection=args.use_pre_mlp_projection,
                 n_layers=args.n_layers,
                 d_model=d_model,
@@ -619,8 +596,6 @@ def generate_activation_charts(d_model_values, activations, n_layers, args):
         else "N/A",
         "n_lr_points": args.n_lr_points if args.lr_low is not None else "N/A",
         "d_model_range": f"{args.d_model_low}-{args.d_model_high}",
-        "reference_directions": args.reference_directions,
-        "time_dim": args.time_dim,
         "use_pre_mlp_projection": args.use_pre_mlp_projection,
         "n_layers": args.n_layers,
         "mlp_expansion_factor": args.mlp_expansion_factor,
@@ -797,8 +772,6 @@ def generate_loss_charts(d_model_values, lr_combinations, losses, test_losses, a
             )
 
         param_info += (
-            f"reference_directions: {args.reference_directions}\n"
-            f"time_dim: {args.time_dim}\n"
             f"pre_mlp_projection: {args.use_pre_mlp_projection}\n"
             f"n_layers: {args.n_layers}\n"
             f"mlp_expansion_factor: {args.mlp_expansion_factor}\n"
@@ -973,8 +946,6 @@ def generate_loss_charts(d_model_values, lr_combinations, losses, test_losses, a
         )
 
     param_info += (
-        f"reference_directions: {args.reference_directions}\n"
-        f"time_dim: {args.time_dim}\n"
         f"pre_mlp_projection: {args.use_pre_mlp_projection}\n"
         f"n_layers: {args.n_layers}\n"
         f"mlp_expansion_factor: {args.mlp_expansion_factor}\n"

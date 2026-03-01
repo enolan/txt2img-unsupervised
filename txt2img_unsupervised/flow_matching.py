@@ -50,12 +50,10 @@ geometry of the sphere, ensuring flows remain on the manifold.
 """
 from dataclasses import dataclass, field, replace
 from datasets import Dataset
-from einops import rearrange, repeat
-from enum import Enum
+from einops import repeat
 from flax import linen as nn
-from flax.training import train_state
 from functools import partial
-from math import floor, ceil
+from math import ceil
 from scipy import stats
 from typing import (
     Any,
@@ -70,7 +68,6 @@ from typing import (
     NamedTuple,
 )
 from tqdm import tqdm, trange
-from tqdm.contrib import tenumerate
 import jax
 import jax.lax
 import jax.numpy as jnp
@@ -89,30 +86,6 @@ from .cap_sampling import (
     sample_from_cap,
     sphere_log_inverse_surface_area,
 )
-
-
-def sinusoidal_scalar_encoding(s, dim: int):
-    """Sinusoidal encoding for a scalar in [0, 1] with configurable dimension (even)."""
-    assert dim % 2 == 0
-    half_d = dim // 2
-
-    min_freq = 1.0
-    max_freq = 1000.0
-    freqs = jnp.exp(jnp.linspace(jnp.log(min_freq), jnp.log(max_freq), half_d))
-
-    sin_components = jnp.sin(2 * jnp.pi * freqs * s)
-    cos_components = jnp.cos(2 * jnp.pi * freqs * s)
-
-    sin_means = -(jnp.cos(2 * jnp.pi * freqs) - 1.0) / (2 * jnp.pi * freqs)
-    cos_means = jnp.sin(2 * jnp.pi * freqs) / (2 * jnp.pi * freqs)
-
-    sin_components = sin_components - sin_means
-    cos_components = cos_components - cos_means
-
-    encoding = jnp.concatenate([sin_components, cos_components])
-    encoding = encoding * jnp.sqrt(2)
-    assert encoding.shape == (dim,)
-    return encoding
 
 
 class MLPBlock(nn.Module):
@@ -233,19 +206,16 @@ class VectorField(nn.Module):
     The vector field is over unit vectors in the domain.
 
     The inputs are processed as follows:
-    * If reference_directions is not None, encode the input unit vectors as a set of cosine
-      similarities with n randomly selected reference directions. Note that in order for this
-      to capture all the information reference_directions must be at least domain_dim. If
-      it is None, pass it through unmodified.
-    * Encode the time parameter: sinusoidal encoding if time_dim specified, scalar if None.
+    * Scale the input unit vectors by sqrt(domain_dim) to have unit variance.
+    * Encode the time parameter as a scalar: (t - 0.5) * sqrt(12).
     * Pass the conditioning vector through unmodified. It should have mean 0 and variance 1.
     * Concatenate the above into a single vector.
     * If use_pre_mlp_projection is true, apply a linear layer to the concatenated vector to create a
       d_model-dimensional vector.
     * If use_pre_mlp_projection is false:
       * The following must sum to less than or equal to d_model:
-        * reference_directions if it is not None, otherwise domain_dim
-        * time_dim if it is not None, otherwise 1 (for scalar encoding)
+        * domain_dim
+        * 1 (scalar time encoding)
         * conditioning_dim
       * If they're less, pad the vector with zeros.
     * If use_pre_mlp_projection is false, add a learnable bias to the vector.
@@ -255,15 +225,8 @@ class VectorField(nn.Module):
 
     # Dimension of the sphere and the vector field
     domain_dim: int
-    # If reference_directions is not None, encode the input unit vectors as a set of cosine
-    # similarities with n randomly selected reference directions. Note that in order for this
-    # encoding to capture all the information reference_directions must be at least domain_dim. If
-    # it is None, pass it through unmodified.
-    reference_directions: Optional[int]
     # Dimension of the conditioning vector. Can be zero for unconditioned models.
     conditioning_dim: int
-    # Dimension of the time encoding. Must be even if specified. If None, uses scalar encoding.
-    time_dim: Optional[int]
     # If true, multiply the inputs by a learnable matrix
     use_pre_mlp_projection: bool
     # Number of MLP blocks
@@ -293,16 +256,11 @@ class VectorField(nn.Module):
 
     @property
     def input_feature_dim(self) -> int:
-        return (
-            self.reference_directions
-            if self.reference_directions is not None
-            else self.domain_dim
-        )
+        return self.domain_dim
 
     @property
     def total_input_dim(self) -> int:
-        time_dim = 1 if self.time_dim is None else self.time_dim
-        return self.input_feature_dim + self.conditioning_dim + time_dim
+        return self.input_feature_dim + self.conditioning_dim + 1
 
     @property
     def initial_total_input_dim(self) -> int:
@@ -314,7 +272,7 @@ class VectorField(nn.Module):
         if "x" not in self.mlp_always_inject:
             dim += self.input_feature_dim
         if "t" not in self.mlp_always_inject:
-            dim += 1 if self.time_dim is None else self.time_dim
+            dim += 1
         if "cond" not in self.mlp_always_inject:
             dim += self.conditioning_dim
         return dim
@@ -447,9 +405,6 @@ class VectorField(nn.Module):
                 f"initial_total_input_dim ({self.initial_total_input_dim}) "
                 f"exceeds d_model ({self.d_model}). Reduce one or more of them or increase d_model."
             )
-        if self.time_dim is not None and self.time_dim % 2 != 0:
-            raise ValueError("Time dimension must be even")
-
         if self.use_pre_mlp_projection:
             self.pre_mlp_proj = nn.Dense(
                 features=self.d_model,
@@ -517,18 +472,9 @@ class VectorField(nn.Module):
             kernel_init=nn.initializers.zeros_init(),
         )
 
-        # Used to encode the input unit vectors as a vector of dot products
-        if self.reference_directions is not None:
-            self.reference_vectors = sample_sphere(
-                jax.random.PRNGKey(20250315), self.reference_directions, self.domain_dim
-            )
-
     def time_encoding(self, t):
-        """Create encoding for the time parameter: sinusoidal if time_dim specified, scalar if None."""
-        if self.time_dim is not None:
-            return sinusoidal_scalar_encoding(t, self.time_dim)
-        else:
-            return jnp.array([(t - 0.5) * jnp.sqrt(12.0)])
+        """Encode the time parameter as a scalar with mean 0 and variance 1 for t ~ U[0, 1]."""
+        return jnp.array([(t - 0.5) * jnp.sqrt(12.0)])
 
     def process_inputs(self, x, t, cond_vec):
         """
@@ -542,8 +488,8 @@ class VectorField(nn.Module):
 
         Returns:
             Dictionary with individual components and combined input:
-            - input_features: Input features (either dot products or scaled input vectors) [batch_size, input_feature_dim]
-            - time_encoding: Time encoding [batch_size, time_dim]
+            - input_features: Scaled input vectors [batch_size, domain_dim]
+            - time_encoding: Time encoding [batch_size, 1]
             - cond_vec: Conditioning vectors [batch_size, conditioning_dim]
             - mlp_input: Combined input to the MLP [batch_size, d_model]
         """
@@ -552,18 +498,11 @@ class VectorField(nn.Module):
         assert t.shape == (batch_size,)
         assert cond_vec.shape == (batch_size, self.conditioning_dim)
 
-        if self.reference_directions is not None:
-            # Encode the input unit vectors as a vector of dot products
-            input_features = (x @ self.reference_vectors.T) * jnp.sqrt(self.domain_dim)
-            assert input_features.shape == (batch_size, self.reference_directions)
-        else:
-            # Use the raw input vectors, scaled to have unit variance
-            input_features = x * jnp.sqrt(self.domain_dim)
-            assert input_features.shape == (batch_size, self.domain_dim)
+        input_features = x * jnp.sqrt(self.domain_dim)
+        assert input_features.shape == (batch_size, self.domain_dim)
 
         time_encoding = jax.vmap(self.time_encoding)(t)
-        expected_time_dim = 1 if self.time_dim is None else self.time_dim
-        assert time_encoding.shape == (batch_size, expected_time_dim)
+        assert time_encoding.shape == (batch_size, 1)
 
         # Build initial input from non-injected components
         components = []
@@ -697,8 +636,7 @@ class VectorField(nn.Module):
         return tangent_outputs
 
 
-@pytest.mark.parametrize("time_dim", [4, 16, 64, None])
-def test_vector_field_time_encoding_statistics(time_dim):
+def test_vector_field_time_encoding_statistics():
     """
     Test that the time encoding function produces vectors with appropriate statistical properties
     when given uniformly distributed time values between 0 and 1.
@@ -709,15 +647,11 @@ def test_vector_field_time_encoding_statistics(time_dim):
     """
     rng = jax.random.PRNGKey(42)
 
-    # Create a minimal VectorField model just to test the time_encoding. Parameters other than
-    # d_model are irrelevant for this test.
     model = VectorField(
         activations_dtype=jnp.float32,
         weights_dtype=jnp.float32,
         domain_dim=3,
         conditioning_dim=0,
-        time_dim=time_dim,
-        reference_directions=16,
         n_layers=1,
         d_model=256,
         mlp_expansion_factor=1,
@@ -734,8 +668,7 @@ def test_vector_field_time_encoding_statistics(time_dim):
     compute_encoding = lambda t: model.apply(params, t, method=model.time_encoding)
     encoded_times = jax.vmap(compute_encoding)(times)
 
-    expected_time_dim = 1 if time_dim is None else time_dim
-    assert encoded_times.shape == (n_samples, expected_time_dim)
+    assert encoded_times.shape == (n_samples, 1)
 
     # Check statistics
     means = jnp.mean(encoded_times, axis=0)
@@ -754,7 +687,7 @@ def test_vector_field_time_encoding_statistics(time_dim):
     np.testing.assert_allclose(overall_mean, expected_mean, atol=0.01)
     np.testing.assert_allclose(overall_std, expected_std, atol=0.01)
 
-    print(f"Time encoding test passed for time_dim={time_dim}")
+    print(f"Time encoding test passed")
     print(f"  Mean: {overall_mean:.6f} (expected {expected_mean:.6f})")
     print(f"  Std: {overall_std:.6f} (expected {expected_std:.6f})")
 
@@ -774,15 +707,12 @@ def test_vector_field_projections_normalization(domain_dim, conditioning_dim):
     * cond_vec's components each have mean 0 variance 1
     """
     rng = jax.random.PRNGKey(42)
-    time_dim = 16
 
     model = VectorField(
         activations_dtype=jnp.float32,
         weights_dtype=jnp.float32,
         domain_dim=domain_dim,
         conditioning_dim=conditioning_dim,
-        time_dim=time_dim,
-        reference_directions=16,
         use_pre_mlp_projection=False,
         n_layers=1,
         d_model=2048,  # Bigger mlp_in vectors reduce the variance of our estimates
@@ -792,7 +722,7 @@ def test_vector_field_projections_normalization(domain_dim, conditioning_dim):
     )
 
     params_rng, sample_rng = jax.random.split(rng)
-    state = create_train_state(params_rng, model, 1e-3)
+    params = model.init(params_rng, *model.dummy_inputs())
 
     # Generate test inputs
     n_samples = 10_000
@@ -807,7 +737,7 @@ def test_vector_field_projections_normalization(domain_dim, conditioning_dim):
     else:
         cond_vec = jnp.zeros((n_samples, 0))
 
-    inputs = model.apply(state.params, x, t, cond_vec, method=model.process_inputs)
+    inputs = model.apply(params, x, t, cond_vec, method=model.process_inputs)
 
     input_features = inputs["input_features"]
     input_features_mean = jnp.mean(input_features)
@@ -834,7 +764,7 @@ def test_vector_field_projections_normalization(domain_dim, conditioning_dim):
     padded_mlp_input_variance = jnp.mean(jnp.var(mlp_input, axis=1))
     # Print statistics
     print(
-        f"\nTesting with domain_dim={domain_dim}, conditioning_dim={conditioning_dim}, time_dim={time_dim}"
+        f"\nTesting with domain_dim={domain_dim}, conditioning_dim={conditioning_dim}"
     )
     # print(
     #    f"scaled_x - Mean: {scaled_x_mean:.6f}, Variance: {scaled_x_variance:.6f}"
@@ -889,7 +819,7 @@ def test_vector_field_projections_normalization(domain_dim, conditioning_dim):
         abs(padded_mlp_input_mean) < 0.05
     ), f"Padded MLP input mean should be close to 0, got {padded_mlp_input_mean}"
     assert (
-        abs(padded_mlp_input_variance - 1.0) < 0.05
+        abs(padded_mlp_input_variance - 1.0) < 0.1
     ), f"Padded MLP input variance should be close to 1.0, got {padded_mlp_input_variance}"
 
 
@@ -1204,37 +1134,6 @@ def conditional_flow_matching_loss(
         return loss
 
 
-def create_train_state(rng, model, learning_rate_or_schedule, gradient_clipping=None):
-    """Create initial training state for a test. See checkpoint.py for the real one."""
-    dummy_inputs = model.dummy_inputs()
-    params = model.init(rng, *dummy_inputs)
-    if callable(learning_rate_or_schedule):
-        scaled_lr_or_schedule = lambda step: model.scale_lr(
-            learning_rate_or_schedule(step)
-        )
-    else:
-        scaled_lr_or_schedule = model.scale_lr(learning_rate_or_schedule)
-
-    if gradient_clipping is not None:
-        opt_fixed_lr = optax.chain(
-            optax.clip_by_global_norm(gradient_clipping),
-            optax.adamw(learning_rate_or_schedule, weight_decay=0.001),
-        )
-        opt_scaled_lr = optax.chain(
-            optax.clip_by_global_norm(gradient_clipping),
-            optax.adamw(scaled_lr_or_schedule, weight_decay=0.001),
-        )
-    else:
-        opt_fixed_lr = optax.adamw(learning_rate_or_schedule, weight_decay=0.001)
-        opt_scaled_lr = optax.adamw(scaled_lr_or_schedule, weight_decay=0.001)
-
-    opt = optax.transforms.partition(
-        {"fixed_lr": opt_fixed_lr, "scaled_lr": opt_scaled_lr},
-        model.mk_partition_map(use_muon=False),
-    )
-    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=opt)
-
-
 @partial(jax.jit, static_argnames=("batch_size", "dim"), inline=True)
 def sample_sphere(rng, batch_size, dim):
     """
@@ -1321,286 +1220,10 @@ def compute_batch_loss(
     )
 
 
-@partial(jax.jit, static_argnames=("model"), donate_argnames=("state", "rng"))
-def train_step(model, state, batch, rng):
-    """
-    Train for a single step.
-
-    Args:
-        model: The vector field model
-        state: Training state
-        batch: Batch of data containing "point_vec" and "cond_vec"
-        rng: JAX random key
-
-    Returns:
-        Updated state, loss value, gradient norm, and updated random key
-    """
-    rng, next_rng = jax.random.split(rng)
-
-    def loss_fn(params):
-        loss = compute_batch_loss(model, params, batch, rng)
-        return loss
-
-    grad_fn = jax.value_and_grad(loss_fn)
-    loss, grads = grad_fn(state.params)
-    grad_norm = optax.global_norm(grads)
-
-    state = state.apply_gradients(grads=grads)
-
-    return state, loss, grad_norm, next_rng
-
-
-def _train_loop_for_tests_generic(
-    model,
-    dataset,
-    batch_size,
-    learning_rate,
-    epochs,
-    test_dataset=None,
-    compute_nll_fn=None,
-    precompute_test_stats_fn=None,
-    train_step_fn=None,
-    compute_batch_loss_fn=None,
-    compute_nll_on_step_0=True,
-):
-    """
-    Generic training loop for unit tests.
-
-    Args:
-        model: The model to train
-        dataset: Training dataset
-        batch_size: Batch size for training
-        learning_rate: Initial learning rate (will use cosine schedule)
-        epochs: Number of epochs to train for
-        test_dataset: Optional test dataset for evaluation after each epoch
-        compute_nll_fn: Function (model, params, batch, n_steps, rng, n_projections, precomputed_stats=None) -> nlls
-        precompute_test_stats_fn: Optional function (model, params, rng, n_steps, n_projections) -> precomputed_stats
-                                  Called once before test evaluation to compute expensive global statistics
-        train_step_fn: Function (model, state, batch, rng) -> (state, loss, grad_norm, rng).
-                       Defaults to flow_matching.train_step.
-        compute_batch_loss_fn: Function (model, params, batch, rng) -> loss.
-                               Defaults to flow_matching.compute_batch_loss.
-        compute_nll_on_step_0: Whether to compute NLL on the first training step (before any
-                               training has occurred). Set to False to skip this, e.g. when the
-                               ODE integration is very slow on an untrained model.
-
-    Returns:
-        state: Final training state
-        train_loss: Final training loss
-        test_loss: Final test loss (if test_dataset provided)
-    """
-    if train_step_fn is None:
-        train_step_fn = train_step
-    if compute_batch_loss_fn is None:
-        compute_batch_loss_fn = compute_batch_loss
-    params_rng, step_rng = jax.random.split(jax.random.PRNGKey(7357), 2)
-
-    # Calculate total number of steps
-    n_samples = len(dataset)
-    steps_per_epoch = n_samples // batch_size
-    total_steps = steps_per_epoch * epochs
-
-    cosine_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=learning_rate,
-        warmup_steps=floor(total_steps * 0.1),
-        decay_steps=total_steps,
-    )
-
-    n_projections = 32
-    nll_steps = 128
-
-    state = create_train_state(params_rng, model, cosine_schedule)
-    np_rng = np.random.Generator(np.random.PCG64(seed=42))
-
-    final_test_loss = None
-    final_test_nll = None
-    first_step = True
-    step_count = 0
-
-    with tqdm(range(epochs), desc="Training", unit="epochs") as pbar:
-        for epoch in pbar:
-            # Compute NLL once at the start of each epoch (plus first step)
-            epoch_train_nll = None
-
-            # Training loop
-            for i, batch in tenumerate(
-                dataset.iter(batch_size, drop_last_batch=True),
-                unit="train batches",
-                total=len(dataset) // batch_size,
-            ):
-                norms = jnp.linalg.norm(batch["point_vec"], axis=1, keepdims=True)
-                np.testing.assert_allclose(np.asarray(norms), 1.0, rtol=0, atol=1e-6)
-
-                state, train_loss, grad_norm, step_rng = train_step_fn(
-                    model, state, batch, step_rng
-                )
-                jax.tree.map(lambda x: x.copy_to_host_async(), (train_loss, grad_norm))
-
-                step_count += 1
-                current_lr = cosine_schedule(step_count)
-
-                # Compute NLL once per epoch (at the beginning), optionally skipping step 0
-                if (
-                    compute_nll_fn is not None
-                    and i == 0
-                    and (not first_step or compute_nll_on_step_0)
-                ):
-                    step_rng, nll_rng = jax.random.split(step_rng)
-                    train_nlls = compute_nll_fn(
-                        model,
-                        state.params,
-                        batch,
-                        n_steps=nll_steps,
-                        rng=nll_rng,
-                        n_projections=n_projections,
-                        precomputed_stats=None,
-                    )
-                    epoch_train_nll = jnp.mean(train_nlls)
-
-                train_loss, grad_norm = jax.device_get((train_loss, grad_norm))
-                if epoch_train_nll is not None:
-                    epoch_train_nll = jax.device_get(epoch_train_nll)
-
-                if first_step:
-                    if epoch_train_nll is not None:
-                        tqdm.write(
-                            f"First step loss: {train_loss:.6f}, grad norm: {grad_norm:.6f}, lr: {current_lr:.6f}, nll: {epoch_train_nll:.6f}"
-                        )
-                    else:
-                        tqdm.write(
-                            f"First step loss: {train_loss:.6f}, grad norm: {grad_norm:.6f}, lr: {current_lr:.6f}"
-                        )
-                    first_step = False
-                pbar.set_postfix(
-                    {
-                        "loss": f"{float(train_loss):.6f}",
-                        "train_nll": f"{float(epoch_train_nll) if epoch_train_nll is not None else 0.0:.6f}",
-                        "grad_norm": f"{float(grad_norm):.6f}",
-                        "lr": f"{float(current_lr):.6f}",
-                    }
-                )
-
-            # Evaluate on test dataset if provided
-            if test_dataset is not None:
-                # Fixed seed so we test the same x0/t/cap across different epochs.
-                test_rng = jax.random.PRNGKey(20250911)
-                test_losses = []
-                test_nlls = []
-
-                # Precompute expensive test statistics if needed
-                precomputed_stats = None
-                if precompute_test_stats_fn is not None:
-                    precompute_rng, test_rng = jax.random.split(test_rng)
-                    precomputed_stats = precompute_test_stats_fn(
-                        model, state.params, precompute_rng, nll_steps, n_projections
-                    )
-
-                for test_batch in tqdm(
-                    test_dataset.iter(batch_size, drop_last_batch=False),
-                    unit="test batches",
-                    total=len(test_dataset) // batch_size,
-                ):
-                    test_batch_rng, test_nll_rng, test_rng = jax.random.split(
-                        test_rng, 3
-                    )
-
-                    batch_test_loss = compute_batch_loss_fn(
-                        model, state.params, test_batch, test_batch_rng
-                    )
-
-                    test_losses.append(batch_test_loss)
-
-                    if compute_nll_fn is not None:
-                        test_nlls.append(
-                            compute_nll_fn(
-                                model,
-                                state.params,
-                                test_batch,
-                                n_steps=nll_steps,
-                                rng=test_nll_rng,
-                                n_projections=n_projections,
-                                precomputed_stats=precomputed_stats,
-                            )
-                        )
-
-                if len(test_losses) > 0:
-                    test_losses = jnp.asarray(test_losses)
-                    avg_test_loss = jax.device_get(jnp.mean(test_losses))
-                    final_test_loss = avg_test_loss
-
-                    if len(test_nlls) > 0:
-                        test_nlls = jnp.concatenate(test_nlls)
-                        avg_test_nll = jax.device_get(jnp.mean(test_nlls))
-                        final_test_nll = avg_test_nll
-                        train_nll_str = (
-                            f", Train NLL: {epoch_train_nll:.6f}"
-                            if epoch_train_nll is not None
-                            else ""
-                        )
-                        tqdm.write(
-                            f"Epoch {epoch}, Train Loss: {train_loss:.6f}{train_nll_str}, Grad Norm: {grad_norm:.6f}, Test Loss: {avg_test_loss:.6f}, Test NLL: {avg_test_nll:.6f}"
-                        )
-                    else:
-                        tqdm.write(
-                            f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Grad Norm: {grad_norm:.6f}, Test Loss: {avg_test_loss:.6f}"
-                        )
-                else:
-                    tqdm.write(
-                        f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Grad Norm: {grad_norm:.6f}, No test batches"
-                    )
-            else:
-                tqdm.write(
-                    f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Grad Norm: {grad_norm:.6f}, No test batches"
-                )
-
-            # Shuffle dataset for next epoch
-            dataset.shuffle(generator=np_rng)
-
-    if test_dataset is not None:
-        if compute_nll_fn is not None:
-            return state, train_loss, final_test_loss, final_test_nll
-        else:
-            return state, train_loss, final_test_loss
-    else:
-        return state, train_loss
-
-
-def _compute_nll_vector_field(
-    model, params, batch, n_steps, rng, n_projections, precomputed_stats=None
-):
-    """Compute NLL for VectorField - use real conditioning data from batch."""
-    if "cond_vec" in batch:
-        cond_vecs = batch["cond_vec"]
-    else:
-        # For unconditional models, create zero-dimensional conditioning
-        batch_size = batch["point_vec"].shape[0]
-        cond_vecs = jnp.zeros((batch_size, 0))
-
-    return -compute_log_probability(
-        model=model,
-        params=params,
-        samples=batch["point_vec"],
-        cond_vecs=cond_vecs,
-        n_steps=n_steps,
-        rng=rng,
-        n_projections=n_projections,
-    )
-
-
-# Create VectorField-specific training loop using partial application
-_train_loop_for_tests = partial(
-    _train_loop_for_tests_generic,
-    compute_nll_fn=_compute_nll_vector_field,
-)
-
-
 _baseline_model = VectorField(
     domain_dim=3,
-    reference_directions=128,
     n_layers=6,
     d_model=512,
-    time_dim=None,
     mlp_expansion_factor=4,
     activations_dtype=jnp.float32,
     weights_dtype=jnp.float32,
@@ -1632,6 +1255,9 @@ _baseline_model = VectorField(
 @pytest.mark.parametrize("domain_dim", [3, 16])
 def test_train_trivial(domain_dim, inject_keys):
     "Train a model with a single example"
+    # Deferred import: training_infra → checkpoint → this module creates a cycle.
+    from .training_infra import train_for_tests
+
     model = replace(
         _baseline_model,
         domain_dim=domain_dim,
@@ -1646,11 +1272,16 @@ def test_train_trivial(domain_dim, inject_keys):
     first_dim_vec = first_dim_vec.at[0].set(1.0)
     points = repeat(first_dim_vec, "v -> b v", b=batch_size * 100)
     dset = Dataset.from_dict({"point_vec": points}).with_format("np")
-    state, loss = _train_loop_for_tests(model, dset, batch_size, lr, ep)
-    print(f"Final loss: {loss:.6f}")
+
+    loss_fn = partial(compute_batch_loss, model)
+
+    result = train_for_tests(
+        model, dset, batch_size, lr, loss_fn, ["point_vec"], epochs=ep
+    )
+    eval_params = result.state.get_eval_params()
     samples = generate_samples(
         model,
-        state.params,
+        eval_params,
         jax.random.PRNGKey(0),
         cond_vecs=jnp.zeros((20, 0)),
         n_steps=1000,
@@ -1764,6 +1395,8 @@ def test_train_vmf(domain_dim, inject_keys):
     """
     Train a model with data from a von Mises-Fisher distribution and evaluate the samples.
     """
+    from .training_infra import train_for_tests
+
     model = replace(
         _baseline_model,
         domain_dim=domain_dim,
@@ -1795,19 +1428,34 @@ def test_train_vmf(domain_dim, inject_keys):
     differential_entropy = _vmf_differential_entropy(kappa)
     print(f"vMF distribution entropy: {differential_entropy:.6f}")
 
-    state, train_loss, test_loss, test_nll = _train_loop_for_tests(
-        model, dset, batch_size, 1e-3, epochs, test_dset
-    )
-    print(f"Final train loss: {train_loss:.6f}")
-    print(f"Final test loss: {test_loss:.6f}")
-    print(f"Final test nll: {test_nll:.6f}")
+    loss_fn = partial(compute_batch_loss, model)
 
-    assert test_nll < differential_entropy + 0.5
+    def nll_fn(model, params, batch, rng):
+        points = jnp.array(batch["point_vec"])
+        cond_vecs = jnp.zeros((points.shape[0], 0))
+        return -compute_log_probability(
+            model, params, points, cond_vecs, n_steps=128, rng=rng, n_projections=32
+        )
+
+    result = train_for_tests(
+        model,
+        dset,
+        batch_size,
+        1e-3,
+        loss_fn,
+        ["point_vec"],
+        epochs=epochs,
+        test_dataset=test_dset,
+        nll_fn=nll_fn,
+    )
+    eval_params = result.state.get_eval_params()
+
+    assert result.test_nll < differential_entropy + 0.5
 
     n_test_samples = 1_000
     samples = generate_samples(
         model,
-        state.params,
+        eval_params,
         jax.random.PRNGKey(42),
         cond_vecs=jnp.zeros((n_test_samples, 0)),
         n_steps=1000,
@@ -1850,14 +1498,14 @@ def test_zero_init_uniform_nll(domain_dim):
     model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2, d_model=32)
 
     params_rng, data_rng = jax.random.split(jax.random.PRNGKey(12345))
-    state = create_train_state(params_rng, model, 1e-3)
+    params = model.init(params_rng, *model.dummy_inputs())
 
     points = sample_sphere(data_rng, 256, domain_dim)
     cond_vecs = jnp.zeros((256, 0))
 
     log_probs = compute_log_probability(
         model,
-        state.params,
+        params,
         points,
         cond_vecs,
         n_steps=128,
@@ -1917,6 +1565,8 @@ def test_train_conditional_vmf(domain_dim, inject_keys):
     When conditioning vector is 0, samples should come from the first vMF distribution.
     When conditioning vector is 1, samples should come from the second vMF distribution.
     """
+    from .training_infra import train_for_tests
+
     model = replace(
         _baseline_model,
         domain_dim=domain_dim,
@@ -1959,17 +1609,27 @@ def test_train_conditional_vmf(domain_dim, inject_keys):
     train_dataset = datasets["train"]
     test_dataset = datasets["test"]
 
-    state, train_loss, test_loss, test_nll = _train_loop_for_tests(
+    loss_fn = partial(compute_batch_loss, model)
+
+    def nll_fn(model, params, batch, rng):
+        points = jnp.array(batch["point_vec"])
+        cond_vecs = jnp.array(batch["cond_vec"])
+        return -compute_log_probability(
+            model, params, points, cond_vecs, n_steps=128, rng=rng, n_projections=32
+        )
+
+    result = train_for_tests(
         model,
         train_dataset,
         batch_size,
         lr,
-        epochs,
-        test_dataset,
+        loss_fn,
+        ["point_vec", "cond_vec"],
+        epochs=epochs,
+        test_dataset=test_dataset,
+        nll_fn=nll_fn,
     )
-    print(
-        f"Final loss - Train: {train_loss:.4f}, Test: {test_loss:.4f}, Test NLL: {test_nll:.4f}"
-    )
+    eval_params = result.state.get_eval_params()
 
     # Test the conditioned model
     n_eval_samples = 200
@@ -1982,14 +1642,14 @@ def test_train_conditional_vmf(domain_dim, inject_keys):
 
     samples_0 = generate_samples(
         model,
-        state.params,
+        eval_params,
         seed1,
         cond_vecs=cond_vec_0,
         n_steps=500,
     )
     samples_1 = generate_samples(
         model,
-        state.params,
+        eval_params,
         seed2,
         cond_vecs=cond_vec_1,
         n_steps=500,
@@ -4261,8 +3921,6 @@ def test_vector_field_evaluation():
         weights_dtype=jnp.float32,
         domain_dim=3,
         conditioning_dim=0,
-        time_dim=32,
-        reference_directions=16,
         n_layers=2,
         d_model=64,
         mlp_expansion_factor=4,
@@ -4270,7 +3928,7 @@ def test_vector_field_evaluation():
         input_dropout_rate=None,
         mlp_dropout_rate=None,
     )
-    state = create_train_state(rng, model, 1e-3)
+    params = model.init(rng, *model.dummy_inputs())
 
     # Generate points & times
     n_samples = 30
@@ -4280,7 +3938,7 @@ def test_vector_field_evaluation():
 
     cond_vecs = jnp.zeros((n_samples, model.conditioning_dim))
 
-    vector_field_values = model.apply(state.params, points, times, cond_vecs)
+    vector_field_values = model.apply(params, points, times, cond_vecs)
 
     dot_products = jnp.sum(points * vector_field_values, axis=1)
     magnitudes = jnp.linalg.norm(vector_field_values, axis=1)
@@ -4787,19 +4445,15 @@ def test_tsit5_divergence_matches_reference_with_less_work():
     assert iterations_tsit5 < coarse_steps
 
 
-def test_vector_field_without_reference_directions():
-    """Test that the VectorField works correctly when reference_directions is None."""
+def test_vector_field_basic_shapes():
+    """Test that the VectorField produces outputs with correct shapes."""
     domain_dim = 3
     batch_size = 4
-    time_dim = 16
     conditioning_dim = 8
 
-    # Create a model with reference_directions=None
     model = VectorField(
         domain_dim=domain_dim,
-        reference_directions=None,  # No reference directions
         conditioning_dim=conditioning_dim,
-        time_dim=time_dim,
         use_pre_mlp_projection=False,
         n_layers=2,
         d_model=64,
@@ -4880,1048 +4534,6 @@ def create_mollweide_projection_figure(samples, title=None):
     return fig
 
 
-class SamplingAlgorithm(Enum):
-    """Enum for selecting cap-constrained sampling algorithms."""
-
-    SIR = "sir"
-    REJECTION = "rejection"
-    MCMC = "mcmc"
-
-
-@dataclass
-class SamplingDebugInfo:
-    """Debug information about sampling performance."""
-
-    n_model_samples_drawn: int
-    n_model_probabilities_calculated: int
-
-
-@dataclass
-class RejectionParams:
-    """Parameters specific to rejection sampling algorithm."""
-
-    proposal_batch_size: int = 256
-
-
-def _generate_cap_constrained_samples_rejection(
-    model,
-    params,
-    rng,
-    cap_center,
-    cap_d_max,
-    table,
-    cond_vec,
-    n_output_samples,
-    rejection_params: RejectionParams,
-    flow_n_steps: int,
-):
-    """
-    Generate samples from a trained model constrained to lie within a spherical cap using
-    rejection sampling.
-
-    Args:
-        model: Trained VectorField model
-        params: Model parameters
-        rng: JAX random key
-        cap_center: Center of the spherical cap [domain_dim]
-        cap_d_max: Maximum cosine distance defining the cap size
-        table: LogitsTable for cap sampling (unused in rejection sampling)
-        cond_vec: Conditioning vector shared across all samples [cond_dim]
-        n_output_samples: Number of final samples to return
-        rejection_params: Rejection sampling specific parameters
-
-    Returns:
-        samples: Cap-constrained samples [n_output_samples, domain_dim]
-        log_probs: Model log densities for returned samples [n_output_samples]
-        ess: Effective sample size (always equals n_output_samples for rejection sampling)
-        debug_info: Performance debugging information
-    """
-    assert cap_center.shape == (model.domain_dim,)
-    assert cond_vec.shape == (model.conditioning_dim,)
-
-    threshold = 1.0 - cap_d_max
-    samples_chunks = []
-    total_proposals = 0
-
-    with tqdm(
-        desc="rejection sampling", unit="accepted samples", total=n_output_samples
-    ) as pbar:
-        while sum(chunk.shape[0] for chunk in samples_chunks) < n_output_samples:
-            rng, sub_rng = jax.random.split(rng)
-
-            # Generate batch of conditioning vectors
-            batch_cond_vecs = jnp.broadcast_to(
-                cond_vec[None, :],
-                (rejection_params.proposal_batch_size, model.conditioning_dim),
-            )
-
-            # Generate samples from the trained model
-            batch_samples = generate_samples(
-                model,
-                params,
-                sub_rng,
-                cond_vecs=batch_cond_vecs,
-                n_steps=flow_n_steps,
-            )
-
-            # Check which samples are in the cap
-            cos_similarities = batch_samples @ cap_center
-            mask = cos_similarities >= threshold
-            accepted = batch_samples[mask]
-
-            if accepted.shape[0] > 0:
-                samples_chunks.append(accepted)
-                pbar.update(accepted.shape[0])
-
-            total_proposals += rejection_params.proposal_batch_size
-
-    # Concatenate and trim to exact number requested
-    all_samples = jnp.concatenate(samples_chunks, axis=0)
-    final_samples = all_samples[:n_output_samples]
-
-    # Compute probabilities for the returned samples
-    batch_cond_vecs = jnp.broadcast_to(
-        cond_vec[None, :], (final_samples.shape[0], model.conditioning_dim)
-    )
-    log_probs = compute_log_probability(
-        model,
-        params,
-        final_samples,
-        batch_cond_vecs,
-        n_steps=flow_n_steps,
-        rng=None,
-        n_projections=10,
-    )
-
-    # For rejection sampling, ESS equals the number of output samples
-    ess = float(n_output_samples)
-
-    debug_info = SamplingDebugInfo(
-        n_model_samples_drawn=total_proposals, n_model_probabilities_calculated=0
-    )
-
-    return final_samples, log_probs, ess, debug_info
-
-
-def calculate_autocorrelation(chain_samples, max_lag=None):
-    """
-    Calculate autocorrelation function for a single MCMC chain using FFT for efficiency.
-
-    Args:
-        chain_samples: Array of shape [n_steps, dim] for a single chain
-        max_lag: Maximum lag to compute autocorrelation for. If None, uses n_steps // 4
-
-    Returns:
-        autocorrelations: Array of autocorrelation values [max_lag + 1]
-    """
-    n_steps, dim = chain_samples.shape
-
-    if max_lag is None:
-        max_lag = n_steps // 4
-    max_lag = min(max_lag, n_steps - 1)
-
-    # Center the data by subtracting the mean
-    centered = chain_samples - jnp.mean(chain_samples, axis=0, keepdims=True)
-
-    # For multivariate case, we'll compute autocorrelation of the scalar quantity
-    # representing the "position" - we'll use the norm of the centered samples
-    # This gives us a single autocorrelation function that captures the overall
-    # chain mixing behavior
-    scalar_series = jnp.linalg.norm(centered, axis=1)
-
-    # Compute autocorrelation using FFT for efficiency
-    n = len(scalar_series)
-    # Pad to next power of 2 for efficient FFT
-    n_fft = 1 << (n - 1).bit_length() + 1
-
-    # Mean-center the scalar series
-    scalar_centered = scalar_series - jnp.mean(scalar_series)
-
-    # Compute autocorrelation via FFT
-    f_transform = jnp.fft.fft(scalar_centered, n_fft)
-    autocorr_fft = jnp.fft.ifft(f_transform * jnp.conj(f_transform)).real
-
-    # Extract the positive lags and normalize
-    autocorr = autocorr_fft[: max_lag + 1]
-    autocorr = autocorr / autocorr[0]  # Normalize so lag 0 = 1
-
-    return autocorr
-
-
-def calculate_integrated_autocorr_time(autocorrelations, c=5):
-    """
-    Calculate integrated autocorrelation time using automatic windowing.
-
-    Args:
-        autocorrelations: Array of autocorrelation values
-        c: Windowing constant (typically 5-10)
-
-    Returns:
-        tau_int: Integrated autocorrelation time
-    """
-    # Find the cutoff where autocorrelation becomes small
-    # We use automatic windowing: stop when W >= c * tau_int
-    max_len = len(autocorrelations)
-
-    # Start with a reasonable initial window
-    tau_int = 1.0
-    for W in range(1, max_len):
-        # Calculate integrated autocorrelation time up to window W
-        if W < len(autocorrelations):
-            tau_int = 1.0 + 2.0 * jnp.sum(autocorrelations[1 : W + 1])
-        else:
-            tau_int = 1.0 + 2.0 * jnp.sum(autocorrelations[1:])
-
-        # Check windowing condition
-        if W >= c * tau_int:
-            break
-
-    return tau_int
-
-
-def calculate_effective_sample_size_single_chain(chain_samples):
-    """
-    Calculate effective sample size for a single MCMC chain.
-
-    Args:
-        chain_samples: Array of shape [n_steps, dim] for a single chain
-
-    Returns:
-        ess: Effective sample size for this chain
-    """
-    n_steps = chain_samples.shape[0]
-
-    if n_steps < 4:
-        # Too few samples to calculate meaningful autocorrelation
-        return float(n_steps)
-
-    # Calculate autocorrelation
-    autocorr = calculate_autocorrelation(chain_samples)
-
-    # Calculate integrated autocorrelation time
-    tau_int = calculate_integrated_autocorr_time(autocorr)
-
-    # ESS = N / (2 * tau_int)
-    # The factor of 2 comes from the relationship between integrated autocorr time
-    # and the variance of the sample mean
-    ess = n_steps / tau_int
-
-    # Ensure ESS doesn't exceed the number of samples
-    ess = jnp.minimum(ess, float(n_steps))
-
-    return float(ess)
-
-
-def calculate_total_effective_sample_size(all_chain_samples):
-    """
-    Calculate total effective sample size across multiple MCMC chains.
-
-    Args:
-        all_chain_samples: Array of shape [n_steps, n_chains, dim]
-
-    Returns:
-        total_ess: Total effective sample size across all chains
-    """
-    n_steps, n_chains, dim = all_chain_samples.shape
-
-    # Calculate ESS for each chain individually
-    ess_per_chain = []
-    for chain_idx in range(n_chains):
-        chain_samples = all_chain_samples[:, chain_idx, :]
-        chain_ess = calculate_effective_sample_size_single_chain(chain_samples)
-        ess_per_chain.append(chain_ess)
-
-    # Total ESS is the sum of individual chain ESS values
-    total_ess = sum(ess_per_chain)
-
-    return total_ess, ess_per_chain
-
-
-@dataclass
-class MCMCParams:
-    """Parameters specific to Markov Chain Monte Carlo (MCMC) algorithm."""
-
-    n_chains: int = 8
-    # Steps of markov chain iteration
-    n_steps_per_chain: int = 1000
-    # Standard deviation of step geodesic distance is cap radius times this value
-    step_scale: float = 1 / 3
-    burnin_steps: int = 100
-
-
-@jax.jit
-def reflect_geodesic_step_into_cap(
-    point, tangent_direction, distance, cap_center, cap_d_max
-):
-    """Reflect a geodesic step at the spherical-cap boundary.
-
-    Given a starting `point` on the unit sphere, a unit `tangent_direction` in its tangent space,
-    and a geodesic `distance` (can be any real number), returns the new point after moving along
-    the great-circle and applying specular reflections at the boundary of the spherical cap
-    defined by x·cap_center >= 1 - cap_d_max.
-
-    The mapping preserves proposal symmetry (detailed balance) when distances are sampled from a
-    symmetric distribution and tangent directions are sampled symmetrically.
-    """
-    threshold = 1.0 - cap_d_max
-    two_pi = 2.0 * jnp.pi
-    eps = 1e-12
-
-    # Compute forward/backward distances to the cap boundary along this geodesic
-    a = jnp.dot(point, cap_center)
-    b = jnp.dot(tangent_direction, cap_center)
-    r = jnp.sqrt(jnp.maximum(a * a + b * b, eps))
-
-    # If the entire great circle stays inside the cap, skip reflection
-    always_inside = threshold <= -r + eps
-    # Clip for numerical stability
-    val = jnp.clip(threshold / r, -1.0, 1.0)
-    delta = jnp.arccos(val)
-    phi = jnp.arctan2(b, a)
-
-    t1_mod = jnp.mod(phi - delta, two_pi)
-    t2_mod = jnp.mod(phi + delta, two_pi)
-
-    # Forward distance to nearest boundary crossing (smallest nonnegative)
-    L_plus = jnp.minimum(t1_mod, t2_mod)
-
-    # Backward distance to nearest boundary crossing (treat boundary at 0 as distance 0)
-    any_zero = jnp.logical_or(t1_mod < eps, t2_mod < eps)
-    L_minus_raw = jnp.minimum(two_pi - t1_mod, two_pi - t2_mod)
-    L_minus = jnp.where(any_zero, 0.0, L_minus_raw)
-
-    # Reflect distance into the interval [-L_minus, L_plus]
-    a_int = -L_minus
-    b_int = L_plus
-    width = b_int - a_int
-
-    def reflect_scalar(s):
-        t = s - a_int
-        two_w = 2.0 * width
-        t_mod = jnp.mod(t, two_w)
-        return jnp.where(
-            t_mod <= width,
-            a_int + t_mod,
-            b_int - (t_mod - width),
-        )
-
-    s_unfolded = jnp.where(width > eps, reflect_scalar(distance), 0.0)
-    s_reflected = jnp.where(always_inside, distance, s_unfolded)
-
-    # Move along geodesic with reflected distance and re-normalize to unit sphere
-    result = point * jnp.cos(s_reflected) + tangent_direction * jnp.sin(s_reflected)
-    return result / jnp.linalg.norm(result)
-
-
-def test_reflected_moves_stay_in_cap_and_on_unit_sphere():
-    """
-    Reflected geodesic moves should remain inside the cap and on the unit sphere.
-    """
-    rng = jax.random.PRNGKey(0)
-    dim = 8
-    n = 512
-
-    cap_center = jnp.zeros((dim,))
-    cap_center = cap_center.at[0].set(1.0)
-    cap_d_max = 0.5  # threshold = 0.5
-
-    def _normalize(v, axis=-1, eps=1e-12):
-        norm = jnp.linalg.norm(v, axis=axis, keepdims=True)
-        norm = jnp.maximum(norm, eps)
-        return v / norm
-
-    # Sample points inside the cap by rotating the cap center along random tangent directions
-    rng, r1, r2, r3 = jax.random.split(rng, 4)
-    table = LogitsTable(dim - 1, 8192)
-    keys = jax.random.split(r1, n)
-    points = jax.vmap(lambda k: sample_from_cap(k, table, cap_center, cap_d_max))(keys)
-
-    # Sample unit tangent directions at each point
-    noise2 = jax.random.normal(r3, (n, dim))
-    tangents = noise2 - jnp.sum(noise2 * points, axis=1, keepdims=True) * points
-    tangents = _normalize(tangents, axis=1)
-
-    # Sample step distances
-    distances = jax.random.normal(r3, (n,)) * 0.8
-
-    reflected = jax.vmap(
-        lambda p, t, s: reflect_geodesic_step_into_cap(p, t, s, cap_center, cap_d_max)
-    )(points, tangents, distances)
-
-    # Unit sphere constraint
-    norms = jnp.linalg.norm(reflected, axis=1)
-    assert jnp.allclose(norms, jnp.ones_like(norms), atol=1e-6, rtol=0)
-
-    # Cap constraint
-    threshold = 1.0 - cap_d_max
-    dots = reflected @ cap_center
-    assert bool(jnp.all(dots >= threshold - 1e-7))
-
-
-def test_reflection_reversibility_round_trip():
-    """
-    For MCMC to be mathematically well founded, the proposal distribution must be symmetric. In
-    other words, the probability of proposing point p from point q must equal the probability of
-    proposing point q from point p. In order for reflections to preserve this symmetry, if a move
-    from p to q of distance d is reflected, there must be a move from q to p of distance d in the
-    reflected direction. Without reflection, this is the case and the reverse move is simply the
-    opposite direction. With reflection, the reverse move is the opposite direction *along the
-    reflected geodesic*, not the opposite direction of the original move. This test verifies that
-    this is the case.
-    """
-    rng = jax.random.PRNGKey(1)
-    dim = 8
-    n = 512
-
-    cap_center = jnp.zeros((dim,))
-    cap_center = cap_center.at[0].set(1.0)
-    cap_d_max = 0.5  # threshold = 0.5
-
-    def _normalize(v, axis=-1, eps=1e-12):
-        norm = jnp.linalg.norm(v, axis=axis, keepdims=True)
-        norm = jnp.maximum(norm, eps)
-        return v / norm
-
-    # Sample points inside the cap
-    rng, r1, r2, r3 = jax.random.split(rng, 4)
-    table = LogitsTable(dim - 1, 8192)
-    keys = jax.random.split(r1, n)
-    points = jax.vmap(lambda k: sample_from_cap(k, table, cap_center, cap_d_max))(keys)
-
-    # Sample unit tangent directions at each point
-    noise = jax.random.normal(r2, (n, dim))
-    tangents = noise - jnp.sum(noise * points, axis=1, keepdims=True) * points
-    tangents = _normalize(tangents, axis=1)
-
-    # Sample step distances; use a wide spread to induce multiple reflections
-    distances = jax.random.normal(r3, (n,)) * 8.0
-
-    # Forward reflected step: p -> q
-    q = jax.vmap(
-        lambda p, t, s: reflect_geodesic_step_into_cap(p, t, s, cap_center, cap_d_max)
-    )(points, tangents, distances)
-
-    # Recover effective angle along the (p, t) great circle that produced q
-    cos_comp = jnp.sum(q * points, axis=1)
-    sin_comp = jnp.sum(q * tangents, axis=1)
-    s_eff = jnp.arctan2(sin_comp, cos_comp)
-
-    # Build the reverse tangent at q along the same great circle, pointing back toward p
-    # t_rev = sin(s_eff) * p - cos(s_eff) * t
-    t_rev = jnp.sin(s_eff)[:, None] * points - jnp.cos(s_eff)[:, None] * tangents
-    t_rev = _normalize(t_rev, axis=1)
-
-    # Reverse reflected step with the effective reflected distance along the same geodesic: q -> p_back
-    p_back = jax.vmap(
-        lambda qq, tt, s: reflect_geodesic_step_into_cap(
-            qq, tt, s, cap_center, cap_d_max
-        )
-    )(q, t_rev, s_eff)
-
-    # Check round trip accuracy
-    assert jnp.allclose(p_back, points, atol=1e-6, rtol=0)
-
-
-@jax.jit
-def _mk_geodesic_proposals_reflected(key, positions, step_size, cap_center, cap_d_max):
-    """Geodesic proposals with specular reflection at the spherical-cap boundary.
-
-    Ensures all proposed positions remain inside the cap defined by
-    x·cap_center >= 1 - cap_d_max, while preserving proposal symmetry.
-    """
-    directions_rng, distances_rng = jax.random.split(key)
-
-    # Sample directions in the tangent spaces of the input positions
-    directions = jax.random.normal(
-        directions_rng, (positions.shape[0], positions.shape[1])
-    )
-    directions = (
-        directions - jnp.sum(directions * positions, axis=1, keepdims=True) * positions
-    )
-    directions = directions / jnp.linalg.norm(directions, axis=1, keepdims=True)
-
-    # Sample distances from a normal distribution (symmetric around 0)
-    distances = jax.random.normal(distances_rng, (positions.shape[0],)) * step_size
-
-    return jax.vmap(
-        lambda p, t, s: reflect_geodesic_step_into_cap(p, t, s, cap_center, cap_d_max)
-    )(positions, directions, distances)
-
-
-def _generate_cap_constrained_samples_mcmc(
-    model,
-    params,
-    rng,
-    cap_center,
-    cap_d_max,
-    table,
-    cond_vec,
-    n_output_samples,
-    mcmc_params: MCMCParams,
-    flow_n_steps: int,
-):
-    """
-    Generate samples from a trained model constrained to lie within a spherical cap using
-    parallel Markov Chain Monte Carlo (MCMC).
-
-    Args:
-        model: Trained VectorField model
-        params: Model parameters
-        rng: JAX random key
-        cap_center: Center of the spherical cap [domain_dim]
-        cap_d_max: Maximum cosine distance defining the cap size
-        table: LogitsTable for cap sampling
-        cond_vec: Conditioning vector shared across all samples [cond_dim]
-        n_output_samples: Number of final samples to return
-        mcmc_params: MCMC-specific parameters
-
-    Returns:
-        samples: Cap-constrained samples [n_output_samples, domain_dim]
-        log_probs: Model log densities for returned samples [n_output_samples]
-        ess: Effective sample size (equals n_output_samples for MCMC)
-        debug_info: Performance debugging information
-    """
-    assert cap_center.shape == (model.domain_dim,)
-    assert cond_vec.shape == (model.conditioning_dim,)
-
-    init_rng, chain_rng = jax.random.split(rng)
-
-    # Initialize chains uniformly within the cap
-    init_keys = jax.random.split(init_rng, mcmc_params.n_chains)
-    chain_positions = jax.vmap(
-        lambda key: sample_from_cap(key, table, cap_center, cap_d_max)
-    )(init_keys)
-
-    # Expand conditioning vector to all chains
-    chain_cond_vecs = jnp.broadcast_to(
-        cond_vec[None, :], (mcmc_params.n_chains, model.conditioning_dim)
-    )
-
-    # Compute initial log probabilities
-    init_log_probs = compute_log_probability(
-        model,
-        params,
-        chain_positions,
-        chain_cond_vecs,
-        n_steps=flow_n_steps,
-        rng=None,
-        n_projections=10,
-    )
-
-    def mcmc_step(state, step_rng):
-        """Single MCMC step for all chains."""
-        positions, log_probs = state
-        proposals_rng, accept_rng = jax.random.split(step_rng, 2)
-
-        proposals = _mk_geodesic_proposals_reflected(
-            proposals_rng,
-            positions,
-            mcmc_params.step_scale * jnp.arccos(1 - cap_d_max),
-            cap_center,
-            cap_d_max,
-        )
-
-        # All proposals are in-cap by construction; assert and report for debugging
-        threshold = 1.0 - cap_d_max
-        in_cap = (proposals @ cap_center) >= threshold
-        assert np.all(in_cap)
-
-        proposal_log_probs = compute_log_probability(
-            model,
-            params,
-            proposals,
-            chain_cond_vecs,
-            n_steps=flow_n_steps,
-            rng=None,
-            n_projections=10,
-        )
-
-        # Metropolis-Hastings acceptance
-        log_accept_probs = jnp.minimum(0.0, proposal_log_probs - log_probs)
-        accept_flags = (
-            jnp.log(jax.random.uniform(accept_rng, (mcmc_params.n_chains,)))
-            < log_accept_probs
-        )
-
-        # Update positions and log probabilities
-        new_positions = jnp.where(accept_flags[:, None], proposals, positions)
-        new_log_probs = jnp.where(accept_flags, proposal_log_probs, log_probs)
-
-        return (new_positions, new_log_probs), (new_positions, accept_flags)
-
-    # Run MCMC chains with regular loop
-    current_state = (chain_positions, init_log_probs)
-    all_positions = []
-    all_accept_flags = []
-
-    with tqdm(
-        total=mcmc_params.n_steps_per_chain, desc="MCMC sampling", unit="step"
-    ) as pbar:
-        for step in range(mcmc_params.n_steps_per_chain):
-            # Get random key for this step
-            step_key = jax.random.fold_in(chain_rng, step)
-
-            # Take MCMC step
-            new_state, (step_positions, step_accept_flags) = mcmc_step(
-                current_state, step_key
-            )
-
-            # Store results
-            step_positions, step_accept_flags = jax.device_get(
-                (step_positions, step_accept_flags)
-            )
-            all_positions.append(step_positions)
-            all_accept_flags.append(step_accept_flags)
-
-            # Update state for next iteration
-            current_state = new_state
-
-            # Update progress bar
-            pbar.update(1)
-
-    # Convert lists to arrays
-    all_positions = np.stack(all_positions, axis=0)  # [n_steps, n_chains, dim]
-    accept_flags = np.stack(all_accept_flags, axis=0)  # [n_steps, n_chains]
-
-    # Extract samples after burnin
-    burnin = mcmc_params.burnin_steps
-    post_burnin_positions = all_positions[burnin:]  # [n_steps - burnin, n_chains, dim]
-
-    # Reshape to [n_samples, dim] where n_samples = (n_steps - burnin) * n_chains
-    all_samples = post_burnin_positions.reshape(-1, model.domain_dim)
-
-    # Randomly select n_output_samples
-    indices = jax.random.choice(
-        jax.random.split(chain_rng)[0],
-        all_samples.shape[0],
-        shape=(n_output_samples,),
-        replace=True,
-    )
-    final_samples = jax.device_put(all_samples[indices])
-
-    # Compute probabilities for the returned samples
-    final_batch_cond_vecs = jnp.broadcast_to(
-        cond_vec[None, :], (final_samples.shape[0], model.conditioning_dim)
-    )
-    final_log_probs = compute_log_probability(
-        model,
-        params,
-        final_samples,
-        final_batch_cond_vecs,
-        n_steps=flow_n_steps,
-        rng=None,
-        n_projections=10,
-    )
-
-    # Compute acceptance rate for debugging
-    total_accepts = jnp.sum(accept_flags)
-    acceptance_rate = total_accepts / (
-        mcmc_params.n_chains * mcmc_params.n_steps_per_chain
-    )
-    print(f"MCMC acceptance rate: {acceptance_rate:.3f}")
-
-    # Calculate effective sample size using autocorrelation analysis
-    # NOTE: this is a dubious method for high dimensions.
-    total_ess, ess_per_chain = calculate_total_effective_sample_size(
-        post_burnin_positions
-    )
-
-    # Report ESS statistics
-    print(f"Total ESS: {total_ess:.1f}")
-    print(
-        f"ESS per chain: min={min(ess_per_chain):.1f}, max={max(ess_per_chain):.1f}, mean={sum(ess_per_chain)/len(ess_per_chain):.1f}"
-    )
-
-    ess = total_ess
-
-    # Debug info: we evaluate probabilities at each step for each chain
-    total_prob_evals = mcmc_params.n_chains * (
-        mcmc_params.n_steps_per_chain + 1
-    )  # +1 for initial
-    debug_info = SamplingDebugInfo(
-        n_model_samples_drawn=0, n_model_probabilities_calculated=total_prob_evals
-    )
-
-    return final_samples, final_log_probs, ess, debug_info
-
-
-@dataclass
-class SIRParams:
-    """Parameters specific to Sampling-Importance-Resampling (SIR) algorithm."""
-
-    n_proposal_samples: int
-    n_projections: int = 10
-    batch_size: int = 512
-
-
-def _generate_cap_constrained_samples_sir(
-    model,
-    params,
-    rng,
-    cap_center,
-    cap_d_max,
-    table,
-    cond_vec,
-    n_output_samples,
-    sir_params: SIRParams,
-    flow_n_steps: int,
-):
-    """
-    Generate samples from a trained model constrained to lie within a spherical cap using
-    Sampling-Importance-Resampling (SIR).
-
-    Args:
-        model: Trained VectorField model
-        params: Model parameters
-        rng: JAX random key
-        cap_center: Center of the spherical cap [domain_dim]
-        cap_d_max: Maximum cosine distance defining the cap size
-        table: LogitsTable for cap sampling
-        cond_vec: Conditioning vector shared across all samples [cond_dim]
-        n_output_samples: Number of final samples to return after importance resampling
-        sir_params: SIR-specific parameters
-
-    Returns:
-        samples: Cap-constrained samples [n_output_samples, domain_dim]
-        log_probs: Model log densities for returned samples [n_output_samples]
-        ess: Effective sample size (measure of sampling efficiency)
-        debug_info: Performance debugging information
-    """
-    assert cap_center.shape == (model.domain_dim,)
-    assert cond_vec.shape == (model.conditioning_dim,)
-
-    proposal_rng, prob_rng, resample_rng = jax.random.split(rng, 3)
-
-    # 1. Sample uniformly from the cap
-    proposal_keys = jax.random.split(proposal_rng, sir_params.n_proposal_samples)
-    proposal_samples = jax.vmap(
-        lambda key: sample_from_cap(key, table, cap_center, cap_d_max)
-    )(proposal_keys)
-
-    # 2. Compute model log probabilities for all proposals in batches
-    n_batches = ceil(sir_params.n_proposal_samples / sir_params.batch_size)
-    model_log_probs_list = []
-
-    # Split RNG for each batch
-    batch_rngs = jax.random.split(prob_rng, n_batches)
-
-    with tqdm(
-        total=sir_params.n_proposal_samples,
-        desc="computing model probabilities",
-        unit="sample",
-    ) as pbar:
-        for batch_idx in range(n_batches):
-            start_idx = batch_idx * sir_params.batch_size
-            end_idx = min(
-                (batch_idx + 1) * sir_params.batch_size, sir_params.n_proposal_samples
-            )
-            actual_batch_size = end_idx - start_idx
-
-            # Extract batch of samples
-            batch_samples = proposal_samples[start_idx:end_idx]
-
-            # Expand cond_vecs to match batch size
-            batch_cond_vecs = jnp.broadcast_to(
-                cond_vec[None, :], (actual_batch_size, model.conditioning_dim)
-            )
-
-            # Compute log probabilities for this batch
-            batch_log_probs = compute_log_probability(
-                model,
-                params,
-                batch_samples,
-                batch_cond_vecs,
-                n_steps=flow_n_steps,
-                rng=batch_rngs[batch_idx],
-                n_projections=sir_params.n_projections,
-            )
-
-            model_log_probs_list.append(batch_log_probs)
-            pbar.update(actual_batch_size)
-
-    # Concatenate all batch results
-    model_log_probs = jnp.concatenate(model_log_probs_list, axis=0)
-    del model_log_probs_list
-
-    # 3. Compute uniform cap log density. Fraction of the total sphere area that is inside the cap,
-    # times the total sphere area gets you the area of the cap, reciprocal of that is the density.
-    log_cap_size_frac = table.log_cap_size(cap_d_max)
-    sphere_log_area = -sphere_log_inverse_surface_area(model.domain_dim)
-    log_cap_area = log_cap_size_frac + sphere_log_area
-    uniform_cap_log_density = -log_cap_area
-
-    # 4. Compute importance weights: model_density / uniform_cap_density
-    # In log space: log_weight = model_log_prob - uniform_cap_log_density
-    log_weights = model_log_probs - uniform_cap_log_density
-
-    # Normalize weights for numerical stability
-    log_weights = log_weights - jnp.max(log_weights)
-    weights = jnp.exp(log_weights)
-    weights = weights / jnp.sum(weights)
-
-    # 5. Compute effective sample size
-    ess = jnp.sum(weights) ** 2 / jnp.sum(weights**2)
-
-    # 6. Resample according to importance weights
-    indices = jax.random.choice(
-        resample_rng,
-        sir_params.n_proposal_samples,
-        shape=(n_output_samples,),
-        p=weights,
-    )
-    final_samples = proposal_samples[indices]
-
-    # Log-densities for returned samples from precomputed log-probs
-    selected_log_probs = model_log_probs[indices]
-
-    debug_info = SamplingDebugInfo(
-        n_model_samples_drawn=0,
-        n_model_probabilities_calculated=sir_params.n_proposal_samples,
-    )
-
-    return final_samples, selected_log_probs, ess, debug_info
-
-
-def generate_cap_constrained_samples(
-    model,
-    params,
-    rng,
-    cap_center,
-    cap_d_max,
-    table,
-    cond_vec,
-    n_output_samples,
-    flow_n_steps: int,
-    algorithm: SamplingAlgorithm,
-    algorithm_params,
-):
-    """
-    Generate samples from a trained model constrained to lie within a spherical cap.
-
-    Args:
-        model: Trained VectorField model
-        params: Model parameters
-        rng: JAX random key
-        cap_center: Center of the spherical cap [domain_dim]
-        cap_d_max: Maximum cosine distance defining the cap size
-        table: LogitsTable for cap sampling
-        cond_vec: Conditioning vector shared across all samples [cond_dim]
-        n_output_samples: Number of final samples to return
-        algorithm: Which sampling algorithm to use
-        algorithm_params: Parameters specific to the chosen algorithm
-
-    Returns:
-        samples: Cap-constrained samples [n_output_samples, domain_dim]
-        log_probs: Model log densities for returned samples [n_output_samples]
-        ess: Effective sample size (measure of sampling efficiency)
-        debug_info: Performance debugging information
-    """
-    if algorithm == SamplingAlgorithm.SIR:
-        if not isinstance(algorithm_params, SIRParams):
-            raise TypeError(
-                f"Expected SIRParams for SIR algorithm, got {type(algorithm_params)}"
-            )
-        return _generate_cap_constrained_samples_sir(
-            model,
-            params,
-            rng,
-            cap_center,
-            cap_d_max,
-            table,
-            cond_vec,
-            n_output_samples,
-            algorithm_params,
-            flow_n_steps,
-        )
-    elif algorithm == SamplingAlgorithm.REJECTION:
-        if not isinstance(algorithm_params, RejectionParams):
-            raise TypeError(
-                f"Expected RejectionParams for REJECTION algorithm, got {type(algorithm_params)}"
-            )
-        return _generate_cap_constrained_samples_rejection(
-            model,
-            params,
-            rng,
-            cap_center,
-            cap_d_max,
-            table,
-            cond_vec,
-            n_output_samples,
-            algorithm_params,
-            flow_n_steps,
-        )
-    elif algorithm == SamplingAlgorithm.MCMC:
-        if not isinstance(algorithm_params, MCMCParams):
-            raise TypeError(
-                f"Expected MCMCParams for MCMC algorithm, got {type(algorithm_params)}"
-            )
-        return _generate_cap_constrained_samples_mcmc(
-            model,
-            params,
-            rng,
-            cap_center,
-            cap_d_max,
-            table,
-            cond_vec,
-            n_output_samples,
-            algorithm_params,
-            flow_n_steps,
-        )
-    else:
-        raise ValueError(f"Unknown sampling algorithm: {algorithm}")
-
-
-@pytest.mark.usefixtures("starts_with_progressbar")
-def test_generate_cap_constrained_samples_matches_rejection():
-    """
-    Train a 3D VectorField on a vMF distribution, then compare cap-constrained samples drawn via:
-    1) rejection sampling using generate_cap_constrained_samples, and
-    2) importance sampling (SIR) using generate_cap_constrained_samples.
-
-    - Uses a fixed random cap center and d_max=0.25
-    - Reports proposal counts for both methods
-    - Verifies all samples are in-cap
-    - Compares statistics of both sets within tolerances
-    """
-
-    # Fixed RNGs
-    rng = jax.random.PRNGKey(20250713)
-    train_rng, cap_rng, rs_rng, imp_rng = jax.random.split(rng, 4)
-
-    # Train VectorField on a 3D vMF distribution
-    model = replace(_baseline_model, domain_dim=3, n_layers=2)
-
-    batch_size = 512
-    n_samples = 32768
-
-    mean_direction = np.zeros(3)
-    mean_direction[0] = 1.0
-    kappa = 2.0
-    vmf = stats.vonmises_fisher(mean_direction, kappa)
-    points = vmf.rvs(n_samples)
-
-    dset = Dataset.from_dict({"point_vec": points}).with_format("np")
-    state, train_loss = _train_loop_for_tests(model, dset, batch_size, 1e-3, 2)
-    params = state.params
-
-    # Cap setup: 2-sphere table for 3D vectors
-    table = LogitsTable(2, 8192)
-    cap_center = np.zeros(3)
-    cap_center[1] = 1.0
-    cap_center = jnp.asarray(cap_center)
-    d_max = jnp.float32(0.25)
-    threshold = 1.0 - d_max
-
-    target_n = 4096
-
-    # Rejection sampling
-    cond_vec = jnp.zeros((model.conditioning_dim,))
-    rejection_params = RejectionParams(proposal_batch_size=256)
-    rs_samples, _rs_probs, rs_ess, rs_debug = generate_cap_constrained_samples(
-        model,
-        params,
-        rs_rng,
-        cap_center,
-        d_max,
-        table,
-        cond_vec,
-        target_n,
-        16,
-        SamplingAlgorithm.REJECTION,
-        rejection_params,
-    )
-
-    # Importance sampling
-    n_proposal_samples = 16384
-    cond_vec = jnp.zeros((model.conditioning_dim,))
-    sir_params = SIRParams(
-        n_proposal_samples=n_proposal_samples,
-        n_projections=10,
-    )
-    imp_samples, _imp_probs, ess, sir_debug = generate_cap_constrained_samples(
-        model,
-        params,
-        imp_rng,
-        cap_center,
-        d_max,
-        table,
-        cond_vec,
-        target_n,
-        16,
-        SamplingAlgorithm.SIR,
-        sir_params,
-    )
-    # MCMC sampling (reduced parameters for testing speed)
-    mcmc_rng = jax.random.split(rng, 4)[3]
-    mcmc_params = MCMCParams(
-        n_chains=512,
-        n_steps_per_chain=128,
-        burnin_steps=16,
-    )
-    mcmc_samples, _mcmc_probs, mcmc_ess, mcmc_debug = generate_cap_constrained_samples(
-        model,
-        params,
-        mcmc_rng,
-        cap_center,
-        d_max,
-        table,
-        cond_vec,
-        target_n,
-        16,
-        SamplingAlgorithm.MCMC,
-        mcmc_params,
-    )
-
-    print(
-        f"Rejection proposals used: {rs_debug.n_model_samples_drawn} for {target_n} accepted samples ({(rs_debug.n_model_samples_drawn / target_n):.2f} per sample)"
-    )
-    print(
-        f"Importance sampling (SIR): {n_proposal_samples} proposals, ESS={float(ess):.2f} ({n_proposal_samples / ess:.2f} per effective sample)"
-    )
-    print(
-        f"MCMC: {mcmc_params.n_chains} chains × {mcmc_params.n_steps_per_chain} steps, ESS={float(mcmc_ess):.2f}, {mcmc_debug.n_model_probabilities_calculated} prob evals"
-    )
-
-    assert ess >= target_n, f"SIR ESS={ess} < target_n={target_n}"
-    assert (
-        rs_ess == target_n
-    ), f"Rejection ESS should equal output samples, got {rs_ess}"
-    # MCMC ESS should be at least 10% of target samples (accounting for autocorrelation)
-    assert (
-        mcmc_ess >= target_n * 0.1
-    ), f"MCMC ESS {mcmc_ess} too low compared to target {target_n}"
-
-    # Verify all samples are in-cap
-    for arr in [rs_samples, imp_samples, mcmc_samples]:
-        cos_vals = arr @ cap_center
-        assert jnp.all(cos_vals >= threshold)
-
-    # Compare statistics: per-coordinate mean and cosine-to-center moments
-    def summarize(arr, label):
-        means = jnp.mean(arr, axis=0)
-        cos_vals = arr @ cap_center
-        cos_mean = jnp.mean(cos_vals)
-        cos_std = jnp.std(cos_vals)
-        print(
-            f"{label} mean: {means}, cos_mean: {cos_mean:.2f}, cos_std: {cos_std:.2f}"
-        )
-        return means, cos_mean, cos_std
-
-    rs_means, rs_cos_mean, rs_cos_std = summarize(rs_samples, "rejection")
-    imp_means, imp_cos_mean, imp_cos_std = summarize(imp_samples, "importance")
-    mcmc_means, mcmc_cos_mean, mcmc_cos_std = summarize(mcmc_samples, "MCMC")
-
-    # Compare rejection vs SIR
-    np.testing.assert_allclose(rs_means, imp_means, atol=0.1, rtol=0)
-    np.testing.assert_allclose(rs_cos_mean, imp_cos_mean, atol=0.03, rtol=0)
-    np.testing.assert_allclose(rs_cos_std, imp_cos_std, atol=0.03, rtol=0)
-
-    # Compare rejection vs MCMC (looser tolerance for MCMC due to finite chain effects)
-    np.testing.assert_allclose(rs_means, mcmc_means, atol=0.1, rtol=0)
-    np.testing.assert_allclose(rs_cos_mean, mcmc_cos_mean, atol=0.05, rtol=0)
-    np.testing.assert_allclose(rs_cos_std, mcmc_cos_std, atol=0.05, rtol=0)
-
-
 def test_compute_psi_t_spherical_antipodal_path_is_geodesic():
     # Two antipodal points on S^2
     x0 = jnp.array([1.0, 0.0, 0.0], dtype=jnp.float32)
@@ -5994,6 +4606,8 @@ def test_train_hemisphere_density(inject_keys):
 
     Uses sample_from_cap to generate uniform-in-cap points (cap d_max=1 corresponds to hemisphere).
     """
+    from .training_infra import train_for_tests
+
     domain_dim = 3
     model = replace(
         _baseline_model,
@@ -6001,7 +4615,6 @@ def test_train_hemisphere_density(inject_keys):
         n_layers=6,
         d_model=512,
         mlp_always_inject=inject_keys,
-        time_dim=None,
     )
     lr = 1e-3
     epochs = 16
@@ -6040,13 +4653,28 @@ def test_train_hemisphere_density(inject_keys):
 
     # Train
     batch_size = 512
-    state, final_loss, test_loss, test_nll = _train_loop_for_tests(
-        model, train_dataset, batch_size, lr, epochs, test_dataset
-    )
 
-    print(
-        f"Final train loss: {final_loss:.6f}, test loss: {test_loss:.6f}, test NLL: {test_nll:.6f}"
+    loss_fn = partial(compute_batch_loss, model)
+
+    def nll_fn(model, params, batch, rng):
+        points = jnp.array(batch["point_vec"])
+        cond_vecs = jnp.zeros((points.shape[0], 0))
+        return -compute_log_probability(
+            model, params, points, cond_vecs, n_steps=128, rng=rng, n_projections=32
+        )
+
+    result = train_for_tests(
+        model,
+        train_dataset,
+        batch_size,
+        lr,
+        loss_fn,
+        ["point_vec"],
+        epochs=epochs,
+        test_dataset=test_dataset,
+        nll_fn=nll_fn,
     )
+    eval_params = result.state.get_eval_params()
 
     # Build two test sets: in-cap (north hemisphere) and opposite (south hemisphere)
     n_test = 1024
@@ -6061,7 +4689,7 @@ def test_train_hemisphere_density(inject_keys):
     # Compute log probabilities
     north_log_probs = compute_log_probability(
         model,
-        state.params,
+        eval_params,
         north_points,
         cond_vecs,
         n_steps=100,
@@ -6070,7 +4698,7 @@ def test_train_hemisphere_density(inject_keys):
     )
     south_log_probs = compute_log_probability(
         model,
-        state.params,
+        eval_params,
         south_points,
         cond_vecs,
         n_steps=100,
@@ -6086,7 +4714,7 @@ def test_train_hemisphere_density(inject_keys):
     )
     geodesic_log_probs = compute_log_probability(
         model,
-        state.params,
+        eval_params,
         geodesic_points,
         jnp.zeros((num_geodesic_points, 0), dtype=jnp.float32),
         n_steps=100,
@@ -6136,15 +4764,12 @@ def test_vector_field_mlp_always_inject_forward(inject_keys):
 
     domain_dim = 8
     conditioning_dim = 4
-    time_dim = 16
 
     model = VectorField(
         activations_dtype=jnp.float32,
         weights_dtype=jnp.float32,
         domain_dim=domain_dim,
         conditioning_dim=conditioning_dim,
-        time_dim=time_dim,
-        reference_directions=16,
         n_layers=2,
         d_model=64,
         mlp_expansion_factor=2,

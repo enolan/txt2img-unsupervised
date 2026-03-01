@@ -11,7 +11,6 @@ import os
 # Import the necessary components from flow_matching.py
 from .flow_matching import (
     VectorField,
-    create_train_state,
     sample_sphere,
 )
 
@@ -132,7 +131,6 @@ def visualize_vector_field(
         model_config = {
             "domain_dim": 3,
             "conditioning_dim": 0,
-            "time_dim": 16,
             "n_layers": 2,
             "d_model": 32,
             "mlp_expansion_factor": 4,
@@ -145,7 +143,7 @@ def visualize_vector_field(
 
     is_2d = model.domain_dim == 2
 
-    state = create_train_state(params_rng, model, learning_rate_or_schedule=1e-3)
+    params = model.init(params_rng, *model.dummy_inputs())
 
     points = sample_sphere(points_rng, n_samples, model.domain_dim)
 
@@ -153,7 +151,7 @@ def visualize_vector_field(
 
     cond_vecs = jnp.zeros((n_samples, model.conditioning_dim))
 
-    vector_field_values = model.apply(state.params, points, times, cond_vecs)
+    vector_field_values = model.apply(params, points, times, cond_vecs)
 
     points_np = np.array(points)
     vectors_np = np.array(vector_field_values)
@@ -323,13 +321,6 @@ def parse_arguments():
         help="Whether to use a learnable projection before the MLP",
     )
     parser.add_argument(
-        "--time-dim",
-        type=int,
-        default=16,
-        help="Dimension of the time encoding (must be even)",
-    )
-
-    parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
     )
 
@@ -342,7 +333,6 @@ if __name__ == "__main__":
     model_config = {
         "domain_dim": args.domain_dim,
         "conditioning_dim": args.conditioning_dim,
-        "time_dim": args.time_dim,
         "n_layers": args.n_layers,
         "d_model": args.d_model,
         "mlp_expansion_factor": args.expansion_factor,

@@ -1,8 +1,6 @@
 {
     "n_layers": 8,
     "domain_dim": 3,
-    "reference_directions": null,
-    "time_dim": null,
     "use_pre_mlp_projection": true,
     "d_model": 512,
     "mlp_expansion_factor": 4,

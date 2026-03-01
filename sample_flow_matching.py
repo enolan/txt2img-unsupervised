@@ -17,7 +17,6 @@ from txt2img_unsupervised.function_weighted_flow_model import (
     BaseDistribution,
     WeightingFunction,
     sample_full_sphere,
-    sample_from_cap_backwards_forwards_importance,
     sample_loop,
 )
 from txt2img_unsupervised.training_infra import setup_jax_for_training
@@ -236,6 +235,15 @@ def main():
             f"Cap angular radius: {args.cap_radius}° (cosine distance: {max_cos_distance:.6f})"
         )
 
+        if mdl.weighting_function not in (
+            WeightingFunction.CAP_INDICATOR,
+            WeightingFunction.SMOOTHED_CAP_INDICATOR,
+        ):
+            raise ValueError(
+                f"Cap conditioning requires CAP_INDICATOR or SMOOTHED_CAP_INDICATOR "
+                f"weighting function, but model has {mdl.weighting_function.value}"
+            )
+
         # Validate d_max constraints for CAP base distribution
         if mdl.base_distribution == BaseDistribution.CAP:
             if max_cos_distance > 1.0:
@@ -274,39 +282,19 @@ def main():
                     args.n_steps,
                 )
         else:
-            # Non-CAP base distribution
-            if (
-                mdl.weighting_function == WeightingFunction.CONSTANT
-                and mdl.base_distribution == BaseDistribution.SPHERE
-            ):
-                # Use CNF backwards-forwards cap-conditioned sampling for constant weighting
-                n_backward = 256
-                samples, ess = sample_from_cap_backwards_forwards_importance(
-                    model=mdl,
-                    params=params,
-                    cap_center=cap_center,
-                    cap_d_max=max_cos_distance,
-                    rng=samples_rng,
-                    tbl=None,
-                    n_backward_samples=n_backward,
-                    n_forward_samples=args.n_samples * 4,
-                    batch_size=args.batch_size,
-                )
-                print(f"Effective sample size (ESS): {ess:.1f}")
-            else:
-                # Generic sampling via weighting function parameters
-                cap_centers = jnp.tile(cap_center, (args.n_samples, 1))
-                cap_d_maxes = jnp.full((args.n_samples,), max_cos_distance)
-                weighting_function_params = (cap_centers, cap_d_maxes)
-                samples = sample_loop(
-                    mdl,
-                    params,
-                    samples_rng,
-                    weighting_function_params,
-                    args.n_samples,
-                    args.batch_size,
-                    args.n_steps,
-                )
+            # Non-CAP base distribution - use weighting function parameters
+            cap_centers = jnp.tile(cap_center, (args.n_samples, 1))
+            cap_d_maxes = jnp.full((args.n_samples,), max_cos_distance)
+            weighting_function_params = (cap_centers, cap_d_maxes)
+            samples = sample_loop(
+                mdl,
+                params,
+                samples_rng,
+                weighting_function_params,
+                args.n_samples,
+                args.batch_size,
+                args.n_steps,
+            )
     else:
         # Unconditioned sampling - use d_max=2.0 (full sphere)
         print("Sampling from full sphere")

@@ -51,7 +51,6 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import pytest
 from datasets import Dataset
 from einops import repeat
@@ -69,9 +68,7 @@ from txt2img_unsupervised.flow_matching import (
     geodesic_step,
     reverse_path_and_compute_divergence,
     sample_sphere,
-    create_train_state,
     generate_samples_inner,
-    _train_loop_for_tests_generic,
 )
 
 
@@ -100,8 +97,6 @@ class ScoreMatchingModel(nn.Module):
 
     # VectorField hyperparameters
     domain_dim: int
-    reference_directions: Optional[int]
-    time_dim: Optional[int]
     use_pre_mlp_projection: bool
     n_layers: int
     d_model: int
@@ -121,16 +116,13 @@ class ScoreMatchingModel(nn.Module):
     # Score matching specific
     schedule: NoiseSchedule = NoiseSchedule()
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
-    relative_cap_encoding: bool = False
 
     @property
     def conditioning_dim(self) -> int:
         if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
             return 0
         elif self.cap_conditioning == CapConditioningMode.CONDITIONED_SCORE:
-            return cap_conditioning_dim(
-                self.domain_dim, self.reference_directions, self.relative_cap_encoding
-            )
+            return cap_conditioning_dim(self.domain_dim)
         elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
             return 0
         else:
@@ -141,9 +133,7 @@ class ScoreMatchingModel(nn.Module):
         """Create a VectorField with parameters derived from this model's config."""
         return VectorField(
             domain_dim=self.domain_dim,
-            reference_directions=self.reference_directions,
             conditioning_dim=self.conditioning_dim,
-            time_dim=self.time_dim,
             use_pre_mlp_projection=self.use_pre_mlp_projection,
             n_layers=self.n_layers,
             d_model=self.d_model,
@@ -400,33 +390,6 @@ def compute_batch_loss(
     x_t = sample_noisy_point(noise_rng, x_1, t, model.schedule)
 
     return denoising_score_matching_loss(model, params, x_1, x_t, t, conditioning_data)
-
-
-@partial(jax.jit, static_argnames=("model",), donate_argnames=("state", "rng"))
-def train_step(model: ScoreMatchingModel, state, batch: dict, rng: Array):
-    """Train for a single step.
-
-    Args:
-        model: Score matching model
-        state: Training state
-        batch: Batch of data
-        rng: JAX random key
-
-    Returns:
-        Updated state, loss value, gradient norm, and updated random key
-    """
-    rng, next_rng = jax.random.split(rng)
-
-    def loss_fn(params):
-        return compute_batch_loss(model, params, batch, rng)
-
-    grad_fn = jax.value_and_grad(loss_fn)
-    loss, grads = grad_fn(state.params)
-    grad_norm = optax.global_norm(grads)
-
-    state = state.apply_gradients(grads=grads)
-
-    return state, loss, grad_norm, next_rng
 
 
 @partial(jax.jit, inline=True, static_argnames=("model",))
@@ -759,48 +722,10 @@ def test_sample_noisy_point():
     ), "Higher κ should give samples closer to x_1"
 
 
-def _train_loop_for_tests(
-    model: ScoreMatchingModel,
-    dataset,
-    batch_size: int,
-    learning_rate: float,
-    epochs: int,
-    test_dataset=None,
-):
-    """Training loop for score matching tests. Wraps the generic flow_matching loop."""
-
-    def compute_nll_wrapper(
-        model, params, batch, n_steps, rng, n_projections, precomputed_stats=None
-    ):
-        return compute_nll(
-            model,
-            params,
-            batch,
-            n_steps=n_steps,
-            rng=rng,
-            n_projections=n_projections,
-        )
-
-    return _train_loop_for_tests_generic(
-        model,
-        dataset,
-        batch_size,
-        learning_rate,
-        epochs,
-        test_dataset=test_dataset,
-        train_step_fn=train_step,
-        compute_batch_loss_fn=compute_batch_loss,
-        compute_nll_fn=compute_nll_wrapper,
-        compute_nll_on_step_0=False,
-    )
-
-
 _baseline_model = ScoreMatchingModel(
     domain_dim=3,
-    reference_directions=128,
     n_layers=6,
     d_model=512,
-    time_dim=None,
     mlp_expansion_factor=4,
     input_dropout_rate=None,
     mlp_dropout_rate=None,
@@ -812,6 +737,9 @@ _baseline_model = ScoreMatchingModel(
 @pytest.mark.parametrize("domain_dim", [3, 16])
 def test_train_trivial(domain_dim):
     """Train a model where all data is a single fixed point."""
+    # Deferred import: training_infra → checkpoint → this module creates a cycle.
+    from txt2img_unsupervised.training_infra import train_for_tests
+
     model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2)
 
     batch_size = 256
@@ -821,19 +749,27 @@ def test_train_trivial(domain_dim):
     dset = Dataset.from_dict({"point_vec": points}).with_format("np")
     test_dset = Dataset.from_dict({"point_vec": points[:batch_size]}).with_format("np")
 
-    state, loss, test_loss, test_nll = _train_loop_for_tests(
+    loss_fn = partial(compute_batch_loss, model)
+
+    def nll_fn(model, params, batch, rng):
+        return compute_nll(model, params, batch, n_steps=256, rng=rng, n_projections=32)
+
+    result = train_for_tests(
         model,
         dset,
         batch_size,
         learning_rate=1e-2,
+        loss_fn=loss_fn,
+        fields=["point_vec"],
         epochs=2,
         test_dataset=test_dset,
+        nll_fn=nll_fn,
     )
-    print(f"Final loss: {loss:.6f}")
+    eval_params = result.state.get_eval_params()
 
     samples = generate_samples(
         model,
-        state.params,
+        eval_params,
         jax.random.PRNGKey(0),
         cond_vecs=jnp.zeros((20, 0)),
         n_steps=1000,
@@ -854,16 +790,18 @@ def test_train_trivial(domain_dim):
     ), f"Only {high_sims.mean()*100:.1f}% of samples close to target"
 
     # Single-point distribution: model should assign very high density, giving very negative NLL
-    print(f"Model NLL: {test_nll:.4f}")
+    print(f"Model NLL: {result.test_nll:.4f}")
     assert (
-        test_nll < -5
-    ), f"NLL {test_nll:.4f} should be << 0 for single-point distribution"
+        result.test_nll < -5
+    ), f"NLL {result.test_nll:.4f} should be << 0 for single-point distribution"
 
 
 @pytest.mark.usefixtures("starts_with_progressbar")
 @pytest.mark.parametrize("domain_dim", [3, 16])
 def test_train_vmf(domain_dim):
     """Train a model with data from a von Mises-Fisher distribution."""
+    from txt2img_unsupervised.training_infra import train_for_tests
+
     model = replace(
         _baseline_model,
         domain_dim=domain_dim,
@@ -892,19 +830,28 @@ def test_train_vmf(domain_dim):
     differential_entropy = vmf_dist.entropy()
     print(f"vMF distribution entropy: {differential_entropy:.6f}")
 
-    state, train_loss = _train_loop_for_tests(
+    loss_fn = partial(compute_batch_loss, model)
+
+    def nll_fn(model, params, batch, rng):
+        return compute_nll(model, params, batch, n_steps=256, rng=rng, n_projections=32)
+
+    result = train_for_tests(
         model,
         dset,
         batch_size,
         learning_rate=1e-3,
+        loss_fn=loss_fn,
+        fields=["point_vec"],
         epochs=3,
+        test_dataset=test_dset,
+        nll_fn=nll_fn,
     )
-    print(f"Final train loss: {train_loss:.6f}")
+    eval_params = result.state.get_eval_params()
 
     n_test_samples = 100
     samples = generate_samples(
         model,
-        state.params,
+        eval_params,
         jax.random.PRNGKey(42),
         cond_vecs=jnp.zeros((n_test_samples, 0)),
         n_steps=100,
@@ -921,21 +868,11 @@ def test_train_vmf(domain_dim):
         sample_nll < differential_entropy + 1.0
     ), f"Sample NLL {sample_nll} too high compared to entropy {differential_entropy}"
 
-    # Compare model NLL to theoretical entropy (computed post-hoc to avoid per-epoch overhead)
-    test_nlls = compute_nll(
-        model,
-        state.params,
-        dict(test_dset[:]),
-        n_steps=256,
-        rng=jax.random.PRNGKey(99),
-        n_projections=32,
-    )
-    model_nll = float(jnp.mean(test_nlls))
-    print(f"Model NLL: {model_nll:.4f}, vMF entropy: {differential_entropy:.4f}")
-    assert np.isfinite(model_nll), f"NLL is not finite: {model_nll}"
+    print(f"Model NLL: {result.test_nll:.4f}, vMF entropy: {differential_entropy:.4f}")
+    assert np.isfinite(result.test_nll), f"NLL is not finite: {result.test_nll}"
     assert (
-        model_nll < differential_entropy + 0.5
-    ), f"Model NLL {model_nll:.4f} too high compared to entropy {differential_entropy:.4f}"
+        result.test_nll < differential_entropy + 0.5
+    ), f"Model NLL {result.test_nll:.4f} too high compared to entropy {differential_entropy:.4f}"
 
 
 @pytest.mark.parametrize("domain_dim", [3, 16])
@@ -950,14 +887,14 @@ def test_zero_init_uniform_nll(domain_dim):
     )
 
     params_rng, data_rng = jax.random.split(jax.random.PRNGKey(12345))
-    state = create_train_state(params_rng, model, 1e-3)
+    params = model.init(params_rng, *model.dummy_inputs())
 
     points = sample_sphere(data_rng, 256, domain_dim)
     batch = {"point_vec": points}
 
     test_nlls = compute_nll(
         model,
-        state.params,
+        params,
         batch,
         n_steps=256,
         rng=jax.random.PRNGKey(99),
