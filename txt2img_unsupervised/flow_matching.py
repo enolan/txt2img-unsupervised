@@ -50,11 +50,10 @@ geometry of the sphere, ensuring flows remain on the manifold.
 """
 from dataclasses import dataclass, field, replace
 from datasets import Dataset
-from einops import rearrange, repeat
+from einops import repeat
 from flax import linen as nn
-from flax.training import train_state
 from functools import partial
-from math import floor, ceil
+from math import ceil
 from scipy import stats
 from typing import (
     Any,
@@ -69,7 +68,6 @@ from typing import (
     NamedTuple,
 )
 from tqdm import tqdm, trange
-from tqdm.contrib import tenumerate
 import jax
 import jax.lax
 import jax.numpy as jnp
@@ -724,7 +722,7 @@ def test_vector_field_projections_normalization(domain_dim, conditioning_dim):
     )
 
     params_rng, sample_rng = jax.random.split(rng)
-    state = create_train_state(params_rng, model, 1e-3)
+    params = model.init(params_rng, *model.dummy_inputs())
 
     # Generate test inputs
     n_samples = 10_000
@@ -739,7 +737,7 @@ def test_vector_field_projections_normalization(domain_dim, conditioning_dim):
     else:
         cond_vec = jnp.zeros((n_samples, 0))
 
-    inputs = model.apply(state.params, x, t, cond_vec, method=model.process_inputs)
+    inputs = model.apply(params, x, t, cond_vec, method=model.process_inputs)
 
     input_features = inputs["input_features"]
     input_features_mean = jnp.mean(input_features)
@@ -1136,37 +1134,6 @@ def conditional_flow_matching_loss(
         return loss
 
 
-def create_train_state(rng, model, learning_rate_or_schedule, gradient_clipping=None):
-    """Create initial training state for a test. See checkpoint.py for the real one."""
-    dummy_inputs = model.dummy_inputs()
-    params = model.init(rng, *dummy_inputs)
-    if callable(learning_rate_or_schedule):
-        scaled_lr_or_schedule = lambda step: model.scale_lr(
-            learning_rate_or_schedule(step)
-        )
-    else:
-        scaled_lr_or_schedule = model.scale_lr(learning_rate_or_schedule)
-
-    if gradient_clipping is not None:
-        opt_fixed_lr = optax.chain(
-            optax.clip_by_global_norm(gradient_clipping),
-            optax.adamw(learning_rate_or_schedule, weight_decay=0.001),
-        )
-        opt_scaled_lr = optax.chain(
-            optax.clip_by_global_norm(gradient_clipping),
-            optax.adamw(scaled_lr_or_schedule, weight_decay=0.001),
-        )
-    else:
-        opt_fixed_lr = optax.adamw(learning_rate_or_schedule, weight_decay=0.001)
-        opt_scaled_lr = optax.adamw(scaled_lr_or_schedule, weight_decay=0.001)
-
-    opt = optax.transforms.partition(
-        {"fixed_lr": opt_fixed_lr, "scaled_lr": opt_scaled_lr},
-        model.mk_partition_map(use_muon=False),
-    )
-    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=opt)
-
-
 @partial(jax.jit, static_argnames=("batch_size", "dim"), inline=True)
 def sample_sphere(rng, batch_size, dim):
     """
@@ -1253,280 +1220,6 @@ def compute_batch_loss(
     )
 
 
-@partial(jax.jit, static_argnames=("model"), donate_argnames=("state", "rng"))
-def train_step(model, state, batch, rng):
-    """
-    Train for a single step.
-
-    Args:
-        model: The vector field model
-        state: Training state
-        batch: Batch of data containing "point_vec" and "cond_vec"
-        rng: JAX random key
-
-    Returns:
-        Updated state, loss value, gradient norm, and updated random key
-    """
-    rng, next_rng = jax.random.split(rng)
-
-    def loss_fn(params):
-        loss = compute_batch_loss(model, params, batch, rng)
-        return loss
-
-    grad_fn = jax.value_and_grad(loss_fn)
-    loss, grads = grad_fn(state.params)
-    grad_norm = optax.global_norm(grads)
-
-    state = state.apply_gradients(grads=grads)
-
-    return state, loss, grad_norm, next_rng
-
-
-def _train_loop_for_tests_generic(
-    model,
-    dataset,
-    batch_size,
-    learning_rate,
-    epochs,
-    test_dataset=None,
-    compute_nll_fn=None,
-    precompute_test_stats_fn=None,
-    train_step_fn=None,
-    compute_batch_loss_fn=None,
-    compute_nll_on_step_0=True,
-):
-    """
-    Generic training loop for unit tests.
-
-    Args:
-        model: The model to train
-        dataset: Training dataset
-        batch_size: Batch size for training
-        learning_rate: Initial learning rate (will use cosine schedule)
-        epochs: Number of epochs to train for
-        test_dataset: Optional test dataset for evaluation after each epoch
-        compute_nll_fn: Function (model, params, batch, n_steps, rng, n_projections, precomputed_stats=None) -> nlls
-        precompute_test_stats_fn: Optional function (model, params, rng, n_steps, n_projections) -> precomputed_stats
-                                  Called once before test evaluation to compute expensive global statistics
-        train_step_fn: Function (model, state, batch, rng) -> (state, loss, grad_norm, rng).
-                       Defaults to flow_matching.train_step.
-        compute_batch_loss_fn: Function (model, params, batch, rng) -> loss.
-                               Defaults to flow_matching.compute_batch_loss.
-        compute_nll_on_step_0: Whether to compute NLL on the first training step (before any
-                               training has occurred). Set to False to skip this, e.g. when the
-                               ODE integration is very slow on an untrained model.
-
-    Returns:
-        state: Final training state
-        train_loss: Final training loss
-        test_loss: Final test loss (if test_dataset provided)
-    """
-    if train_step_fn is None:
-        train_step_fn = train_step
-    if compute_batch_loss_fn is None:
-        compute_batch_loss_fn = compute_batch_loss
-    params_rng, step_rng = jax.random.split(jax.random.PRNGKey(7357), 2)
-
-    # Calculate total number of steps
-    n_samples = len(dataset)
-    steps_per_epoch = n_samples // batch_size
-    total_steps = steps_per_epoch * epochs
-
-    cosine_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=learning_rate,
-        warmup_steps=floor(total_steps * 0.1),
-        decay_steps=total_steps,
-    )
-
-    n_projections = 32
-    nll_steps = 128
-
-    state = create_train_state(params_rng, model, cosine_schedule)
-    np_rng = np.random.Generator(np.random.PCG64(seed=42))
-
-    final_test_loss = None
-    final_test_nll = None
-    first_step = True
-    step_count = 0
-
-    with tqdm(range(epochs), desc="Training", unit="epochs") as pbar:
-        for epoch in pbar:
-            # Compute NLL once at the start of each epoch (plus first step)
-            epoch_train_nll = None
-
-            # Training loop
-            for i, batch in tenumerate(
-                dataset.iter(batch_size, drop_last_batch=True),
-                unit="train batches",
-                total=len(dataset) // batch_size,
-            ):
-                norms = jnp.linalg.norm(batch["point_vec"], axis=1, keepdims=True)
-                np.testing.assert_allclose(np.asarray(norms), 1.0, rtol=0, atol=1e-6)
-
-                state, train_loss, grad_norm, step_rng = train_step_fn(
-                    model, state, batch, step_rng
-                )
-                jax.tree.map(lambda x: x.copy_to_host_async(), (train_loss, grad_norm))
-
-                step_count += 1
-                current_lr = cosine_schedule(step_count)
-
-                # Compute NLL once per epoch (at the beginning), optionally skipping step 0
-                if (
-                    compute_nll_fn is not None
-                    and i == 0
-                    and (not first_step or compute_nll_on_step_0)
-                ):
-                    step_rng, nll_rng = jax.random.split(step_rng)
-                    train_nlls = compute_nll_fn(
-                        model,
-                        state.params,
-                        batch,
-                        n_steps=nll_steps,
-                        rng=nll_rng,
-                        n_projections=n_projections,
-                        precomputed_stats=None,
-                    )
-                    epoch_train_nll = jnp.mean(train_nlls)
-
-                train_loss, grad_norm = jax.device_get((train_loss, grad_norm))
-                if epoch_train_nll is not None:
-                    epoch_train_nll = jax.device_get(epoch_train_nll)
-
-                if first_step:
-                    if epoch_train_nll is not None:
-                        tqdm.write(
-                            f"First step loss: {train_loss:.6f}, grad norm: {grad_norm:.6f}, lr: {current_lr:.6f}, nll: {epoch_train_nll:.6f}"
-                        )
-                    else:
-                        tqdm.write(
-                            f"First step loss: {train_loss:.6f}, grad norm: {grad_norm:.6f}, lr: {current_lr:.6f}"
-                        )
-                    first_step = False
-                pbar.set_postfix(
-                    {
-                        "loss": f"{float(train_loss):.6f}",
-                        "train_nll": f"{float(epoch_train_nll) if epoch_train_nll is not None else 0.0:.6f}",
-                        "grad_norm": f"{float(grad_norm):.6f}",
-                        "lr": f"{float(current_lr):.6f}",
-                    }
-                )
-
-            # Evaluate on test dataset if provided
-            if test_dataset is not None:
-                # Fixed seed so we test the same x0/t/cap across different epochs.
-                test_rng = jax.random.PRNGKey(20250911)
-                test_losses = []
-                test_nlls = []
-
-                # Precompute expensive test statistics if needed
-                precomputed_stats = None
-                if precompute_test_stats_fn is not None:
-                    precompute_rng, test_rng = jax.random.split(test_rng)
-                    precomputed_stats = precompute_test_stats_fn(
-                        model, state.params, precompute_rng, nll_steps, n_projections
-                    )
-
-                for test_batch in tqdm(
-                    test_dataset.iter(batch_size, drop_last_batch=False),
-                    unit="test batches",
-                    total=len(test_dataset) // batch_size,
-                ):
-                    test_batch_rng, test_nll_rng, test_rng = jax.random.split(
-                        test_rng, 3
-                    )
-
-                    batch_test_loss = compute_batch_loss_fn(
-                        model, state.params, test_batch, test_batch_rng
-                    )
-
-                    test_losses.append(batch_test_loss)
-
-                    if compute_nll_fn is not None:
-                        test_nlls.append(
-                            compute_nll_fn(
-                                model,
-                                state.params,
-                                test_batch,
-                                n_steps=nll_steps,
-                                rng=test_nll_rng,
-                                n_projections=n_projections,
-                                precomputed_stats=precomputed_stats,
-                            )
-                        )
-
-                if len(test_losses) > 0:
-                    test_losses = jnp.asarray(test_losses)
-                    avg_test_loss = jax.device_get(jnp.mean(test_losses))
-                    final_test_loss = avg_test_loss
-
-                    if len(test_nlls) > 0:
-                        test_nlls = jnp.concatenate(test_nlls)
-                        avg_test_nll = jax.device_get(jnp.mean(test_nlls))
-                        final_test_nll = avg_test_nll
-                        train_nll_str = (
-                            f", Train NLL: {epoch_train_nll:.6f}"
-                            if epoch_train_nll is not None
-                            else ""
-                        )
-                        tqdm.write(
-                            f"Epoch {epoch}, Train Loss: {train_loss:.6f}{train_nll_str}, Grad Norm: {grad_norm:.6f}, Test Loss: {avg_test_loss:.6f}, Test NLL: {avg_test_nll:.6f}"
-                        )
-                    else:
-                        tqdm.write(
-                            f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Grad Norm: {grad_norm:.6f}, Test Loss: {avg_test_loss:.6f}"
-                        )
-                else:
-                    tqdm.write(
-                        f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Grad Norm: {grad_norm:.6f}, No test batches"
-                    )
-            else:
-                tqdm.write(
-                    f"Epoch {epoch}, Train Loss: {train_loss:.6f}, Grad Norm: {grad_norm:.6f}, No test batches"
-                )
-
-            # Shuffle dataset for next epoch
-            dataset.shuffle(generator=np_rng)
-
-    if test_dataset is not None:
-        if compute_nll_fn is not None:
-            return state, train_loss, final_test_loss, final_test_nll
-        else:
-            return state, train_loss, final_test_loss
-    else:
-        return state, train_loss
-
-
-def _compute_nll_vector_field(
-    model, params, batch, n_steps, rng, n_projections, precomputed_stats=None
-):
-    """Compute NLL for VectorField - use real conditioning data from batch."""
-    if "cond_vec" in batch:
-        cond_vecs = batch["cond_vec"]
-    else:
-        # For unconditional models, create zero-dimensional conditioning
-        batch_size = batch["point_vec"].shape[0]
-        cond_vecs = jnp.zeros((batch_size, 0))
-
-    return -compute_log_probability(
-        model=model,
-        params=params,
-        samples=batch["point_vec"],
-        cond_vecs=cond_vecs,
-        n_steps=n_steps,
-        rng=rng,
-        n_projections=n_projections,
-    )
-
-
-# Create VectorField-specific training loop using partial application
-_train_loop_for_tests = partial(
-    _train_loop_for_tests_generic,
-    compute_nll_fn=_compute_nll_vector_field,
-)
-
-
 _baseline_model = VectorField(
     domain_dim=3,
     n_layers=6,
@@ -1562,6 +1255,9 @@ _baseline_model = VectorField(
 @pytest.mark.parametrize("domain_dim", [3, 16])
 def test_train_trivial(domain_dim, inject_keys):
     "Train a model with a single example"
+    # Deferred import: training_infra → checkpoint → this module creates a cycle.
+    from .training_infra import train_for_tests
+
     model = replace(
         _baseline_model,
         domain_dim=domain_dim,
@@ -1576,11 +1272,16 @@ def test_train_trivial(domain_dim, inject_keys):
     first_dim_vec = first_dim_vec.at[0].set(1.0)
     points = repeat(first_dim_vec, "v -> b v", b=batch_size * 100)
     dset = Dataset.from_dict({"point_vec": points}).with_format("np")
-    state, loss = _train_loop_for_tests(model, dset, batch_size, lr, ep)
-    print(f"Final loss: {loss:.6f}")
+
+    loss_fn = partial(compute_batch_loss, model)
+
+    result = train_for_tests(
+        model, dset, batch_size, lr, loss_fn, ["point_vec"], epochs=ep
+    )
+    eval_params = result.state.get_eval_params()
     samples = generate_samples(
         model,
-        state.params,
+        eval_params,
         jax.random.PRNGKey(0),
         cond_vecs=jnp.zeros((20, 0)),
         n_steps=1000,
@@ -1694,6 +1395,8 @@ def test_train_vmf(domain_dim, inject_keys):
     """
     Train a model with data from a von Mises-Fisher distribution and evaluate the samples.
     """
+    from .training_infra import train_for_tests
+
     model = replace(
         _baseline_model,
         domain_dim=domain_dim,
@@ -1725,19 +1428,34 @@ def test_train_vmf(domain_dim, inject_keys):
     differential_entropy = _vmf_differential_entropy(kappa)
     print(f"vMF distribution entropy: {differential_entropy:.6f}")
 
-    state, train_loss, test_loss, test_nll = _train_loop_for_tests(
-        model, dset, batch_size, 1e-3, epochs, test_dset
-    )
-    print(f"Final train loss: {train_loss:.6f}")
-    print(f"Final test loss: {test_loss:.6f}")
-    print(f"Final test nll: {test_nll:.6f}")
+    loss_fn = partial(compute_batch_loss, model)
 
-    assert test_nll < differential_entropy + 0.5
+    def nll_fn(model, params, batch, rng):
+        points = jnp.array(batch["point_vec"])
+        cond_vecs = jnp.zeros((points.shape[0], 0))
+        return -compute_log_probability(
+            model, params, points, cond_vecs, n_steps=128, rng=rng, n_projections=32
+        )
+
+    result = train_for_tests(
+        model,
+        dset,
+        batch_size,
+        1e-3,
+        loss_fn,
+        ["point_vec"],
+        epochs=epochs,
+        test_dataset=test_dset,
+        nll_fn=nll_fn,
+    )
+    eval_params = result.state.get_eval_params()
+
+    assert result.test_nll < differential_entropy + 0.5
 
     n_test_samples = 1_000
     samples = generate_samples(
         model,
-        state.params,
+        eval_params,
         jax.random.PRNGKey(42),
         cond_vecs=jnp.zeros((n_test_samples, 0)),
         n_steps=1000,
@@ -1780,14 +1498,14 @@ def test_zero_init_uniform_nll(domain_dim):
     model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2, d_model=32)
 
     params_rng, data_rng = jax.random.split(jax.random.PRNGKey(12345))
-    state = create_train_state(params_rng, model, 1e-3)
+    params = model.init(params_rng, *model.dummy_inputs())
 
     points = sample_sphere(data_rng, 256, domain_dim)
     cond_vecs = jnp.zeros((256, 0))
 
     log_probs = compute_log_probability(
         model,
-        state.params,
+        params,
         points,
         cond_vecs,
         n_steps=128,
@@ -1847,6 +1565,8 @@ def test_train_conditional_vmf(domain_dim, inject_keys):
     When conditioning vector is 0, samples should come from the first vMF distribution.
     When conditioning vector is 1, samples should come from the second vMF distribution.
     """
+    from .training_infra import train_for_tests
+
     model = replace(
         _baseline_model,
         domain_dim=domain_dim,
@@ -1889,17 +1609,27 @@ def test_train_conditional_vmf(domain_dim, inject_keys):
     train_dataset = datasets["train"]
     test_dataset = datasets["test"]
 
-    state, train_loss, test_loss, test_nll = _train_loop_for_tests(
+    loss_fn = partial(compute_batch_loss, model)
+
+    def nll_fn(model, params, batch, rng):
+        points = jnp.array(batch["point_vec"])
+        cond_vecs = jnp.array(batch["cond_vec"])
+        return -compute_log_probability(
+            model, params, points, cond_vecs, n_steps=128, rng=rng, n_projections=32
+        )
+
+    result = train_for_tests(
         model,
         train_dataset,
         batch_size,
         lr,
-        epochs,
-        test_dataset,
+        loss_fn,
+        ["point_vec", "cond_vec"],
+        epochs=epochs,
+        test_dataset=test_dataset,
+        nll_fn=nll_fn,
     )
-    print(
-        f"Final loss - Train: {train_loss:.4f}, Test: {test_loss:.4f}, Test NLL: {test_nll:.4f}"
-    )
+    eval_params = result.state.get_eval_params()
 
     # Test the conditioned model
     n_eval_samples = 200
@@ -1912,14 +1642,14 @@ def test_train_conditional_vmf(domain_dim, inject_keys):
 
     samples_0 = generate_samples(
         model,
-        state.params,
+        eval_params,
         seed1,
         cond_vecs=cond_vec_0,
         n_steps=500,
     )
     samples_1 = generate_samples(
         model,
-        state.params,
+        eval_params,
         seed2,
         cond_vecs=cond_vec_1,
         n_steps=500,
@@ -4198,7 +3928,7 @@ def test_vector_field_evaluation():
         input_dropout_rate=None,
         mlp_dropout_rate=None,
     )
-    state = create_train_state(rng, model, 1e-3)
+    params = model.init(rng, *model.dummy_inputs())
 
     # Generate points & times
     n_samples = 30
@@ -4208,7 +3938,7 @@ def test_vector_field_evaluation():
 
     cond_vecs = jnp.zeros((n_samples, model.conditioning_dim))
 
-    vector_field_values = model.apply(state.params, points, times, cond_vecs)
+    vector_field_values = model.apply(params, points, times, cond_vecs)
 
     dot_products = jnp.sum(points * vector_field_values, axis=1)
     magnitudes = jnp.linalg.norm(vector_field_values, axis=1)
@@ -4876,6 +4606,8 @@ def test_train_hemisphere_density(inject_keys):
 
     Uses sample_from_cap to generate uniform-in-cap points (cap d_max=1 corresponds to hemisphere).
     """
+    from .training_infra import train_for_tests
+
     domain_dim = 3
     model = replace(
         _baseline_model,
@@ -4921,13 +4653,28 @@ def test_train_hemisphere_density(inject_keys):
 
     # Train
     batch_size = 512
-    state, final_loss, test_loss, test_nll = _train_loop_for_tests(
-        model, train_dataset, batch_size, lr, epochs, test_dataset
-    )
 
-    print(
-        f"Final train loss: {final_loss:.6f}, test loss: {test_loss:.6f}, test NLL: {test_nll:.6f}"
+    loss_fn = partial(compute_batch_loss, model)
+
+    def nll_fn(model, params, batch, rng):
+        points = jnp.array(batch["point_vec"])
+        cond_vecs = jnp.zeros((points.shape[0], 0))
+        return -compute_log_probability(
+            model, params, points, cond_vecs, n_steps=128, rng=rng, n_projections=32
+        )
+
+    result = train_for_tests(
+        model,
+        train_dataset,
+        batch_size,
+        lr,
+        loss_fn,
+        ["point_vec"],
+        epochs=epochs,
+        test_dataset=test_dataset,
+        nll_fn=nll_fn,
     )
+    eval_params = result.state.get_eval_params()
 
     # Build two test sets: in-cap (north hemisphere) and opposite (south hemisphere)
     n_test = 1024
@@ -4942,7 +4689,7 @@ def test_train_hemisphere_density(inject_keys):
     # Compute log probabilities
     north_log_probs = compute_log_probability(
         model,
-        state.params,
+        eval_params,
         north_points,
         cond_vecs,
         n_steps=100,
@@ -4951,7 +4698,7 @@ def test_train_hemisphere_density(inject_keys):
     )
     south_log_probs = compute_log_probability(
         model,
-        state.params,
+        eval_params,
         south_points,
         cond_vecs,
         n_steps=100,
@@ -4967,7 +4714,7 @@ def test_train_hemisphere_density(inject_keys):
     )
     geodesic_log_probs = compute_log_probability(
         model,
-        state.params,
+        eval_params,
         geodesic_points,
         jnp.zeros((num_geodesic_points, 0), dtype=jnp.float32),
         n_steps=100,

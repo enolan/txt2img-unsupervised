@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 
-from .flow_matching import VectorField, create_train_state, sample_sphere
+from .flow_matching import VectorField, sample_sphere
 
 
 def create_rotating_animation(
@@ -65,7 +65,7 @@ def create_rotating_animation(
         activations_dtype=jnp.float32, weights_dtype=jnp.float32, **model_config
     )
 
-    state = create_train_state(params_rng, model, learning_rate_or_schedule=1e-3)
+    params = model.init(params_rng, *model.dummy_inputs())
 
     print("Sampling points")
     points = sample_sphere(points_rng, n_samples, model.domain_dim)
@@ -77,7 +77,7 @@ def create_rotating_animation(
     if not animate_time:
         print("Evaluating vector field")
         times = jnp.full((n_samples,), time)
-        vector_field_values = model.apply(state.params, points, times, cond_vecs)
+        vector_field_values = model.apply(params, points, times, cond_vecs)
         vectors_np = np.array(vector_field_values)
     else:
         print("Time animation enabled - vector field will be computed for each frame")
@@ -129,7 +129,7 @@ def create_rotating_animation(
     if animate_time:
         # Compute initial vector field
         times = jnp.full((n_samples,), time_values[0])
-        vector_field_values = model.apply(state.params, points, times, cond_vecs)
+        vector_field_values = model.apply(params, points, times, cond_vecs)
         vectors_np = np.array(vector_field_values)
 
     # Store quiver plot in a list to allow updating it from the update function
@@ -172,7 +172,7 @@ def create_rotating_animation(
 
             # Compute new vector field for current time
             times = jnp.full((n_samples,), current_time)
-            vector_field_values = model.apply(state.params, points, times, cond_vecs)
+            vector_field_values = model.apply(params, points, times, cond_vecs)
             vectors_np = np.array(vector_field_values)
 
             # For 3D quiver plots, we need to remove the old quiver and create a new one

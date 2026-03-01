@@ -10,12 +10,11 @@ import optax  # type: ignore[import]
 import pytest
 from copy import copy
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datasets import Dataset
 from enum import Enum
 from einops import rearrange, reduce, repeat
 from flax import struct
 from functools import partial
-from infinidata import TableView
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 from tqdm import tqdm, trange
@@ -1953,82 +1952,52 @@ def test_cap_train() -> None:
     assert all(correct_conds)
 
 
-def train_loop_simple(
-    data: jax.Array,
-    mdl: ImageModel,
-    iters: int,
-    learning_rate: float = 3e-5,
-    warmup_steps: Optional[int] = None,
-) -> Tuple[jax.Array, dict[str, Any]]:
-    """Train the model repeatedly on a single batch for testing."""
-    assert mdl.clip_conditioning is False
-    assert len(data.shape) == 2
-    batch_size = data.shape[0]
-    assert data.shape == (batch_size, mdl.image_tokens)
-
-    params = mdl.init(
-        {"dropout": jax.random.PRNGKey(0), "params": jax.random.PRNGKey(1)},
-        *mdl.dummy_inputs(),
-    )
-    if warmup_steps is None:
-        warmup_steps = iters // 10
-    opt = optax.contrib.schedule_free_adamw(
-        learning_rate=learning_rate, b1=0.98, warmup_steps=warmup_steps
-    )
-    opt_state = opt.init(params)
-    loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
-
-    def opt_step(
-        params: dict[str, Any],
-        opt_state: Any,
-        rng: jax.Array,
-        batch_imgs: jax.Array,
-    ) -> Tuple[dict[str, Any], Any, jax.Array, jax.Array]:
-        dropout_rng, rng2 = jax.random.split(rng, 2)
-        loss, grads = loss_grad_fn(
-            mdl,
-            params,
-            dropout_rng,
-            batch_imgs=batch_imgs,
-            batch_clips=jnp.zeros((batch_imgs.shape[0], 0), dtype=jnp.float32),
-            batch_max_cos_distances=jnp.zeros(
-                (batch_imgs.shape[0], 0), dtype=jnp.float32
-            ),
-        )
-        updates, opt_state = opt.update(grads, opt_state, params)
-        new_params: dict[str, Any] = optax.apply_updates(params, updates)
-        return new_params, opt_state, rng2, loss
-
-    opt_step = jax.jit(opt_step, donate_argnums=(0, 1, 2))
-
-    train_rng = jax.random.PRNGKey(0)
-    for i in trange(iters):
-        params, opt_state, train_rng, loss = opt_step(  # type:ignore[misc]
-            params, opt_state, train_rng, data
-        )
-        tqdm.write(f"iter {i} loss: {loss}")
-    params = optax.contrib.schedule_free_eval_params(opt_state, params)
-    return loss, params  # type:ignore[return-value]
-
-
 @pytest.mark.parametrize("weights_dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("pre_norm", [True, False])
 def test_learn_zeros(pre_norm: bool, weights_dtype: jnp.dtype) -> None:
     """Test whether the model can learn to predict all zeros."""
+    # Deferred import: training_infra → checkpoint → this module creates a cycle.
+    from txt2img_unsupervised.training_infra import train_for_tests
+
     mdl_cfg = copy(gpt_1_config)
     mdl_cfg.pre_norm = pre_norm
     mdl_cfg.activations_dtype = weights_dtype
     mdl_cfg.weights_dtype = weights_dtype
     mdl = ImageModel(**mdl_cfg.__dict__)
     data = jnp.zeros((16, gpt_1_config.image_tokens), dtype=jnp.int32)
-    loss, params = train_loop_simple(
-        data, mdl, iters=7, learning_rate=1e-1, warmup_steps=1
+    dset = Dataset.from_dict({"encoded_img": np.array(data)}).with_format("np")
+
+    def loss_fn(params, batch, rng):
+        return loss_batch(
+            mdl,
+            params,
+            rng,
+            batch_imgs=batch["encoded_img"],
+            batch_clips=jnp.zeros((batch["encoded_img"].shape[0], 0)),
+            batch_max_cos_distances=jnp.zeros((batch["encoded_img"].shape[0], 0)),
+        )
+
+    result = train_for_tests(
+        mdl,
+        dset,
+        batch_size=16,
+        learning_rate=1e-1,
+        loss_fn=loss_fn,
+        fields=["encoded_img"],
+        steps=7,
+        warmup_steps=1,
+        schedule_free_beta1=0.98,
+        adam_beta2=0.9 if weights_dtype == jnp.bfloat16 else 0.999,
+        weight_decay=0.0,
     )
-    assert loss < 1e-10
+    eval_params = result.state.get_eval_params()
+
+    test_loss = loss_fn(eval_params, {"encoded_img": data}, jax.random.PRNGKey(0))
+    assert test_loss < 1e-6
 
     sampled_arr = sample(
         mdl,
-        params,
+        eval_params,
         jnp.zeros((1, 0), dtype=jnp.float32),
         jnp.zeros((1, 0), dtype=jnp.float32),
         jax.random.PRNGKey(0)[None, :],
@@ -2048,15 +2017,15 @@ def test_learn_sequential(
     weights_dtype: jnp.dtype, activations_dtype: jnp.dtype
 ) -> None:
     """Test whether the model can learn to predict consecutive numbers."""
+    from txt2img_unsupervised.training_infra import train_for_tests
+
     mdl_cfg = copy(gpt_1_config)
     mdl_cfg.pre_norm = True
     mdl_cfg.activations_dtype = activations_dtype
     mdl_cfg.weights_dtype = weights_dtype
     mdl = ImageModel(**mdl_cfg.__dict__)
 
-    data_rng, params_rng, train_rng, sample_rng = jax.random.split(
-        jax.random.PRNGKey(777), 4
-    )
+    data_rng, sample_rng = jax.random.split(jax.random.PRNGKey(777))
 
     # Generate a dataset of sequential numbers
     n_imgs = 8192
@@ -2064,58 +2033,42 @@ def test_learn_sequential(
     data = (start_vals[:, None] + jnp.arange(gpt_1_config.image_tokens)) % 8192
     assert data.shape == (n_imgs, gpt_1_config.image_tokens)
     data = jax.device_get(data)
-    dset_all = TableView({"encoded_img": data}).shuffle(seed=0)
-    test_set_size = n_imgs // 10
-    dset_train = dset_all.new_view(slice(None, -test_set_size))
-    dset_test = dset_all.new_view(slice(-test_set_size, None))
 
-    # Train a model
-    params = mdl.init(
-        {"params": params_rng, "dropout": jax.random.PRNGKey(0)}, *mdl.dummy_inputs()
-    )
+    hf_dset = Dataset.from_dict({"encoded_img": data}).with_format("np")
+    split = hf_dset.train_test_split(test_size=n_imgs // 10, seed=0)
+    train_dset = split["train"]
+    test_dset = split["test"]
 
-    steps = 300
     batch_size = 64
 
-    opt = optax.contrib.schedule_free_adamw(
-        learning_rate=1e-3, b1=0.98, warmup_steps=10
-    )
-    opt_state = opt.init(params)
-    loss_grad_fn = jax.value_and_grad(loss_batch, argnums=1)
-
-    def opt_step(params, opt_state, rng, batch_imgs):
-        dropout_rng, rng2 = jax.random.split(rng, 2)
-        loss, grads = loss_grad_fn(
+    def loss_fn(params, batch, rng):
+        return loss_batch(
             mdl,
             params,
-            dropout_rng,
-            batch_imgs=batch_imgs,
-            batch_clips=jnp.zeros((batch_size, 0), dtype=jnp.float32),
-            batch_max_cos_distances=jnp.zeros((batch_size, 0), dtype=jnp.float32),
+            rng,
+            batch_imgs=batch["encoded_img"],
+            batch_clips=jnp.zeros(
+                (batch["encoded_img"].shape[0], 0), dtype=jnp.float32
+            ),
+            batch_max_cos_distances=jnp.zeros(
+                (batch["encoded_img"].shape[0], 0), dtype=jnp.float32
+            ),
         )
-        updates, opt_state = opt.update(grads, opt_state, params)
-        new_params = optax.apply_updates(params, updates)
-        return new_params, opt_state, rng2, loss
 
-    opt_step = jax.jit(opt_step, donate_argnums=(0, 1, 2))
-
-    with tqdm(total=steps) as pbar:
-        while pbar.n < steps:
-            for batch in dset_train.shuffle(seed=pbar.n).batch_iter(
-                batch_size, drop_last_batch=True
-            ):
-                params, opt_state, train_rng, loss = opt_step(
-                    params, opt_state, train_rng, batch["encoded_img"]
-                )
-                loss = jax.device_get(loss)
-                if pbar.n % 10 == 0:
-                    tqdm.write(f"iter {pbar.n:04d} loss: {loss:0.4f}")
-                pbar.update(1)
-                pbar.set_postfix({"loss": loss})
-                if pbar.n >= steps:
-                    break
-    print(f"Final train loss: {loss}")
-    params = optax.contrib.schedule_free_eval_params(opt_state, params)
+    result = train_for_tests(
+        mdl,
+        train_dset,
+        batch_size=batch_size,
+        learning_rate=1e-3,
+        loss_fn=loss_fn,
+        fields=["encoded_img"],
+        steps=300,
+        warmup_steps=10,
+        schedule_free_beta1=0.98,
+        adam_beta2=0.9 if weights_dtype == jnp.bfloat16 else 0.999,
+        weight_decay=0.0,
+    )
+    eval_params = result.state.get_eval_params()
 
     # Compute test loss
     test_mdl = mdl.clone(dropout=None, image_dropout=None, clip_dropout=None)
@@ -2130,13 +2083,9 @@ def test_learn_sequential(
         )
     )
     test_losses = []
-    test_batches = len(dset_test) // batch_size + (
-        1 if len(dset_test) % batch_size > 0 else 0
-    )
-    for batch in tqdm(
-        dset_test.batch_iter(batch_size, drop_last_batch=False), total=test_batches
-    ):
-        test_losses.append(calc_loss(batch["encoded_img"], params))
+    for i in trange(len(test_dset) // batch_size):
+        batch_data = test_dset[i * batch_size : (i + 1) * batch_size]["encoded_img"]
+        test_losses.append(calc_loss(batch_data, eval_params))
     test_loss = jnp.mean(jnp.array(test_losses))
     print(f"Final test loss: {test_loss}")
     assert test_loss < 0.04
@@ -2152,7 +2101,7 @@ def test_learn_sequential(
         samples.append(
             sample(
                 mdl,
-                params,
+                eval_params,
                 jnp.zeros((sample_batch_size, 0), dtype=jnp.float32),
                 jnp.zeros((sample_batch_size, 0), dtype=jnp.float32),
                 split_rngs[:-1],

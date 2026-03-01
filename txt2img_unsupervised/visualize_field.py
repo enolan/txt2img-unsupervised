@@ -11,7 +11,6 @@ import os
 # Import the necessary components from flow_matching.py
 from .flow_matching import (
     VectorField,
-    create_train_state,
     sample_sphere,
 )
 
@@ -144,7 +143,7 @@ def visualize_vector_field(
 
     is_2d = model.domain_dim == 2
 
-    state = create_train_state(params_rng, model, learning_rate_or_schedule=1e-3)
+    params = model.init(params_rng, *model.dummy_inputs())
 
     points = sample_sphere(points_rng, n_samples, model.domain_dim)
 
@@ -152,7 +151,7 @@ def visualize_vector_field(
 
     cond_vecs = jnp.zeros((n_samples, model.conditioning_dim))
 
-    vector_field_values = model.apply(state.params, points, times, cond_vecs)
+    vector_field_values = model.apply(params, points, times, cond_vecs)
 
     points_np = np.array(points)
     vectors_np = np.array(vector_field_values)

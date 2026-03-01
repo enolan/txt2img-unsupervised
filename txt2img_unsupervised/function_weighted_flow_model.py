@@ -1205,6 +1205,9 @@ def test_train_trivial_distribution(
     Train a function-weighted model on a trivial distribution (uniform or vMF), then verify it
     produces the correct weighted distributions.
     """
+    # Deferred import: training_infra → checkpoint → config → this module creates a cycle.
+    from .training_infra import train_for_tests
+
     # Set up model with appropriate extra parameters
     # Use different d_max_dist based on base distribution:
     # - CAP: can only handle caps up to hemisphere (d_max <= 1.0)
@@ -1285,7 +1288,6 @@ def test_train_trivial_distribution(
 
     # Create dataset
     train_dataset = Dataset.from_dict({"point_vec": train_points}).with_format("np")
-    test_dataset = Dataset.from_dict({"point_vec": test_points}).with_format("np")
     # Train the model using the shared infrastructure
     batch_size = 256
     learning_rate = 3e-4
@@ -1329,20 +1331,18 @@ def test_train_trivial_distribution(
         f"Training FWFM for domain_dim={domain_dim}, data_distribution={data_distribution}, weighting_function={weighting_function}"
     )
 
-    # Use the generic training loop via partial application. No test_dataset or NLL
-    # computation since correctness is verified post-training via compute_log_probability.
-    state, final_loss, test_loss, test_nll = _train_loop_for_tests(
+    loss_fn = partial(flow_matching.compute_batch_loss, model)
+
+    result = train_for_tests(
         model=model,
         dataset=train_dataset,
         batch_size=batch_size,
         learning_rate=learning_rate,
+        loss_fn=loss_fn,
+        fields=["point_vec"],
         epochs=epochs,
-        test_dataset=test_dataset,
     )
-
-    print(
-        f"Training completed. Final loss: {final_loss:.6f}, test loss: {test_loss:.6f}, test NLL: {test_nll:.6f}"
-    )
+    eval_params = result.state.get_eval_params()
 
     # Generate independent test points
     n_test_points = 1000
@@ -1457,7 +1457,7 @@ def test_train_trivial_distribution(
 
         extended_model_log_probs = compute_log_probability(
             model=model,
-            params=state.params,
+            params=eval_params,
             samples=extended_test_points,
             weighting_function_params=extended_model_params_batch,
             n_steps=20,
@@ -3291,11 +3291,3 @@ def test_cap_conditioned_cnf_sampling_backwards_forwards_mcmc():
     assert jnp.all(cos_distances <= cap_d_max + 1e-5), "Some samples outside cap"
 
     print(f"MCMC test: {samples.shape[0]} samples, all in cap, ESS: {float(ess):.1f}")
-
-
-# Create FunctionWeightedFlowModel-specific training loop using partial application
-_train_loop_for_tests = partial(
-    flow_matching._train_loop_for_tests_generic,
-    compute_nll_fn=compute_nll,
-    precompute_test_stats_fn=compute_hemisphere_masses,
-)
