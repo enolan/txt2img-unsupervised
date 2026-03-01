@@ -94,9 +94,8 @@ class NoiseSchedule:
 class ScoreMatchingModel(nn.Module):
     """Score matching model bundling a VectorField with noise schedule and conditioning mode.
 
-    Wraps a VectorField submodule. Currently __call__ forwards directly to the VectorField,
-    but will eventually preprocess cap specifications into conditioning vectors for
-    CONDITIONED_SCORE mode.
+    Wraps a VectorField submodule. The neural network predicts the scaled score σ²(t) · s(x, t),
+    and __call__ divides by σ²(t) so callers receive the true score.
     """
 
     # VectorField hyperparameters
@@ -189,7 +188,23 @@ class ScoreMatchingModel(nn.Module):
         return self.mk_vector_field().scale_lr(lr)
 
     def __call__(self, x, t, cond_vec):
-        return self.vector_field(x, t, cond_vec)
+        """Run the model, returning the estimated score ∇log p_t(x).
+
+        Internally the neural network predicts the scaled score σ²(t) · s(x, t), which is
+        bounded and easier to learn. This method divides by σ²(t) so callers always receive
+        the true score.
+
+        Args:
+            x: Points on the sphere [batch_size, domain_dim]
+            t: Time values [batch_size]
+            cond_vec: Conditioning vectors [batch_size, cond_dim]
+
+        Returns:
+            Estimated score vectors [batch_size, domain_dim] in the tangent space at x.
+        """
+        scaled_score = self.vector_field(x, t, cond_vec)
+        sigma_sq = sigma_squared(t, self.schedule)
+        return scaled_score / sigma_sq[:, None]
 
 
 def sigma_squared(t: Array, schedule: NoiseSchedule) -> Array:
@@ -316,13 +331,16 @@ def denoising_score_matching_loss(
     conditioning_data: Array,
     rng: Optional[Array] = None,
 ) -> Array:
-    """Compute MSE loss between predicted and target scaled score.
+    f"""Compute weighted MSE loss between predicted and target score.
 
-    We train the network to predict the "scaled score" σ²(t) * s(x,t) = P_x(x_1),
-    which is bounded (magnitude ≤ 1) regardless of t. This avoids the issue where
-    the raw score κ(t) * P_x(x_1) can be very large when t→1.
+    The target score for the conditional distribution p_t(x|x_1) is κ(t) · P_{x_t}(x_1).
+    The model returns the true score (internally the neural network predicts the bounded
+    scaled score s(x,t) / κ(t) = P_{x_t}(x_1), then multiplies by κ(t)).
 
-    At sampling time, we recover the actual score by dividing by σ²(t).
+    We use an MSE loss on the scaled score, P_{x_t}(x_1). Yes it's confusing and wasteful to scale
+    the score up in ScoreMatchingModel only to scale it back down again by the exact same factor,
+    but it's also confusing to have the model's output not actually be the score when the class is
+    called ScoreMatchingModel.
 
     Args:
         model: Score matching model
@@ -338,15 +356,17 @@ def denoising_score_matching_loss(
     """
     # Target is the scaled score: σ²(t) * score = σ²(t) * κ(t) * P_x(x_1) = P_x(x_1)
     # This is just the tangent projection, bounded in [-1, 1]
-    target_scaled_score = tangent_projection(x_t, x_1)
+    target_scaled_scores = tangent_projection(x_t, x_1)
 
     rngs_dict = {"dropout": rng} if rng is not None else {}
-    predicted_scaled_score = model.apply(
+    predicted_scores = model.apply(
         params, x_t, t, conditioning_data, rngs=rngs_dict
-    )
+    )  # [batch_size, dim]
+    kappas = kappa(t, model.schedule)  # [batch_size]
+    predicted_scaled_scores = predicted_scores / kappas[:, None]
 
     per_sample_loss = jnp.sum(
-        (predicted_scaled_score - target_scaled_score) ** 2, axis=1
+        (target_scaled_scores - predicted_scaled_scores) ** 2, axis=1
     )
     return jnp.mean(per_sample_loss)
 
@@ -420,9 +440,8 @@ def _compute_velocity_for_sampling(
 ) -> Array:
     """Compute ODE velocity for sampling.
 
-    The network outputs the scaled score: σ²(t) * s(x, t).
-    The actual score is: s(x, t) = network_output / σ²(t).
-    The ODE velocity is: coeff * s(x, t) = coeff / σ²(t) * network_output.
+    The probability flow ODE is dx/dt = coeff · s(x, t), where coeff = ½(σ²_max - σ²_min)
+    is constant.
 
     Args:
         model: Score matching model
@@ -448,13 +467,9 @@ def _compute_velocity_for_sampling(
     else:
         t_vec = jnp.full((x.shape[0],), t)
 
-    # Network outputs scaled score: σ²(t) * s(x, t)
-    scaled_score = model.apply(params, x, t_vec, cond_vecs, rngs=rngs_dict)
-
-    # ODE velocity = coeff * s = coeff * (scaled_score / σ²) = (coeff / σ²) * scaled_score
+    score = model.apply(params, x, t_vec, cond_vecs, rngs=rngs_dict)
     coeff = ode_coefficient(t_vec, model.schedule)
-    sigma_sq = sigma_squared(t_vec, model.schedule)
-    return (coeff / sigma_sq[:, None]) * scaled_score
+    return coeff * score
 
 
 @partial(jax.jit, static_argnames=("model",), inline=True)
