@@ -45,8 +45,8 @@ class LearnedNoiseSchedule(nn.Module):
 
     hidden_dim: int = 32
     n_quadrature_points: int = 1024
-    init_log_kappa_min: float = -0.693  # log(1/σ²_max) = log(1/2.0)
-    init_log_kappa_max: float = 9.210  # log(1/σ²_min) = log(1/1e-4)
+    init_log_kappa_min: float = -0.693  # log(0.5)
+    init_log_kappa_max: float = 9.210  # log(10000)
 
     def setup(self):
         assert (

@@ -29,7 +29,7 @@ from .config import (
     TransformerModelConfig,
 )
 from .function_weighted_flow_model import FunctionWeightedFlowModel
-from .score_matching import NoiseSchedule, ScoreMatchingModel
+from .score_matching import ScoreMatchingModel
 from .muon import muon
 from .transformer_model import ImageModel
 from .triangle_schedule import triangle_schedule
@@ -103,6 +103,25 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
                 f"Unknown learning rate schedule {training_cfg.learning_rate_schedule}"
             )
 
+    # Check if model has "schedule" params (e.g., ScoreMatchingModel)
+    has_schedule_params = use_mup_scaling and "schedule" in mdl.mk_partition_map(
+        use_muon=False
+    ).get("params", {})
+
+    # Create schedule optimizer if needed
+    def _mk_schedule_opt(base_lr_schedule):
+        schedule_lr = training_cfg.schedule_learning_rate or (
+            base_lr_schedule
+            if not callable(base_lr_schedule)
+            else training_cfg.learning_rate
+        )
+        sched_lr = create_lr_schedule(schedule_lr)
+        return optax.adamw(
+            learning_rate=sched_lr,
+            weight_decay=training_cfg.weight_decay,
+            b2=training_cfg.adam_beta2,
+        )
+
     # Handle schedule-free Adam (not compatible with Muon)
     if (
         training_cfg.learning_rate_schedule
@@ -126,8 +145,13 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
                 b2=training_cfg.adam_beta2,
                 weight_decay=training_cfg.weight_decay,
             )
+            partition_dict = {"fixed_lr": opt_fixed_lr, "scaled_lr": opt_scaled_lr}
+            if has_schedule_params:
+                partition_dict["schedule"] = _mk_schedule_opt(
+                    training_cfg.learning_rate
+                )
             opt = optax.transforms.partition(
-                {"fixed_lr": opt_fixed_lr, "scaled_lr": opt_scaled_lr},
+                partition_dict,
                 mdl.mk_partition_map(use_muon=False),
             )
         else:
@@ -167,13 +191,16 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
             muon_fixed_opt = muon(lr_schedule, **muon_params)
             muon_scaled_opt = muon(scaled_lr_schedule, **muon_params)
 
+            partition_dict = {
+                "adam_fixed": adam_fixed_opt,
+                "adam_scaled": adam_scaled_opt,
+                "muon_fixed": muon_fixed_opt,
+                "muon_scaled": muon_scaled_opt,
+            }
+            if has_schedule_params:
+                partition_dict["schedule"] = _mk_schedule_opt(lr_schedule)
             opt = optax.transforms.partition(
-                {
-                    "adam_fixed": adam_fixed_opt,
-                    "adam_scaled": adam_scaled_opt,
-                    "muon_fixed": muon_fixed_opt,
-                    "muon_scaled": muon_scaled_opt,
-                },
+                partition_dict,
                 mdl.mk_partition_map(use_muon=True),
             )
         else:
@@ -189,8 +216,11 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
                     learning_rate=scaled_lr_schedule, **adam_params
                 )
 
+                partition_dict = {"fixed_lr": opt_fixed_lr, "scaled_lr": opt_scaled_lr}
+                if has_schedule_params:
+                    partition_dict["schedule"] = _mk_schedule_opt(lr_schedule)
                 opt = optax.transforms.partition(
-                    {"fixed_lr": opt_fixed_lr, "scaled_lr": opt_scaled_lr},
+                    partition_dict,
                     mdl.mk_partition_map(use_muon=False),
                 )
             else:
@@ -437,10 +467,10 @@ class ScoreMatchingTrainState(BaseTrainState):
         vf_kwargs.pop("conditioning_dim")
         return ScoreMatchingModel(
             **vf_kwargs,
-            schedule=NoiseSchedule(
-                sigma_sq_min=model_cfg.sigma_sq_min,
-                sigma_sq_max=model_cfg.sigma_sq_max,
-            ),
+            init_log_kappa_min=model_cfg.init_log_kappa_min,
+            init_log_kappa_max=model_cfg.init_log_kappa_max,
+            schedule_hidden_dim=model_cfg.schedule_hidden_dim,
+            schedule_n_quadrature_points=model_cfg.schedule_n_quadrature_points,
             cap_conditioning=model_cfg.cap_conditioning,
         )
 

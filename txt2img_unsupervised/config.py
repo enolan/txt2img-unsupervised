@@ -442,12 +442,14 @@ class FlowMatchingModelConfig(VectorFieldConfig):
 class ScoreMatchingModelConfig(VectorFieldConfig):
     """Configuration for score matching models.
 
-    Adds noise schedule parameters and optional cap conditioning on top of the shared
-    VectorField config.
+    Uses a learned noise schedule (VDM design) with VLB loss. The schedule maps
+    t ∈ [0,1] to log κ(t) via a monotonic neural network, with learned endpoints.
     """
 
-    sigma_sq_min: float = 1e-4
-    sigma_sq_max: float = 2.0
+    init_log_kappa_min: float = -0.693  # log(0.5)
+    init_log_kappa_max: float = 9.210  # log(10000)
+    schedule_hidden_dim: int = 32
+    schedule_n_quadrature_points: int = 1024
 
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
     d_max_dist: Optional[Tuple[Tuple[float, float], ...]] = None
@@ -507,10 +509,12 @@ class ScoreMatchingModelConfig(VectorFieldConfig):
         """Validate score matching specific configuration."""
         self._validate_vf(self.conditioning_dim)
 
-        if self.sigma_sq_min <= 0:
-            raise ValueError("sigma_sq_min must be positive")
-        if self.sigma_sq_max <= self.sigma_sq_min:
-            raise ValueError("sigma_sq_max must be greater than sigma_sq_min")
+        if self.init_log_kappa_min >= self.init_log_kappa_max:
+            raise ValueError("init_log_kappa_min must be less than init_log_kappa_max")
+        if self.schedule_hidden_dim <= 0:
+            raise ValueError("schedule_hidden_dim must be positive")
+        if self.schedule_n_quadrature_points < 2:
+            raise ValueError("schedule_n_quadrature_points must be >= 2")
 
         if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
             if self.d_max_dist is not None:
@@ -783,7 +787,8 @@ def test_score_matching_config_roundtrip_unconditioned() -> None:
         mlp_expansion_factor=4,
         mlp_dropout_rate=None,
         input_dropout_rate=None,
-        sigma_sq_min=0.01,
+        init_log_kappa_min=-2.0,
+        init_log_kappa_max=8.0,
     )
     json_str = json.dumps(cfg.to_json_dict())
     regenerated = ScoreMatchingModelConfig.from_json_dict(json.loads(json_str))
@@ -801,7 +806,6 @@ def test_score_matching_config_roundtrip_conditioned_score() -> None:
         mlp_expansion_factor=4,
         mlp_dropout_rate=0.1,
         input_dropout_rate=None,
-        sigma_sq_min=0.01,
         cap_conditioning=CapConditioningMode.CONDITIONED_SCORE,
         d_max_dist=((0.95, 1.0), (0.05, 2.0)),
     )
@@ -914,6 +918,8 @@ class TrainingConfig:
     # Muon optimizer settings
     use_muon: bool = False
     muon_beta: float = 0.95  # Momentum parameter for Muon optimizer
+    # Separate learning rate for the learned noise schedule (VDM). If None, uses the main LR.
+    schedule_learning_rate: Optional[float] = None
 
     @staticmethod
     def from_json_dict(dict: dict[str, Any]) -> "TrainingConfig":
@@ -1025,6 +1031,12 @@ class TrainingConfig:
         else:
             raise ValueError(
                 f"Unknown learning rate schedule {self.learning_rate_schedule}"
+            )
+
+        # Schedule learning rate validation
+        if self.schedule_learning_rate is not None and self.schedule_learning_rate <= 0:
+            raise ValueError(
+                f"schedule_learning_rate must be positive, got {self.schedule_learning_rate}"
             )
 
         # Muon validation

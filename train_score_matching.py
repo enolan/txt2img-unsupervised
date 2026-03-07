@@ -121,16 +121,26 @@ def parse_arguments():
     parser.add_argument("--alpha-input", type=float, help="Alpha scaling for inputs")
     parser.add_argument("--alpha-output", type=float, help="Alpha scaling for outputs")
 
-    # Noise schedule arguments
+    # Learned noise schedule arguments
     parser.add_argument(
-        "--sigma-sq-min",
+        "--init-log-kappa-min",
         type=float,
-        help="Minimum sigma squared (at t=1, near data)",
+        help="Initial log κ at t=0 (noisy end)",
     )
     parser.add_argument(
-        "--sigma-sq-max",
+        "--init-log-kappa-max",
         type=float,
-        help="Maximum sigma squared (at t=0, near noise)",
+        help="Initial log κ at t=1 (data end)",
+    )
+    parser.add_argument(
+        "--schedule-hidden-dim",
+        type=int,
+        help="Hidden dimension for the learned noise schedule network",
+    )
+    parser.add_argument(
+        "--schedule-learning-rate",
+        type=float,
+        help="Separate learning rate for the learned noise schedule (default: use main LR)",
     )
 
     args, _unknown = parser.parse_known_args()

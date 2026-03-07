@@ -1,49 +1,47 @@
 """
-Score matching model for spherical data.
+Score matching model for spherical data using a Variational Diffusion Model (VDM) design.
 
-This implementation adapts denoising diffusion models to the unit sphere using vMF noise.
+This implementation adapts denoising diffusion models to the unit sphere using vMF noise,
+with a learned noise schedule and proper variational lower bound (VLB) loss.
 
 ## Theory and Design
 
 ### Forward Process
-The forward process is Brownian motion on the sphere starting from clean data. At time t, the
-conditional distribution p_t(x|x_1) is approximately vMF centered at x_1 with concentration
-κ(t) = 1/σ²(t). (The true heat kernel on the sphere isn't exactly vMF, but vMF is a good
-approximation, especially at high concentration.)
+The forward process adds noise to data on the sphere. At time t, the conditional distribution
+p_t(x|x_1) is vMF centered at x_1 with concentration κ(t), where κ is determined by a learned
+monotonic schedule: log κ(t) = γ(t).
 
 ### Score Function
 The score of the vMF distribution is ∇log p_t(x|x_1) = κ(t) · P_x(x_1), where P_x denotes
-projection onto the tangent space at x. This points toward x_1 along the geodesic, with magnitude
-κ(t) * sin(θ) where θ is the angle between x and x_1. Note: the magnitude is zero both at the mode
-(θ=0) and at the antipode (θ=π), peaking at θ=π/2.
+projection onto the tangent space at x.
 
 ### Time Convention
 Following flow matching convention: t ∈ [0,1] where t=0 is pure noise, t=1 is data.
 
 ### Noise Schedule
-We use a linear schedule: σ²(t) = σ²_max - (σ²_max - σ²_min) * t
-- At t=0: σ²(0) = σ²_max (high noise, nearly uniform on sphere)
-- At t=1: σ²(1) = σ²_min ≈ 0 (minimal noise, nearly clean data)
+The schedule is a learned monotonic function γ(t) = log κ(t) implemented by LearnedNoiseSchedule.
+The endpoints γ(0) = log κ_min and γ(1) = log κ_max are also learned.
+
+### VLB Loss
+The variational lower bound decomposes into three terms:
+  L_prior = KL(vMF(κ_min) ‖ Uniform)
+  L_diff  = ½ E_t[ γ'(t) · κ(t) · ‖w_θ − w_true‖² ]
+  L_recon = -log C_d(κ_max) - κ_max · A_d(κ_max)
+where w = P_{x_t}(x_1) is the scaled score (tangent projection).
 
 ### Probability Flow ODE
 For sampling, we integrate the probability flow ODE from t=0 (noise) to t=1 (data):
-
-    dx/dt = ½ |dσ²/dt| · ∇log p_t(x)
-
-With the linear schedule, |dσ²/dt| = (σ²_max - σ²_min) is constant, giving:
-
-    dx/dt = ½ * (σ²_max - σ²_min) · s_θ(x, t)
-
-where s_θ is the learned score. After each integration step, project back onto the sphere.
+    dx/dt = ½ γ'(t) · w_θ(x, t)
+The model's __call__ directly returns this ODE velocity.
 
 ### Model Reuse
-We reuse the VectorField class from flow_matching.py since estimating a score (tangent vector at x)
+We reuse the VectorField class from flow_matching.py since estimating a tangent vector at x
 has the same shape as estimating a velocity field.
 """
 
 import math
 
-from dataclasses import dataclass, field, replace
+from dataclasses import field
 from functools import partial
 from typing import FrozenSet, Literal, Optional
 
@@ -70,29 +68,17 @@ from txt2img_unsupervised.flow_matching import (
     sample_sphere,
     generate_samples_inner,
 )
-
-
-@dataclass(frozen=True)
-class NoiseSchedule:
-    """Configuration for the vMF noise schedule.
-
-    The schedule defines σ²(t) = σ²_max - (σ²_max - σ²_min) * t (linear)
-    and κ(t) = 1/σ²(t).
-
-    Attributes:
-        sigma_sq_min: σ² at t=1 (near data). Should be small but positive for numerical stability.
-        sigma_sq_max: σ² at t=0 (near uniform). Larger values give more diffuse initial distribution.
-    """
-
-    sigma_sq_min: float = 1e-4
-    sigma_sq_max: float = 2.0
+from txt2img_unsupervised.learned_schedule import LearnedNoiseSchedule
+from txt2img_unsupervised.vmf import (
+    kl_vmf_uniform,
+)
 
 
 class ScoreMatchingModel(nn.Module):
-    """Score matching model bundling a VectorField with noise schedule and conditioning mode.
+    """Score matching model bundling a VectorField with a learned noise schedule.
 
-    Wraps a VectorField submodule. The neural network predicts the scaled score σ²(t) · s(x, t),
-    and __call__ divides by σ²(t) so callers receive the true score.
+    The neural network (vector_field) predicts the scaled score w_θ = P_{x_t}(x_1),
+    and __call__ returns the ODE velocity ½γ'(t)·w_θ for direct use by the ODE solver.
     """
 
     # VectorField hyperparameters
@@ -113,8 +99,12 @@ class ScoreMatchingModel(nn.Module):
     alpha_input: float = 1.0
     alpha_output: float = 2.0 / math.pi
 
-    # Score matching specific
-    schedule: NoiseSchedule = NoiseSchedule()
+    # Learned schedule hyperparameters
+    schedule_hidden_dim: int = 32
+    schedule_n_quadrature_points: int = 1024
+    init_log_kappa_min: float = -0.693  # log(0.5)
+    init_log_kappa_max: float = 9.210  # log(10000)
+
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
 
     @property
@@ -155,6 +145,12 @@ class ScoreMatchingModel(nn.Module):
                 f"Cap conditioning mode {self.cap_conditioning} is not yet implemented"
             )
         self.vector_field = self.mk_vector_field()
+        self.schedule = LearnedNoiseSchedule(
+            hidden_dim=self.schedule_hidden_dim,
+            n_quadrature_points=self.schedule_n_quadrature_points,
+            init_log_kappa_min=self.init_log_kappa_min,
+            init_log_kappa_max=self.init_log_kappa_max,
+        )
 
     @nn.nowrap
     def dummy_inputs(self):
@@ -168,7 +164,8 @@ class ScoreMatchingModel(nn.Module):
             "params": {
                 "vector_field": self.mk_vector_field().mk_partition_map(use_muon)[
                     "params"
-                ]
+                ],
+                "schedule": "schedule",
             }
         }
 
@@ -178,11 +175,7 @@ class ScoreMatchingModel(nn.Module):
         return self.mk_vector_field().scale_lr(lr)
 
     def __call__(self, x, t, cond_vec):
-        """Run the model, returning the estimated score ∇log p_t(x).
-
-        Internally the neural network predicts the scaled score σ²(t) · s(x, t), which is
-        bounded and easier to learn. This method divides by σ²(t) so callers always receive
-        the true score.
+        """Run the model, returning the ODE velocity ½γ'(t)·w_θ(x, t).
 
         Args:
             x: Points on the sphere [batch_size, domain_dim]
@@ -190,90 +183,77 @@ class ScoreMatchingModel(nn.Module):
             cond_vec: Conditioning vectors [batch_size, cond_dim]
 
         Returns:
-            Estimated score vectors [batch_size, domain_dim] in the tangent space at x.
+            ODE velocity vectors [batch_size, domain_dim] in the tangent space at x.
         """
-        scaled_score = self.vector_field(x, t, cond_vec)
-        sigma_sq = sigma_squared(t, self.schedule)
-        return scaled_score / sigma_sq[:, None]
+        w = self.vector_field(x, t, cond_vec)
+        gamma_prime = self.schedule.log_kappa_derivative(t)
+        return 0.5 * gamma_prime[:, None] * w
+
+    def compute_vlb_loss(self, x_1, t, cond_vec):
+        """Compute the VLB loss combining prior, diffusion, and reconstruction terms.
+
+        Args:
+            x_1: Clean data points [batch_size, dim]
+            t: Uniformly sampled time values [batch_size]
+            cond_vec: Conditioning vectors [batch_size, cond_dim]
+
+        Returns:
+            Scalar VLB loss value.
+        """
+        batch_size = x_1.shape[0]
+        dim = self.domain_dim
+
+        # Get schedule values
+        log_kappa_t = self.schedule(t)
+        kappa_t = jnp.exp(log_kappa_t)
+        gamma_prime = self.schedule.log_kappa_derivative(t)
+
+        # Sample noisy points x_t ~ vMF(x_1, κ(t)).
+        # stop_gradient: the sampling process uses rejection sampling (lax.while_loop)
+        # which doesn't support reverse-mode differentiation. Gradients w.r.t. the schedule
+        # flow through the loss weighting (gamma_prime * kappa_t) and boundary losses instead.
+        noise_rng = self.make_rng("noise")
+        x_t = vmf.sample(
+            noise_rng, x_1, jax.lax.stop_gradient(kappa_t), n_samples=batch_size
+        )
+
+        # Predict scaled score and compute target
+        w_theta = self.vector_field(x_t, t, cond_vec)
+        w_true = tangent_projection(x_t, x_1)
+
+        # Diffusion loss: ½ E_t[ γ'(t) · κ(t) · ‖w_θ − w_true‖² ]
+        per_sample_sq_err = jnp.sum((w_theta - w_true) ** 2, axis=1)
+        diffusion_loss = 0.5 * jnp.mean(gamma_prime * kappa_t * per_sample_sq_err)
+
+        # Prior loss: KL(vMF(κ_min) ‖ Uniform)
+        kappa_min = jnp.exp(self.schedule.log_kappa_min)
+        prior_loss = kl_vmf_uniform(kappa_min, dim)
+
+        # Reconstruction loss: -log C_d(κ_max) - κ_max · A_d(κ_max)
+        kappa_max = jnp.exp(self.schedule.log_kappa_max)
+        recon_loss = vmf_recon_loss(kappa_max, dim)
+
+        return diffusion_loss + prior_loss + recon_loss
 
 
-def sigma_squared(t: Array, schedule: NoiseSchedule) -> Array:
-    """Compute σ²(t) using a linear schedule.
+def vmf_recon_loss(kappa, dim):
+    """Compute the VLB reconstruction loss: -log C_d(κ) - κ·A_d(κ).
 
-    σ²(t) = σ²_max - (σ²_max - σ²_min) * t
-
-    At t=0: σ²(0) = σ²_max (high noise)
-    At t=1: σ²(1) = σ²_min (low noise, near data)
-    """
-    return schedule.sigma_sq_max - (schedule.sigma_sq_max - schedule.sigma_sq_min) * t
-
-
-def kappa(t: Array, schedule: NoiseSchedule) -> Array:
-    """Compute κ(t) = 1/σ²(t), the vMF concentration parameter."""
-    return 1.0 / sigma_squared(t, schedule)
-
-
-def ode_coefficient(t: Array, schedule: NoiseSchedule) -> Array:
-    """Compute the ODE coefficient: ½|dσ²/dt| = ½(σ²_max - σ²_min).
-
-    With a linear schedule, this is constant throughout the integration,
-    ensuring non-zero velocity at all times (unlike cosine schedule where
-    the coefficient is zero at t=0 and t=1).
-    """
-    return 0.5 * (schedule.sigma_sq_max - schedule.sigma_sq_min)
-
-
-def sample_t_log_uniform_kappa(
-    rng: Array, shape: tuple, schedule: NoiseSchedule
-) -> Array:
-    """Sample t so that κ(t) is log-uniformly distributed, giving density p(t) ∝ 1/σ²(t).
-
-    This partially compensates for the σ⁴(t) bias that the scaled score parameterization
-    introduces, without being as aggressive as full κ²-weighting (which concentrates
-    almost all training at t→1 where gradient signal is tiny).
-
-    Samples log(κ) ~ U[log(κ_min), log(κ_max)] where κ_min = 1/σ²_max and
-    κ_max = 1/σ²_min, then inverts to get t.
-
-    Args:
-        rng: JAX random key
-        shape: Shape of the output array
-        schedule: Noise schedule configuration
-
-    Returns:
-        Sampled t values with the given shape, in [0, 1]
-    """
-    u = jax.random.uniform(rng, shape)
-    s_min = schedule.sigma_sq_min
-    s_max = schedule.sigma_sq_max
-    # log(κ) ~ U[log(1/s_max), log(1/s_min)], so σ² = 1/κ is log-uniform on [s_min, s_max]
-    sigma_sq = s_min * (s_max / s_min) ** u
-    return (s_max - sigma_sq) / (s_max - s_min)
-
-
-def sample_noisy_point(
-    rng: Array, x_1: Array, t: Array, schedule: NoiseSchedule
-) -> Array:
-    """Sample x_t ~ vMF(x_1, κ(t)) for each (x_1, t) pair.
+    This is the expected negative log-likelihood of the data under the final-time
+    vMF distribution, i.e. -E_{x~vMF(x_1, κ)}[log p(x|x_1)] = -(log C_d(κ) + κ·A_d(κ)).
 
     Args:
-        rng: JAX random key
-        x_1: Clean data points [batch_size, dim]
-        t: Time values [batch_size]
-        schedule: Noise schedule configuration
+        kappa: Concentration at t=1 (JAX array).
+        dim: Ambient space dimension (int).
 
     Returns:
-        Noisy samples x_t [batch_size, dim]
+        Reconstruction loss, same shape as kappa.
     """
-    assert x_1.ndim == 2
-    assert t.ndim == 1
-    assert x_1.shape[0] == t.shape[0]
-
-    batch_size = x_1.shape[0]
-    kappa_values = kappa(t, schedule)
-
-    # Use vmf.sample's batched mode: mu (n, d), kappa (n,) -> (n, d)
-    return vmf.sample(rng, x_1, kappa_values, n_samples=batch_size)
+    log_surface_area = -sphere_log_inverse_surface_area(dim)
+    # H(vMF) = log|S^{d-1}| - KL(vMF || Uniform). Reusing the numerically stable
+    # KL implementation avoids both small-κ cancellation in high dimensions and
+    # large-κ cancellation in low dimensions.
+    return log_surface_area - kl_vmf_uniform(kappa, dim)
 
 
 def tangent_projection(x: Array, v: Array) -> Array:
@@ -290,77 +270,6 @@ def tangent_projection(x: Array, v: Array) -> Array:
     return v - dot_products * x
 
 
-def compute_target_score(
-    x_t: Array, x_1: Array, t: Array, schedule: NoiseSchedule
-) -> Array:
-    """Compute the ground-truth score: κ(t) * P_{x_t}(x_1).
-
-    The score of the vMF distribution p_t(x|x_1) is the gradient of log p_t with respect to x,
-    constrained to the tangent space. For vMF(μ=x_1, κ), this is κ * P_x(x_1).
-
-    Args:
-        x_t: Noisy points [batch_size, dim]
-        x_1: Clean data points [batch_size, dim]
-        t: Time values [batch_size]
-        schedule: Noise schedule configuration
-
-    Returns:
-        Target score vectors [batch_size, dim]
-    """
-    kappa_values = kappa(t, schedule)
-    projected = tangent_projection(x_t, x_1)
-    return kappa_values[:, None] * projected
-
-
-def denoising_score_matching_loss(
-    model: ScoreMatchingModel,
-    params,
-    x_1: Array,
-    x_t: Array,
-    t: Array,
-    conditioning_data: Array,
-    rng: Optional[Array] = None,
-) -> Array:
-    f"""Compute weighted MSE loss between predicted and target score.
-
-    The target score for the conditional distribution p_t(x|x_1) is κ(t) · P_{x_t}(x_1).
-    The model returns the true score (internally the neural network predicts the bounded
-    scaled score s(x,t) / κ(t) = P_{x_t}(x_1), then multiplies by κ(t)).
-
-    We use an MSE loss on the scaled score, P_{x_t}(x_1). Yes it's confusing and wasteful to scale
-    the score up in ScoreMatchingModel only to scale it back down again by the exact same factor,
-    but it's also confusing to have the model's output not actually be the score when the class is
-    called ScoreMatchingModel.
-
-    Args:
-        model: Score matching model
-        params: Model parameters
-        x_1: Clean data [batch_size, dim]
-        x_t: Noisy samples [batch_size, dim]
-        t: Times [batch_size]
-        conditioning_data: Conditioning vectors [batch_size, cond_dim]
-        rng: Random key for dropout (if model uses it)
-
-    Returns:
-        Scalar loss value
-    """
-    # Target is the scaled score: σ²(t) * score = σ²(t) * κ(t) * P_x(x_1) = P_x(x_1)
-    # This is just the tangent projection, bounded in [-1, 1]
-    target_scaled_scores = tangent_projection(x_t, x_1)
-
-    rngs_dict = {"dropout": rng} if rng is not None else {}
-    predicted_scores = model.apply(
-        params, x_t, t, conditioning_data, rngs=rngs_dict
-    )  # [batch_size, dim]
-    kappas = kappa(t, model.schedule)  # [batch_size]
-    predicted_scaled_scores = predicted_scores / kappas[:, None]
-
-    per_sample_loss = jnp.sum(
-        (target_scaled_scores - predicted_scaled_scores) ** 2, axis=1
-    )
-    return jnp.mean(per_sample_loss)
-
-
 @partial(jax.jit, static_argnames=("model",))
 def compute_batch_loss(
     model: ScoreMatchingModel,
@@ -368,7 +277,7 @@ def compute_batch_loss(
     batch: dict,
     rng: Array,
 ) -> Array:
-    """Extract data from batch, sample t and x_t, compute loss.
+    """Extract data from batch, sample t, compute VLB loss.
 
     Args:
         model: Score matching model
@@ -377,19 +286,25 @@ def compute_batch_loss(
         rng: JAX random key
 
     Returns:
-        The computed loss value
+        The computed VLB loss value
     """
     x_1 = batch["point_vec"]
     batch_size = x_1.shape[0]
 
-    noise_rng, time_rng = jax.random.split(rng)
+    noise_rng, time_rng, dropout_rng = jax.random.split(rng, 3)
 
-    conditioning_data = batch.get("cond_vec", jnp.zeros((batch_size, 0)))
+    cond_vecs = batch.get("cond_vec", jnp.zeros((batch_size, 0)))
 
-    t = sample_t_log_uniform_kappa(time_rng, (batch_size,), model.schedule)
-    x_t = sample_noisy_point(noise_rng, x_1, t, model.schedule)
+    t = jax.random.uniform(time_rng, (batch_size,))
 
-    return denoising_score_matching_loss(model, params, x_1, x_t, t, conditioning_data)
+    return model.apply(
+        params,
+        x_1,
+        t,
+        cond_vecs,
+        rngs={"dropout": dropout_rng, "noise": noise_rng},
+        method=model.compute_vlb_loss,
+    )
 
 
 @partial(jax.jit, inline=True, static_argnames=("model",))
@@ -403,8 +318,7 @@ def _compute_velocity_for_sampling(
 ) -> Array:
     """Compute ODE velocity for sampling.
 
-    The probability flow ODE is dx/dt = coeff · s(x, t), where coeff = ½(σ²_max - σ²_min)
-    is constant.
+    model.__call__ directly returns the ODE velocity ½γ'(t)·w_θ.
 
     Args:
         model: Score matching model
@@ -430,9 +344,7 @@ def _compute_velocity_for_sampling(
     else:
         t_vec = jnp.full((x.shape[0],), t)
 
-    score = model.apply(params, x, t_vec, cond_vecs, rngs=rngs_dict)
-    coeff = ode_coefficient(t_vec, model.schedule)
-    return coeff * score
+    return model.apply(params, x, t_vec, cond_vecs, rngs=rngs_dict)
 
 
 @partial(jax.jit, static_argnames=("model",), inline=True)
@@ -455,7 +367,7 @@ def generate_samples(
 ) -> Array:
     """Generate samples by integrating the probability flow ODE.
 
-    Integrates dx/dt = ode_coefficient(t) * s_θ(x, t) from t=0 (noise) to t=1 (data).
+    Integrates dx/dt = ½γ'(t)·w_θ(x, t) from t=0 (noise) to t=1 (data).
 
     Args:
         model: Score matching model
@@ -579,168 +491,70 @@ def compute_nll(
 # =============================================================================
 
 
-def test_noise_schedule():
-    """Test that the noise schedule functions compute correct values."""
-    schedule = NoiseSchedule(sigma_sq_min=1e-4, sigma_sq_max=2.0)
-
-    # Test boundary conditions
-    t_0 = jnp.array(0.0)
-    t_1 = jnp.array(1.0)
-
-    # At t=0: σ²(0) = σ²_max
-    sigma_sq_0 = sigma_squared(t_0, schedule)
-    np.testing.assert_allclose(sigma_sq_0, schedule.sigma_sq_max, rtol=1e-6)
-
-    # At t=1: σ²(1) = σ²_min
-    sigma_sq_1 = sigma_squared(t_1, schedule)
-    np.testing.assert_allclose(sigma_sq_1, schedule.sigma_sq_min, rtol=1e-3)
-
-    # Test κ(t) = 1/σ²(t)
-    t_mid = jnp.array(0.5)
-    kappa_mid = kappa(t_mid, schedule)
-    sigma_sq_mid = sigma_squared(t_mid, schedule)
-    np.testing.assert_allclose(kappa_mid, 1.0 / sigma_sq_mid, rtol=1e-6)
-
-    # Test ODE coefficient is constant and positive (linear schedule)
-    t_values = jnp.linspace(0.0, 1.0, 100)
-    coeffs = jax.vmap(lambda t: ode_coefficient(t, schedule))(t_values)
-    expected_coeff = 0.5 * (schedule.sigma_sq_max - schedule.sigma_sq_min)
-
-    # All coefficients should be equal to the expected constant
-    np.testing.assert_allclose(coeffs, expected_coeff, rtol=1e-6)
-    assert jnp.all(coeffs > 0), "ODE coefficient should be positive"
-
-
-def test_sample_t_log_uniform_kappa():
-    """Test that sample_t_log_uniform_kappa produces a log-uniform distribution over κ."""
-    schedule = NoiseSchedule(sigma_sq_min=0.01, sigma_sq_max=2.0)
-    n = 100_000
-    samples = sample_t_log_uniform_kappa(jax.random.PRNGKey(0), (n,), schedule)
-
-    # Output should be in [0, 1]
-    assert jnp.all(samples >= 0.0)
-    assert jnp.all(samples <= 1.0)
-
-    # CDF: F(t) = log(σ²_max / σ²(t)) / log(σ²_max / σ²_min)
-    # (equivalently, log(κ(t) / κ_min) / log(κ_max / κ_min))
-    s_min, s_max = schedule.sigma_sq_min, schedule.sigma_sq_max
-    log_ratio = jnp.log(s_max / s_min)
-    cdf = lambda t: jnp.log(s_max / sigma_squared(t, schedule)) / log_ratio
-    np.testing.assert_allclose(float(cdf(0.0)), 0.0, atol=1e-10)
-    np.testing.assert_allclose(float(cdf(1.0)), 1.0, atol=1e-10)
-
-    # KS test: compare empirical samples against the theoretical CDF
-    ks_stat, p_value = stats.kstest(
-        np.array(samples), lambda t: np.array(cdf(jnp.array(t)))
-    )
-    assert p_value > 0.01, f"KS test failed: stat={ks_stat:.4f}, p={p_value:.4f}"
-
-    # Samples should be skewed toward t=1 (low noise), but less extremely than κ²
-    assert jnp.mean(samples) > 0.5, "Samples should be skewed toward t=1"
-
-
 def test_target_score_at_mode():
-    """Test that score is zero when x_t = x_1 (at the mode)."""
-    schedule = NoiseSchedule()
-
-    # When x_t = x_1, the tangent projection P_{x_t}(x_1) = x_1 - (x_1·x_1)x_1 = 0
+    """Test that tangent projection is zero when x_t = x_1 (at the mode)."""
     batch_size = 10
     dim = 3
     rng = jax.random.PRNGKey(42)
 
     x_1 = sample_sphere(rng, batch_size, dim)
     x_t = x_1  # Same point
-    t = jax.random.uniform(rng, (batch_size,))
 
-    target = compute_target_score(x_t, x_1, t, schedule)
-
-    # Score should be zero (within numerical precision)
+    target = tangent_projection(x_t, x_1)
     np.testing.assert_allclose(target, 0.0, atol=1e-5)
 
 
-def test_target_score_direction():
-    """Test that score points toward x_1 in tangent space."""
-    schedule = NoiseSchedule()
-
-    batch_size = 100
-    dim = 16
-
-    key1, key2 = jax.random.split(jax.random.PRNGKey(123))
-    x_1 = sample_sphere(key1, batch_size, dim)
-
-    t = jnp.full((batch_size,), 0.5)
-    x_t = sample_noisy_point(key2, x_1, t, schedule)
-
-    target = compute_target_score(x_t, x_1, t, schedule)
-
-    # The geodesic direction from x_t toward x_1 is P_{x_t}(x_1) / ||P_{x_t}(x_1)||
-    geodesic_dir = tangent_projection(x_t, x_1)
-    geodesic_dir_norm = jnp.linalg.norm(geodesic_dir, axis=1, keepdims=True)
-
-    # For non-coincident points, check alignment
-    nonzero_mask = geodesic_dir_norm[:, 0] > 1e-6
-    if jnp.any(nonzero_mask):
-        geodesic_dir_unit = geodesic_dir / jnp.maximum(geodesic_dir_norm, 1e-8)
-        target_unit = target / jnp.maximum(
-            jnp.linalg.norm(target, axis=1, keepdims=True), 1e-8
-        )
-
-        # Dot product should be positive (pointing in same direction)
-        alignment = jnp.sum(geodesic_dir_unit * target_unit, axis=1)
-        assert jnp.all(alignment[nonzero_mask] > 0.99), "Score should point toward x_1"
-
-
 def test_sample_noisy_point():
-    """Test that sample_noisy_point produces valid samples."""
-    schedule = NoiseSchedule()
-
+    """Test that vMF sampling produces valid samples with correct concentration behavior."""
     batch_size = 1000
     dim = 3
 
     key1, key2, key3 = jax.random.split(jax.random.PRNGKey(456), 3)
     x_1 = sample_sphere(key1, batch_size, dim)
-    # With linear schedule: σ²(0.95) ≈ 0.1, so κ(0.95) ≈ 10
-    t = jnp.full((batch_size,), 0.95)
+    kappa_low = 10.0
+    kappa_high = 100.0
 
-    x_t = sample_noisy_point(key2, x_1, t, schedule)
+    x_t_low = vmf.sample(
+        key2, x_1, jnp.full((batch_size,), kappa_low), n_samples=batch_size
+    )
+    x_t_high = vmf.sample(
+        key3, x_1, jnp.full((batch_size,), kappa_high), n_samples=batch_size
+    )
 
-    norms = jnp.linalg.norm(x_t, axis=1)
+    norms = jnp.linalg.norm(x_t_low, axis=1)
     np.testing.assert_allclose(norms, 1.0, rtol=1e-5)
 
-    similarities = jnp.sum(x_t * x_1, axis=1)
-    mean_similarity = jnp.mean(similarities)
-    assert mean_similarity > 0.8, f"Mean similarity {mean_similarity} should be > 0.8"
+    similarities_low = jnp.mean(jnp.sum(x_t_low * x_1, axis=1))
+    similarities_high = jnp.mean(jnp.sum(x_t_high * x_1, axis=1))
 
-    # Higher t = higher κ = more concentrated samples
-    t_high = jnp.full((batch_size,), 0.99)
-    x_t_high = sample_noisy_point(key3, x_1, t_high, schedule)
-    similarities_high = jnp.sum(x_t_high * x_1, axis=1)
-    mean_similarity_high = jnp.mean(similarities_high)
-
+    assert similarities_low > 0.8, f"Mean similarity {similarities_low} should be > 0.8"
     assert (
-        mean_similarity_high > mean_similarity
+        similarities_high > similarities_low
     ), "Higher κ should give samples closer to x_1"
 
 
-_baseline_model = ScoreMatchingModel(
-    domain_dim=3,
-    n_layers=6,
-    d_model=512,
-    mlp_expansion_factor=4,
-    input_dropout_rate=None,
-    mlp_dropout_rate=None,
-    use_pre_mlp_projection=True,
-)
+def _make_model(domain_dim, **kwargs):
+    """Create a ScoreMatchingModel with test-friendly defaults."""
+    defaults = dict(
+        domain_dim=domain_dim,
+        n_layers=2,
+        d_model=512,
+        mlp_expansion_factor=4,
+        input_dropout_rate=None,
+        mlp_dropout_rate=None,
+        use_pre_mlp_projection=True,
+    )
+    defaults.update(kwargs)
+    return ScoreMatchingModel(**defaults)
 
 
 @pytest.mark.usefixtures("starts_with_progressbar")
 @pytest.mark.parametrize("domain_dim", [3, 16])
 def test_train_trivial(domain_dim):
     """Train a model where all data is a single fixed point."""
-    # Deferred import: training_infra → checkpoint → this module creates a cycle.
     from txt2img_unsupervised.training_infra import train_for_tests
 
-    model = replace(_baseline_model, domain_dim=domain_dim, n_layers=2)
+    model = _make_model(domain_dim)
 
     batch_size = 256
     first_dim_vec = jnp.zeros(domain_dim)
@@ -802,12 +616,11 @@ def test_train_vmf(domain_dim):
     """Train a model with data from a von Mises-Fisher distribution."""
     from txt2img_unsupervised.training_infra import train_for_tests
 
-    model = replace(
-        _baseline_model,
-        domain_dim=domain_dim,
-        n_layers=2,
+    model = _make_model(
+        domain_dim,
         d_model=256,
-        schedule=NoiseSchedule(sigma_sq_min=0.01),
+        init_log_kappa_min=-0.693,
+        init_log_kappa_max=jnp.log(100.0).item(),  # κ_max = 100
     )
 
     batch_size = 256
@@ -877,14 +690,12 @@ def test_train_vmf(domain_dim):
 
 @pytest.mark.parametrize("domain_dim", [3, 16])
 def test_zero_init_uniform_nll(domain_dim):
-    """Verify that a freshly initialized model (zero-init output) gives correct uniform NLL."""
-    model = replace(
-        _baseline_model,
-        domain_dim=domain_dim,
-        n_layers=2,
-        d_model=32,
-        schedule=NoiseSchedule(sigma_sq_min=0.01),
-    )
+    """Verify that a freshly initialized model (zero-init output) gives correct uniform NLL.
+
+    At initialization, w_θ ≈ 0, so the ODE velocity ≈ 0, and the model
+    should produce uniform density on the sphere.
+    """
+    model = _make_model(domain_dim, d_model=32)
 
     params_rng, data_rng = jax.random.split(jax.random.PRNGKey(12345))
     params = model.init(params_rng, *model.dummy_inputs())
@@ -904,3 +715,114 @@ def test_zero_init_uniform_nll(domain_dim):
     uniform_entropy = float(-sphere_log_inverse_surface_area(domain_dim))
     print(f"Model NLL: {model_nll:.4f}, uniform entropy: {uniform_entropy:.4f}")
     np.testing.assert_allclose(model_nll, uniform_entropy, atol=1e-2, rtol=0)
+
+
+def test_vlb_loss_components():
+    """Verify VLB loss components are reasonable at initialization."""
+    dim = 3
+    model = _make_model(dim, d_model=32)
+
+    params_rng, data_rng, noise_rng = jax.random.split(jax.random.PRNGKey(42), 3)
+    params = model.init(params_rng, *model.dummy_inputs())
+
+    x_1 = sample_sphere(data_rng, 64, dim)
+    t = jnp.linspace(0.01, 0.99, 64)
+    cond_vecs = jnp.zeros((64, 0))
+
+    loss = model.apply(
+        params,
+        x_1,
+        t,
+        cond_vecs,
+        rngs={"noise": noise_rng},
+        method=model.compute_vlb_loss,
+    )
+
+    assert jnp.isfinite(loss), f"VLB loss is not finite: {loss}"
+    assert float(loss) > 0, f"VLB loss should be positive, got {loss}"
+
+    # Prior loss should be small for the default small κ_min
+    kappa_min = jnp.exp(jnp.array(model.init_log_kappa_min))
+    prior = float(kl_vmf_uniform(kappa_min, dim))
+    print(f"Prior loss: {prior:.6f}")
+    assert (
+        prior < 1.0
+    ), f"Prior loss {prior} too large for κ_min = {float(kappa_min):.3f}"
+
+    # Recon loss should be finite
+    kappa_max = jnp.exp(jnp.array(model.init_log_kappa_max))
+    recon = float(vmf_recon_loss(kappa_max, dim))
+    print(f"Recon loss: {recon:.6f}")
+    assert jnp.isfinite(jnp.array(recon)), f"Recon loss is not finite: {recon}"
+
+
+def test_vlb_loss_gradients_flow():
+    """Verify that gradients flow through the VLB loss to both vector field and schedule params."""
+    dim = 3
+    model = _make_model(dim, d_model=32)
+
+    params_rng, data_rng, noise_rng = jax.random.split(jax.random.PRNGKey(7), 3)
+    params = model.init(params_rng, *model.dummy_inputs())
+
+    x_1 = sample_sphere(data_rng, 32, dim)
+    t = jax.random.uniform(jax.random.PRNGKey(0), (32,))
+    cond_vecs = jnp.zeros((32, 0))
+
+    def loss_fn(p):
+        return model.apply(
+            p,
+            x_1,
+            t,
+            cond_vecs,
+            rngs={"noise": noise_rng},
+            method=model.compute_vlb_loss,
+        )
+
+    grads = jax.grad(loss_fn)(params)
+
+    # Check vector field grads exist
+    vf_grads = grads["params"]["vector_field"]
+    flat_vf = jax.tree_util.tree_leaves(vf_grads)
+    assert any(jnp.any(g != 0) for g in flat_vf), "No gradient flow to vector field"
+
+    # Check schedule grads exist
+    sched_grads = grads["params"]["schedule"]
+    flat_sched = jax.tree_util.tree_leaves(sched_grads)
+    assert any(jnp.any(g != 0) for g in flat_sched), "No gradient flow to schedule"
+
+
+def test_vmf_recon_loss_gradient_flows():
+    """Test that gradients flow through vmf_recon_loss."""
+    grad_fn = jax.grad(lambda k: vmf_recon_loss(k, 768))
+    g = grad_fn(jnp.array(100.0))
+    assert jnp.isfinite(g)
+
+
+def _exact_vmf_recon_loss_dim_3(kappa: float) -> float:
+    """Closed-form vMF entropy in d=3."""
+    log_sinh = kappa - np.log(2.0) + np.log1p(-np.exp(-2.0 * kappa))
+    return np.log(4.0 * np.pi) + log_sinh - np.log(kappa) - kappa / np.tanh(kappa) + 1.0
+
+
+@pytest.mark.parametrize("kappa", [1e-3, 0.1, 1.0, 100.0, 10000.0])
+def test_vmf_recon_loss_matches_closed_form_dim_3(kappa):
+    """Test vmf_recon_loss against the exact d=3 entropy formula."""
+    result = float(vmf_recon_loss(jnp.array(kappa), 3))
+    expected = _exact_vmf_recon_loss_dim_3(kappa)
+    np.testing.assert_allclose(result, expected, atol=1e-6, err_msg=f"κ={kappa}")
+
+
+@pytest.mark.parametrize("kappa", [1e-6, 1e-3, 0.1])
+def test_vmf_recon_loss_gradient_small_kappa_high_dim(kappa):
+    """Test the small-κ entropy gradient in high dimension."""
+    dim = 768
+    grad_fn = jax.grad(lambda concentration: vmf_recon_loss(concentration, dim))
+    gradient = float(grad_fn(jnp.array(kappa)))
+    expected = -(kappa / dim + kappa**3 / (2.0 * dim * (dim + 2)))
+    np.testing.assert_allclose(
+        gradient,
+        expected,
+        rtol=5e-4,
+        atol=1e-12,
+        err_msg=f"κ={kappa}",
+    )
