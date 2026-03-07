@@ -225,7 +225,8 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
     your context window. If you are running a test that might produce tons of output, send its
     output to a file. You can efficiently read the relevant data from the log file with tools like
     `grep`, or by invoking a subagent. Never directly read thousands of lines of logging output when
-    there's a more efficient option.
+    there's a more efficient option. Never pipe test output directly to `tail` or `grep`, this may
+    lose important information.
 - **GPU locking**: Multiple agents may be running concurrently in this project. Any command that
   uses the GPU (tests, training, inference) MUST be wrapped with `flock` to avoid conflicts:
   ```
