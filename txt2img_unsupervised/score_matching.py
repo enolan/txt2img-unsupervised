@@ -41,9 +41,9 @@ has the same shape as estimating a velocity field.
 
 import math
 
-from dataclasses import field
+from dataclasses import dataclass, field
 from functools import partial
-from typing import FrozenSet, Literal, Optional
+from typing import Callable, FrozenSet, Literal, Optional
 
 import flax.linen as nn
 import jax
@@ -610,11 +610,93 @@ def test_train_trivial(domain_dim):
     ), f"NLL {result.test_nll:.4f} should be << 0 for single-point distribution"
 
 
+def _sample_sphere_np(n, dim, rng):
+    """Sample uniformly from the unit sphere using numpy."""
+    points = rng.standard_normal((n, dim))
+    points /= np.linalg.norm(points, axis=1, keepdims=True)
+    return points
+
+
+@dataclass
+class _TargetDistribution:
+    """A target distribution for training tests.
+
+    Attributes:
+        rvs: Sample function (n, rng) -> [n, dim] array.
+        logpdf: Log-probability function (points) -> [n] array. May return -inf.
+        entropy: Differential entropy of the distribution.
+        interior_mask: Returns True for points well inside the support, far from any boundary,
+            where we expect the model's density to be accurate.
+        exterior_mask: Returns True for points well outside the support, far from any boundary,
+            where we expect the model to assign very low density.
+    """
+
+    rvs: Callable[[int, np.random.Generator], np.ndarray]
+    logpdf: Callable[[np.ndarray], np.ndarray]
+    entropy: float
+    interior_mask: Callable[[np.ndarray], np.ndarray]
+    exterior_mask: Callable[[np.ndarray], np.ndarray]
+
+
+def _make_target_distribution(name, domain_dim):
+    """Create a target distribution for training tests."""
+    _all_true = lambda x: np.ones(x.shape[0], dtype=bool)
+    _all_false = lambda x: np.zeros(x.shape[0], dtype=bool)
+
+    if name == "vmf":
+        mean_direction = np.zeros(domain_dim)
+        mean_direction[0] = 1.0
+        vmf_dist = stats.vonmises_fisher(mean_direction, 2)
+        return _TargetDistribution(
+            rvs=vmf_dist.rvs,
+            logpdf=vmf_dist.logpdf,
+            entropy=vmf_dist.entropy(),
+            interior_mask=_all_true,
+            exterior_mask=_all_false,
+        )
+    elif name == "uniform":
+        log_inv_sa = float(sphere_log_inverse_surface_area(domain_dim))
+        return _TargetDistribution(
+            rvs=lambda n, rng: _sample_sphere_np(n, domain_dim, rng),
+            logpdf=lambda x: np.full(x.shape[0], log_inv_sa),
+            entropy=-log_inv_sa,
+            interior_mask=_all_true,
+            exterior_mask=_all_false,
+        )
+    elif name == "hemisphere":
+        log_inv_sa = float(sphere_log_inverse_surface_area(domain_dim))
+        hemi_logp = log_inv_sa + np.log(2)
+        margin = 0.05
+
+        def hemi_rvs(n, rng):
+            points = _sample_sphere_np(n, domain_dim, rng)
+            points[points[:, 0] < 0] *= -1
+            return points
+
+        def hemi_logpdf(x):
+            result = np.full(x.shape[0], hemi_logp)
+            result[x[:, 0] <= 0] = -np.inf
+            return result
+
+        return _TargetDistribution(
+            rvs=hemi_rvs,
+            logpdf=hemi_logpdf,
+            entropy=-hemi_logp,
+            interior_mask=lambda x: x[:, 0] > margin,
+            exterior_mask=lambda x: x[:, 0] < -margin,
+        )
+    else:
+        raise ValueError(f"Unknown distribution: {name}")
+
+
 @pytest.mark.usefixtures("starts_with_progressbar")
 @pytest.mark.parametrize("domain_dim", [3, 16])
-def test_train_vmf(domain_dim):
-    """Train a model with data from a von Mises-Fisher distribution."""
+@pytest.mark.parametrize("dist_name", ["vmf", "uniform", "hemisphere"])
+def test_train_distribution(domain_dim, dist_name):
+    """Train a model on a distribution and verify learned densities match at uniform test points."""
     from txt2img_unsupervised.training_infra import train_for_tests
+
+    dist = _make_target_distribution(dist_name, domain_dim)
 
     model = _make_model(
         domain_dim,
@@ -626,22 +708,15 @@ def test_train_vmf(domain_dim):
     batch_size = 256
     n_samples = 32768
 
-    mean_direction = np.zeros(domain_dim)
-    mean_direction[0] = 1.0
-    kappa_data = 2
-
-    vmf_dist = stats.vonmises_fisher(mean_direction, kappa_data)
     data_rng = np.random.default_rng(42)
-    points = vmf_dist.rvs(n_samples, random_state=data_rng)
-
+    points = dist.rvs(n_samples, data_rng)
     dset = Dataset.from_dict({"point_vec": points}).with_format("np")
 
     test_n_samples = 128
-    test_points = vmf_dist.rvs(test_n_samples, random_state=data_rng)
+    test_points = dist.rvs(test_n_samples, data_rng)
     test_dset = Dataset.from_dict({"point_vec": test_points}).with_format("np")
 
-    differential_entropy = vmf_dist.entropy()
-    print(f"vMF distribution entropy: {differential_entropy:.6f}")
+    print(f"Distribution entropy: {dist.entropy:.6f}")
 
     loss_fn = partial(compute_batch_loss, model)
 
@@ -655,37 +730,83 @@ def test_train_vmf(domain_dim):
         learning_rate=1e-3,
         loss_fn=loss_fn,
         fields=["point_vec"],
-        epochs=3,
+        epochs=5,
         test_dataset=test_dset,
         nll_fn=nll_fn,
     )
     eval_params = result.state.get_eval_params()
 
-    n_test_samples = 100
+    # Generate samples and check quality under the true distribution
+    n_gen_samples = 100
     samples = generate_samples(
         model,
         eval_params,
         jax.random.PRNGKey(42),
-        cond_vecs=jnp.zeros((n_test_samples, 0)),
+        cond_vecs=jnp.zeros((n_gen_samples, 0)),
         n_steps=100,
     )
-
     samples_np = np.array(samples)
-    log_probs = vmf_dist.logpdf(samples_np)
-    sample_nll = -np.mean(log_probs)
+    sample_log_probs = dist.logpdf(samples_np)
 
-    print(f"Sample NLL: {sample_nll:.6f}")
-    print(f"Differential entropy: {differential_entropy:.6f}")
+    sample_in_support = np.isfinite(sample_log_probs)
+    in_support_frac = np.mean(sample_in_support)
+    print(f"Fraction of generated samples in support: {in_support_frac:.4f}")
+    if not np.all(sample_in_support):
+        assert (
+            in_support_frac > 0.8
+        ), f"Only {in_support_frac:.1%} of samples are in-support"
 
+    if np.any(sample_in_support):
+        in_support_nll = -np.mean(sample_log_probs[sample_in_support])
+        print(
+            f"In-support sample NLL: {in_support_nll:.6f}, entropy: {dist.entropy:.6f}"
+        )
+        assert (
+            in_support_nll < dist.entropy + 1.0
+        ), f"In-support sample NLL {in_support_nll} too high vs entropy {dist.entropy}"
+
+    # Compare model log-likelihoods to true log-likelihoods at uniformly distributed test
+    # points. This tests that the model has learned the correct density shape everywhere.
+    n_uniform = 256
+    uniform_points = np.array(
+        sample_sphere(jax.random.PRNGKey(99), n_uniform, domain_dim)
+    )
+    model_log_probs = -np.array(
+        compute_nll(
+            model,
+            eval_params,
+            {"point_vec": jnp.array(uniform_points)},
+            n_steps=256,
+            rng=jax.random.PRNGKey(123),
+            n_projections=32,
+        )
+    )
+    true_log_probs = dist.logpdf(uniform_points)
+
+    # Check density accuracy well inside the support (away from any boundary).
+    interior = dist.interior_mask(uniform_points)
+    n_interior = np.sum(interior)
+    print(f"Interior points: {n_interior}/{n_uniform}")
     assert (
-        sample_nll < differential_entropy + 1.0
-    ), f"Sample NLL {sample_nll} too high compared to entropy {differential_entropy}"
+        n_interior >= 10
+    ), f"Too few interior points ({n_interior}) for meaningful check"
+    mae = np.mean(np.abs(model_log_probs[interior] - true_log_probs[interior]))
+    print(f"Interior MAE of log-probs: {mae:.4f}")
+    assert mae < 0.5, f"Interior MAE {mae:.4f} too high"
 
-    print(f"Model NLL: {result.test_nll:.4f}, vMF entropy: {differential_entropy:.4f}")
-    assert np.isfinite(result.test_nll), f"NLL is not finite: {result.test_nll}"
-    assert (
-        result.test_nll < differential_entropy + 0.5
-    ), f"Model NLL {result.test_nll:.4f} too high compared to entropy {differential_entropy:.4f}"
+    # Check that the model assigns low density well outside the support.
+    exterior = dist.exterior_mask(uniform_points)
+    n_exterior = np.sum(exterior)
+    if n_exterior > 0:
+        mean_interior_lp = np.mean(true_log_probs[interior])
+        mean_exterior_lp = np.mean(model_log_probs[exterior])
+        print(f"Mean interior true log-prob: {mean_interior_lp:.4f}")
+        print(f"Mean exterior model log-prob: {mean_exterior_lp:.4f}")
+        # Average exterior density should be <5% of interior density (3 nats gap)
+        assert mean_exterior_lp < mean_interior_lp - 3, (
+            f"Mean exterior log-prob {mean_exterior_lp:.4f} too close to "
+            f"interior mean {mean_interior_lp:.4f} (gap {mean_interior_lp - mean_exterior_lp:.2f}, need >3)"
+        )
 
 
 @pytest.mark.parametrize("domain_dim", [3, 16])
