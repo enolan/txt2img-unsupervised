@@ -38,7 +38,8 @@ class LogitsTable:
     """
 
     def __init__(self, d, n):
-        """Generate a table of log band-area densities for a d-sphere.
+        """Generate a table of log band-area densities for a d-sphere. Reminder: this a sphere in
+        R^(d+1), the *surface* is d-dimensional.
 
         We discretize heights ``h ∈ [-1, 1]`` into ``n`` buckets and compute logits proportional to
         the area of the spherical band per unit ``h`` at each height. For a d-sphere, the density is
