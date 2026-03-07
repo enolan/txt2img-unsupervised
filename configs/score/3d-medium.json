@@ -1,0 +1,14 @@
+{
+    "model_type": "score_matching",
+    "n_layers": 16,
+    "domain_dim": 3,
+    "use_pre_mlp_projection": true,
+    "d_model": 512,
+    "mlp_expansion_factor": 4,
+    "mlp_dropout_rate": null,
+    "input_dropout_rate": null,
+    "init_log_kappa_min": -0.693,
+    "init_log_kappa_max": 9.210,
+    "schedule_hidden_dim": 32,
+    "schedule_n_quadrature_points": 1024
+}
