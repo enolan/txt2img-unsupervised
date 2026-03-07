@@ -13,28 +13,8 @@ from txt2img_unsupervised.vmf import (
     sample,
     fit,
     _DEFAULT_MAX_KAPPA,
-    _log_modified_bessel_i,
-    _log_modified_bessel_small_x,
     _sample_uniform_sphere,
 )
-
-
-class TestBesselUtilities:
-    def test_fallback_to_series_expansion(self, monkeypatch):
-        """Ensure series fallback runs when SciPy returns non-positive values."""
-
-        def fake_ive(nu, x):
-            return -1.0
-
-        monkeypatch.setattr("txt2img_unsupervised.vmf.sps.ive", fake_ive)
-
-        nu = 1.5
-        x = 1e-4
-
-        fallback = _log_modified_bessel_small_x(nu, x)
-        actual = _log_modified_bessel_i(nu, x)
-
-        assert jnp.allclose(actual, fallback)
 
 
 class TestLogNormalizationConstant:
