@@ -116,9 +116,8 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
             else training_cfg.learning_rate
         )
         sched_lr = create_lr_schedule(schedule_lr)
-        return optax.adamw(
+        return optax.adam(
             learning_rate=sched_lr,
-            weight_decay=training_cfg.weight_decay,
             b2=training_cfg.adam_beta2,
         )
 
