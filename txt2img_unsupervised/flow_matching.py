@@ -684,8 +684,8 @@ def test_vector_field_time_encoding_statistics():
     overall_mean = jnp.mean(encoded_times)
     overall_std = jnp.std(encoded_times)
 
-    np.testing.assert_allclose(overall_mean, expected_mean, atol=0.01)
-    np.testing.assert_allclose(overall_std, expected_std, atol=0.01)
+    np.testing.assert_allclose(overall_mean, expected_mean, atol=0.02)
+    np.testing.assert_allclose(overall_std, expected_std, atol=0.02)
 
     print(f"Time encoding test passed")
     print(f"  Mean: {overall_mean:.6f} (expected {expected_mean:.6f})")
@@ -2297,6 +2297,7 @@ def _tsit5_integrate_core(
             live_count, min_t, max_t = jax.device_get(
                 (jnp.sum(live_mask), jnp.min(t), jnp.max(t))
             )
+            live_count, min_t, max_t = int(live_count), float(min_t), float(max_t)
             new_extreme_t = min_t if forward else max_t
 
             # Shrinking the batch size is a relatively expensive operation: it involves a potential

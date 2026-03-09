@@ -1035,18 +1035,12 @@ def test_vlb_loss_gradients_flow():
     assert any(jnp.any(g != 0) for g in flat_sched), "No gradient flow to schedule"
 
 
-@pytest.mark.xfail(
-    reason="XLA produces spurious NaN when vmf.sample custom_vjp backward is compiled with schedule backward"
-)
 def test_vlb_schedule_grads_finite_with_vmf_sample():
     """VLB schedule gradients must be finite when vmf.sample is differentiable.
 
-    vmf.sample uses a custom_vjp whose backward (_sample_w_reparam_bwd) computes
-    dw/dkappa via implicit reparameterization. When this backward is JIT-compiled
-    in the same XLA program as the schedule's backward, XLA can produce spurious
-    NaN in the schedule gradients. This test catches that by computing a single
-    VLB gradient step at batch_size=2048 in dim=3, a configuration where the issue
-    reproduces reliably.
+    Regression test: in JAX 0.4.33, XLA produced spurious NaN when vmf.sample's
+    custom_vjp backward was compiled together with the schedule's backward. Fixed
+    by upgrading to JAX 0.9.1.
     """
     dim = 3
     batch_size = 2048

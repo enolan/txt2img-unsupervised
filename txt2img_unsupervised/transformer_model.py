@@ -1,5 +1,4 @@
 import flash_attention_jax  # Pure JAX flash attention implementation by lucidrains
-import flash_attn_jax as flash_attention_cpp  # C++ flash attention by Tri Dao et al, JAX bindings by nshepperd
 import flax.core
 import flax.linen as nn
 import jax
@@ -25,7 +24,7 @@ from .gpu_check import gpu_is_ampere_or_newer
 from .load_pq_dir import load_pq_to_infinidata
 
 
-AttnMethod = Enum("AttnMethod", ["STANDARD", "FLASH_JAX", "FLASH_CPP", "CUDNN"])
+AttnMethod = Enum("AttnMethod", ["STANDARD", "FLASH_JAX", "CUDNN"])
 
 
 class ImageModel(nn.Module):
@@ -187,20 +186,11 @@ class ImageModel(nn.Module):
         if self.attn_method is None:
             if gpu_is_ampere_or_newer():
                 if self.activations_dtype in [jnp.float16, jnp.bfloat16]:
-                    if (
-                        jax.local_device_count("gpu") > 1
-                        and "H100" in jax.devices("gpu")[0].device_kind
-                    ):
-                        print(
-                            "Using CUDNN flash attention to work around H100 deadlock bug"
-                        )
-                        attn_method = AttnMethod.CUDNN
-                    else:
-                        attn_method = AttnMethod.FLASH_CPP
+                    attn_method = AttnMethod.CUDNN
                 else:
                     print(
                         f"Warning: GPU is eligible for faster attention but activations_dtype "
-                        f"is {self.activations_dtype}. Must be half precision for CUDNN or Tri Dao "
+                        f"is {self.activations_dtype}. Must be half precision for CUDNN "
                         "flash attention to work, using pure JAX flash attention instead."
                     )
                     attn_method = AttnMethod.FLASH_JAX
@@ -1587,35 +1577,6 @@ class TransformerLayer(nn.Module):
                 assert res.shape == (batch_size, seq_len, num_heads, v_head_dim)
                 return res
 
-        elif self.attn_method == AttnMethod.FLASH_CPP:
-
-            def attn_function(
-                q,
-                k,
-                v,
-                bias=None,
-                mask=None,
-                broadcast_dropout=True,
-                dropout_rng=None,
-                dropout_rate=0.0,
-                deterministic=False,
-                dtype=None,
-                precision=None,
-            ):
-                assert bias == None, "attention bias not implemented"
-                assert (
-                    mask == None
-                ), "attention mask is redundant with causal_flash_attention"
-                assert dropout_rate == 0.0, "attention dropout not implemented"
-                assert dtype in [
-                    jnp.bfloat16,
-                    jnp.float16,
-                ], "CPP flash attention only supports bfloat16 & float16"
-
-                res = flash_attention_cpp.flash_mha(q, k, v, is_causal=True)
-                assert res.shape == v.shape
-                return res
-
         elif self.attn_method == AttnMethod.CUDNN:
 
             def attn_function(
@@ -1708,7 +1669,6 @@ class TransformerLayer(nn.Module):
 
         if (
             self.attn_method == AttnMethod.FLASH_JAX
-            or self.attn_method == AttnMethod.FLASH_CPP
             or self.attn_method == AttnMethod.CUDNN
         ) and not self.record_attention_weights:
             mask = None
@@ -1739,7 +1699,6 @@ class TransformerLayer(nn.Module):
     "flash_method",
     [
         pytest.param(AttnMethod.FLASH_JAX),
-        pytest.param(AttnMethod.FLASH_CPP, marks=pytest.mark.requires_ampere_or_newer),
         pytest.param(AttnMethod.CUDNN, marks=pytest.mark.requires_ampere_or_newer),
     ],
 )
