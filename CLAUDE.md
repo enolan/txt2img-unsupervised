@@ -223,10 +223,13 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
   - Many tests use progress bars which can update thousands or even tens of thousands of times per
     test, or otherwise do very verbose logging. Reading that output directly will pollute or exhaust
     your context window. If you are running a test that might produce tons of output, send its
-    output to a file. You can efficiently read the relevant data from the log file with tools like
-    `grep`, or by invoking a subagent. Never directly read thousands of lines of logging output when
-    there's a more efficient option. Never pipe test output directly to `tail` or `grep`, this may
-    lose important information.
+    output to a file, rather than reading it directly:
+    `uv run pytest -vs noisy_test.py &> /tmp/noisy_test.log`. You can efficiently read the relevant
+    data from the log file with tools like `grep`, or by invoking a subagent to intelligently
+    summarize it. Never directly read thousands of lines of logging output when there's a more
+    efficient option. Never pipe test output directly to `tail` or `grep`, this may lose important
+    information. Never use `tee` to send the output to a file *in addition* to sending it to stdout,
+    this defeats the entire purpose.
 - **GPU locking**: Multiple agents may be running concurrently in this project. Any command that
   uses the GPU (tests, training, inference) MUST be wrapped with `flock` to avoid conflicts:
   ```
