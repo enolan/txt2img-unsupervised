@@ -77,6 +77,7 @@ import numpy as np
 import optax
 import os
 import pytest
+import time
 
 from .cap_sampling import (
     LogitsTable,
@@ -1969,6 +1970,102 @@ def _next_power_of_two(n: int) -> int:
     return int(2 ** int(np.ceil(np.log2(n))))
 
 
+_ETA_POLY_DEGREE = 2
+_ETA_WEIGHT_DECAY = 0.0  # 0 = uniform weighting; higher = more weight on recent points
+
+
+class _PolynomialETAEstimator:
+    """Estimates ODE integration completion time.
+
+    Fits a polynomial to (iteration_count, progress) to predict how many more
+    iterations are needed, then multiplies by the mean wall-time per iteration.
+    Using iteration count rather than wall time as the x-axis makes the fit immune
+    to JIT compilation pauses, which inject large time gaps unrelated to integration
+    speed.
+    """
+
+    def __init__(self, degree: int = 2, weight_decay: float = 0.0):
+        """Create an estimator.
+
+        Args:
+            degree: Degree of the polynomial to fit. Must be >= 1.
+            weight_decay: Controls how much more recent points are weighted relative
+                to older ones. The weight of point i out of n is exp(weight_decay *
+                (i - n + 1) / n), so the oldest point has weight exp(-weight_decay)
+                and the newest has weight 1.0. Set to 0 for uniform weighting.
+        """
+        assert degree >= 1
+        assert weight_decay >= 0
+        self.degree = degree
+        self.weight_decay = weight_decay
+        self.progress_values: list[float] = []
+        self._start_time: float = time.monotonic()
+
+    def record(self, progress: float) -> None:
+        """Record progress for the current iteration."""
+        self.progress_values.append(progress)
+
+    def _compute_weights(self, n: int) -> np.ndarray:
+        """Compute exponential weights for n data points.
+
+        Returns weights where the last (most recent) point has weight 1.0 and the
+        first has weight exp(-weight_decay). With weight_decay=0, all weights are 1.0.
+        """
+        if self.weight_decay == 0:
+            return np.ones(n)
+        indices = np.arange(n)
+        return np.exp(self.weight_decay * (indices - n + 1) / n)
+
+    def eta_seconds(self) -> Optional[float]:
+        """Estimate seconds remaining until progress reaches 1.0."""
+        n = len(self.progress_values)
+        if n <= self.degree:
+            return None
+
+        iter_arr = np.arange(n, dtype=float)
+        p_arr = np.array(self.progress_values)
+        weights = self._compute_weights(n)
+        coeffs = np.polyfit(iter_arr, p_arr, self.degree, w=weights)
+
+        # Solve p(iter) = 1.0
+        roots_coeffs = coeffs.copy()
+        roots_coeffs[-1] -= 1.0
+        roots = np.roots(roots_coeffs)
+
+        current_iter = float(n - 1)
+
+        # Find the smallest real root in the future
+        valid_roots = [
+            float(np.real(r))
+            for r in roots
+            if np.isreal(r) and float(np.real(r)) > current_iter
+        ]
+
+        if valid_roots:
+            remaining_iters = min(valid_roots) - current_iter
+        elif n >= 2 and p_arr[-1] > p_arr[-2]:
+            # Fallback: linear extrapolation
+            dp = p_arr[-1] - p_arr[-2]
+            remaining_iters = (1.0 - p_arr[-1]) / dp
+        else:
+            return None
+
+        # Convert remaining iterations to wall time using mean time per iteration
+        elapsed = time.monotonic() - self._start_time
+        mean_step_time = elapsed / n
+        return remaining_iters * mean_step_time
+
+    def format_eta(self) -> str:
+        """Format the ETA as a human-readable string (MM:SS or HH:MM:SS)."""
+        eta = self.eta_seconds()
+        if eta is None or eta < 0:
+            return "??:??"
+        eta_int = int(eta)
+        if eta_int >= 3600:
+            return f"{eta_int // 3600}:{(eta_int % 3600) // 60:02d}:{eta_int % 60:02d}"
+        return f"{eta_int // 60:02d}:{eta_int % 60:02d}"
+
+
 def _filter_and_pad_to_size(
     arrays: dict, live_mask: jax.Array, forward: bool, target_size: int
 ) -> dict:
@@ -2235,8 +2332,11 @@ def _tsit5_integrate_core(
     iterations_since_last_shrink = 0  # iterations since last batch size shrink
 
     # Progress tracking
-    current_extreme_t = 0.0 if forward else 1.0
     display_progress = 0.0
+    eta_estimator = _PolynomialETAEstimator(
+        degree=_ETA_POLY_DEGREE,
+        weight_decay=_ETA_WEIGHT_DECAY,
+    )
 
     with tqdm(
         total=1.0,
@@ -2244,6 +2344,7 @@ def _tsit5_integrate_core(
         leave=True,
         initial=0.0,
         unit="progress",
+        bar_format="{desc}: {percentage:3.0f}%|{bar}| {n:.4f}/{total:.1f} [{elapsed}<{postfix}]",
     ) as pbar:
         for _ in range(max_iters):
             (
@@ -2294,11 +2395,12 @@ def _tsit5_integrate_core(
 
             # Check if we should reduce batch size
             live_mask = ~done
-            live_count, min_t, max_t = jax.device_get(
-                (jnp.sum(live_mask), jnp.min(t), jnp.max(t))
+            live_count, live_t_sum = jax.device_get(
+                (
+                    jnp.sum(live_mask),
+                    jnp.sum(jnp.where(live_mask, t, 0.0)),
+                )
             )
-            live_count, min_t, max_t = int(live_count), float(min_t), float(max_t)
-            new_extreme_t = min_t if forward else max_t
 
             # Shrinking the batch size is a relatively expensive operation: it involves a potential
             # recompile and filtering the data down. But it also speeds progress up substantially
@@ -2395,29 +2497,33 @@ def _tsit5_integrate_core(
                 current_batch_size = new_batch_size
                 iterations_since_last_shrink = 0
 
-            # Update progress bar based on slowest sample
-            if forward:
-                raw_progress = new_extreme_t
+            # Compute mean progress for the bar and ETA
+            num_completed = initial_batch_size - int(live_count)
+            if int(live_count) > 0:
+                if forward:
+                    mean_progress = (
+                        float(live_t_sum) + num_completed
+                    ) / initial_batch_size
+                else:
+                    mean_progress = (
+                        float(live_count) - float(live_t_sum) + num_completed
+                    ) / initial_batch_size
             else:
-                raw_progress = 1.0 - new_extreme_t
+                mean_progress = 1.0
+            mean_progress = max(0.0, min(1.0, mean_progress))
+            eta_estimator.record(mean_progress)
 
-            new_progress = max(0.0, min(1.0, raw_progress))
-            target_progress = max(display_progress, new_progress)
+            target_progress = max(display_progress, mean_progress)
             progress_delta = target_progress - display_progress
             if progress_delta > 1e-8:
                 pbar.update(progress_delta)
                 display_progress = target_progress
-            current_extreme_t = new_extreme_t
 
-            # Update progress bar description with current status
-            pbar.set_postfix(
-                {
-                    "iter": actual_iterations,
-                    "incomplete": f"{live_count}/{initial_batch_size}",
-                    "batch": current_batch_size,
-                    "min_t": f"{min_t:.4f}",
-                    "max_t": f"{max_t:.4f}",
-                }
+            pbar.set_postfix_str(
+                f"{eta_estimator.format_eta()}, "
+                f"iter {actual_iterations}, "
+                f"{live_count}/{initial_batch_size} incomplete, "
+                f"batch {current_batch_size}"
             )
 
             if bool(live_count == 0):
@@ -5132,3 +5238,120 @@ def test_shrinking_batch_disabled_fallback():
 
     print(f"Batch shrinking disabled/enabled give identical results")
     print(f"Iterations - Disabled: {iter_disabled}, Enabled: {iter_enabled}")
+
+
+@pytest.mark.parametrize("degree", [1, 2, 3, 4])
+def test_polynomial_eta_estimator_with_linear_data(degree):
+    """Polynomial fit of any degree should handle linear progress correctly."""
+    est = _PolynomialETAEstimator(degree=degree)
+    # 20 iterations, linear progress completing at iteration 40
+    # Pretend 10s have elapsed (0.5s per iteration)
+    est._start_time = time.monotonic() - 10.0
+    for i in range(20):
+        est.progress_values.append(float(i) / 40.0)
+
+    eta = est.eta_seconds()
+    assert eta is not None
+    # 20 more iterations needed at 0.5s each → ETA ≈ 10s
+    assert (
+        8.0 < eta < 12.0
+    ), f"degree={degree}: Expected ETA ~10s for linear data, got {eta:.2f}"
+
+
+@pytest.mark.parametrize("degree", [2, 3, 4])
+def test_polynomial_eta_estimator_with_quadratic_data(degree):
+    """Polynomial fit should predict completion accurately for accelerating progress."""
+    est = _PolynomialETAEstimator(degree=degree)
+    # 20 iterations with quadratic progress: p(i) = (i/30)^2, completes at i=30
+    # Pretend 10s have elapsed (0.5s per iteration)
+    est._start_time = time.monotonic() - 10.0
+    for i in range(20):
+        est.progress_values.append((float(i) / 30.0) ** 2)
+
+    eta = est.eta_seconds()
+    assert eta is not None
+    # ~10 more iterations at 0.5s each → ETA ≈ 5s
+    assert 3.0 < eta < 7.0, f"degree={degree}: Expected ETA ~5s, got {eta:.2f}"
+
+
+@pytest.mark.parametrize("degree", [1, 2, 3])
+def test_polynomial_eta_estimator_insufficient_data(degree):
+    """Should return '??:??' when there are too few data points for the polynomial degree."""
+    est = _PolynomialETAEstimator(degree=degree)
+    assert est.format_eta() == "??:??"
+
+    # Add exactly `degree` points — still not enough (need degree + 1)
+    for i in range(degree):
+        est.record(float(i) * 0.1)
+    assert est.format_eta() == "??:??"
+
+
+def test_polynomial_eta_format():
+    """Test ETA formatting for various durations."""
+    # Under a minute: 10 iterations, linear progress completing at i=20, 1s elapsed
+    est = _PolynomialETAEstimator()
+    est._start_time = time.monotonic() - 1.0
+    for i in range(10):
+        est.progress_values.append(float(i) / 20.0)
+    formatted = est.format_eta()
+    assert len(formatted.split(":")) == 2, f"Expected MM:SS format, got {formatted}"
+
+    # Over an hour: 10 iterations, very slow progress, 100s elapsed per iteration
+    est2 = _PolynomialETAEstimator()
+    est2._start_time = time.monotonic() - 1000.0
+    for i in range(10):
+        est2.progress_values.append(float(i) / 100000.0)
+    eta2 = est2.eta_seconds()
+    assert eta2 is not None and eta2 >= 3600, f"Expected ETA > 1hr, got {eta2}"
+    formatted2 = est2.format_eta()
+    assert (
+        len(formatted2.split(":")) == 3
+    ), f"Expected HH:MM:SS format, got {formatted2}"
+
+
+def test_polynomial_eta_weighting_emphasizes_recent_data():
+    """Higher weight_decay should make the estimate follow recent trends more closely.
+
+    Feed data where progress-per-iteration doubles at the midpoint. With a degree-1
+    fit and uniform weights, the fit averages both rates. With high weight_decay,
+    the fit tracks the faster recent rate and predicts fewer remaining iterations.
+    """
+
+    def make_estimator(weight_decay):
+        est = _PolynomialETAEstimator(degree=1, weight_decay=weight_decay)
+        est._start_time = time.monotonic() - 40.0  # 1s per iteration
+        # Slow phase: 20 iterations, progress 0.0 to 0.1
+        for i in range(20):
+            est.progress_values.append(float(i) * 0.005)
+        # Fast phase: 20 iterations, progress 0.1 to 0.3
+        for i in range(20):
+            est.progress_values.append(0.1 + float(i) * 0.01)
+        return est
+
+    eta_uniform = make_estimator(0.0).eta_seconds()
+    eta_weighted = make_estimator(5.0).eta_seconds()
+    assert eta_uniform is not None and eta_weighted is not None
+    assert eta_weighted < eta_uniform, (
+        f"Weighted ETA ({eta_weighted:.2f}s) should be shorter than uniform "
+        f"({eta_uniform:.2f}s) when recent progress is faster"
+    )
+
+
+def test_polynomial_eta_immune_to_jit_pauses():
+    """ETA should be stable even when wall time includes JIT pauses.
+
+    The iteration-based fit should give the same predicted remaining iterations
+    regardless of how long each iteration takes, so JIT pauses only affect the
+    time-per-iteration average (which dilutes naturally).
+    """
+    # 50 iterations of linear progress (p = i/100), completing at i=100
+    est = _PolynomialETAEstimator(degree=1)
+    # Pretend 25s elapsed, including some JIT pauses — 0.5s/iter average
+    est._start_time = time.monotonic() - 25.0
+    for i in range(50):
+        est.progress_values.append(float(i) / 100.0)
+
+    eta = est.eta_seconds()
+    assert eta is not None
+    # 50 remaining iterations at 0.5s each → ETA ≈ 25s
+    assert 20.0 < eta < 30.0, f"Expected ETA ~25s, got {eta:.2f}"
