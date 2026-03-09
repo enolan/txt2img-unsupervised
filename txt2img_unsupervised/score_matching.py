@@ -302,20 +302,12 @@ class ScoreMatchingModel(nn.Module):
         gamma_prime = self.schedule.log_kappa_derivative(t)
 
         # Sample noisy points x_t ~ vMF(x_1, κ(t)).
-        # stop_gradient: the sampling process uses rejection sampling (lax.while_loop)
-        # which doesn't support reverse-mode differentiation. Gradients w.r.t. the schedule
-        # flow through the loss weighting (gamma_prime * kappa_t) and boundary losses instead.
         noise_rng = self.make_rng("noise")
-        x_t = vmf.sample(
-            noise_rng, x_1, jax.lax.stop_gradient(kappa_t), n_samples=batch_size
-        )
+        x_t = vmf.sample(noise_rng, x_1, kappa_t, n_samples=batch_size)
 
         # Predict scaled score and compute target
         cond_vecs = self._cap_params_to_cond_vecs(cap_params, batch_size)
-        # Gradients to schedule should come from schedule derivative and the VLB regularization
-        # terms, not from the vector field MSE - that would push the value of log_kappa_t towards
-        # a different value, but our MSE target is based on the current value.
-        t_normalized = self._normalize_log_kappa(jax.lax.stop_gradient(log_kappa_t))
+        t_normalized = self._normalize_log_kappa(log_kappa_t)
         w_theta = self.vector_field(x_t, t_normalized, cond_vecs)
         w_true = tangent_projection(x_t, x_1)
 
@@ -1041,6 +1033,38 @@ def test_vlb_loss_gradients_flow():
     sched_grads = grads["params"]["schedule"]
     flat_sched = jax.tree_util.tree_leaves(sched_grads)
     assert any(jnp.any(g != 0) for g in flat_sched), "No gradient flow to schedule"
+
+
+@pytest.mark.xfail(
+    reason="XLA produces spurious NaN when vmf.sample custom_vjp backward is compiled with schedule backward"
+)
+def test_vlb_schedule_grads_finite_with_vmf_sample():
+    """VLB schedule gradients must be finite when vmf.sample is differentiable.
+
+    vmf.sample uses a custom_vjp whose backward (_sample_w_reparam_bwd) computes
+    dw/dkappa via implicit reparameterization. When this backward is JIT-compiled
+    in the same XLA program as the schedule's backward, XLA can produce spurious
+    NaN in the schedule gradients. This test catches that by computing a single
+    VLB gradient step at batch_size=2048 in dim=3, a configuration where the issue
+    reproduces reliably.
+    """
+    dim = 3
+    batch_size = 2048
+    model = _make_model(dim, d_model=64)
+
+    rng = jax.random.PRNGKey(0)
+    params_rng, data_rng, loss_rng = jax.random.split(rng, 3)
+    params = model.init(params_rng, *model.dummy_inputs())
+    x_1 = sample_sphere(data_rng, batch_size, dim)
+    batch = {"point_vec": x_1}
+
+    def loss_fn(p):
+        return compute_batch_loss(model, p, batch, loss_rng)
+
+    grads = jax.jit(jax.grad(loss_fn, has_aux=True))(params)[0]
+    sched_grads = grads["params"]["schedule"]
+    for leaf in jax.tree_util.tree_leaves(sched_grads):
+        assert jnp.all(jnp.isfinite(leaf)), "Non-finite schedule gradient"
 
 
 def test_vmf_recon_loss_gradient_flows():
