@@ -636,7 +636,7 @@ def loss_fn(params, batch, rng, mdl=None):
         )
 
     # Call the model's loss function
-    return transformer_model.loss_batch(
+    loss = transformer_model.loss_batch(
         mdl,
         params,
         dropout_rng,
@@ -644,6 +644,7 @@ def loss_fn(params, batch, rng, mdl=None):
         batch_clips,
         batch_max_cos_distances,
     )
+    return loss, {}
 
 
 def slow_post_step_hook(loss, state, global_step, norm):

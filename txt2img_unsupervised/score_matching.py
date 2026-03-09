@@ -57,13 +57,18 @@ from scipy import stats
 
 from txt2img_unsupervised import vmf
 from txt2img_unsupervised.cap_sampling import (
+    LogitsTable,
     cap_conditioning_dim,
+    encode_cap_params,
+    sample_cap,
+    sample_from_cap_v,
     sphere_log_inverse_surface_area,
 )
 from txt2img_unsupervised.config import CapConditioningMode
 from txt2img_unsupervised.flow_matching import (
+    Tsit5Settings,
     VectorField,
-    geodesic_step,
+    compute_psi_t_spherical,
     reverse_path_and_compute_divergence,
     sample_sphere,
     generate_samples_inner,
@@ -79,6 +84,10 @@ class ScoreMatchingModel(nn.Module):
 
     The neural network (vector_field) predicts the scaled score w_θ = P_{x_t}(x_1),
     and __call__ returns the ODE velocity ½γ'(t)·w_θ for direct use by the ODE solver.
+
+    In UNCONDITIONED mode, forwards directly to VectorField with no conditioning.
+    In CONDITIONED_SCORE mode, encodes cap parameters (center + d_max) into conditioning
+    vectors before passing to VectorField.
     """
 
     # VectorField hyperparameters
@@ -106,6 +115,7 @@ class ScoreMatchingModel(nn.Module):
     init_log_kappa_max: float = 9.210  # log(10000)
 
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
+    d_max_dist: Optional[tuple] = None
 
     @property
     def conditioning_dim(self) -> int:
@@ -140,10 +150,10 @@ class ScoreMatchingModel(nn.Module):
         )
 
     def setup(self):
-        if self.cap_conditioning != CapConditioningMode.UNCONDITIONED:
-            raise NotImplementedError(
-                f"Cap conditioning mode {self.cap_conditioning} is not yet implemented"
-            )
+        if self.cap_conditioning == CapConditioningMode.CONDITIONED_SCORE:
+            self.logits_table = LogitsTable(self.domain_dim - 1, 8192)
+        elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
+            raise NotImplementedError("Classifier guidance is not yet implemented")
         self.vector_field = self.mk_vector_field()
         self.schedule = LearnedNoiseSchedule(
             hidden_dim=self.schedule_hidden_dim,
@@ -155,7 +165,17 @@ class ScoreMatchingModel(nn.Module):
     @nn.nowrap
     def dummy_inputs(self):
         """Create dummy inputs for model initialization."""
-        return self.mk_vector_field().dummy_inputs()
+        x = jnp.ones((1, self.domain_dim))
+        t = jnp.ones((1,))
+        if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
+            cap_params = None
+        elif self.cap_conditioning == CapConditioningMode.CONDITIONED_SCORE:
+            cap_params = (jnp.ones((1, self.domain_dim)), jnp.ones((1,)))
+        elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
+            cap_params = None
+        else:
+            raise ValueError(f"Unknown cap conditioning mode: {self.cap_conditioning}")
+        return x, t, cap_params
 
     @nn.nowrap
     def mk_partition_map(self, use_muon: bool):
@@ -174,31 +194,104 @@ class ScoreMatchingModel(nn.Module):
         """Scaled learning rate for hidden layers."""
         return self.mk_vector_field().scale_lr(lr)
 
-    def __call__(self, x, t, cond_vec):
-        """Run the model, returning the ODE velocity ½γ'(t)·w_θ(x, t).
+    def sample_cap_params(self, x: Array) -> tuple:
+        """Sample a cap containing point x, for training conditioning.
+
+        Args:
+            x: A unit vector on the sphere [domain_dim]
+
+        Returns:
+            Tuple of (cap_center [domain_dim], d_max scalar)
+        """
+        rng = self.make_rng("sample_cap_params")
+        return sample_cap(self.logits_table, rng, x, self.d_max_dist)
+
+    def prepare_training_conditioning(self, batch):
+        """Sample cap parameters for each point in the batch.
+
+        Splits the RNG explicitly before vmapping so each element gets a unique key.
+        (Flax's make_rng returns the same key for every vmap element.)
+
+        Args:
+            batch: Training batch containing "point_vec"
+
+        Returns:
+            None for UNCONDITIONED, (cap_centers, d_maxes) for CONDITIONED_SCORE
+        """
+        if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
+            return None
+        elif self.cap_conditioning == CapConditioningMode.CONDITIONED_SCORE:
+            x1_batch = batch["point_vec"]
+            batch_size = x1_batch.shape[0]
+            rng = self.make_rng("sample_cap_params")
+            rngs = jax.random.split(rng, batch_size)
+            return jax.vmap(
+                lambda rng, x: sample_cap(self.logits_table, rng, x, self.d_max_dist)
+            )(rngs, x1_batch)
+        elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
+            return None
+        else:
+            raise ValueError(f"Unknown cap conditioning mode: {self.cap_conditioning}")
+
+    def _cap_params_to_cond_vecs(self, cap_params, batch_size):
+        """Convert cap_params to conditioning vectors for the vector field."""
+        if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
+            return jnp.zeros((batch_size, 0))
+        elif self.cap_conditioning == CapConditioningMode.CONDITIONED_SCORE:
+            cap_centers, d_maxes = cap_params
+            return encode_cap_params(
+                cap_center=cap_centers,
+                d_max=d_maxes,
+                d_max_dist=self.d_max_dist,
+                domain_dim=self.domain_dim,
+            )
+        elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
+            raise NotImplementedError("Classifier guidance is not yet implemented")
+        else:
+            raise ValueError(f"Unknown cap conditioning mode: {self.cap_conditioning}")
+
+    def _normalize_log_kappa(self, log_kappa):
+        """Normalize log_kappa to [0, 1] at initialization using init endpoints.
+
+        Makes the vector field's time input directly reflect the noise level
+        rather than raw time, whose meaning shifts as the schedule is learned.
+        """
+        return (log_kappa - self.init_log_kappa_min) / (
+            self.init_log_kappa_max - self.init_log_kappa_min
+        )
+
+    def __call__(self, x, t, cap_params):
+        """Run the model, returning the ODE velocity ½γ'(t)·w_θ(x, t_norm).
+
+        The vector field receives normalized log_kappa as its time input:
+        t_norm = (log_kappa(t) - init_log_kappa_min) / (init_log_kappa_max - init_log_kappa_min).
 
         Args:
             x: Points on the sphere [batch_size, domain_dim]
             t: Time values [batch_size]
-            cond_vec: Conditioning vectors [batch_size, cond_dim]
+            cap_params: None for UNCONDITIONED, (cap_centers, d_maxes) for CONDITIONED_SCORE
 
         Returns:
             ODE velocity vectors [batch_size, domain_dim] in the tangent space at x.
         """
-        w = self.vector_field(x, t, cond_vec)
+        cond_vecs = self._cap_params_to_cond_vecs(cap_params, x.shape[0])
+        log_kappa = self.schedule(t)
+        t_normalized = self._normalize_log_kappa(log_kappa)
+        w = self.vector_field(x, t_normalized, cond_vecs)
         gamma_prime = self.schedule.log_kappa_derivative(t)
         return 0.5 * gamma_prime[:, None] * w
 
-    def compute_vlb_loss(self, x_1, t, cond_vec):
+    def compute_vlb_loss(self, x_1, t, cap_params):
         """Compute the VLB loss combining prior, diffusion, and reconstruction terms.
 
         Args:
             x_1: Clean data points [batch_size, dim]
             t: Uniformly sampled time values [batch_size]
-            cond_vec: Conditioning vectors [batch_size, cond_dim]
+            cap_params: None for UNCONDITIONED, (cap_centers, d_maxes) for CONDITIONED_SCORE
 
         Returns:
-            Scalar VLB loss value.
+            Tuple of (total_loss, components_dict) where components_dict has keys
+            "diffusion", "prior", and "recon".
         """
         batch_size = x_1.shape[0]
         dim = self.domain_dim
@@ -218,7 +311,12 @@ class ScoreMatchingModel(nn.Module):
         )
 
         # Predict scaled score and compute target
-        w_theta = self.vector_field(x_t, t, cond_vec)
+        cond_vecs = self._cap_params_to_cond_vecs(cap_params, batch_size)
+        # Gradients to schedule should come from schedule derivative and the VLB regularization
+        # terms, not from the vector field MSE - that would push the value of log_kappa_t towards
+        # a different value, but our MSE target is based on the current value.
+        t_normalized = self._normalize_log_kappa(jax.lax.stop_gradient(log_kappa_t))
+        w_theta = self.vector_field(x_t, t_normalized, cond_vecs)
         w_true = tangent_projection(x_t, x_1)
 
         # Diffusion loss: ½ E_t[ γ'(t) · κ(t) · ‖w_θ − w_true‖² ]
@@ -233,7 +331,12 @@ class ScoreMatchingModel(nn.Module):
         kappa_max = jnp.exp(self.schedule.log_kappa_max)
         recon_loss = vmf_recon_loss(kappa_max, dim)
 
-        return diffusion_loss + prior_loss + recon_loss
+        components = {
+            "diffusion": diffusion_loss,
+            "prior": prior_loss,
+            "recon": recon_loss,
+        }
+        return diffusion_loss + prior_loss + recon_loss, components
 
 
 def vmf_recon_loss(kappa, dim):
@@ -276,32 +379,39 @@ def compute_batch_loss(
     params,
     batch: dict,
     rng: Array,
-) -> Array:
+) -> tuple[Array, dict[str, Array]]:
     """Extract data from batch, sample t, compute VLB loss.
 
     Args:
         model: Score matching model
         params: Model parameters
-        batch: Batch of data containing "point_vec" and optionally "cond_vec"
+        batch: Batch of data containing "point_vec"
         rng: JAX random key
 
     Returns:
-        The computed VLB loss value
+        Tuple of (total_loss, components_dict) where components_dict has keys
+        "diffusion", "prior", and "recon".
     """
     x_1 = batch["point_vec"]
     batch_size = x_1.shape[0]
 
-    noise_rng, time_rng, dropout_rng = jax.random.split(rng, 3)
+    noise_rng, time_rng, dropout_rng, cap_rng = jax.random.split(rng, 4)
 
-    cond_vecs = batch.get("cond_vec", jnp.zeros((batch_size, 0)))
+    cap_params = model.apply(
+        params,
+        batch,
+        method=model.prepare_training_conditioning,
+        rngs={"sample_cap_params": cap_rng},
+    )
 
-    t = jax.random.uniform(time_rng, (batch_size,))
+    t0 = jax.random.uniform(time_rng, ())
+    t = (t0 + jnp.linspace(0.0, 1.0, batch_size, endpoint=False)) % 1.0
 
     return model.apply(
         params,
         x_1,
         t,
-        cond_vecs,
+        cap_params,
         rngs={"dropout": dropout_rng, "noise": noise_rng},
         method=model.compute_vlb_loss,
     )
@@ -311,7 +421,7 @@ def compute_batch_loss(
 def _compute_velocity_for_sampling(
     model: ScoreMatchingModel,
     params,
-    cond_vecs: Array,
+    cap_params,
     x: Array,
     t,
     rng: Optional[Array] = None,
@@ -323,7 +433,7 @@ def _compute_velocity_for_sampling(
     Args:
         model: Score matching model
         params: Model parameters
-        cond_vecs: Conditioning vectors [batch_size, cond_dim]
+        cap_params: None for unconditioned, (cap_centers, d_maxes) for CONDITIONED_SCORE
         x: Current points [batch_size, dim]
         t: Current time (scalar or [batch_size])
         rng: Random key for dropout
@@ -344,26 +454,27 @@ def _compute_velocity_for_sampling(
     else:
         t_vec = jnp.full((x.shape[0],), t)
 
-    return model.apply(params, x, t_vec, cond_vecs, rngs=rngs_dict)
+    return model.apply(params, x, t_vec, cap_params, rngs=rngs_dict)
 
 
 @partial(jax.jit, static_argnames=("model",), inline=True)
-def _velocity_fn_for_ode(model, params, cond_vecs, x, t, rng):
+def _velocity_fn_for_ode(model, params, cap_params, x, t, rng):
     """ODE velocity function for score matching sampling and NLL computation.
 
     Delegates to _compute_velocity_for_sampling. Defined at module level so JIT
     caching works across calls.
     """
-    return _compute_velocity_for_sampling(model, params, cond_vecs, x, t, rng)
+    return _compute_velocity_for_sampling(model, params, cap_params, x, t, rng)
 
 
 def generate_samples(
     model: ScoreMatchingModel,
     params,
     rng: Array,
-    cond_vecs: Array,
+    cap_params,
     n_steps: int = 100,
     method: str = "tsit5",
+    batch_size: Optional[int] = None,
 ) -> Array:
     """Generate samples by integrating the probability flow ODE.
 
@@ -373,15 +484,26 @@ def generate_samples(
         model: Score matching model
         params: Model parameters
         rng: JAX random key
-        cond_vecs: Conditioning vectors [batch_size, cond_dim]
+        cap_params: None for unconditioned, (cap_centers, d_maxes) for CONDITIONED_SCORE
         n_steps: Number of integration steps
         method: ODE solver method
+        batch_size: Required if cap_params is None, inferred from cap_params otherwise
 
     Returns:
         Generated samples [batch_size, domain_dim]
     """
-    assert len(cond_vecs.shape) == 2
-    batch_size = cond_vecs.shape[0]
+    if cap_params is None:
+        if batch_size is None:
+            raise ValueError("batch_size must be specified when cap_params is None")
+    else:
+        leading_dims = jax.tree.leaves(jax.tree.map(lambda x: x.shape[0], cap_params))
+        inferred = leading_dims[0]
+        if batch_size is None:
+            batch_size = inferred
+        elif batch_size != inferred:
+            raise ValueError(
+                f"batch_size {batch_size} doesn't match cap_params leading dim {inferred}"
+            )
 
     x, _eval_counts = generate_samples_inner(
         rng,
@@ -391,8 +513,9 @@ def generate_samples(
         _velocity_fn_for_ode,
         model,
         params,
-        cond_vecs,
+        cap_params,
         model.domain_dim,
+        tsit5_settings=Tsit5Settings(atol=1e-6, rtol=1e-6),
     )
     return x
 
@@ -401,11 +524,12 @@ def compute_log_probability(
     model: ScoreMatchingModel,
     params,
     samples: Array,
-    cond_vecs: Array,
+    cap_params,
     n_steps: int = 100,
     rng=None,
     n_projections: int = 10,
     method: str = "tsit5",
+    tsit5_settings: Optional[Tsit5Settings] = None,
 ) -> Array:
     """Compute the log probability of samples under the score matching model.
 
@@ -416,18 +540,21 @@ def compute_log_probability(
         model: Score matching model
         params: Model parameters
         samples: Points on the sphere to evaluate [batch_size, dim]
-        cond_vecs: Conditioning vectors [batch_size, cond_dim]
+        cap_params: None for unconditioned, (cap_centers, d_maxes) for CONDITIONED_SCORE
         n_steps: Number of integration steps
         rng: JAX random key for stochastic divergence estimation
         n_projections: Number of random projections for divergence estimation
         method: ODE solver method ('rk4' or 'tsit5')
+        tsit5_settings: Tsit5 integrator settings. Defaults to atol=1e-6, rtol=1e-6.
 
     Returns:
         Log probabilities of the samples [batch_size]
     """
+    if tsit5_settings is None:
+        tsit5_settings = Tsit5Settings(atol=1e-6, rtol=1e-6)
+
     batch_size = samples.shape[0]
     assert samples.shape == (batch_size, model.domain_dim)
-    assert cond_vecs.shape == (batch_size, model.conditioning_dim)
 
     if rng is None:
         rng = jax.random.PRNGKey(0)
@@ -436,12 +563,13 @@ def compute_log_probability(
         _velocity_fn_for_ode,
         model,
         params,
-        cond_vecs,
+        cap_params,
         samples,
         n_steps,
         rng,
         n_projections,
         method=method,
+        tsit5_settings=tsit5_settings,
     )
 
     log_p0 = sphere_log_inverse_surface_area(model.domain_dim)
@@ -456,6 +584,7 @@ def compute_nll(
     rng=None,
     n_projections: int = 10,
     method: str = "tsit5",
+    cap_params=None,
 ) -> Array:
     """Compute negative log-likelihood for a batch of data.
 
@@ -467,18 +596,17 @@ def compute_nll(
         rng: JAX random key
         n_projections: Number of random projections for divergence estimation
         method: ODE solver method ('rk4' or 'tsit5')
+        cap_params: None for unconditioned, (cap_centers, d_maxes) for CONDITIONED_SCORE
 
     Returns:
         NLL per example [batch_size]
     """
     samples = batch["point_vec"]
-    batch_size = samples.shape[0]
-    cond_vecs = jnp.zeros((batch_size, model.conditioning_dim))
     return -compute_log_probability(
         model,
         params,
         samples,
-        cond_vecs,
+        cap_params,
         n_steps=n_steps,
         rng=rng,
         n_projections=n_projections,
@@ -585,8 +713,9 @@ def test_train_trivial(domain_dim):
         model,
         eval_params,
         jax.random.PRNGKey(0),
-        cond_vecs=jnp.zeros((20, 0)),
+        cap_params=None,
         n_steps=1000,
+        batch_size=20,
     )
     cos_sims = samples @ points[0]
 
@@ -742,8 +871,9 @@ def test_train_distribution(domain_dim, dist_name):
         model,
         eval_params,
         jax.random.PRNGKey(42),
-        cond_vecs=jnp.zeros((n_gen_samples, 0)),
+        cap_params=None,
         n_steps=100,
+        batch_size=n_gen_samples,
     )
     samples_np = np.array(samples)
     sample_log_probs = dist.logpdf(samples_np)
@@ -848,19 +978,21 @@ def test_vlb_loss_components():
 
     x_1 = sample_sphere(data_rng, 64, dim)
     t = jnp.linspace(0.01, 0.99, 64)
-    cond_vecs = jnp.zeros((64, 0))
 
-    loss = model.apply(
+    loss, components = model.apply(
         params,
         x_1,
         t,
-        cond_vecs,
+        None,
         rngs={"noise": noise_rng},
         method=model.compute_vlb_loss,
     )
 
     assert jnp.isfinite(loss), f"VLB loss is not finite: {loss}"
     assert float(loss) > 0, f"VLB loss should be positive, got {loss}"
+    for key in ("diffusion", "prior", "recon"):
+        assert key in components, f"Missing component '{key}' in VLB loss"
+        assert jnp.isfinite(components[key]), f"VLB component '{key}' is not finite"
 
     # Prior loss should be small for the default small κ_min
     kappa_min = jnp.exp(jnp.array(model.init_log_kappa_min))
@@ -887,19 +1019,18 @@ def test_vlb_loss_gradients_flow():
 
     x_1 = sample_sphere(data_rng, 32, dim)
     t = jax.random.uniform(jax.random.PRNGKey(0), (32,))
-    cond_vecs = jnp.zeros((32, 0))
 
     def loss_fn(p):
         return model.apply(
             p,
             x_1,
             t,
-            cond_vecs,
+            None,
             rngs={"noise": noise_rng},
             method=model.compute_vlb_loss,
         )
 
-    grads = jax.grad(loss_fn)(params)
+    grads = jax.grad(loss_fn, has_aux=True)(params)[0]
 
     # Check vector field grads exist
     vf_grads = grads["params"]["vector_field"]
@@ -947,3 +1078,224 @@ def test_vmf_recon_loss_gradient_small_kappa_high_dim(kappa):
         atol=1e-12,
         err_msg=f"κ={kappa}",
     )
+
+
+@pytest.mark.usefixtures("starts_with_progressbar")
+@pytest.mark.parametrize("domain_dim", [3, 16])
+@pytest.mark.parametrize("data_distribution", ["uniform", "vmf"])
+def test_train_conditioned_score(domain_dim, data_distribution):
+    """Train a CONDITIONED_SCORE model and verify conditioned generation and density."""
+    jax.config.update("jax_compilation_cache_dir", "/tmp/t2i-u-jax-cache")
+    from txt2img_unsupervised.training_infra import train_for_tests
+
+    d_max_dist = ((1.0, 2.0),)
+    model = _make_model(
+        domain_dim,
+        n_layers=6,
+        d_model=512,
+        cap_conditioning=CapConditioningMode.CONDITIONED_SCORE,
+        d_max_dist=d_max_dist,
+    )
+
+    batch_size = 2048
+    n_train_samples = 2_000_000
+    n_test_samples = 4096
+
+    # Generate training data and define data_log_density_fn
+    rng = jax.random.PRNGKey(42)
+    if data_distribution == "uniform":
+        points = np.asarray(
+            sample_sphere(rng, n_train_samples + n_test_samples, domain_dim)
+        )
+        uniform_log_density = sphere_log_inverse_surface_area(domain_dim)
+        print(f"Distribution differential entropy: {uniform_log_density:.6f}")
+
+        def data_log_density_fn(pts):
+            return jnp.full((pts.shape[0],), uniform_log_density)
+
+    elif data_distribution == "vmf":
+        mean_direction = np.zeros(domain_dim)
+        # use axis 1 to ensure vmf center is different from cap center
+        mean_direction[1] = 1.0
+        vmf_dist = stats.vonmises_fisher(mean_direction, 5.0)
+        np_seed = int(jax.random.randint(rng, (), 0, 2**31 - 1))
+        points = vmf_dist.rvs(n_train_samples + n_test_samples, random_state=np_seed)
+        print(f"Distribution differential entropy: {vmf_dist.entropy():.6f}")
+
+        def data_log_density_fn(pts):
+            return jnp.asarray(vmf_dist.logpdf(np.array(pts)))
+
+    else:
+        raise ValueError(f"Unknown data_distribution: {data_distribution}")
+
+    train_points = points[:n_train_samples]
+    test_points = points[n_train_samples:]
+    train_dataset = Dataset.from_dict({"point_vec": train_points}).with_format("np")
+    test_dataset = Dataset.from_dict({"point_vec": test_points}).with_format("np")
+
+    loss_fn = partial(compute_batch_loss, model)
+
+    def nll_fn(model, params, batch, rng):
+        # Report NLL conditioned on the whole sphere (d_max=2.0)
+        north = jnp.zeros(model.domain_dim).at[0].set(1.0)
+        norths = repeat(north, "v -> b v", b=batch["point_vec"].shape[0])
+        d_maxes = jnp.full((batch["point_vec"].shape[0],), 2.0)
+        return compute_nll(
+            model,
+            params,
+            batch,
+            n_steps=100,
+            rng=rng,
+            n_projections=10,
+            cap_params=(norths, d_maxes),
+        )
+
+    result = train_for_tests(
+        model,
+        train_dataset,
+        batch_size,
+        learning_rate=1e-3,
+        schedule_learning_rate=3e-4,
+        use_muon=True,
+        loss_fn=loss_fn,
+        fields=["point_vec"],
+        epochs=10,
+        test_dataset=test_dataset,
+        nll_fn=nll_fn,
+    )
+    eval_params = result.state.get_eval_params()
+
+    # Diagnostic: print learned schedule endpoints
+    sched_params = eval_params["params"]["schedule"]
+    learned_log_kappa_min = float(sched_params["log_kappa_min"])
+    learned_log_kappa_max = float(sched_params["log_kappa_max"])
+    print(
+        f"Learned schedule endpoints: log_kappa_min={learned_log_kappa_min:.3f} (κ={np.exp(learned_log_kappa_min):.1f}), log_kappa_max={learned_log_kappa_max:.3f} (κ={np.exp(learned_log_kappa_max):.1f})"
+    )
+
+    n_gen = 200
+    cap_center = jnp.zeros(domain_dim).at[0].set(1.0)
+    d_max = 0.5
+    cap_centers = repeat(cap_center, "d -> n d", n=n_gen)
+    d_maxes = jnp.full((n_gen,), d_max)
+    print(
+        f"Generating samples conditioned on a cap centered on the first basis vector with d_max={d_max}"
+    )
+
+    samples = generate_samples(
+        model,
+        eval_params,
+        jax.random.PRNGKey(42),
+        cap_params=(cap_centers, d_maxes),
+        n_steps=200,
+    )
+
+    cos_sims = samples @ cap_center
+    cos_dists = 1.0 - cos_sims
+
+    print(f"Cosine distance deciles: {np.quantile(cos_dists, np.linspace(0, 1, 11))}")
+
+    inside_fraction = float(jnp.mean(cos_dists <= d_max))
+    mean_dist = float(jnp.mean(cos_dists))
+    print(f"Inside cap: {inside_fraction*100:.1f}%")
+    print(f"Mean cosine distance to cap center: {mean_dist:.4f}")
+
+    inside_fraction_threshold = 0.98
+    assert (
+        inside_fraction >= inside_fraction_threshold
+    ), f"Only {inside_fraction*100:.1f}% inside cap (d_max={d_max}), expected >={inside_fraction_threshold*100:.1f}%"
+
+    # --- Density verification ---
+    table = LogitsTable(d=domain_dim - 1, n=8192)
+    log_sphere_area = -sphere_log_inverse_surface_area(domain_dim)
+    d_max_values = [1.0, 0.5]
+
+    for d_max_test in d_max_values:
+        print(f"\n--- Density check for d_max={d_max_test} ---")
+
+        # Fresh test points for density evaluation
+        n_density_test = 1000
+        density_test_rng, z_rng = jax.random.split(jax.random.PRNGKey(9999))
+        density_test_points = sample_sphere(
+            density_test_rng, n_density_test, domain_dim
+        )
+
+        # True weights: cap indicator
+        in_cap_mask = 1.0 - density_test_points @ cap_center <= d_max_test
+
+        # Estimate log Z (mass inside cap) by sampling uniformly from the cap
+        n_z_points = 10000
+        z_cap_points = sample_from_cap_v(
+            z_rng, table, cap_center, d_max_test, n_z_points
+        )
+        log_densities_in_cap = data_log_density_fn(z_cap_points)
+        log_cap_area = table.log_cap_size(d_max_test) + log_sphere_area
+        log_Z = (
+            log_cap_area
+            + jax.nn.logsumexp(log_densities_in_cap)
+            - jnp.log(jnp.float32(n_z_points))
+        )
+
+        print(f"  In cap: {jnp.sum(in_cap_mask)}/{len(in_cap_mask)} points")
+
+        # Model log probabilities
+        test_cap_params = (
+            jnp.broadcast_to(cap_center, (n_density_test, domain_dim)),
+            jnp.full((n_density_test,), d_max_test),
+        )
+
+        model_log_densities = compute_log_probability(
+            model,
+            eval_params,
+            density_test_points,
+            cap_params=test_cap_params,
+            n_steps=100,
+            n_projections=50,
+            tsit5_settings=Tsit5Settings(atol=1e-6, rtol=1e-6),
+        )
+        base_log_densities = data_log_density_fn(density_test_points)
+
+        # Check model densities inside cap
+        assert jnp.any(in_cap_mask), "No sampled test points fell within the cap"
+        expected_log_densities = np.full((n_density_test,), -np.inf)
+        expected_log_densities[in_cap_mask] = base_log_densities[in_cap_mask] - log_Z
+        absdiffs_in_cap = jnp.abs(
+            expected_log_densities[in_cap_mask] - model_log_densities[in_cap_mask]
+        )
+
+        density_abs_diff_threshold = np.log(1.2)
+        max_fraction_over_threshold = 0.05
+        count_diffs_over_threshold = np.sum(
+            absdiffs_in_cap > density_abs_diff_threshold
+        )
+
+        print("  Checking densities for points inside cap...")
+        print(f"    Mean abs diff: {jnp.mean(absdiffs_in_cap):.3f}")
+        print(
+            f"    Number of points with abs diff > {density_abs_diff_threshold:.3f}: {count_diffs_over_threshold}/{len(absdiffs_in_cap)}"
+        )
+
+        assert count_diffs_over_threshold < max_fraction_over_threshold * len(
+            absdiffs_in_cap
+        ), f"Too many likelihoods differ by more than a factor of {np.exp(density_abs_diff_threshold):.2f}: {count_diffs_over_threshold}/{len(absdiffs_in_cap)}"
+
+        # Check the points that are outside the cap
+        outside_cap_mask = ~in_cap_mask
+        assert jnp.any(outside_cap_mask), "No sampled test points fell outside the cap"
+
+        EXPECTED_MASS_FRACTION_IN_CAP = 0.95
+        log_outside_cap_area = table.log_cap_size(2.0 - d_max_test) + log_sphere_area
+        model_log_density_outside_cap = jax.nn.logsumexp(
+            model_log_densities[outside_cap_mask]
+        ) - jnp.log(jnp.sum(outside_cap_mask))
+        model_log_mass_outside_cap = (
+            model_log_density_outside_cap + log_outside_cap_area
+        )
+
+        print(
+            f"  Model mass outside cap: {jnp.exp(model_log_mass_outside_cap):.3f} (should be under {1.0 - EXPECTED_MASS_FRACTION_IN_CAP:.3f})"
+        )
+
+        assert (
+            jnp.exp(model_log_mass_outside_cap) < 1.0 - EXPECTED_MASS_FRACTION_IN_CAP
+        ), f"Model mass outside cap {jnp.exp(model_log_mass_outside_cap):.3f} is too high (should be under {1.0 - EXPECTED_MASS_FRACTION_IN_CAP:.3f})"

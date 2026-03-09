@@ -1207,7 +1207,7 @@ def compute_batch_loss(
     )
     t = jax.random.uniform(time_rng, (batch_size,))
 
-    return conditional_flow_matching_loss(
+    result = conditional_flow_matching_loss(
         model,
         params,
         x0_batch,
@@ -1218,6 +1218,11 @@ def compute_batch_loss(
         capture_intermediates=capture_intermediates,
         antipodal_dir_fn=antipodal_dir_fn,
     )
+    if capture_intermediates:
+        loss, intermediates = result
+        return loss, intermediates
+    else:
+        return result, {}
 
 
 _baseline_model = VectorField(

@@ -193,9 +193,13 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_ste
     for i in range(n_batches):
         batch_rng, rng = jax.random.split(rng)
         this_batch_size = min(batch_size, n_samples - i * batch_size)
-        cond_vecs = jnp.zeros((this_batch_size, 0))
         batch_samples = generate_samples(
-            mdl, params, batch_rng, cond_vecs, n_steps=n_steps
+            mdl,
+            params,
+            batch_rng,
+            cap_params=None,
+            n_steps=n_steps,
+            batch_size=this_batch_size,
         )
         all_samples.append(batch_samples)
 

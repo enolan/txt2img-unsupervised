@@ -471,6 +471,7 @@ class ScoreMatchingTrainState(BaseTrainState):
             schedule_hidden_dim=model_cfg.schedule_hidden_dim,
             schedule_n_quadrature_points=model_cfg.schedule_n_quadrature_points,
             cap_conditioning=model_cfg.cap_conditioning,
+            d_max_dist=model_cfg.d_max_dist,
         )
 
 

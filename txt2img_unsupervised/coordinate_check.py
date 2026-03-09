@@ -81,7 +81,7 @@ def process_intermediates(intermediates):
 def compute_loss_no_grad(mdl, params, rng, pts):
     """Compute loss without gradients for test evaluation."""
     rng, next_rng = jax.random.split(rng)
-    loss = flow_matching.compute_batch_loss(
+    loss, _aux = flow_matching.compute_batch_loss(
         mdl,
         params,
         {"point_vec": pts},

@@ -665,8 +665,9 @@ def make_train_step_with_metrics(loss_fn):
                         "clipped_last"
                     ] = state.opt_state.inner_state.clipped_last.copy()
 
-        grad_fn = jax.value_and_grad(loss_fn, argnums=0)
-        loss, grads = grad_fn(state.params, batch, step_rng)
+        grad_fn = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
+        (loss, aux), grads = grad_fn(state.params, batch, step_rng)
+        metrics.update(aux)
 
         new_state = state.apply_gradients(grads=grads)
 
@@ -857,7 +858,11 @@ def train_loop_async(
                     # Done with all steps
                     break
 
-            pbar_step.set_description(f"Loss: {current_loss:.4f}")
+            desc = f"Loss: {current_loss:.4f}"
+            for key in ("diffusion", "prior", "recon"):
+                if key in current_metrics:
+                    desc += f" {key}: {current_metrics[key]:.4f}"
+            pbar_step.set_description(desc)
 
         pbar_step.close()
 
@@ -1037,6 +1042,10 @@ def fast_post_step_hook(loss, metrics, global_step, norm):
     if "gradient_noise_scale" in metrics:
         to_log["train/gradient_noise_scale"] = metrics["gradient_noise_scale"]
 
+    for key in ("diffusion", "prior", "recon"):
+        if key in metrics:
+            to_log[f"train/vlb_{key}"] = metrics[key]
+
     if not np.isfinite(loss):
         tqdm.write(f"Loss nonfinite 😢 ({loss})")
 
@@ -1170,7 +1179,7 @@ def save_checkpoint_and_evaluate_vector_model(
         )
 
         test_batch = {"point_vec": batch[vector_column]}
-        loss = compute_loss_fn(eval_params, test_batch, batch_rng)
+        loss, _aux = compute_loss_fn(eval_params, test_batch, batch_rng)
         losses.append(loss)
 
     test_loss = jnp.mean(jnp.stack(losses))
@@ -1264,6 +1273,9 @@ def train_for_tests(
     test_dataset: Optional[Dataset] = None,
     nll_fn: Optional[Callable] = None,
     nll_eval_fields: Optional[List[str]] = None,
+    schedule_learning_rate: Optional[float] = None,
+    use_muon: bool = False,
+    muon_beta: float = 0.95,
 ) -> TrainResult:
     """Convenience wrapper around the production train_loop for use in tests.
 
@@ -1291,6 +1303,10 @@ def train_for_tests(
             If provided along with test_dataset, NLL is computed and printed after each epoch.
         nll_eval_fields: Dataset columns to fetch for NLL evaluation batches.
             Defaults to fields if not provided.
+        schedule_learning_rate: Separate learning rate for the learned noise schedule.
+            If None, uses the main learning rate.
+        use_muon: If True, use the Muon optimizer for applicable parameters.
+        muon_beta: Momentum parameter for Muon optimizer.
 
     Returns:
         TrainResult with state, step, and optionally test_loss and test_nll from
@@ -1323,6 +1339,9 @@ def train_for_tests(
         weight_decay=weight_decay,
         schedule_free_beta1=schedule_free_beta1,
         adam_beta2=adam_beta2,
+        schedule_learning_rate=schedule_learning_rate,
+        use_muon=use_muon,
+        muon_beta=muon_beta,
     )
 
     rng = jax.random.PRNGKey(rng_seed)
@@ -1359,13 +1378,29 @@ def train_for_tests(
         def post_epoch_hook(state, epoch_idx, global_step):
             eval_params = state.get_eval_params()
             test_losses = []
+            all_aux = []
             for i in trange(n_test_batches, desc="test loss", leave=False):
                 batch = get_batch(test_dataset, eval_batch_size, i, eval_fields)
-                test_losses.append(
-                    loss_fn(eval_params, batch, jax.random.PRNGKey(global_step + i))
+                loss, aux = loss_fn(
+                    eval_params, batch, jax.random.PRNGKey(global_step + i)
                 )
+                test_losses.append(loss)
+                all_aux.append(aux)
             mean_test_loss = float(jnp.mean(jnp.array(test_losses)))
             last_epoch_stats["test_loss"] = mean_test_loss
+
+            # Compute mean of each aux metric across batches
+            aux_means = {}
+            if all_aux and all_aux[0]:
+                for key in all_aux[0]:
+                    aux_means[key] = float(
+                        jnp.mean(jnp.array([a[key] for a in all_aux]))
+                    )
+
+            parts = [f"test loss = {mean_test_loss:.4f}"]
+            for key, val in sorted(aux_means.items()):
+                parts.append(f"{key} = {val:.4f}")
+
             if nll_fn is not None:
                 nlls = []
                 for i in trange(n_test_batches, desc="test NLL", leave=False):
@@ -1380,11 +1415,9 @@ def train_for_tests(
                     )
                 mean_nll = float(jnp.mean(jnp.concatenate(nlls)))
                 last_epoch_stats["test_nll"] = mean_nll
-                print(
-                    f"Epoch {epoch_idx + 1}: test loss = {mean_test_loss:.4f}, test NLL = {mean_nll:.4f}"
-                )
-            else:
-                print(f"Epoch {epoch_idx + 1}: test loss = {mean_test_loss:.4f}")
+                parts.append(f"test NLL = {mean_nll:.4f}")
+
+            print(f"Epoch {epoch_idx + 1}: {', '.join(parts)}")
 
     else:
         post_epoch_hook = None
