@@ -11,8 +11,17 @@ from txt2img_unsupervised.vmf import (
     log_normalization_constant,
     log_prob,
     sample,
-    _sample_uniform_sphere,
+    mean_resultant_length,
+    _compute_dw_dkappa,
+    _sample_w_single,
 )
+
+
+def _sample_uniform_sphere(key, dim, n_samples):
+    """Sample uniformly from unit sphere."""
+    samples = jax.random.normal(key, (n_samples, dim))
+    norms = jnp.linalg.norm(samples, axis=-1, keepdims=True)
+    return samples / norms
 
 
 class TestLogNormalizationConstant:
@@ -286,6 +295,210 @@ class TestNumericalStability:
 
         log_probs = log_prob(samples, mu, kappa)
         assert log_probs.dtype == dtype
+
+
+class TestSampleReparam:
+    """Tests for differentiable vMF sampling via implicit reparameterization."""
+
+    @pytest.mark.parametrize(
+        "dim,kappa",
+        [
+            (3, 5.0),
+            (3, 50.0),
+            (10, 10.0),
+            (10, 50.0),
+            (768, 10.0),
+            (768, 100.0),
+        ],
+    )
+    def test_forward_first_moment(self, dim, kappa):
+        """E[x.mu] should match the mean resultant length A_d(kappa)."""
+        n_samples = 20000
+        key = random.PRNGKey(42)
+        mu = jnp.zeros(dim, dtype=jnp.float32).at[0].set(1.0)
+
+        samples = sample(key, mu, kappa, n_samples)
+        empirical = jnp.mean(jnp.dot(samples, mu))
+
+        expected = float(mean_resultant_length(jnp.array(kappa), dim))
+        np.testing.assert_allclose(float(empirical), expected, atol=0.02)
+
+    @pytest.mark.parametrize(
+        "dim,kappa",
+        [
+            (3, 1.0),
+            (3, 10.0),
+            (3, 50.0),
+            (10, 5.0),
+            (10, 50.0),
+            (768, 10.0),
+            (768, 100.0),
+        ],
+    )
+    def test_gradient_finite_and_positive(self, dim, kappa):
+        """d/dkappa E[x.mu] should be finite and positive."""
+        n_samples = 4096
+        key = random.PRNGKey(123)
+        mu = jnp.zeros(dim, dtype=jnp.float32).at[0].set(1.0)
+
+        def mean_dot(kap):
+            s = sample(key, mu, kap, n_samples)
+            return jnp.mean(jnp.dot(s, mu))
+
+        grad_val = float(jax.grad(mean_dot)(jnp.float32(kappa)))
+        assert np.isfinite(grad_val), f"gradient not finite: {grad_val}"
+        assert grad_val > 0, f"gradient should be positive, got {grad_val}"
+
+    @pytest.mark.parametrize(
+        "dim,kappa,w",
+        [
+            (3, 1.0, -0.9),
+            (3, 10.0, -0.9),
+            (3, 5.0, 0.5),
+            (3, 20.0, 0.9),
+            (3, 50.0, 0.95),
+            (10, 1.0, -0.5),
+            (10, 10.0, 0.3),
+            (10, 50.0, 0.8),
+            (768, 10.0, 0.01),
+            (768, 100.0, 0.1),
+        ],
+    )
+    def test_dw_dkappa_matches_finite_differences(self, dim, kappa, w):
+        """_compute_dw_dkappa should match numerical finite differences.
+
+        We compare against finite differences of the normalized CDF inverse,
+        computed via bisection. The normalized CDF F(w; kappa) = U(w; kappa) / Z(kappa)
+        where U is the unnormalized CDF and Z = U(1; kappa).
+        """
+        eps = 1e-3 if kappa < 30 else kappa * 1e-4
+        n_quad = 512
+
+        def unnorm_cdf(w_val, kap):
+            """Unnormalized CDF via Gauss-Legendre quadrature."""
+            nodes, weights = np.polynomial.legendre.leggauss(n_quad)
+            nodes = jnp.array(nodes, dtype=jnp.float32)
+            weights = jnp.array(weights, dtype=jnp.float32)
+            half_range = (w_val - (-1.0)) / 2.0
+            midpoint = (w_val + (-1.0)) / 2.0
+            t = midpoint + half_range * nodes
+            half_exp = (dim - 3.0) / 2.0
+            log_integrand = kap * t + half_exp * jnp.log(
+                jnp.maximum(1.0 - t * t, 1e-30)
+            )
+            log_max = jnp.max(log_integrand)
+            integrand = jnp.exp(log_integrand - log_max)
+            return float(jnp.exp(log_max) * half_range * jnp.dot(weights, integrand))
+
+        def norm_cdf(w_val, kap):
+            """Normalized CDF: F(w; kappa) = U(w; kappa) / Z(kappa)."""
+            return unnorm_cdf(w_val, kap) / unnorm_cdf(1.0 - 1e-10, kap)
+
+        target_quantile = norm_cdf(w, kappa)
+
+        def find_w_for_kappa(kap):
+            """Find w such that norm_cdf(w, kap) == target_quantile, via bisection."""
+            lo, hi = -1.0 + 1e-10, 1.0 - 1e-10
+            for _ in range(80):
+                mid = (lo + hi) / 2.0
+                if norm_cdf(mid, kap) < target_quantile:
+                    lo = mid
+                else:
+                    hi = mid
+            return (lo + hi) / 2.0
+
+        w_plus = find_w_for_kappa(kappa + eps)
+        w_minus = find_w_for_kappa(kappa - eps)
+        fd_grad = (w_plus - w_minus) / (2 * eps)
+
+        analytic_grad = float(
+            _compute_dw_dkappa(jnp.float32(w), jnp.float32(kappa), dim)
+        )
+
+        np.testing.assert_allclose(
+            analytic_grad,
+            fd_grad,
+            rtol=0.05,
+            err_msg=f"dim={dim}, kappa={kappa}, w={w}",
+        )
+
+    @pytest.mark.parametrize("dim", [3, 10, 768])
+    def test_gradient_of_mean_dot_matches_analytic(self, dim):
+        """d/dkappa E[x.mu] = dA_d/dkappa, compare autodiff vs analytic.
+
+        The analytic derivative of A_d(kappa) = I_{d/2}(kappa)/I_{d/2-1}(kappa)
+        is computed via JAX autodiff of mean_resultant_length (which is already
+        tested separately).
+        """
+        kappa_val = 10.0
+        n_samples = 50000
+        key = random.PRNGKey(999)
+        mu = jnp.zeros(dim, dtype=jnp.float32).at[0].set(1.0)
+
+        def mean_dot(kap):
+            s = sample(key, mu, kap, n_samples)
+            return jnp.mean(jnp.dot(s, mu))
+
+        empirical_grad = float(jax.grad(mean_dot)(jnp.float32(kappa_val)))
+        analytic_grad = float(
+            jax.grad(lambda k: mean_resultant_length(k, dim))(jnp.float32(kappa_val))
+        )
+
+        np.testing.assert_allclose(
+            empirical_grad,
+            analytic_grad,
+            rtol=0.15,
+            err_msg=f"dim={dim}",
+        )
+
+    @pytest.mark.parametrize("kappa", [0.0, 0.001])
+    def test_kappa_near_zero(self, kappa):
+        """Sampling and gradients should be well-behaved near kappa=0."""
+        dim = 10
+        n_samples = 1000
+        key = random.PRNGKey(77)
+        mu = jnp.zeros(dim, dtype=jnp.float32).at[0].set(1.0)
+
+        samples = sample(key, mu, kappa, n_samples)
+        assert samples.shape == (n_samples, dim)
+        assert jnp.all(jnp.isfinite(samples))
+
+        # Mean should be near zero for kappa~0
+        mean_dot = float(jnp.mean(jnp.dot(samples, mu)))
+        assert abs(mean_dot) < 0.15
+
+        # Gradient should be finite
+        if kappa > 0:
+
+            def loss(kap):
+                s = sample(key, mu, kap, n_samples)
+                return jnp.mean(jnp.dot(s, mu))
+
+            g = float(jax.grad(loss)(jnp.float32(kappa)))
+            assert np.isfinite(g)
+
+    def test_large_kappa(self):
+        """Sampling and gradients should be well-behaved at large kappa."""
+        dim = 10
+        kappa = 1000.0
+        n_samples = 1000
+        key = random.PRNGKey(88)
+        mu = jnp.zeros(dim, dtype=jnp.float32).at[0].set(1.0)
+
+        samples = sample(key, mu, kappa, n_samples)
+        assert jnp.all(jnp.isfinite(samples))
+
+        # Samples should be very concentrated
+        dots = jnp.dot(samples, mu)
+        assert float(jnp.mean(dots)) > 0.99
+
+        def loss(kap):
+            s = sample(key, mu, kap, n_samples)
+            return jnp.mean(jnp.dot(s, mu))
+
+        g = float(jax.grad(loss)(jnp.float32(kappa)))
+        assert np.isfinite(g)
+        assert g > 0
 
 
 if __name__ == "__main__":

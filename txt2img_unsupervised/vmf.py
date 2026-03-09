@@ -13,11 +13,84 @@ import scipy.special as sps
 from txt2img_unsupervised.cap_sampling import sphere_log_inverse_surface_area
 
 _WOOD_MAX_ITERS = 1000
+# Gauss-Legendre quadrature nodes and weights for implicit reparameterization gradient.
+# Precomputed once at import time in float64 (via numpy/scipy), then cast to float32.
+_N_QUAD = 128
+_GL_NODES_NP, _GL_WEIGHTS_NP = np.polynomial.legendre.leggauss(_N_QUAD)
+_GL_NODES = jnp.array(_GL_NODES_NP, dtype=jnp.float32)
+_GL_WEIGHTS = jnp.array(_GL_WEIGHTS_NP, dtype=jnp.float32)
+
+
+def _prepare_sample_inputs(
+    mu: Array, kappa, n_samples: int
+) -> Tuple[Array, Array, int]:
+    """Normalize and broadcast inputs for vMF sampling.
+
+    Args:
+        mu: Mean direction(s), shape (d,) or (n_samples, d)
+        kappa: Concentration parameter(s), scalar or shape (n_samples,)
+        n_samples: Number of samples
+
+    Returns:
+        (mu, kappa, dim) where mu is (n_samples, d) normalized, kappa is (n_samples,)
+    """
+    assert jnp.issubdtype(
+        mu.dtype, jnp.floating
+    ), f"mu must have float dtype, got {mu.dtype}"
+
+    if mu.ndim == 1:
+        dim = mu.shape[0]
+        mu = mu / jnp.linalg.norm(mu)
+        mu = jnp.broadcast_to(mu, (n_samples, dim))
+        kappa = jnp.full((n_samples,), kappa)
+    elif mu.ndim == 2:
+        batch_size, dim = mu.shape
+        kappa = jnp.asarray(kappa)
+        assert (
+            batch_size == n_samples
+        ), f"mu batch size ({batch_size}) must match n_samples ({n_samples})"
+        assert kappa.shape == (
+            n_samples,
+        ), f"kappa must have shape ({n_samples},), got {kappa.shape}"
+        mu = mu / jnp.linalg.norm(mu, axis=1, keepdims=True)
+    else:
+        raise ValueError(f"mu must be 1D or 2D, got {mu.ndim}D")
+
+    return mu, kappa, dim
+
+
+def _combine_w_with_tangent(key_v: random.PRNGKey, mu: Array, w: Array) -> Array:
+    """Sample a tangent direction and combine with w to produce vMF samples.
+
+    Args:
+        key_v: JAX random key for the tangent direction
+        mu: Mean directions, shape (n, d), assumed already normalized
+        w: Cosine component values, shape (n,)
+
+    Returns:
+        Samples on the unit sphere, shape (n, d)
+    """
+    n, dim = mu.shape
+    v_full = random.normal(key_v, (n, dim))
+    mu_component = jnp.sum(v_full * mu, axis=1, keepdims=True)
+    v_orthogonal = v_full - mu_component * mu
+    v_orthogonal = v_orthogonal / jnp.maximum(
+        jnp.linalg.norm(v_orthogonal, axis=1, keepdims=True), 1e-8
+    )
+
+    sqrt_term = jnp.sqrt(jnp.maximum(1 - w**2, 0.0))
+    samples = w[:, None] * mu + sqrt_term[:, None] * v_orthogonal
+
+    return samples / jnp.maximum(jnp.linalg.norm(samples, axis=1, keepdims=True), 1e-8)
 
 
 @partial(jax.jit, static_argnames=("n_samples",), inline=True)
 def sample(key: random.PRNGKey, mu: Array, kappa, n_samples: int) -> Array:
     """Sample from von Mises-Fisher distribution using Wood's algorithm.
+
+    Differentiable w.r.t. both mu and kappa. Gradients through kappa use
+    implicit reparameterization (custom_vjp) since Wood's rejection loop
+    is not directly differentiable.
 
     Supports two modes:
     - Unbatched: mu shape (d,), kappa scalar -> (n_samples, d) samples from single distribution
@@ -33,69 +106,13 @@ def sample(key: random.PRNGKey, mu: Array, kappa, n_samples: int) -> Array:
     Returns:
         Samples from vMF distribution, shape (n_samples, d)
     """
-    assert jnp.issubdtype(
-        mu.dtype, jnp.floating
-    ), f"mu must have float dtype, got {mu.dtype}"
-
-    if mu.ndim == 1:
-        # Unbatched: broadcast to batched format
-        dim = mu.shape[0]
-        mu = mu / jnp.linalg.norm(mu)
-        mu = jnp.broadcast_to(mu, (n_samples, dim))
-        kappa = jnp.full((n_samples,), kappa)
-    elif mu.ndim == 2:
-        # Batched case: n_samples (mu, kappa) pairs
-        batch_size, dim = mu.shape
-        kappa = jnp.asarray(kappa)
-        assert (
-            batch_size == n_samples
-        ), f"mu batch size ({batch_size}) must match n_samples ({n_samples})"
-        assert kappa.shape == (
-            n_samples,
-        ), f"kappa must have shape ({n_samples},), got {kappa.shape}"
-        mu = mu / jnp.linalg.norm(mu, axis=1, keepdims=True)
-    else:
-        raise ValueError(f"mu must be 1D or 2D, got {mu.ndim}D")
-
-    return _sample_wood_batched(key, mu, kappa, dim)
-
-
-def _sample_wood_batched(
-    key: random.PRNGKey, mu: Array, kappa: Array, dim: int
-) -> Array:
-    """Sample from batched vMF distributions (one sample per distribution).
-
-    Args:
-        key: JAX random key
-        mu: Mean directions, shape (n, d), assumed already normalized
-        kappa: Concentration parameters, shape (n,)
-        dim: Dimension of the sphere
-
-    Returns:
-        Samples, shape (n, d)
-    """
-    n = mu.shape[0]
+    mu, kappa, dim = _prepare_sample_inputs(mu, kappa, n_samples)
 
     key_w, key_v = random.split(key)
-    keys_w = random.split(key_w, n)
+    keys_w = random.split(key_w, n_samples)
+    w = jax.vmap(lambda k, kap: _sample_w_reparam(k, kap, dim))(keys_w, kappa)
 
-    # Sample w for each (key, kappa) pair
-    w = jax.vmap(lambda k, kap: _sample_w_single(k, kap, dim))(keys_w, kappa)
-
-    # Sample v and project perpendicular to each mu
-    v_full = random.normal(key_v, (n, dim))
-    mu_component = jnp.sum(v_full * mu, axis=1, keepdims=True)
-    v_orthogonal = v_full - mu_component * mu
-    v_orthogonal = v_orthogonal / jnp.maximum(
-        jnp.linalg.norm(v_orthogonal, axis=1, keepdims=True), 1e-8
-    )
-
-    # Combine: x = w * mu + sqrt(1-w^2) * v_orthogonal
-    sqrt_term = jnp.sqrt(jnp.maximum(1 - w**2, 0.0))
-    samples = w[:, None] * mu + sqrt_term[:, None] * v_orthogonal
-
-    # Normalize (should already be close to unit norm)
-    return samples / jnp.maximum(jnp.linalg.norm(samples, axis=1, keepdims=True), 1e-8)
+    return _combine_w_with_tangent(key_v, mu, w)
 
 
 def _sample_w_single(key: random.PRNGKey, kappa: Array, dim: int) -> Array:
@@ -156,6 +173,104 @@ def _sample_w_single(key: random.PRNGKey, kappa: Array, dim: int) -> Array:
     )
 
     return jnp.where(accepted_final, w_final, last_candidate)
+
+
+def _compute_dw_dkappa(w: Array, kappa: Array, dim: int) -> Array:
+    """Compute dw/dkappa via the implicit function theorem.
+
+    For w drawn from the vMF marginal CDF F(w; kappa), the implicit
+    reparameterization gradient is:
+
+        dw/dkappa = -dF(w; kappa)/dkappa / f(w; kappa)
+
+    which simplifies (after cancelling the normalization constant) to:
+
+        dw/dkappa = -integral_{-1}^{w} exp(kappa*(t-w))
+                     * ((1-t^2)/(1-w^2))^{(d-3)/2}
+                     * (t - A_d(kappa)) dt
+
+    The unsigned envelope of the integrand (without the (t - A_d) factor) peaks
+    at t_peak = kappa*(1-t^2)/(d-3), approximately kappa/(d-3) for small t.
+    The width around the peak scales as 1/sqrt(d-3). We choose the integration
+    range to cover the envelope's support, capped at [-1, w].
+
+    Args:
+        w: Sample from the vMF marginal, scalar in [-1, 1]
+        kappa: Concentration parameter, scalar
+        dim: Ambient dimension
+
+    Returns:
+        Scalar dw/dkappa
+    """
+    d = jnp.float32(dim)
+    half_exp = (d - 3.0) / 2.0
+    a_d = mean_resultant_length(kappa, dim)
+    one_minus_w2 = jnp.maximum(1.0 - w * w, 1e-30)
+
+    # The unsigned envelope exp(kappa*t + half_exp*log(1-t^2)) peaks where
+    # kappa = 2*half_exp*t / (1-t^2). Solving the quadratic
+    # kappa*t^2 + 2*half_exp*t - kappa = 0 gives:
+    # t_peak = (-half_exp + sqrt(half_exp^2 + kappa^2)) / kappa
+    he_safe = jnp.maximum(half_exp, 0.5)
+    kappa_safe = jnp.maximum(kappa, 1e-10)
+    t_peak = (-he_safe + jnp.sqrt(he_safe * he_safe + kappa_safe * kappa_safe)) / (
+        kappa_safe
+    )
+
+    # Width from second derivative of log-envelope at peak:
+    # h''(t) = -2*half_exp*(1+t^2)/(1-t^2)^2 ≈ -2*half_exp for small t
+    # => sigma ≈ 1/sqrt(2*half_exp)
+    sigma = 1.0 / jnp.sqrt(jnp.maximum(2.0 * he_safe, 1.0))
+
+    # Cover the full support: from well below t_peak to w
+    lower = jnp.maximum(-1.0, t_peak - 8.0 * sigma)
+    # Ensure the range isn't degenerate when w is near or below t_peak
+    lower = jnp.minimum(lower, w - sigma)
+    lower = jnp.maximum(lower, -1.0)
+
+    # Map GL nodes from [-1, 1] to [lower, w]
+    half_range = (w - lower) / 2.0
+    midpoint = (w + lower) / 2.0
+    t = midpoint + half_range * _GL_NODES
+
+    # Evaluate integrand: exp(kappa*(t-w)) * ratio^half_exp * (t - A_d)
+    log_exp_part = kappa * (t - w)
+    t_clamped = jnp.clip(t, -1.0 + 1e-7, 1.0 - 1e-7)
+    log_ratio = half_exp * (
+        jnp.log(jnp.maximum(1.0 - t_clamped * t_clamped, 1e-30)) - jnp.log(one_minus_w2)
+    )
+
+    log_abs_integrand = log_exp_part + log_ratio
+    integrand = jnp.exp(log_abs_integrand) * (t - a_d)
+
+    integral = half_range * jnp.dot(_GL_WEIGHTS, integrand)
+    return -integral
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(2,))
+def _sample_w_reparam(key: random.PRNGKey, kappa: Array, dim: int) -> Array:
+    """Sample w from the vMF marginal with a custom backward pass.
+
+    Forward: exact samples via Wood's rejection sampler.
+    Backward: exact dw/dkappa via implicit reparameterization.
+    """
+    return _sample_w_single(key, kappa, dim)
+
+
+def _sample_w_reparam_fwd(key, kappa, dim):
+    """Forward pass: sample w and save residuals for backward."""
+    w = _sample_w_single(key, kappa, dim)
+    return w, (w, kappa)
+
+
+def _sample_w_reparam_bwd(dim, res, g):
+    """Backward pass: compute gradient dw/dkappa via implicit reparameterization."""
+    w, kappa = res
+    dw_dk = _compute_dw_dkappa(w, kappa, dim)
+    return (None, g * dw_dk)
+
+
+_sample_w_reparam.defvjp(_sample_w_reparam_fwd, _sample_w_reparam_bwd)
 
 
 def _hankel_log_bessel(nu: Array, x: Array) -> Array:
