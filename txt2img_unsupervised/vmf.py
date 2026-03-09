@@ -1,7 +1,7 @@
 """von Mises-Fisher distributions in JAX."""
 
 from functools import partial
-from typing import Optional, Tuple
+from typing import Tuple
 
 import jax
 import jax.numpy as jnp
@@ -13,7 +13,6 @@ import scipy.special as sps
 from txt2img_unsupervised.cap_sampling import sphere_log_inverse_surface_area
 
 _WOOD_MAX_ITERS = 1000
-_DEFAULT_MAX_KAPPA = 1e8
 
 
 @partial(jax.jit, static_argnames=("n_samples",), inline=True)
@@ -157,61 +156,6 @@ def _sample_w_single(key: random.PRNGKey, kappa: Array, dim: int) -> Array:
     )
 
     return jnp.where(accepted_final, w_final, last_candidate)
-
-
-def fit(
-    x: Array,
-    max_kappa: Optional[float] = _DEFAULT_MAX_KAPPA,
-    weights: Optional[Array] = None,
-) -> Tuple[Array, float]:
-    """Fit vMF distribution parameters via maximum likelihood.
-
-    Args:
-        x: Data points on unit sphere, shape (n, d)
-        max_kappa: Optional upper bound for the concentration estimate. ``None`` disables
-            clamping.
-        weights: Optional log-weights for each example, shape (n,). If provided, examples
-            are weighted according to softmax(weights) in the MLE computation.
-
-    Returns:
-        Tuple of (mu_hat, kappa_hat)
-    """
-    n, dim = x.shape
-
-    # Input validation for weights
-    if weights is not None:
-        weights = jnp.asarray(weights)
-        if weights.shape != (n,):
-            raise ValueError(f"weights must have shape ({n},), got {weights.shape}")
-        if not jnp.all(jnp.isfinite(weights)):
-            raise ValueError("weights must be finite")
-
-    # Compute empirical mean direction (weighted or unweighted)
-    if weights is None:
-        R = jnp.mean(x, axis=0)
-    else:
-        # Convert log-weights to probabilities via softmax
-        probs = jax.nn.softmax(weights)
-        R = jnp.sum(probs[:, None] * x, axis=0)
-
-    R_norm = jnp.linalg.norm(R)
-
-    mu_hat = R / jnp.maximum(R_norm, 1e-8)
-
-    # Solve for kappa using MLE equation: A_d(kappa) = ||R||
-    # where A_d(kappa) = I_{d/2}(kappa) / I_{d/2-1}(kappa)
-
-    if R_norm < 1e-8:
-        # Nearly uniform distribution
-        kappa_hat = 0.0
-    else:
-        if R_norm >= 1.0 - 1e-5:
-            effective_r = float(min(R_norm, 1.0 - 1e-8))
-            kappa_hat = _solve_kappa_mle(effective_r, dim, max_kappa=max_kappa)
-        else:
-            kappa_hat = _solve_kappa_mle(float(R_norm), dim, max_kappa=max_kappa)
-
-    return mu_hat, kappa_hat
 
 
 def _hankel_log_bessel(nu: Array, x: Array) -> Array:
@@ -653,63 +597,6 @@ def log_prob(x: Array, mu: Array, kappa: float) -> Array:
     dot_product = jnp.sum(x * mu, axis=-1)
     log_c = log_normalization_constant(kappa, dim)
     return log_c + kappa * dot_product
-
-
-def _solve_kappa_mle(
-    r_norm: float, dim: int, max_kappa: Optional[float] = _DEFAULT_MAX_KAPPA
-) -> float:
-    """Solve for kappa in MLE equation ``A_d(kappa) = r_norm``."""
-
-    def objective(kappa: float) -> float:
-        if kappa <= 0.0:
-            return -r_norm
-        return float(mean_resultant_length(jnp.array(kappa), dim)) - r_norm
-
-    # Initial guess using asymptotic inverse
-    if r_norm > 0.9:
-        # Use asymptotic formula: kappa ≈ (d-1)/(2(1-r_norm))
-        kappa_init = (dim - 1.0) / (2.0 * (1.0 - r_norm + 1e-8))
-    else:
-        # Use small kappa approximation: A_d(kappa) ≈ kappa / (d-1)
-        kappa_init = r_norm * (dim - 1.0)
-
-    # Simple bisection method for root finding
-    kappa_low = 0.0
-    kappa_high = max(1000.0, 2.0 * kappa_init)
-    if max_kappa is not None:
-        kappa_high = min(kappa_high, max_kappa)
-
-    for _ in range(32):
-        if objective(kappa_high) > 0:
-            break
-        if max_kappa is not None and kappa_high >= max_kappa:
-            return float(max_kappa)
-        new_high = kappa_high * 2.0
-        if max_kappa is not None:
-            new_high = min(new_high, max_kappa)
-        kappa_high = new_high
-    else:
-        if max_kappa is not None:
-            return float(max_kappa)
-        raise RuntimeError("Failed to bracket kappa in _solve_kappa_mle")
-
-    for _ in range(100):
-        kappa_mid = 0.5 * (kappa_low + kappa_high)
-        obj_mid = objective(kappa_mid)
-
-        if abs(obj_mid) < 1e-8:
-            kappa_high = kappa_mid
-            break
-
-        if obj_mid > 0:
-            kappa_high = kappa_mid
-        else:
-            kappa_low = kappa_mid
-
-    estimate = 0.5 * (kappa_low + kappa_high)
-    if max_kappa is not None:
-        estimate = min(estimate, max_kappa)
-    return float(estimate)
 
 
 # =============================================================================

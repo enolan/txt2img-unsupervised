@@ -11,8 +11,6 @@ from txt2img_unsupervised.vmf import (
     log_normalization_constant,
     log_prob,
     sample,
-    fit,
-    _DEFAULT_MAX_KAPPA,
     _sample_uniform_sphere,
 )
 
@@ -242,121 +240,6 @@ class TestSample:
         assert jnp.abs(empirical - expected) < 0.05
 
 
-class TestFit:
-    def test_uniform_fitting(self):
-        """Test fitting uniform distribution."""
-        dim = 10
-        n_samples = 1000
-        key = random.PRNGKey(42)
-
-        # Generate uniform samples
-        samples = _sample_uniform_sphere(key, dim, n_samples)
-
-        mu_hat, kappa_hat = fit(samples)
-
-        # For uniform distribution, kappa should be small (but not necessarily < 0.1 for finite samples)
-        assert kappa_hat < 1.0
-
-        # mu_hat should be unit vector
-        assert jnp.abs(jnp.linalg.norm(mu_hat) - 1.0) < 1e-6
-
-    def test_concentrated_fitting(self):
-        """Test fitting concentrated distribution."""
-        dim = 10
-        n_samples = 1000
-        key = random.PRNGKey(42)
-
-        # True parameters
-        mu_true = jnp.array([1.0] + [0.0] * (dim - 1))
-        kappa_true = 10.0
-
-        # Generate samples
-        samples = sample(key, mu_true, kappa_true, n_samples)
-
-        # Fit parameters
-        mu_hat, kappa_hat = fit(samples)
-
-        # Check parameter recovery (more lenient for stochastic test)
-        assert jnp.linalg.norm(mu_hat - mu_true) < 0.3
-        assert jnp.abs(kappa_hat - kappa_true) / kappa_true < 1.0  # Relative error
-
-    def test_round_trip_consistency(self):
-        """Test sample -> fit -> sample consistency."""
-        for dim in [3, 10, 50]:
-            for kappa_true in [0.1, 1.0, 10.0, 100.0]:
-                key = random.PRNGKey(42)
-                key1, key2 = random.split(key)
-
-                mu_true = jnp.zeros(dim).at[0].set(1.0)
-                n_samples = 2000
-
-                # Sample -> fit -> sample
-                samples1 = sample(key1, mu_true, kappa_true, n_samples)
-                mu_hat, kappa_hat = fit(samples1)
-                samples2 = sample(key2, mu_hat, kappa_hat, n_samples)
-
-                # Compare sample statistics
-                mean1 = jnp.mean(samples1, axis=0)
-                mean2 = jnp.mean(samples2, axis=0)
-
-                # Mean directions should be similar (very lenient for stochastic test)
-                assert jnp.linalg.norm(mean1 - mean2) < 1.5
-
-    def test_edge_cases(self):
-        """Test fitting edge cases."""
-        dim = 5
-
-        # Single sample
-        sample_single = jnp.array([[1.0] + [0.0] * (dim - 1)])
-        mu_hat, kappa_hat = fit(sample_single)
-        assert jnp.allclose(mu_hat, sample_single[0])
-        assert kappa_hat == pytest.approx(_DEFAULT_MAX_KAPPA)
-
-        # Antipodal samples
-        samples_antipodal = jnp.array(
-            [[1.0] + [0.0] * (dim - 1), [-1.0] + [0.0] * (dim - 1)]
-        )
-        mu_hat, kappa_hat = fit(samples_antipodal)
-        assert kappa_hat < 0.1  # Should be nearly uniform
-
-    def test_detects_uniform_mean(self):
-        """Zero resultant should trigger kappa=0 branch."""
-
-        dim = 4
-        eye = jnp.eye(dim)
-        samples = jnp.concatenate([eye, -eye], axis=0)
-
-        _, kappa_hat = fit(samples)
-
-        assert kappa_hat == pytest.approx(0.0)
-
-    def test_detects_near_degenerate_mean(self):
-        """Resultant near unit length should trigger large kappa branch."""
-
-        dim = 3
-        mu = jnp.array([1.0, 0.0, 0.0])
-        samples = jnp.tile(mu[None, :], (16, 1))
-
-        _, kappa_hat = fit(samples)
-
-        assert kappa_hat == pytest.approx(_DEFAULT_MAX_KAPPA)
-
-    def test_fit_respects_max_kappa(self):
-        """Optional clamp should bound concentration when requested."""
-
-        dim = 5
-        mu = jnp.zeros(dim).at[0].set(1.0)
-        key = random.PRNGKey(123)
-
-        noise = 1e-6 * random.normal(key, (512, dim))
-        samples = mu[None, :] + noise
-        samples = samples / jnp.linalg.norm(samples, axis=1, keepdims=True)
-
-        _, kappa_hat = fit(samples, max_kappa=500.0)
-
-        assert kappa_hat <= 500.0 + 1e-3
-
-
 class TestNumericalStability:
     def test_extreme_dimensions(self):
         """Test stability in extreme dimensions."""
@@ -375,10 +258,6 @@ class TestNumericalStability:
 
                 log_probs = log_prob(samples, mu, kappa)
                 assert jnp.all(jnp.isfinite(log_probs))
-
-                mu_hat, kappa_hat = fit(samples)
-                assert jnp.isfinite(kappa_hat)
-                assert jnp.all(jnp.isfinite(mu_hat))
 
     def test_extreme_kappa(self):
         """Test stability for extreme kappa values."""
@@ -407,84 +286,6 @@ class TestNumericalStability:
 
         log_probs = log_prob(samples, mu, kappa)
         assert log_probs.dtype == dtype
-
-        mu_hat, kappa_hat = fit(samples)
-        assert mu_hat.dtype == dtype
-
-
-class TestWeightedFit:
-    """Test weighted fitting functionality."""
-
-    def test_uniform_weights_equals_unweighted(self):
-        """Test that uniform weights give same result as no weights."""
-        dim = 5
-        n_samples = 200
-        key = random.PRNGKey(123)
-
-        true_mu = jnp.array([1.0, 0.0, 0.0, 0.0, 0.0])
-        true_kappa = 5.0
-
-        samples = sample(key, true_mu, true_kappa, n_samples)
-
-        # Uniform weights (should give same result as no weights)
-        uniform_weights = jnp.zeros(n_samples)  # log(1) = 0 for all
-
-        mu_unweighted, kappa_unweighted = fit(samples)
-        mu_weighted, kappa_weighted = fit(samples, weights=uniform_weights)
-
-        # Should be very close (allowing for numerical differences)
-        assert jnp.allclose(mu_unweighted, mu_weighted, rtol=1e-6)
-        assert jnp.allclose(kappa_unweighted, kappa_weighted, rtol=1e-6)
-
-    def test_extreme_weights(self):
-        """Test that extreme weights work correctly."""
-        dim = 3
-        n_samples = 100
-        key = random.PRNGKey(456)
-
-        # Create mixed samples
-        mu1 = jnp.array([1.0, 0.0, 0.0])
-        mu2 = jnp.array([0.0, 1.0, 0.0])
-
-        key1, key2 = random.split(key)
-        samples1 = sample(key1, mu1, 10.0, n_samples // 2)
-        samples2 = sample(key2, mu2, 10.0, n_samples // 2)
-
-        all_samples = jnp.vstack([samples1, samples2])
-
-        # Weight heavily toward first group
-        weights = jnp.concatenate(
-            [
-                jnp.ones(n_samples // 2) * 10.0,  # High weight
-                jnp.ones(n_samples // 2) * (-10.0),  # Very low weight
-            ]
-        )
-
-        mu_weighted, kappa_weighted = fit(all_samples, weights=weights)
-
-        # With extreme weights (difference of 20), mu_weighted should be nearly identical to mu1
-        # The softmax of [10, -10] gives approximately [0.99995, 0.00005] probabilities
-        dot_product = jnp.dot(mu_weighted, mu1)
-        assert (
-            dot_product > 0.99
-        ), f"Expected mu_weighted to be nearly identical to mu1, got dot product {dot_product}"
-
-    def test_input_validation(self):
-        """Test input validation for weights."""
-        dim = 3
-        n_samples = 10
-        key = random.PRNGKey(789)
-
-        samples = sample(key, jnp.array([1.0, 0.0, 0.0]), 1.0, n_samples)
-
-        # Wrong shape
-        with pytest.raises(ValueError, match="weights must have shape"):
-            fit(samples, weights=jnp.ones(n_samples + 1))
-
-        # Non-finite weights
-        bad_weights = jnp.ones(n_samples).at[0].set(jnp.inf)
-        with pytest.raises(ValueError, match="weights must be finite"):
-            fit(samples, weights=bad_weights)
 
 
 if __name__ == "__main__":
