@@ -29,6 +29,13 @@ The variational lower bound decomposes into three terms:
   L_recon = -log C_d(κ_max) - κ_max · A_d(κ_max)
 where w = P_{x_t}(x_1) is the scaled score (tangent projection).
 
+Optionally, a variance minimization term can be added (Kingma et al. VDM):
+  L_var = λ · mean(f_i²)
+where f_i = ½ γ'(t_i) · κ(t_i) · ‖w_θ − w_true‖² is the per-sample diffusion loss.
+Since E[L_diff] is invariant to the schedule, minimizing E[f_i²] minimizes Var(L̂_diff),
+reducing Monte Carlo estimator variance. stop_gradient on the squared error ensures only
+schedule parameters receive gradients from this term.
+
 ### Probability Flow ODE
 For sampling, we integrate the probability flow ODE from t=0 (noise) to t=1 (data):
     dx/dt = ½ γ'(t) · w_θ(x, t)
@@ -116,6 +123,7 @@ class ScoreMatchingModel(nn.Module):
 
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
     d_max_dist: Optional[tuple] = None
+    vlb_variance_loss_weight: Optional[float] = None
 
     @property
     def conditioning_dim(self) -> int:
@@ -291,7 +299,7 @@ class ScoreMatchingModel(nn.Module):
 
         Returns:
             Tuple of (total_loss, components_dict) where components_dict has keys
-            "diffusion", "prior", and "recon".
+            "diffusion", "prior", "recon", and "variance".
         """
         batch_size = x_1.shape[0]
         dim = self.domain_dim
@@ -323,12 +331,23 @@ class ScoreMatchingModel(nn.Module):
         kappa_max = jnp.exp(self.schedule.log_kappa_max)
         recon_loss = vmf_recon_loss(kappa_max, dim)
 
+        # VLB variance minimization: minimize the second moment of the per-sample diffusion
+        # loss. Since E[L_diff] is invariant to the schedule, minimizing E[f_i²] is equivalent
+        # to minimizing Var(L̂). stop_gradient on per_sample_sq_err ensures gradients only
+        # flow to schedule params.
+        if self.vlb_variance_loss_weight is not None:
+            f_i = 0.5 * gamma_prime * kappa_t * jax.lax.stop_gradient(per_sample_sq_err)
+            variance_loss = jnp.mean(f_i**2) * self.vlb_variance_loss_weight
+        else:
+            variance_loss = jnp.array(0.0)
+
         components = {
             "diffusion": diffusion_loss,
             "prior": prior_loss,
             "recon": recon_loss,
+            "variance": variance_loss,
         }
-        return diffusion_loss + prior_loss + recon_loss, components
+        return diffusion_loss + prior_loss + recon_loss + variance_loss, components
 
 
 def vmf_recon_loss(kappa, dim):
@@ -382,7 +401,7 @@ def compute_batch_loss(
 
     Returns:
         Tuple of (total_loss, components_dict) where components_dict has keys
-        "diffusion", "prior", and "recon".
+        "diffusion", "prior", "recon", and "variance".
     """
     x_1 = batch["point_vec"]
     batch_size = x_1.shape[0]
@@ -1113,6 +1132,7 @@ def test_train_conditioned_score(domain_dim, data_distribution):
         d_model=512,
         cap_conditioning=CapConditioningMode.CONDITIONED_SCORE,
         d_max_dist=d_max_dist,
+        vlb_variance_loss_weight=1e-3,
     )
 
     batch_size = 2048
@@ -1317,3 +1337,174 @@ def test_train_conditioned_score(domain_dim, data_distribution):
         assert (
             jnp.exp(model_log_mass_outside_cap) < 1.0 - EXPECTED_MASS_FRACTION_IN_CAP
         ), f"Model mass outside cap {jnp.exp(model_log_mass_outside_cap):.3f} is too high (should be under {1.0 - EXPECTED_MASS_FRACTION_IN_CAP:.3f})"
+
+
+def test_variance_loss_computed():
+    """When vlb_variance_loss_weight is set, the variance component should be finite and positive."""
+    dim = 3
+    model = _make_model(dim, d_model=32, vlb_variance_loss_weight=1.0)
+
+    params_rng, data_rng, noise_rng = jax.random.split(jax.random.PRNGKey(42), 3)
+    params = model.init(params_rng, *model.dummy_inputs())
+
+    x_1 = sample_sphere(data_rng, 64, dim)
+    t = jnp.linspace(0.01, 0.99, 64)
+
+    loss, components = model.apply(
+        params,
+        x_1,
+        t,
+        None,
+        rngs={"noise": noise_rng},
+        method=model.compute_vlb_loss,
+    )
+
+    assert jnp.isfinite(
+        components["variance"]
+    ), f"Variance loss not finite: {components['variance']}"
+    assert (
+        float(components["variance"]) > 0
+    ), f"Variance loss should be positive, got {components['variance']}"
+    assert jnp.isfinite(loss), f"Total loss not finite: {loss}"
+
+
+def test_variance_loss_zero_when_disabled():
+    """Default model (weight=None) should have variance component equal to 0."""
+    dim = 3
+    model = _make_model(dim, d_model=32)
+
+    params_rng, data_rng, noise_rng = jax.random.split(jax.random.PRNGKey(42), 3)
+    params = model.init(params_rng, *model.dummy_inputs())
+
+    x_1 = sample_sphere(data_rng, 64, dim)
+    t = jnp.linspace(0.01, 0.99, 64)
+
+    _loss, components = model.apply(
+        params,
+        x_1,
+        t,
+        None,
+        rngs={"noise": noise_rng},
+        method=model.compute_vlb_loss,
+    )
+
+    assert float(components["variance"]) == 0.0
+
+
+def test_variance_loss_gradients_schedule_only():
+    """Gradients of the variance loss should flow to schedule params but not vector field params."""
+    dim = 3
+    model = _make_model(dim, d_model=32, vlb_variance_loss_weight=1.0)
+
+    params_rng, data_rng, noise_rng = jax.random.split(jax.random.PRNGKey(7), 3)
+    params = model.init(params_rng, *model.dummy_inputs())
+
+    x_1 = sample_sphere(data_rng, 32, dim)
+    t = jax.random.uniform(jax.random.PRNGKey(0), (32,))
+
+    def variance_only_loss(p):
+        _loss, components = model.apply(
+            p,
+            x_1,
+            t,
+            None,
+            rngs={"noise": noise_rng},
+            method=model.compute_vlb_loss,
+        )
+        return components["variance"]
+
+    grads = jax.grad(variance_only_loss)(params)
+
+    # Vector field grads should all be zero (stop_gradient blocks them)
+    vf_grads = grads["params"]["vector_field"]
+    flat_vf = jax.tree_util.tree_leaves(vf_grads)
+    assert all(
+        jnp.all(g == 0) for g in flat_vf
+    ), "Variance loss should not produce gradients for vector field params"
+
+    # Schedule grads should be non-zero
+    sched_grads = grads["params"]["schedule"]
+    flat_sched = jax.tree_util.tree_leaves(sched_grads)
+    assert any(
+        jnp.any(g != 0) for g in flat_sched
+    ), "Variance loss should produce gradients for schedule params"
+
+
+def test_variance_loss_scales_with_weight():
+    """weight=2.0 should produce 2x the variance loss of weight=1.0."""
+    dim = 3
+    model_1 = _make_model(dim, d_model=32, vlb_variance_loss_weight=1.0)
+    model_2 = _make_model(dim, d_model=32, vlb_variance_loss_weight=2.0)
+
+    params_rng, data_rng, noise_rng = jax.random.split(jax.random.PRNGKey(42), 3)
+    # Both models have identical architecture, so same init gives same params
+    params = model_1.init(params_rng, *model_1.dummy_inputs())
+
+    x_1 = sample_sphere(data_rng, 64, dim)
+    t = jnp.linspace(0.01, 0.99, 64)
+
+    _, components_1 = model_1.apply(
+        params, x_1, t, None, rngs={"noise": noise_rng}, method=model_1.compute_vlb_loss
+    )
+    _, components_2 = model_2.apply(
+        params, x_1, t, None, rngs={"noise": noise_rng}, method=model_2.compute_vlb_loss
+    )
+
+    np.testing.assert_allclose(
+        float(components_2["variance"]),
+        2.0 * float(components_1["variance"]),
+        rtol=1e-5,
+    )
+
+
+@pytest.mark.usefixtures("starts_with_progressbar")
+def test_train_trivial_with_variance_loss():
+    """Train single-point distribution with variance loss enabled, verify convergence."""
+    from txt2img_unsupervised.training_infra import train_for_tests
+
+    domain_dim = 3
+    model = _make_model(domain_dim, vlb_variance_loss_weight=0.1)
+
+    batch_size = 256
+    first_dim_vec = jnp.zeros(domain_dim)
+    first_dim_vec = first_dim_vec.at[0].set(1.0)
+    points = repeat(first_dim_vec, "v -> b v", b=batch_size * 100)
+    dset = Dataset.from_dict({"point_vec": points}).with_format("np")
+    test_dset = Dataset.from_dict({"point_vec": points[:batch_size]}).with_format("np")
+
+    loss_fn = partial(compute_batch_loss, model)
+
+    def nll_fn(model, params, batch, rng):
+        return compute_nll(model, params, batch, n_steps=256, rng=rng, n_projections=32)
+
+    result = train_for_tests(
+        model,
+        dset,
+        batch_size,
+        learning_rate=1e-2,
+        loss_fn=loss_fn,
+        fields=["point_vec"],
+        epochs=2,
+        test_dataset=test_dset,
+        nll_fn=nll_fn,
+    )
+    eval_params = result.state.get_eval_params()
+
+    samples = generate_samples(
+        model,
+        eval_params,
+        jax.random.PRNGKey(0),
+        cap_params=None,
+        n_steps=1000,
+        batch_size=20,
+    )
+    cos_sims = samples @ points[0]
+
+    high_sims = cos_sims > 0.99
+    assert (
+        high_sims.mean() >= 0.9
+    ), f"Only {high_sims.mean()*100:.1f}% of samples close to target"
+
+    assert (
+        result.test_nll < -5
+    ), f"NLL {result.test_nll:.4f} should be << 0 for single-point distribution"

@@ -450,6 +450,7 @@ class ScoreMatchingModelConfig(VectorFieldConfig):
     init_log_kappa_max: float = 9.210  # log(10000)
     schedule_hidden_dim: int = 32
     schedule_n_quadrature_points: int = 1024
+    vlb_variance_loss_weight: Optional[float] = None
 
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
     d_max_dist: Optional[Tuple[Tuple[float, float], ...]] = None
@@ -515,6 +516,11 @@ class ScoreMatchingModelConfig(VectorFieldConfig):
             raise ValueError("schedule_hidden_dim must be positive")
         if self.schedule_n_quadrature_points < 2:
             raise ValueError("schedule_n_quadrature_points must be >= 2")
+        if (
+            self.vlb_variance_loss_weight is not None
+            and self.vlb_variance_loss_weight < 0
+        ):
+            raise ValueError("vlb_variance_loss_weight must be non-negative")
 
         if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
             if self.d_max_dist is not None:

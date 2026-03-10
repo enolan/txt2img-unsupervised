@@ -859,7 +859,7 @@ def train_loop_async(
                     break
 
             desc = f"Loss: {current_loss:.4f}"
-            for key in ("diffusion", "prior", "recon"):
+            for key in ("diffusion", "prior", "recon", "variance"):
                 if key in current_metrics:
                     desc += f" {key}: {current_metrics[key]:.4f}"
             pbar_step.set_description(desc)
@@ -1042,7 +1042,7 @@ def fast_post_step_hook(loss, metrics, global_step, norm):
     if "gradient_noise_scale" in metrics:
         to_log["train/gradient_noise_scale"] = metrics["gradient_noise_scale"]
 
-    for key in ("diffusion", "prior", "recon"):
+    for key in ("diffusion", "prior", "recon", "variance"):
         if key in metrics:
             to_log[f"train/vlb_{key}"] = metrics[key]
 

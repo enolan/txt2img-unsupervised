@@ -142,6 +142,11 @@ def parse_arguments():
         type=float,
         help="Separate learning rate for the learned noise schedule (default: use main LR)",
     )
+    parser.add_argument(
+        "--vlb-variance-loss-weight",
+        type=float,
+        help="Weight for VLB variance minimization loss on schedule params (default: disabled)",
+    )
 
     args, _unknown = parser.parse_known_args()
     return args
