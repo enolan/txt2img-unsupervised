@@ -16,7 +16,7 @@ allow much better prompt following and image quality.
 
 The image generation model is an autoregressive transformer using a VQGAN for the image tokens. The
 model that generates embeddings is a spherical flow matching model with optimal transport paths, or
-a score matching model.
+a spherical variational diffusion model.
 
 ## Code Style Guidelines
 
@@ -192,6 +192,7 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
 * Scripts
   * `train_transformer.py`. Train an image generation model.
   * `train_flow_matching.py`. Train a flow matching model.
+  * `train_score_matching.py`. Train a score matching model.
   * `txt2img_unsupervised/visualize_field.py`. Visualize the field of a flow matching model.
   * `txt2img_unsupervised/rotating_field_animation.py`. Make an animation of the field of a flow
     matching model where the sphere rotates so you can see the field from different angles.
@@ -202,6 +203,8 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
   * `txt2img_unsupervised/function_weighted_flow_model.py`. Function-weighted flow matching model:
     models that generate a distribution weighted by a function whose parameters are specified at
     inference time. Used to generate CLIP image embeddings for image generation.
+  * `txt2img_unsupervised/score_matching.py`. Spherical variational diffusion model. An alternate
+    approach. Includes code for cap-conditioned generation. Does not use FunctionWeightedFlowModel.
   * `txt2img_unsupervised/cap_sampling.py`. Functions for sampling spherical caps and sampling
     points inside them.
   * `txt2img_unsupervised/transformer_model.py`. The transformer-based image generation model.
