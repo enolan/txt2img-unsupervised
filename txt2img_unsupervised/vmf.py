@@ -78,7 +78,9 @@ def _combine_w_with_tangent(key_v: random.PRNGKey, mu: Array, w: Array) -> Array
         jnp.linalg.norm(v_orthogonal, axis=1, keepdims=True), 1e-8
     )
 
-    sqrt_term = jnp.sqrt(jnp.maximum(1 - w**2, 0.0))
+    # important to enforce input to sqrt is positive because d/dw sqrt(1 - w^2) is -inf when
+    # w = 1.0
+    sqrt_term = jnp.sqrt(jnp.maximum(1 - w**2, 1e-12))
     samples = w[:, None] * mu + sqrt_term[:, None] * v_orthogonal
 
     return samples / jnp.maximum(jnp.linalg.norm(samples, axis=1, keepdims=True), 1e-8)

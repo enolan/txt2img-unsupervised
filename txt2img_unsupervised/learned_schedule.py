@@ -2,7 +2,7 @@
 
 Implements a monotonic function that maps t ∈ [0, 1] to log κ(t), the log-concentration
 of the vMF noise distribution. Monotonicity is guaranteed by construction: we define a
-positive rate function g(t) = softplus(NN(t)) with an unconstrained neural network, then
+positive rate function g(t) = softplus(NN(t)) + 1.0 with an unconstrained neural network, then
 integrate to get the normalized CDF F(t) = ∫₀ᵗ g(s)ds / ∫₀¹ g(s)ds. Since g > 0, F is
 strictly increasing. The integral is computed via trapezoidal quadrature on a uniform grid.
 
@@ -34,7 +34,7 @@ class LearnedNoiseSchedule(nn.Module):
     The schedule is parameterized as:
         log_kappa(t) = log_kappa_min + (log_kappa_max - log_kappa_min) · F(t)
     where F(t) = ∫₀ᵗ g(s)ds / ∫₀¹ g(s)ds is the normalized CDF of a positive rate
-    function g(t) = softplus(NN(t)).
+    function g(t) = softplus(NN(t)) + 1.0.
 
     Attributes:
         hidden_dim: Width of the hidden layer in the rate network.
@@ -64,7 +64,7 @@ class LearnedNoiseSchedule(nn.Module):
         self.dense1 = nn.Dense(1)
 
     def _rate(self, t: Array) -> Array:
-        """Compute the positive rate function g(t) = softplus(NN(t)).
+        """Compute the positive rate function g(t) = softplus(NN(t)) + 1.0.
 
         Using an unconstrained NN allows g to increase or decrease freely, enabling
         both convex and concave schedules.
@@ -72,7 +72,10 @@ class LearnedNoiseSchedule(nn.Module):
         x = t[..., None]  # (..., 1)
         x = jax.nn.tanh(self.dense0(x))
         x = self.dense1(x).squeeze(-1)
-        return jax.nn.softplus(x)
+        # Add an offset here so that the integral of _rate from 0 to 1 does not underflow to 0 and
+        # we can't get NaNs when dividing by it. Since we scale by that integral, adding a constant
+        # has no effect on the scaled rate.
+        return jax.nn.softplus(x) + 1.0
 
     def _normalized_cdf(self, t: Array) -> Array:
         """Compute F(t) = ∫₀ᵗ g(s)ds / ∫₀¹ g(s)ds via trapezoidal quadrature."""
