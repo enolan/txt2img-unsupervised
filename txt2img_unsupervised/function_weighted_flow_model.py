@@ -884,7 +884,7 @@ def generate_samples(
     params,
     rng,
     weighting_function_params,
-    n_steps=20,
+    n_steps: Optional[int] = None,
     method="tsit5",
     batch_size=None,
 ):
@@ -897,7 +897,7 @@ def generate_samples(
         rng: JAX random key
         weighting_function_params: Parameters for the weighting function. PyTree with leading dim
             batch_size, None if the weighting function is constant.
-        n_steps: Number of integration steps
+        n_steps: Number of integration steps (required for fixed-step methods, forbidden for tsit5)
         method: Method of integration
         batch_size: Batch size. If None, will be inferred from the shape of the weighting function
             parameters.
@@ -962,7 +962,7 @@ def sample_loop(
     weighting_function_params,
     n_samples,
     batch_size,
-    n_steps=20,
+    n_steps: Optional[int] = None,
     method="tsit5",
 ):
     """
@@ -976,7 +976,7 @@ def sample_loop(
             n_samples, None if the weighting function is constant.
         n_samples: Total number of samples to generate
         batch_size: Batch size for generation
-        n_steps: Number of integration steps
+        n_steps: Number of integration steps (required for fixed-step methods, forbidden for tsit5)
         method: Method of integration
 
     Returns:
@@ -1027,7 +1027,6 @@ def compute_log_probability(
     params,
     samples,
     weighting_function_params,
-    n_steps=20,
     rng=None,
     n_projections=10,
 ):
@@ -1067,7 +1066,7 @@ def compute_log_probability(
         params,
         weighting_function_params,
         samples,
-        n_steps,
+        None,
         rng,
         n_projections,
         method="tsit5",
@@ -1434,7 +1433,6 @@ def test_train_trivial_distribution(
             params=eval_params,
             samples=extended_test_points,
             weighting_function_params=extended_model_params_batch,
-            n_steps=20,
             rng=jax.random.PRNGKey(12345),
             n_projections=50,
         )
@@ -1544,9 +1542,7 @@ def test_train_trivial_distribution(
             ), f"{num_too_high} zero-weight points have log prob >= {sufficiently_negative_logprob}"
 
 
-def compute_hemisphere_probability_masses(
-    model, params, rng, n_samples, n_steps, n_projections
-):
+def compute_hemisphere_probability_masses(model, params, rng, n_samples, n_projections):
     """Compute the model probability masses for the northern (centered on [1, ...]) and southern
     (centered on [-1, ...]) hemispheres."""
 
@@ -1610,7 +1606,6 @@ def compute_hemisphere_probability_masses(
             axis=0,
         ),
         weighting_function_params=(cap_centers, cap_d_maxes),
-        n_steps=n_steps,
         rng=logprob_rng,
         n_projections=n_projections,
     )
@@ -1682,7 +1677,7 @@ def compute_hemisphere_probability_masses(
     return output_dict
 
 
-def compute_hemisphere_masses(model, params, rng, n_steps, n_projections):
+def compute_hemisphere_masses(model, params, rng, n_projections):
     """Precompute hemisphere probability masses for NLL calculation in cap_conditioned_base FWFM
     models. If cap_conditioned_base is off, returns None.
 
@@ -1693,7 +1688,6 @@ def compute_hemisphere_masses(model, params, rng, n_steps, n_projections):
         model: FunctionWeightedFlowModel with cap_conditioned_base=True
         params: Model parameters
         rng: JAX random key
-        n_steps: Number of integration steps
         n_projections: Number of divergence projections
 
     Returns:
@@ -1708,14 +1702,19 @@ def compute_hemisphere_masses(model, params, rng, n_steps, n_projections):
             params=params,
             rng=rng,
             n_samples=64,
-            n_steps=n_steps,
             n_projections=n_projections,
         )
     return None
 
 
 def sample_full_sphere(
-    model, params, rng, n_samples, batch_size, n_steps=20, method="tsit5"
+    model,
+    params,
+    rng,
+    n_samples,
+    batch_size,
+    n_steps: Optional[int] = None,
+    method="tsit5",
 ):
     """
     Sample from the full sphere using hemisphere sampling strategy for CAP models, or direct
@@ -1732,7 +1731,7 @@ def sample_full_sphere(
         rng: JAX random key
         n_samples: Total number of samples to generate
         batch_size: Batch size for generation
-        n_steps: Number of integration steps
+        n_steps: Number of integration steps (required for fixed-step methods, forbidden for tsit5)
         method: Integration method
 
     Returns:
@@ -1746,9 +1745,7 @@ def sample_full_sphere(
 
         hemisphere_rng, choice_rng = jax.random.split(rng)
 
-        hemisphere_masses = compute_hemisphere_masses(
-            model, params, hemisphere_rng, n_steps, 32
-        )
+        hemisphere_masses = compute_hemisphere_masses(model, params, hemisphere_rng, 32)
         north_log_mass = hemisphere_masses["north_log_mass"]
         south_log_mass = hemisphere_masses["south_log_mass"]
 
@@ -1803,9 +1800,7 @@ def sample_full_sphere(
         )
 
 
-def compute_nll(
-    model, params, batch, n_steps, rng, n_projections, precomputed_stats=None
-):
+def compute_nll(model, params, batch, rng, n_projections, precomputed_stats=None):
     """Compute NLL for FunctionWeightedFlowModel using weighting function params that produce the
     flattest weights possible.
     """
@@ -1840,7 +1835,6 @@ def compute_nll(
                 params=params,
                 samples=batch["point_vec"],
                 weighting_function_params=weighting_function_params,
-                n_steps=n_steps,
                 rng=rng,
                 n_projections=n_projections,
             )
@@ -1884,7 +1878,6 @@ def compute_nll(
                         params=params,
                         rng=masses_rng,
                         n_samples=64,
-                        n_steps=n_steps,
                         n_projections=n_projections,
                     )
                 )
@@ -1894,7 +1887,6 @@ def compute_nll(
                 params=params,
                 samples=points,
                 weighting_function_params=weighting_function_params,
-                n_steps=n_steps,
                 rng=prob_rng,
                 n_projections=n_projections,
             )
@@ -1926,7 +1918,6 @@ def compute_nll(
         params=params,
         samples=batch["point_vec"],
         weighting_function_params=weighting_function_params,
-        n_steps=n_steps,
         rng=rng,
         n_projections=n_projections,
     )

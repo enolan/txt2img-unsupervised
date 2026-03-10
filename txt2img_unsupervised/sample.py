@@ -492,7 +492,6 @@ def two_stage_sample_loop(
     logit_filter_threshold=0.9,
     temperature=1.0,
     force_f32=True,
-    n_flow_steps=100,
     flow_batch_size=None,
 ):
     """Two-stage sampling pipeline that uses a function-weighted flow model to generate CLIP
@@ -514,7 +513,6 @@ def two_stage_sample_loop(
         logit_filter_threshold: Threshold for logit filtering
         temperature: Temperature for transformer sampling
         force_f32: Whether to force float32 precision for transformer
-        n_flow_steps: Number of ODE integration steps for flow model
         flow_batch_size: Batch size for flow model sampling (defaults to batch_size)
 
     Returns:
@@ -593,7 +591,6 @@ def two_stage_sample_loop(
                     flow_params_gpu,
                     rngs_batch[0],
                     weighting_function_params,
-                    n_steps=n_flow_steps,
                 )
 
                 generated_clip_embeddings[ctr : ctr + batch] = jax.device_get(samples)
@@ -732,12 +729,6 @@ def main():
         "--flow-model",
         type=Path,
         help="Optional flow model checkpoint directory for two-stage sampling",
-    )
-    parser.add_argument(
-        "--n-flow-steps",
-        type=int,
-        default=100,
-        help="Number of ODE integration steps for flow model",
     )
     parser.add_argument(
         "--flow-batch-size",
@@ -966,7 +957,6 @@ def main():
             logit_filter_threshold=args.logit_filter_threshold,
             temperature=args.temperature,
             force_f32=args.force_fp32,
-            n_flow_steps=args.n_flow_steps,
         )
     else:
         imgs = sample_loop(

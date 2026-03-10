@@ -81,12 +81,6 @@ def parse_arguments():
         help="Number of samples to generate for visualization (only used when domain_dim=3)",
     )
     parser.add_argument(
-        "--integration-steps",
-        type=int,
-        default=16,
-        help="Number of integration steps for both sampling and NLL calculation",
-    )
-    parser.add_argument(
         "--nll-n-projections",
         type=int,
         default=32,
@@ -190,7 +184,7 @@ def init_train_state(
     )
 
 
-def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_steps=100):
+def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step):
     """
     Generate samples from the model and visualize them using a Mollweide projection.
 
@@ -201,7 +195,6 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_ste
         batch_size: Batch size for generation
         rng: JAX random key
         step: Current training step (for logging)
-        n_steps: Number of integration steps for sample generation
 
     Returns:
         None, but logs the visualization to wandb
@@ -220,13 +213,12 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_ste
             weighting_function_params,
             n_samples,
             batch_size,
-            n_steps,
         )
     elif mdl.weighting_function in [
         WeightingFunction.CAP_INDICATOR,
         WeightingFunction.SMOOTHED_CAP_INDICATOR,
     ]:
-        samples = sample_full_sphere(mdl, params, rng, n_samples, batch_size, n_steps)
+        samples = sample_full_sphere(mdl, params, rng, n_samples, batch_size)
     else:
         raise ValueError(
             f"Unsupported weighting function for visualization: {mdl.weighting_function}"
@@ -327,7 +319,6 @@ if __name__ == "__main__":
             args.viz_batch_size,
             viz_rng,
             step,
-            n_steps=args.integration_steps,
         )
 
     def _nll_setup(eval_params, rng):
@@ -335,7 +326,6 @@ if __name__ == "__main__":
             mdl,
             eval_params,
             rng,
-            args.integration_steps,
             args.nll_n_projections,
         )
 
@@ -344,7 +334,6 @@ if __name__ == "__main__":
             mdl,
             eval_params,
             test_batch,
-            n_steps=args.integration_steps,
             rng=rng,
             n_projections=args.nll_n_projections,
             precomputed_stats=precomputed_stats,

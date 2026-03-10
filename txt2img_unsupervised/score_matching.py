@@ -483,7 +483,7 @@ def generate_samples(
     params,
     rng: Array,
     cap_params,
-    n_steps: int = 100,
+    n_steps: Optional[int] = None,
     method: str = "tsit5",
     batch_size: Optional[int] = None,
 ) -> Array:
@@ -496,7 +496,7 @@ def generate_samples(
         params: Model parameters
         rng: JAX random key
         cap_params: None for unconditioned, (cap_centers, d_maxes) for CONDITIONED_SCORE
-        n_steps: Number of integration steps
+        n_steps: Number of integration steps (required for fixed-step methods, forbidden for tsit5)
         method: ODE solver method
         batch_size: Required if cap_params is None, inferred from cap_params otherwise
 
@@ -536,7 +536,7 @@ def compute_log_probability(
     params,
     samples: Array,
     cap_params,
-    n_steps: int = 100,
+    n_steps: Optional[int] = None,
     rng=None,
     n_projections: int = 10,
     method: str = "tsit5",
@@ -552,7 +552,7 @@ def compute_log_probability(
         params: Model parameters
         samples: Points on the sphere to evaluate [batch_size, dim]
         cap_params: None for unconditioned, (cap_centers, d_maxes) for CONDITIONED_SCORE
-        n_steps: Number of integration steps
+        n_steps: Number of integration steps (required for fixed-step methods, forbidden for tsit5)
         rng: JAX random key for stochastic divergence estimation
         n_projections: Number of random projections for divergence estimation
         method: ODE solver method ('rk4' or 'tsit5')
@@ -591,7 +591,7 @@ def compute_nll(
     model: ScoreMatchingModel,
     params,
     batch: dict,
-    n_steps: int = 100,
+    n_steps: Optional[int] = None,
     rng=None,
     n_projections: int = 10,
     method: str = "tsit5",
@@ -603,7 +603,7 @@ def compute_nll(
         model: Score matching model
         params: Model parameters
         batch: Dict with "point_vec" key containing data [batch_size, dim]
-        n_steps: Number of integration steps
+        n_steps: Number of integration steps (required for fixed-step methods, forbidden for tsit5)
         rng: JAX random key
         n_projections: Number of random projections for divergence estimation
         method: ODE solver method ('rk4' or 'tsit5')
@@ -705,7 +705,7 @@ def test_train_trivial(domain_dim):
     loss_fn = partial(compute_batch_loss, model)
 
     def nll_fn(model, params, batch, rng):
-        return compute_nll(model, params, batch, n_steps=256, rng=rng, n_projections=32)
+        return compute_nll(model, params, batch, rng=rng, n_projections=32)
 
     result = train_for_tests(
         model,
@@ -725,7 +725,6 @@ def test_train_trivial(domain_dim):
         eval_params,
         jax.random.PRNGKey(0),
         cap_params=None,
-        n_steps=1000,
         batch_size=20,
     )
     cos_sims = samples @ points[0]
@@ -861,7 +860,7 @@ def test_train_distribution(domain_dim, dist_name):
     loss_fn = partial(compute_batch_loss, model)
 
     def nll_fn(model, params, batch, rng):
-        return compute_nll(model, params, batch, n_steps=256, rng=rng, n_projections=32)
+        return compute_nll(model, params, batch, rng=rng, n_projections=32)
 
     result = train_for_tests(
         model,
@@ -883,7 +882,6 @@ def test_train_distribution(domain_dim, dist_name):
         eval_params,
         jax.random.PRNGKey(42),
         cap_params=None,
-        n_steps=100,
         batch_size=n_gen_samples,
     )
     samples_np = np.array(samples)
@@ -917,7 +915,6 @@ def test_train_distribution(domain_dim, dist_name):
             model,
             eval_params,
             {"point_vec": jnp.array(uniform_points)},
-            n_steps=256,
             rng=jax.random.PRNGKey(123),
             n_projections=32,
         )
@@ -969,7 +966,6 @@ def test_zero_init_uniform_nll(domain_dim):
         model,
         params,
         batch,
-        n_steps=256,
         rng=jax.random.PRNGKey(99),
         n_projections=32,
     )
@@ -1182,7 +1178,6 @@ def test_train_conditioned_score(domain_dim, data_distribution):
             model,
             params,
             batch,
-            n_steps=100,
             rng=rng,
             n_projections=10,
             cap_params=(norths, d_maxes),
@@ -1225,7 +1220,6 @@ def test_train_conditioned_score(domain_dim, data_distribution):
         eval_params,
         jax.random.PRNGKey(42),
         cap_params=(cap_centers, d_maxes),
-        n_steps=200,
     )
 
     cos_sims = samples @ cap_center
@@ -1287,7 +1281,6 @@ def test_train_conditioned_score(domain_dim, data_distribution):
             eval_params,
             density_test_points,
             cap_params=test_cap_params,
-            n_steps=100,
             n_projections=50,
             tsit5_settings=Tsit5Settings(atol=1e-6, rtol=1e-6),
         )
@@ -1475,7 +1468,7 @@ def test_train_trivial_with_variance_loss():
     loss_fn = partial(compute_batch_loss, model)
 
     def nll_fn(model, params, batch, rng):
-        return compute_nll(model, params, batch, n_steps=256, rng=rng, n_projections=32)
+        return compute_nll(model, params, batch, rng=rng, n_projections=32)
 
     result = train_for_tests(
         model,
@@ -1495,7 +1488,6 @@ def test_train_trivial_with_variance_loss():
         eval_params,
         jax.random.PRNGKey(0),
         cap_params=None,
-        n_steps=1000,
         batch_size=20,
     )
     cos_sims = samples @ points[0]

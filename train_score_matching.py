@@ -66,12 +66,6 @@ def parse_arguments():
         help="Batch size for sample generation during visualization",
     )
     parser.add_argument(
-        "--integration-steps",
-        type=int,
-        default=100,
-        help="Number of integration steps for sampling and NLL calculation",
-    )
-    parser.add_argument(
         "--nll-n-projections",
         type=int,
         default=32,
@@ -188,7 +182,7 @@ def init_train_state(
     )
 
 
-def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_steps=100):
+def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step):
     """Generate samples from the model and visualize them using a Mollweide projection."""
     if mdl.domain_dim != 3:
         return
@@ -203,7 +197,6 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step, n_ste
             params,
             batch_rng,
             cap_params=None,
-            n_steps=n_steps,
             batch_size=this_batch_size,
         )
         all_samples.append(batch_samples)
@@ -298,7 +291,6 @@ if __name__ == "__main__":
             args.viz_batch_size,
             viz_rng,
             step,
-            n_steps=args.integration_steps,
         )
 
     def _nll_setup(eval_params, rng):
@@ -309,7 +301,6 @@ if __name__ == "__main__":
             mdl,
             eval_params,
             test_batch,
-            n_steps=args.integration_steps,
             rng=rng,
             n_projections=args.nll_n_projections,
         )

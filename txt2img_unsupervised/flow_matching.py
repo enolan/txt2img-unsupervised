@@ -1290,7 +1290,6 @@ def test_train_trivial(domain_dim, inject_keys):
         eval_params,
         jax.random.PRNGKey(0),
         cond_vecs=jnp.zeros((20, 0)),
-        n_steps=1000,
     )
     cos_sims = samples @ points[0]
 
@@ -1440,7 +1439,7 @@ def test_train_vmf(domain_dim, inject_keys):
         points = jnp.array(batch["point_vec"])
         cond_vecs = jnp.zeros((points.shape[0], 0))
         return -compute_log_probability(
-            model, params, points, cond_vecs, n_steps=128, rng=rng, n_projections=32
+            model, params, points, cond_vecs, rng=rng, n_projections=32
         )
 
     result = train_for_tests(
@@ -1464,7 +1463,6 @@ def test_train_vmf(domain_dim, inject_keys):
         eval_params,
         jax.random.PRNGKey(42),
         cond_vecs=jnp.zeros((n_test_samples, 0)),
-        n_steps=1000,
     )
 
     # Calculate negative log-likelihood of samples under the VMF distribution
@@ -1514,7 +1512,6 @@ def test_zero_init_uniform_nll(domain_dim):
         params,
         points,
         cond_vecs,
-        n_steps=128,
         rng=jax.random.PRNGKey(99),
         n_projections=32,
     )
@@ -1621,7 +1618,7 @@ def test_train_conditional_vmf(domain_dim, inject_keys):
         points = jnp.array(batch["point_vec"])
         cond_vecs = jnp.array(batch["cond_vec"])
         return -compute_log_probability(
-            model, params, points, cond_vecs, n_steps=128, rng=rng, n_projections=32
+            model, params, points, cond_vecs, rng=rng, n_projections=32
         )
 
     result = train_for_tests(
@@ -1651,14 +1648,12 @@ def test_train_conditional_vmf(domain_dim, inject_keys):
         eval_params,
         seed1,
         cond_vecs=cond_vec_0,
-        n_steps=500,
     )
     samples_1 = generate_samples(
         model,
         eval_params,
         seed2,
         cond_vecs=cond_vec_1,
-        n_steps=500,
     )
 
     # Calculate average cosine similarities
@@ -3110,7 +3105,7 @@ def generate_samples(
     params,
     rng,
     cond_vecs,
-    n_steps=100,
+    n_steps: Optional[int] = None,
     method="tsit5",
 ):
     """
@@ -3121,7 +3116,7 @@ def generate_samples(
         params: Model parameters
         rng: JAX random key
         cond_vecs: Conditioning vectors [batch_size, cond_dim]
-        n_steps: Number of integration steps
+        n_steps: Number of integration steps (required for fixed-step methods, forbidden for tsit5)
         method: ODE solver method ('euler', 'rk4', or 'tsit5')
 
     Returns:
@@ -3146,7 +3141,7 @@ def generate_samples(
 
 def generate_samples_inner(
     rng,
-    n_steps,
+    n_steps: Optional[int],
     batch_size,
     method,
     vector_field_fn,
@@ -3163,7 +3158,8 @@ def generate_samples_inner(
 
     Args:
         rng: JAX random key
-        n_steps: Number of integration steps
+        n_steps: Number of integration steps (required for fixed-step methods, must be None for
+            tsit5)
         batch_size: Number of samples to generate
         method: ODE solver method ('euler', 'rk4', or 'tsit5')
         vector_field_fn: Function that computes the tangent vector field. Note this MUST be declared
@@ -3184,24 +3180,30 @@ def generate_samples_inner(
           - samples: Generated samples [batch_size, dim]
           - vf_eval_counts: Number of vector-field evaluations per input [batch_size]
     """
+    if method == "tsit5":
+        if n_steps is not None:
+            raise ValueError(
+                "n_steps must not be specified when using tsit5, because tsit5 chooses step sizes adaptively and ignores a fixed step count"
+            )
+    else:
+        if n_steps is None:
+            raise ValueError(f"n_steps is required for fixed-step method '{method}'")
+
     if initial_x0 is None:
-        x0_rng, *dropout_rngs = jax.random.split(rng, num=n_steps + 1)
-        # Sample initial points uniformly from the sphere
+        x0_rng, rng = jax.random.split(rng)
         x0 = sample_sphere(x0_rng, batch_size, domain_dim)
     else:
         assert initial_x0.shape == (batch_size, domain_dim)
         x0 = initial_x0
-        dropout_rngs = jax.random.split(rng, num=n_steps)
 
-    # Solve ODE
-    dt = 1.0 / n_steps
     x = x0
 
     # Track vector-field evaluation counts per input
     vf_eval_counts: jax.Array
 
     if method == "euler":
-        # Forward Euler method
+        dt = 1.0 / n_steps
+        dropout_rngs = jax.random.split(rng, num=n_steps)
         step_iter = tqdm(
             range(n_steps),
             desc="ODE solving. Solver: Euler, Direction: forward",
@@ -3222,7 +3224,8 @@ def generate_samples_inner(
         vf_eval_counts = jnp.full((batch_size,), n_steps, dtype=jnp.int32)
 
     elif method == "rk4":
-        # 4th order Runge-Kutta method
+        dt = 1.0 / n_steps
+        dropout_rngs = jax.random.split(rng, num=n_steps)
         step_iter = tqdm(
             range(n_steps),
             desc="ODE solving. Solver: RK4, Direction: forward",
@@ -3246,15 +3249,12 @@ def generate_samples_inner(
         # Adaptive Tsitouras 5/4 method using shared core implementation
         settings = tsit5_settings or Tsit5Settings()
 
-        # Determine initial step size using clean API
+        # Determine initial step size
         if settings.initial_dt is not None:
-            # User provided explicit initial step size
             dt = settings.initial_dt
         elif settings.auto_dt_estimation:
-            # Default: auto-estimate based on tolerances and problem dimension
             dt = _estimate_initial_dt(settings.atol, settings.rtol, domain_dim)
         else:
-            # Fallback to reasonable default
             dt = 0.01
 
         # Per-sample initial step sizes
@@ -3293,7 +3293,7 @@ def sample_loop(
     batch_size,
     rng,
     cond_vecs,
-    n_steps=100,
+    n_steps: Optional[int] = None,
     method="tsit5",
 ):
     """
@@ -3307,7 +3307,7 @@ def sample_loop(
         batch_size: Size of each batch for generation
         rng: JAX random key
         cond_vecs: Conditioning vectors [n_samples, cond_dim]
-        n_steps: Number of integration steps
+        n_steps: Number of integration steps (required for fixed-step methods, forbidden for tsit5)
         method: ODE solver method ('euler', 'rk4', or 'tsit5')
 
     Returns:
@@ -3655,7 +3655,6 @@ def reverse_path_and_compute_divergence_tsit5(
     vector_field_fn_fixed_params,
     vector_field_fn_per_sample_params,
     samples,
-    n_steps,
     rng,
     n_projections=10,
     compute_divergence: bool = True,
@@ -3704,7 +3703,7 @@ def reverse_path_and_compute_divergence(
     vector_field_fn_fixed_params,
     vector_field_fn_per_sample_params,
     samples,
-    n_steps,
+    n_steps: Optional[int],
     rng,
     n_projections=10,
     method: str = "tsit5",
@@ -3715,6 +3714,9 @@ def reverse_path_and_compute_divergence(
 
     Supports fixed-step RK4 (jitted) and adaptive Tsitouras 5/4.
 
+    Args:
+        n_steps: Number of integration steps (required for rk4, must be None for tsit5)
+
     NOTE: vector_field_fn MUST be defined at the top level for jit caching to work. If you define it
     inside a function, it won't hash to the same value across different invocations of that outer
     function and caching will not happen and performance will be awful.
@@ -3722,6 +3724,8 @@ def reverse_path_and_compute_divergence(
     if method == "rk4":
         if tsit5_settings is not None:
             raise ValueError("Tsit5 settings should not be passed when using RK4")
+        if n_steps is None:
+            raise ValueError("n_steps is required for fixed-step method 'rk4'")
         return reverse_path_and_compute_divergence_rk4(
             vector_field_fn,
             vector_field_fn_fixed_static_params,
@@ -3733,14 +3737,17 @@ def reverse_path_and_compute_divergence(
             n_projections,
         )
 
-    if method == "tsit5":
+    elif method == "tsit5":
+        if n_steps is not None:
+            raise ValueError(
+                "n_steps must not be specified when using tsit5, because tsit5 chooses step sizes adaptively and ignores a fixed step count"
+            )
         return reverse_path_and_compute_divergence_tsit5(
             vector_field_fn,
             vector_field_fn_fixed_static_params,
             vector_field_fn_fixed_params,
             vector_field_fn_per_sample_params,
             samples,
-            n_steps,
             rng,
             n_projections,
             tsit5_settings=tsit5_settings,
@@ -3755,7 +3762,7 @@ def compute_log_probability(
     params,
     samples,
     cond_vecs,
-    n_steps=100,
+    n_steps: Optional[int] = None,
     rng=None,
     n_projections=10,
     method: str = "tsit5",
@@ -3768,7 +3775,7 @@ def compute_log_probability(
         params: Model parameters
         samples: Points on the sphere to evaluate [batch_size, dim]
         cond_vecs: Conditioning vectors [batch_size, cond_dim]
-        n_steps: Number of integration steps (or max steps for adaptive)
+        n_steps: Number of integration steps (required for fixed-step methods, forbidden for tsit5)
         rng: JAX random key for stochastic estimation (if None, uses deterministic keys)
         n_projections: Number of random projections to use for divergence estimation
         method: ODE solver method ('rk4' fixed-step or 'tsit5' adaptive)
@@ -4278,7 +4285,7 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
     )
     x_tsit5, tsit5_eval_counts = generate_samples_inner(
         rng=jax.random.PRNGKey(2),
-        n_steps=n_steps_rk4,  # ignored by tsit5; step size controlled by tsit5_settings
+        n_steps=None,
         batch_size=batch_size,
         method="tsit5",
         vector_field_fn=vf,
@@ -4772,7 +4779,7 @@ def test_train_hemisphere_density(inject_keys):
         points = jnp.array(batch["point_vec"])
         cond_vecs = jnp.zeros((points.shape[0], 0))
         return -compute_log_probability(
-            model, params, points, cond_vecs, n_steps=128, rng=rng, n_projections=32
+            model, params, points, cond_vecs, rng=rng, n_projections=32
         )
 
     result = train_for_tests(
@@ -4804,7 +4811,6 @@ def test_train_hemisphere_density(inject_keys):
         eval_params,
         north_points,
         cond_vecs,
-        n_steps=100,
         rng=jax.random.PRNGKey(12345),
         n_projections=32,
     )
@@ -4813,7 +4819,6 @@ def test_train_hemisphere_density(inject_keys):
         eval_params,
         south_points,
         cond_vecs,
-        n_steps=100,
         rng=jax.random.PRNGKey(67890),
         n_projections=32,
     )
@@ -4829,7 +4834,6 @@ def test_train_hemisphere_density(inject_keys):
         eval_params,
         geodesic_points,
         jnp.zeros((num_geodesic_points, 0), dtype=jnp.float32),
-        n_steps=100,
         rng=jax.random.PRNGKey(13579),
         n_projections=32,
     )

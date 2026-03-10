@@ -58,13 +58,6 @@ def parse_arguments():
     parser.add_argument(
         "--cap-radius", type=float, help="Angular radius of the cap in degrees"
     )
-    parser.add_argument(
-        "--n-steps",
-        type=int,
-        default=8,
-        help="Number of integration steps for sampling",
-    )
-
     return parser.parse_args()
 
 
@@ -261,7 +254,6 @@ def main():
                         samples_rng,
                         args.n_samples,
                         args.batch_size,
-                        args.n_steps,
                     )
                 else:
                     raise ValueError(
@@ -279,7 +271,6 @@ def main():
                     weighting_function_params,
                     args.n_samples,
                     args.batch_size,
-                    args.n_steps,
                 )
         else:
             # Non-CAP base distribution - use weighting function parameters
@@ -293,13 +284,12 @@ def main():
                 weighting_function_params,
                 args.n_samples,
                 args.batch_size,
-                args.n_steps,
             )
     else:
         # Unconditioned sampling - use d_max=2.0 (full sphere)
         print("Sampling from full sphere")
         samples = sample_full_sphere(
-            mdl, params, centers_rng, args.n_samples, args.batch_size, args.n_steps
+            mdl, params, centers_rng, args.n_samples, args.batch_size
         )
 
     samples = jax.device_get(samples)
