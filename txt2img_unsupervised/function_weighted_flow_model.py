@@ -1930,4 +1930,3 @@ def compute_nll(
         rng=rng,
         n_projections=n_projections,
     )
-
