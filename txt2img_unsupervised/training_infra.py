@@ -1377,13 +1377,14 @@ def train_for_tests(
 
         def post_epoch_hook(state, epoch_idx, global_step):
             eval_params = state.get_eval_params()
+            eval_rng = jax.random.PRNGKey(7357)
+            loss_rng, nll_rng = jax.random.split(eval_rng)
             test_losses = []
             all_aux = []
             for i in trange(n_test_batches, desc="test loss", leave=False):
                 batch = get_batch(test_dataset, eval_batch_size, i, eval_fields)
-                loss, aux = loss_fn(
-                    eval_params, batch, jax.random.PRNGKey(global_step + i)
-                )
+                loss_rng, batch_rng = jax.random.split(loss_rng)
+                loss, aux = loss_fn(eval_params, batch, batch_rng)
                 test_losses.append(loss)
                 all_aux.append(aux)
             mean_test_loss = float(jnp.mean(jnp.array(test_losses)))
@@ -1405,12 +1406,13 @@ def train_for_tests(
                 nlls = []
                 for i in trange(n_test_batches, desc="test NLL", leave=False):
                     batch = get_batch(test_dataset, eval_batch_size, i, eval_fields)
+                    nll_rng, batch_rng = jax.random.split(nll_rng)
                     nlls.append(
                         nll_fn(
                             model,
                             eval_params,
                             batch,
-                            jax.random.PRNGKey(global_step + i),
+                            batch_rng,
                         )
                     )
                 mean_nll = float(jnp.mean(jnp.concatenate(nlls)))
