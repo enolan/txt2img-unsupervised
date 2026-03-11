@@ -290,7 +290,8 @@ class ScoreMatchingModel(nn.Module):
         return 0.5 * gamma_prime[:, None] * w
 
     def compute_vlb_loss(self, x_1, t, cap_params):
-        """Compute the VLB loss combining prior, diffusion, and reconstruction terms.
+        """Compute the loss for the model, including the VLB (composed of prior, diffusion, and
+        reconstruction terms) and variance loss.
 
         Args:
             x_1: Clean data points [batch_size, dim]
@@ -342,6 +343,7 @@ class ScoreMatchingModel(nn.Module):
             variance_loss = jnp.array(0.0)
 
         components = {
+            "vlb_total": diffusion_loss + prior_loss + recon_loss,
             "diffusion": diffusion_loss,
             "prior": prior_loss,
             "recon": recon_loss,
