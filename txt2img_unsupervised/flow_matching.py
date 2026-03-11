@@ -1152,6 +1152,17 @@ def sample_sphere(rng, batch_size, dim):
     return normal_samples / jnp.linalg.norm(normal_samples, axis=1, keepdims=True)
 
 
+def stratified_time_sample(rng: jax.Array, batch_size: int) -> jax.Array:
+    """Sample time values in [0, 1) with stratified sampling for variance reduction.
+
+    Uses a random offset plus evenly spaced grid, wrapped to [0, 1). Each sample gets a different t,
+    but together they cover [0, 1] uniformly, reducing variance of the Monte Carlo time integral
+    estimate vs independent uniform samples.
+    """
+    t0 = jax.random.uniform(rng, ())
+    return (t0 + jnp.linspace(0.0, 1.0, batch_size, endpoint=False)) % 1.0
+
+
 @partial(
     jax.jit,
     inline=True,
@@ -1206,7 +1217,7 @@ def compute_batch_loss(
         method=model.sample_base_distribution,
         rngs={"sample_base": noise_rng},
     )
-    t = jax.random.uniform(time_rng, (batch_size,))
+    t = stratified_time_sample(time_rng, batch_size)
 
     result = conditional_flow_matching_loss(
         model,

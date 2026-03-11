@@ -76,9 +76,10 @@ from txt2img_unsupervised.flow_matching import (
     Tsit5Settings,
     VectorField,
     compute_psi_t_spherical,
+    generate_samples_inner,
     reverse_path_and_compute_divergence,
     sample_sphere,
-    generate_samples_inner,
+    stratified_time_sample,
 )
 from txt2img_unsupervised.learned_schedule import LearnedNoiseSchedule
 from txt2img_unsupervised.vmf import (
@@ -417,8 +418,7 @@ def compute_batch_loss(
         rngs={"sample_cap_params": cap_rng},
     )
 
-    t0 = jax.random.uniform(time_rng, ())
-    t = (t0 + jnp.linspace(0.0, 1.0, batch_size, endpoint=False)) % 1.0
+    t = stratified_time_sample(time_rng, batch_size)
 
     return model.apply(
         params,
