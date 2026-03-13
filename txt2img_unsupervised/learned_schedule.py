@@ -15,8 +15,9 @@ The output exactly hits learned endpoints:
     log_kappa(1) = log_kappa_max   (clean end, near data)
 
 This is used in the VLB loss as:
-    L_diff = (1/2) E_t [ γ'(t) · ||w_target - w_θ||² ]
-where γ(t) = log κ(t) and γ'(t) is computed via autodiff through this network.
+    L_diff = (1/2) E_t [ γ'(t) · κ(t) · ||w_target - w_θ||² ]
+where γ(t) = log κ(t), κ(t) = exp(γ(t)), and γ'(t) is computed via autodiff through
+this network.
 """
 
 import flax.linen as nn
@@ -119,6 +120,49 @@ class LearnedNoiseSchedule(nn.Module):
         """
         scalar_fn = lambda ti: self(ti)
         return jax.vmap(jax.grad(scalar_fn))(t)
+
+    def sample_kappa_weighted(
+        self, rng: jax.Array, batch_size: int
+    ) -> tuple[Array, Array]:
+        """Sample t with density proportional to κ(t) = exp(γ(t)).
+
+        Uses stratified sampling in the CDF space of κ(t) for variance reduction,
+        analogous to stratified_time_sample but with non-uniform density.
+
+        Args:
+            rng: JAX random key.
+            batch_size: Number of time samples to draw.
+
+        Returns:
+            Tuple of (t, kappa_integral) where:
+            - t: sampled time values, shape (batch_size,)
+            - kappa_integral: ∫₀¹ κ(s)ds, scalar normalization constant
+        """
+        n = self.n_quadrature_points
+        grid = jnp.linspace(0.0, 1.0, n)
+        kappa_grid = jnp.exp(self(grid))
+
+        # CDF of κ(t) via trapezoidal quadrature
+        dt = 1.0 / (n - 1)
+        segment_areas = (kappa_grid[:-1] + kappa_grid[1:]) / 2 * dt
+        cumulative = jnp.concatenate([jnp.array([0.0]), jnp.cumsum(segment_areas)])
+        kappa_integral = cumulative[-1]
+        cdf = cumulative / kappa_integral
+
+        # Stratified sampling in CDF space
+        u0 = jax.random.uniform(rng, ())
+        u = (u0 + jnp.linspace(0.0, 1.0, batch_size, endpoint=False)) % 1.0
+
+        # Invert CDF via linear interpolation on the grid
+        idx = jnp.searchsorted(cdf, u, side="right") - 1
+        idx = jnp.clip(idx, 0, n - 2)
+        cdf_lo = cdf[idx]
+        cdf_hi = cdf[idx + 1]
+        frac = jnp.where(cdf_hi > cdf_lo, (u - cdf_lo) / (cdf_hi - cdf_lo), 0.5)
+        t = grid[idx] + frac * dt
+        t = jnp.clip(t, 0.0, 1.0)
+
+        return t, kappa_integral
 
 
 def visualize_schedule(
@@ -455,3 +499,68 @@ def test_learn_function(target_name, target_fn):
     endpoint_atol = max(0.1, isotonic_range * 0.02)
     np.testing.assert_allclose(final_pred[0], isotonic_target[0], atol=endpoint_atol)
     np.testing.assert_allclose(final_pred[-1], isotonic_target[-1], atol=endpoint_atol)
+
+
+@pytest.mark.parametrize(
+    "init_log_kappa_min,init_log_kappa_max",
+    [(-0.693, 9.210), (-2.0, 5.0), (0.0, 15.0)],
+)
+def test_kappa_weighted_sampling(init_log_kappa_min, init_log_kappa_max):
+    """Test that κ-weighted sampling produces a distribution proportional to κ(t)."""
+    schedule = LearnedNoiseSchedule(
+        init_log_kappa_min=init_log_kappa_min,
+        init_log_kappa_max=init_log_kappa_max,
+    )
+    params = schedule.init(jax.random.PRNGKey(0), jnp.array(0.5))
+
+    batch_size = 100_000
+    t, kappa_integral = schedule.apply(
+        params,
+        jax.random.PRNGKey(42),
+        batch_size,
+        method=schedule.sample_kappa_weighted,
+    )
+
+    assert t.shape == (batch_size,)
+    assert kappa_integral.shape == ()
+    assert jnp.all((t >= 0.0) & (t <= 1.0))
+    assert kappa_integral > 0
+
+    # Verify the distribution matches κ(t) by checking CDF in bins.
+    # Bin the samples and compare empirical density to κ evaluated at bin centers.
+    n_bins = 50
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_centers = jnp.array((bin_edges[:-1] + bin_edges[1:]) / 2)
+    counts, _ = np.histogram(np.array(t), bins=bin_edges)
+    empirical_density = counts / (batch_size / n_bins)  # relative to uniform
+
+    kappa_at_centers = np.array(jnp.exp(schedule.apply(params, bin_centers)))
+    expected_density = kappa_at_centers / kappa_at_centers.mean()
+
+    # Allow 5% median relative error (Monte Carlo noise)
+    relative_errors = np.abs(empirical_density - expected_density) / expected_density
+    median_relative_error = np.median(relative_errors)
+    assert median_relative_error < 0.05, (
+        f"Median relative error {median_relative_error:.3f} too high; "
+        f"sampling distribution doesn't match κ(t)"
+    )
+
+
+def test_kappa_weighted_sampling_integral():
+    """Test that kappa_integral matches numerical integration of κ(t)."""
+    schedule = LearnedNoiseSchedule()
+    params = schedule.init(jax.random.PRNGKey(0), jnp.array(0.5))
+
+    _, kappa_integral = schedule.apply(
+        params, jax.random.PRNGKey(0), 10, method=schedule.sample_kappa_weighted
+    )
+
+    # Compare to fine-grid trapezoidal integration
+    t_fine = jnp.linspace(0.0, 1.0, 10000)
+    kappa_fine = jnp.exp(schedule.apply(params, t_fine))
+    dt = 1.0 / (len(t_fine) - 1)
+    expected_integral = jnp.sum((kappa_fine[:-1] + kappa_fine[1:]) / 2 * dt)
+
+    np.testing.assert_allclose(
+        float(kappa_integral), float(expected_integral), rtol=1e-3
+    )

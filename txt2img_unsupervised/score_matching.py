@@ -36,6 +36,13 @@ Since E[L_diff] is invariant to the schedule, minimizing E[f_i²] minimizes Var(
 reducing Monte Carlo estimator variance. stop_gradient on the squared error ensures only
 schedule parameters receive gradients from this term.
 
+### Time Sampling
+By default, time is sampled uniformly. Optionally, time can be sampled with density
+proportional to κ(t) (kappa_weighted_time_sampling=True). This importance-samples time
+so that high-κ regions get more samples, replacing the per-sample weight γ'(t)·κ(t) with
+the much more uniform γ'(t)·Z (where Z = ∫κ(s)ds). This reduces gradient variance when
+the κ range is large.
+
 ### Probability Flow ODE
 For sampling, we integrate the probability flow ODE from t=0 (noise) to t=1 (data):
     dx/dt = ½ γ'(t) · w_θ(x, t)
@@ -125,6 +132,7 @@ class ScoreMatchingModel(nn.Module):
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
     d_max_dist: Optional[tuple] = None
     vlb_variance_loss_weight: Optional[float] = None
+    kappa_weighted_time_sampling: bool = False
 
     @property
     def conditioning_dim(self) -> int:
@@ -202,6 +210,20 @@ class ScoreMatchingModel(nn.Module):
     def scale_lr(self, lr: float) -> float:
         """Scaled learning rate for hidden layers."""
         return self.mk_vector_field().scale_lr(lr)
+
+    def sample_time_kappa_weighted(
+        self, rng: jax.Array, batch_size: int
+    ) -> tuple[Array, Array]:
+        """Sample t with density ∝ κ(t), delegating to the schedule.
+
+        Args:
+            rng: JAX random key.
+            batch_size: Number of time samples.
+
+        Returns:
+            Tuple of (t, kappa_integral). See LearnedNoiseSchedule.sample_kappa_weighted.
+        """
+        return self.schedule.sample_kappa_weighted(rng, batch_size)
 
     def sample_cap_params(self, x: Array) -> tuple:
         """Sample a cap containing point x, for training conditioning.
@@ -290,14 +312,16 @@ class ScoreMatchingModel(nn.Module):
         gamma_prime = self.schedule.log_kappa_derivative(t)
         return 0.5 * gamma_prime[:, None] * w
 
-    def compute_vlb_loss(self, x_1, t, cap_params):
+    def compute_vlb_loss(self, x_1, t, cap_params, kappa_integral=None):
         """Compute the loss for the model, including the VLB (composed of prior, diffusion, and
         reconstruction terms) and variance loss.
 
         Args:
             x_1: Clean data points [batch_size, dim]
-            t: Uniformly sampled time values [batch_size]
+            t: Time values [batch_size], sampled uniformly or ∝ κ(t)
             cap_params: None for UNCONDITIONED, (cap_centers, d_maxes) for CONDITIONED_SCORE
+            kappa_integral: When using κ-weighted time sampling, the normalization constant
+                ∫₀¹ κ(s)ds. None for uniform sampling.
 
         Returns:
             Tuple of (total_loss, components_dict) where components_dict has keys
@@ -306,10 +330,17 @@ class ScoreMatchingModel(nn.Module):
         batch_size = x_1.shape[0]
         dim = self.domain_dim
 
-        # Get schedule values
-        log_kappa_t = self.schedule(t)
+        # Gradients are tricky with κ-weighted time sampling. The diffusion loss should have
+        # identical expected gradients to uniform t sampling, so we stop-gradient t to block
+        # reparameterization gradients from the sampling process. The variance loss needs
+        # gradients through both the schedule and the sampling distribution.
+
+        # Schedule values computed with sg(t) — blocks reparameterization gradient from
+        # κ-weighted sampling while preserving direct gradients through schedule params.
+        t_sg = jax.lax.stop_gradient(t)
+        log_kappa_t = self.schedule(t_sg)
         kappa_t = jnp.exp(log_kappa_t)
-        gamma_prime = self.schedule.log_kappa_derivative(t)
+        gamma_prime = self.schedule.log_kappa_derivative(t_sg)
 
         # Sample noisy points x_t ~ vMF(x_1, κ(t)).
         noise_rng = self.make_rng("noise")
@@ -322,8 +353,18 @@ class ScoreMatchingModel(nn.Module):
         w_true = tangent_projection(x_t, x_1)
 
         # Diffusion loss: ½ E_t[ γ'(t) · κ(t) · ‖w_θ − w_true‖² ]
+        # With κ-weighted sampling, we multiply by the importance weight Z/κ(t_i).
+        # We stop-gradient the weight itself so it doesn't introduce sampling-distribution
+        # gradients, but preserve the live κ(t) factor so endpoint gradients (∂κ/∂log_kappa_max
+        # etc.) are correct. Forward value: γ' · κ · sg(Z/κ) = γ' · Z.
         per_sample_sq_err = jnp.sum((w_theta - w_true) ** 2, axis=1)
-        diffusion_loss = 0.5 * jnp.mean(gamma_prime * kappa_t * per_sample_sq_err)
+        if kappa_integral is not None:
+            importance_weight = jax.lax.stop_gradient(kappa_integral / kappa_t)
+            diffusion_loss = 0.5 * jnp.mean(
+                gamma_prime * kappa_t * importance_weight * per_sample_sq_err
+            )
+        else:
+            diffusion_loss = 0.5 * jnp.mean(gamma_prime * kappa_t * per_sample_sq_err)
 
         # Prior loss: KL(vMF(κ_min) ‖ Uniform)
         kappa_min = jnp.exp(self.schedule.log_kappa_min)
@@ -336,9 +377,17 @@ class ScoreMatchingModel(nn.Module):
         # VLB variance minimization: minimize the second moment of the per-sample diffusion
         # loss. Since E[L_diff] is invariant to the schedule, minimizing E[f_i²] is equivalent
         # to minimizing Var(L̂). stop_gradient on per_sample_sq_err ensures gradients only
-        # flow to schedule params.
+        # flow to schedule params. Unlike the diffusion loss, we use unstopped t here so
+        # gradients also flow through the κ-weighted sampling distribution.
         if self.vlb_variance_loss_weight is not None:
-            f_i = 0.5 * gamma_prime * kappa_t * jax.lax.stop_gradient(per_sample_sq_err)
+            if kappa_integral is not None:
+                # Recompute γ' with unstopped t so the schedule can optimize the sampling
+                # distribution for lower variance.
+                gamma_prime_var = self.schedule.log_kappa_derivative(t)
+                var_weight = gamma_prime_var * kappa_integral
+            else:
+                var_weight = gamma_prime * kappa_t
+            f_i = 0.5 * var_weight * jax.lax.stop_gradient(per_sample_sq_err)
             variance_loss = jnp.mean(f_i**2) * self.vlb_variance_loss_weight
         else:
             variance_loss = jnp.array(0.0)
@@ -418,7 +467,16 @@ def compute_batch_loss(
         rngs={"sample_cap_params": cap_rng},
     )
 
-    t = stratified_time_sample(time_rng, batch_size)
+    if model.kappa_weighted_time_sampling:
+        t, kappa_integral = model.apply(
+            params,
+            time_rng,
+            batch_size,
+            method=model.sample_time_kappa_weighted,
+        )
+    else:
+        t = stratified_time_sample(time_rng, batch_size)
+        kappa_integral = None
 
     return model.apply(
         params,
@@ -427,6 +485,7 @@ def compute_batch_loss(
         cap_params,
         rngs={"dropout": dropout_rng, "noise": noise_rng},
         method=model.compute_vlb_loss,
+        kappa_integral=kappa_integral,
     )
 
 
@@ -1050,6 +1109,199 @@ def test_vlb_loss_gradients_flow():
     sched_grads = grads["params"]["schedule"]
     flat_sched = jax.tree_util.tree_leaves(sched_grads)
     assert any(jnp.any(g != 0) for g in flat_sched), "No gradient flow to schedule"
+
+
+def test_kappa_weighted_loss_and_gradients():
+    """Verify κ-weighted time sampling produces finite loss and gradients to both model parts."""
+    dim = 3
+    batch_size = 256
+    model = _make_model(dim, d_model=32, kappa_weighted_time_sampling=True)
+
+    rng = jax.random.PRNGKey(0)
+    params_rng, data_rng, loss_rng = jax.random.split(rng, 3)
+    params = model.init(params_rng, *model.dummy_inputs())
+    x_1 = sample_sphere(data_rng, batch_size, dim)
+    batch = {"point_vec": x_1}
+
+    def loss_fn(p):
+        return compute_batch_loss(model, p, batch, loss_rng)
+
+    (loss, components), grads = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))(
+        params
+    )
+
+    assert jnp.isfinite(loss), f"Loss is not finite: {loss}"
+    for name, val in components.items():
+        assert jnp.isfinite(val), f"Component {name} is not finite: {val}"
+
+    # Gradients should flow to both vector field and schedule
+    vf_grads = grads["params"]["vector_field"]
+    flat_vf = jax.tree_util.tree_leaves(vf_grads)
+    assert any(jnp.any(g != 0) for g in flat_vf), "No gradient flow to vector field"
+    assert jax.tree.all(
+        jax.tree.map(jnp.isfinite, vf_grads)
+    ), "Non-finite vector field gradient"
+
+    sched_grads = grads["params"]["schedule"]
+    flat_sched = jax.tree_util.tree_leaves(sched_grads)
+    assert any(jnp.any(g != 0) for g in flat_sched), "No gradient flow to schedule"
+    assert jax.tree.all(
+        jax.tree.map(jnp.isfinite, sched_grads)
+    ), "Non-finite schedule gradient"
+
+
+def test_kappa_weighted_loss_matches_uniform_in_expectation():
+    """The κ-weighted and uniform estimators should agree in expectation (same VLB)."""
+    dim = 3
+    batch_size = 8192
+    n_batches = 50
+    model_kw = _make_model(dim, d_model=64, kappa_weighted_time_sampling=True)
+    model_uni = _make_model(dim, d_model=64, kappa_weighted_time_sampling=False)
+
+    rng = jax.random.PRNGKey(0)
+    params_rng, data_rng = jax.random.split(rng)
+    # Both models have the same architecture, so same params work for both
+    params = model_kw.init(params_rng, *model_kw.dummy_inputs())
+    x_1 = sample_sphere(data_rng, batch_size, dim)
+    batch = {"point_vec": x_1}
+
+    kw_losses = []
+    uni_losses = []
+    for i in range(n_batches):
+        batch_rng = jax.random.PRNGKey(i + 100)
+        kw_loss, kw_comp = compute_batch_loss(model_kw, params, batch, batch_rng)
+        uni_loss, uni_comp = compute_batch_loss(model_uni, params, batch, batch_rng)
+        kw_losses.append(kw_comp["vlb_total"])
+        uni_losses.append(uni_comp["vlb_total"])
+
+    mean_kw = float(jnp.mean(jnp.stack(kw_losses)))
+    mean_uni = float(jnp.mean(jnp.stack(uni_losses)))
+    print(f"Mean VLB (κ-weighted): {mean_kw:.4f}, (uniform): {mean_uni:.4f}")
+    # They estimate the same quantity, so means should be close
+    np.testing.assert_allclose(mean_kw, mean_uni, atol=0.5)
+
+
+def test_kappa_weighted_diffusion_schedule_gradient_matches_uniform():
+    """κ-weighted time sampling should preserve the diffusion-loss schedule gradient."""
+    dim = 3
+    batch_size = 4096
+    n_batches = 64
+    model_kw = _make_model(dim, d_model=16, kappa_weighted_time_sampling=True)
+    model_uni = _make_model(dim, d_model=16, kappa_weighted_time_sampling=False)
+
+    rng = jax.random.PRNGKey(0)
+    params_rng, data_rng = jax.random.split(rng)
+    params = model_kw.init(params_rng, *model_kw.dummy_inputs())
+    x_1 = sample_sphere(data_rng, batch_size, dim)
+    batch = {"point_vec": x_1}
+
+    def make_grad_fn(model):
+        def grad_fn(rng):
+            def diffusion_loss_fn(p):
+                _loss, components = compute_batch_loss(model, p, batch, rng)
+                return components["diffusion"]
+
+            grads = jax.grad(diffusion_loss_fn)(params)
+            return grads["params"]["schedule"]["log_kappa_max"]
+
+        return jax.jit(grad_fn)
+
+    kw_grad_fn = make_grad_fn(model_kw)
+    uni_grad_fn = make_grad_fn(model_uni)
+
+    kw_grads = []
+    uni_grads = []
+    for i in range(n_batches):
+        batch_rng = jax.random.PRNGKey(i + 1000)
+        kw_grads.append(kw_grad_fn(batch_rng))
+        uni_grads.append(uni_grad_fn(batch_rng))
+
+    kw_grads_arr = jnp.stack(kw_grads)
+    uni_grads_arr = jnp.stack(uni_grads)
+    kw_mean = float(jnp.mean(kw_grads_arr))
+    uni_mean = float(jnp.mean(uni_grads_arr))
+    kw_stderr = float(jnp.std(kw_grads_arr) / jnp.sqrt(n_batches))
+    uni_stderr = float(jnp.std(uni_grads_arr) / jnp.sqrt(n_batches))
+    atol = 5 * math.sqrt(kw_stderr**2 + uni_stderr**2)
+
+    np.testing.assert_allclose(kw_mean, uni_mean, atol=atol)
+
+
+@pytest.mark.usefixtures("starts_with_progressbar")
+def test_kappa_weighted_does_not_reduce_diffusion_loss_variance():
+    """κ-weighted time sampling does NOT reduce diffusion loss variance.
+
+    The VLB diffusion integrand γ'(t)·κ(t)·||w_θ - w_true||² is naturally self-balancing:
+    ||error||² scales as ~1/κ (because vMF noise decreases with concentration, making both
+    w_true and the residual error smaller at high κ). This holds at initialization (where
+    ||error||² ≈ ||w_true||² ∝ 1/κ) and after training (constant relative error). The κ
+    factor in the loss exactly compensates, making the integrand roughly uniform in t and
+    uniform stratified sampling near-optimal. κ-weighted IS oversamples high-κ/low-error
+    regions and gives huge importance weights at low κ, increasing variance.
+
+    The variance loss (vlb_variance_loss_weight), which reshapes γ'(t) via the learned
+    schedule, is the correct approach to VLB variance reduction.
+    """
+    from txt2img_unsupervised.training_infra import train_for_tests
+
+    dim = 3
+    batch_size = 256
+    model_uni = _make_model(dim, d_model=64)
+    model_kw = _make_model(dim, d_model=64, kappa_weighted_time_sampling=True)
+
+    # Train on a single point
+    point = jnp.zeros(dim).at[0].set(1.0)
+    points = repeat(point, "v -> b v", b=batch_size * 100)
+    dset = Dataset.from_dict({"point_vec": points}).with_format("np")
+
+    loss_fn = partial(compute_batch_loss, model_uni)
+    result = train_for_tests(
+        model_uni,
+        dset,
+        batch_size,
+        learning_rate=1e-2,
+        loss_fn=loss_fn,
+        fields=["point_vec"],
+        epochs=2,
+    )
+    params = result.state.get_eval_params()
+
+    # Measure variance of both estimators using the trained params
+    eval_batch_size = 4096
+    n_batches = 100
+    eval_data = repeat(point, "v -> b v", b=eval_batch_size)
+    batch = {"point_vec": np.array(eval_data)}
+
+    @jax.jit
+    def compute_both(batch_rng):
+        _, kw_comp = compute_batch_loss(model_kw, params, batch, batch_rng)
+        _, uni_comp = compute_batch_loss(model_uni, params, batch, batch_rng)
+        return kw_comp["diffusion"], uni_comp["diffusion"]
+
+    kw_losses = []
+    uni_losses = []
+    for i in range(n_batches):
+        kw_l, uni_l = compute_both(jax.random.PRNGKey(i + 2000))
+        kw_losses.append(kw_l)
+        uni_losses.append(uni_l)
+
+    kw_arr = jnp.stack(kw_losses)
+    uni_arr = jnp.stack(uni_losses)
+    kw_std = float(jnp.std(kw_arr))
+    uni_std = float(jnp.std(uni_arr))
+    kw_mean = float(jnp.mean(kw_arr))
+    uni_mean = float(jnp.mean(uni_arr))
+
+    print(f"Diffusion loss (uniform):    mean={uni_mean:.6f}, std={uni_std:.6f}")
+    print(f"Diffusion loss (κ-weighted): mean={kw_mean:.6f}, std={kw_std:.6f}")
+    print(f"Std ratio (κ-weighted / uniform): {kw_std / uni_std:.1f}x")
+
+    # Both estimate the same quantity
+    np.testing.assert_allclose(kw_mean, uni_mean, atol=0.5)
+    # κ-weighted has higher variance due to the self-balancing integrand
+    assert (
+        kw_std > uni_std
+    ), f"Expected κ-weighted to have higher std, but got kw={kw_std:.6f} vs uni={uni_std:.6f}"
 
 
 def test_vlb_schedule_grads_finite_with_vmf_sample():
