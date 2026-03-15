@@ -1253,6 +1253,7 @@ class TrainResult:
     step: int
     test_loss: Optional[float] = None
     test_nll: Optional[float] = None
+    test_aux: Optional[dict[str, float]] = None
 
 
 def train_for_tests(
@@ -1272,6 +1273,7 @@ def train_for_tests(
     rng_seed: int = 7357,
     test_dataset: Optional[Dataset] = None,
     nll_fn: Optional[Callable] = None,
+    nll_max_batches: Optional[int] = None,
     nll_eval_fields: Optional[List[str]] = None,
     schedule_learning_rate: Optional[float] = None,
     use_muon: bool = False,
@@ -1301,6 +1303,8 @@ def train_for_tests(
         nll_fn: Optional NLL function with signature
             (model, eval_params, batch_dict, rng) -> nll_per_example.
             If provided along with test_dataset, NLL is computed and printed after each epoch.
+        nll_max_batches: Maximum number of batches for NLL evaluation. If None, uses the
+            full test dataset.
         nll_eval_fields: Dataset columns to fetch for NLL evaluation batches.
             Defaults to fields if not provided.
         schedule_learning_rate: Separate learning rate for the learned noise schedule.
@@ -1309,8 +1313,8 @@ def train_for_tests(
         muon_beta: Momentum parameter for Muon optimizer.
 
     Returns:
-        TrainResult with state, step, and optionally test_loss and test_nll from
-        the last epoch (when test_dataset is provided).
+        TrainResult with state, step, and optionally test_loss, test_nll, and test_aux
+        from the last epoch (when test_dataset is provided).
     """
     (
         steps_per_epoch,
@@ -1374,6 +1378,8 @@ def train_for_tests(
         eval_fields = nll_eval_fields or fields
         eval_batch_size = min(batch_size, len(test_dataset))
         n_test_batches = len(test_dataset) // eval_batch_size
+        if nll_max_batches is not None:
+            n_test_batches = min(n_test_batches, nll_max_batches)
 
         def post_epoch_hook(state, epoch_idx, global_step):
             eval_params = state.get_eval_params()
@@ -1397,6 +1403,8 @@ def train_for_tests(
                     aux_means[key] = float(
                         jnp.mean(jnp.array([a[key] for a in all_aux]))
                     )
+
+            last_epoch_stats["aux_means"] = aux_means
 
             parts = [f"test loss = {mean_test_loss:.4f}"]
             for key, val in sorted(aux_means.items()):
@@ -1448,4 +1456,5 @@ def train_for_tests(
         step=final_step,
         test_loss=last_epoch_stats.get("test_loss"),
         test_nll=last_epoch_stats.get("test_nll"),
+        test_aux=last_epoch_stats.get("aux_means"),
     )

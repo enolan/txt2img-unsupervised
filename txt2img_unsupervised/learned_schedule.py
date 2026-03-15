@@ -19,6 +19,9 @@ This is used in the VLB loss as:
 where γ(t) = log κ(t) and γ'(t) is computed via autodiff through this network.
 """
 
+from functools import partial
+from typing import Optional
+
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -47,6 +50,7 @@ class LearnedNoiseSchedule(nn.Module):
     n_quadrature_points: int = 1024
     init_log_kappa_min: float = -0.693  # log(0.5)
     init_log_kappa_max: float = 9.210  # log(10000)
+    log_kappa_max_cap: Optional[float] = None
 
     def setup(self):
         assert (
@@ -62,6 +66,19 @@ class LearnedNoiseSchedule(nn.Module):
         )
         self.dense0 = nn.Dense(self.hidden_dim)
         self.dense1 = nn.Dense(1)
+
+    @property
+    def effective_log_kappa_max(self):
+        """The log_kappa_max value after applying the optional soft cap.
+
+        Uses cap - softplus(cap - x) which equals x when x << cap and asymptotes
+        to cap from below. Gradients always flow (they shrink but never die),
+        so the optimizer can pull the value back down if needed.
+        """
+        if self.log_kappa_max_cap is not None:
+            cap = self.log_kappa_max_cap
+            return cap - jax.nn.softplus(cap - self.log_kappa_max)
+        return self.log_kappa_max
 
     def _rate(self, t: Array) -> Array:
         """Compute the positive rate function g(t) = softplus(NN(t)) + 1.0.
@@ -104,7 +121,8 @@ class LearnedNoiseSchedule(nn.Module):
             log κ(t) values, same shape as t.
         """
         f = self._normalized_cdf(t)
-        return self.log_kappa_min + (self.log_kappa_max - self.log_kappa_min) * f
+        kappa_max = self.effective_log_kappa_max
+        return self.log_kappa_min + (kappa_max - self.log_kappa_min) * f
 
     def log_kappa_derivative(self, t: Array) -> Array:
         """Compute γ'(t) = d(log κ)/dt for the given time values.
@@ -232,6 +250,52 @@ def test_endpoints():
 
         np.testing.assert_allclose(float(val_at_0), log_kappa_min, atol=1e-5)
         np.testing.assert_allclose(float(val_at_1), log_kappa_max, atol=1e-5)
+
+
+def test_log_kappa_max_cap():
+    """Test that log_kappa_max_cap soft-clamps output and always preserves gradients."""
+    cap = 5.0
+
+    def loss_fn(schedule, p):
+        return schedule.apply(p, jnp.array(1.0))
+
+    # When init is well above cap: effective max ≈ cap, gradient is small but nonzero
+    schedule_above = LearnedNoiseSchedule(
+        init_log_kappa_min=-1.0,
+        init_log_kappa_max=9.0,
+        log_kappa_max_cap=cap,
+    )
+    params_above = schedule_above.init(jax.random.PRNGKey(0), jnp.array(0.5))
+
+    val_above = schedule_above.apply(params_above, jnp.array(1.0))
+    assert float(val_above) < cap, "Soft clamp should stay strictly below cap"
+    np.testing.assert_allclose(float(val_above), cap, atol=0.02)
+
+    eff_above = schedule_above.apply(
+        params_above, method=lambda self: self.effective_log_kappa_max
+    )
+    np.testing.assert_allclose(float(eff_above), cap, atol=0.02)
+
+    # Gradient should be small but nonzero (soft clamp never kills gradients)
+    grads_above = jax.grad(partial(loss_fn, schedule_above))(params_above)
+    g = float(grads_above["params"]["log_kappa_max"])
+    assert g > 0.0, f"Gradient should be nonzero even above cap, got {g}"
+    assert g < 0.1, f"Gradient should be small above cap, got {g}"
+
+    # When init is well below cap: effective max ≈ init, gradient ≈ 1
+    schedule_below = LearnedNoiseSchedule(
+        init_log_kappa_min=-1.0,
+        init_log_kappa_max=3.0,
+        log_kappa_max_cap=cap,
+    )
+    params_below = schedule_below.init(jax.random.PRNGKey(0), jnp.array(0.5))
+
+    val_below = schedule_below.apply(params_below, jnp.array(1.0))
+    np.testing.assert_allclose(float(val_below), 3.0, atol=0.15)
+
+    grads_below = jax.grad(partial(loss_fn, schedule_below))(params_below)
+    g_below = float(grads_below["params"]["log_kappa_max"])
+    assert g_below > 0.5, f"Gradient should be near 1 below cap, got {g_below}"
 
 
 def test_monotonicity():

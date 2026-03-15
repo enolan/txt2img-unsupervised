@@ -255,6 +255,10 @@ class VectorField(nn.Module):
     alpha_input: float = 1.0  # scaling factor for inputs
     alpha_output: float = 1.0  # scaling factor for outputs
 
+    # If True (default), project the output to the tangent space of the sphere at x
+    # and scale by chi(d-1). If False, output lives in full R^d and scale by chi(d).
+    project_to_tangent: bool = True
+
     @property
     def input_feature_dim(self) -> int:
         return self.domain_dim
@@ -611,30 +615,29 @@ class VectorField(nn.Module):
         points_out = self.out_proj(mlp_out)
         assert points_out.shape == (batch_size, self.domain_dim)
 
-        # Project to tangent space of the sphere
-        # For a unit vector x, the tangent space projection is: v - (v·x)x
-        dot_products = jnp.sum(points_out * x, axis=1, keepdims=True)
-        tangent_outputs = points_out - dot_products * x
-        assert tangent_outputs.shape == (batch_size, self.domain_dim)
-
         # The output layer kernel is zero-initialized so the model starts by predicting zero
-        # velocity/score everywhere, implying a uniform distribution on the sphere. This gives
-        # optimal initial NLL and near-optimal initial MSE loss. The domain_scale_factor controls
-        # the gain of the output layer once training moves the kernel away from zero.
-        #
-        # The tangent space projection of a d-dimensional Gaussian has magnitude following a chi
-        # distribution with (d-1) degrees of freedom. The expectation is:
+        # velocity/score everywhere. The domain_scale_factor controls the gain of the output
+        # layer once training moves the kernel away from zero.
+        if self.project_to_tangent:
+            # Project to tangent space of the sphere: v - (v·x)x
+            dot_products = jnp.sum(points_out * x, axis=1, keepdims=True)
+            output = points_out - dot_products * x
+            # Tangent projection of a d-dimensional Gaussian follows chi(d-1).
+            chi_dof = self.domain_dim - 1
+        else:
+            # Full R^d output (no projection). A d-dimensional Gaussian follows chi(d).
+            output = points_out
+            chi_dof = self.domain_dim
+        assert output.shape == (batch_size, self.domain_dim)
+
         # E[chi(k)] = sqrt(2) * Gamma((k+1)/2) / Gamma(k/2)
         expected_magnitude = jnp.sqrt(2) * jnp.exp(
-            jax.lax.lgamma(self.domain_dim / 2)
-            - jax.lax.lgamma((self.domain_dim - 1) / 2)
+            jax.lax.lgamma((chi_dof + 1) / 2) - jax.lax.lgamma(chi_dof / 2)
         )
 
         domain_scale_factor = (jnp.pi / 2) / expected_magnitude
 
-        tangent_outputs = tangent_outputs * domain_scale_factor * self.alpha_output
-
-        return tangent_outputs
+        return output * domain_scale_factor * self.alpha_output
 
 
 def test_vector_field_time_encoding_statistics():
