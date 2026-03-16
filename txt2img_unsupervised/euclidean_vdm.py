@@ -512,7 +512,10 @@ def generate_samples_ode(
     n_steps: int = 100,
     batch_size: Optional[int] = None,
 ) -> Array:
-    """Generate samples by integrating the probability flow ODE in log-SNR space.
+    """Generate samples by integrating the probability flow ODE in log-SNR space. Note this samples
+    from a *different* distribution than generate_samples_sde, and *not* the one that's constrained
+    by the VLB. They're only the same when the score is perfect i.e. they're never the same. The
+    only reason to use this is potentially better performance, especially when using tsit5.
 
     Integrates dz/dγ = ½[σ²z − σε̂] from γ_min (noise) to γ_max (data) with
     RK4 and uniform steps in γ.
@@ -572,12 +575,13 @@ def compute_nll(
 ) -> Array:
     """Compute spherical NLL via the probability flow ODE.
 
-    Uses the change-of-variables formula with Hutchinson divergence estimation to
-    compute the Euclidean log-density, then converts to the spherical NLL:
+    Uses the change-of-variables formula with Hutchinson divergence estimation to compute the
+    Euclidean log-density, then converts to the spherical NLL:
         NLL_sphere = NLL_ℝd − log(σ_radial) − ½log(2π)
 
-    Note: this is the ODE NLL, not the SDE NLL. The VLB bounds the SDE NLL, not
-    this quantity. The two differ when the score function is approximate.
+    Note: this is the ODE NLL, not the SDE NLL. The VLB bounds the SDE NLL, not this quantity. The
+    two differ when the score function is approximate (i.e. always). In general, this is not a great
+    measure for model quality.
 
     Args:
         model: Euclidean diffusion model
