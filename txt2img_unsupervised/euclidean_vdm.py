@@ -54,6 +54,7 @@ from txt2img_unsupervised.cap_sampling import (
     cap_conditioning_dim,
     encode_cap_params,
     sample_cap,
+    sample_from_cap_v,
     sphere_log_inverse_surface_area,
 )
 from txt2img_unsupervised.config import CapConditioningMode
@@ -1100,13 +1101,42 @@ def _make_target_distribution(name, domain_dim):
             interior_mask=lambda x: x[:, 0] > margin,
             exterior_mask=lambda x: x[:, 0] < -margin,
         )
+    elif name == "cap":
+        d_max = 0.5
+        cap_center = np.zeros(domain_dim)
+        cap_center[0] = 1.0
+        table = LogitsTable(d=domain_dim - 1, n=8192)
+        log_cap_frac = float(table.log_cap_size(d_max))
+        log_inv_sa = float(sphere_log_inverse_surface_area(domain_dim))
+        cap_logp = log_inv_sa - log_cap_frac
+        margin = 0.05
+
+        def cap_rvs(n, rng):
+            jax_key = jax.random.PRNGKey(rng.integers(0, 2**31))
+            return np.asarray(
+                sample_from_cap_v(jax_key, table, jnp.array(cap_center), d_max, n)
+            )
+
+        def cap_logpdf(x):
+            cos_dists = 1.0 - x @ cap_center
+            result = np.full(x.shape[0], cap_logp)
+            result[cos_dists > d_max] = -np.inf
+            return result
+
+        return _TargetDistribution(
+            rvs=cap_rvs,
+            logpdf=cap_logpdf,
+            entropy=-cap_logp,
+            interior_mask=lambda x: (1.0 - x @ cap_center) < d_max - margin,
+            exterior_mask=lambda x: (1.0 - x @ cap_center) > d_max + margin,
+        )
     else:
         raise ValueError(f"Unknown distribution: {name}")
 
 
 @pytest.mark.usefixtures("starts_with_progressbar")
 @pytest.mark.parametrize("domain_dim", [3, 16])
-@pytest.mark.parametrize("dist_name", ["vmf", "uniform", "hemisphere"])
+@pytest.mark.parametrize("dist_name", ["vmf", "uniform", "hemisphere", "cap"])
 def test_train_distribution(domain_dim, dist_name):
     """Train on a distribution and verify SDE samples match the target.
 
@@ -1118,15 +1148,24 @@ def test_train_distribution(domain_dim, dist_name):
 
     dist = _make_target_distribution(dist_name, domain_dim)
 
-    model = _make_model(
-        domain_dim,
-        d_model=256,
-        vlb_variance_loss_weight=1e-3,
-        log_snr_max_cap=10.0,
-    )
+    if dist_name == "cap":
+        model = _make_model(
+            domain_dim,
+            n_layers=6,
+            d_model=512,
+            vlb_variance_loss_weight=1e-3,
+            log_snr_max_cap=10.0,
+        )
+    else:
+        model = _make_model(
+            domain_dim,
+            d_model=256,
+            vlb_variance_loss_weight=1e-3,
+            log_snr_max_cap=10.0,
+        )
 
     batch_size = 1024
-    n_samples = 32768
+    n_samples = 32768 if dist_name != "cap" else 500_000
 
     data_rng = np.random.default_rng(42)
     points = dist.rvs(n_samples, data_rng)
@@ -1143,7 +1182,11 @@ def test_train_distribution(domain_dim, dist_name):
     match (dist_name, domain_dim):
         case ("hemisphere", 16):
             epochs = 40
+        case ("cap", 16):
+            epochs = 40
         case ("vmf", 16):
+            epochs = 20
+        case ("cap", _):
             epochs = 20
         case _:
             epochs = 15
@@ -1180,8 +1223,13 @@ def test_train_distribution(domain_dim, dist_name):
     in_support_frac = np.mean(in_support)
     print(f"In-support fraction: {in_support_frac:.4f}")
     if not np.all(in_support):
+        # The "cap" distribution has a sharp boundary where SDE boundary
+        # leakage is worse in high dimensions (concentration of measure puts
+        # most mass near the boundary). Use a softer sanity check for it;
+        # the KS test below is the main distributional assertion.
+        in_support_threshold = 0.95 if dist_name == "cap" else 0.98
         assert (
-            in_support_frac > 0.98
+            in_support_frac > in_support_threshold
         ), f"Only {in_support_frac:.1%} of samples in support"
 
     # 2. Cross-entropy under the true density should approximate entropy.
@@ -1220,3 +1268,205 @@ def test_train_distribution(domain_dim, dist_name):
     assert (
         max_ks < 0.05
     ), f"Max KS statistic {max_ks:.4f} too large across {n_projections} projections"
+
+    # 5. For distributions with a natural center (cap, hemisphere), compare
+    #    cosine distance from that center — tests the radial profile.
+    if dist_name in ("cap", "hemisphere"):
+        center_np = np.zeros(domain_dim)
+        center_np[0] = 1.0
+        model_cos_dists = 1.0 - samples_np[in_support] @ center_np
+        ref_cos_dists = 1.0 - ref_np @ center_np
+        cos_dist_ks, _ = stats.ks_2samp(model_cos_dists, ref_cos_dists)
+        print(f"KS on cosine distance from center: {cos_dist_ks:.4f}")
+        assert (
+            cos_dist_ks < 0.05
+        ), f"Cosine distance KS statistic {cos_dist_ks:.4f} too large"
+
+
+@pytest.mark.usefixtures("starts_with_progressbar")
+@pytest.mark.parametrize("domain_dim", [3, 16])
+@pytest.mark.parametrize("data_distribution", ["uniform", "vmf"])
+def test_train_conditioned_score(domain_dim, data_distribution):
+    """Train a CONDITIONED_SCORE model and verify conditioned generation and density."""
+    jax.config.update("jax_compilation_cache_dir", "/tmp/t2i-u-jax-cache")
+    from txt2img_unsupervised.training_infra import train_for_tests
+
+    d_max_dist = ((0.8, 1.0), (0.2, 2.0))
+    model = _make_model(
+        domain_dim,
+        n_layers=6,
+        d_model=512,
+        cap_conditioning=CapConditioningMode.CONDITIONED_SCORE,
+        d_max_dist=d_max_dist,
+        vlb_variance_loss_weight=1e-3,
+    )
+
+    batch_size = 2048
+    n_train_samples = 2_000_000
+    n_test_samples = 4096
+
+    # Generate training data
+    rng = jax.random.PRNGKey(42)
+    if data_distribution == "uniform":
+        points = np.asarray(
+            sample_sphere(rng, n_train_samples + n_test_samples, domain_dim)
+        )
+    elif data_distribution == "vmf":
+        mean_direction = np.zeros(domain_dim)
+        # Axis 1 so vmf center differs from cap center (axis 0)
+        mean_direction[1] = 1.0
+        vmf_dist = stats.vonmises_fisher(mean_direction, 5.0)
+        np_seed = int(jax.random.randint(rng, (), 0, 2**31 - 1))
+        points = vmf_dist.rvs(n_train_samples + n_test_samples, random_state=np_seed)
+    else:
+        raise ValueError(f"Unknown data_distribution: {data_distribution}")
+
+    train_points = points[:n_train_samples]
+    test_points = points[n_train_samples:]
+    train_dataset = Dataset.from_dict({"point_vec": train_points}).with_format("np")
+    test_dataset = Dataset.from_dict({"point_vec": test_points}).with_format("np")
+
+    loss_fn = partial(compute_batch_loss, model)
+
+    match (data_distribution, domain_dim):
+        case ("vmf", 16):
+            epochs = 30
+        case (_, 16):
+            epochs = 20
+        case ("vmf", _):
+            epochs = 15
+        case _:
+            epochs = 10
+
+    result = train_for_tests(
+        model,
+        train_dataset,
+        batch_size,
+        learning_rate=1e-3,
+        schedule_learning_rate=3e-4,
+        use_muon=True,
+        loss_fn=loss_fn,
+        fields=["point_vec"],
+        epochs=epochs,
+        test_dataset=test_dataset,
+    )
+    eval_params = result.state.get_eval_params()
+
+    gamma_min, gamma_max = model.apply(eval_params, method=model.gamma_range)
+    print(
+        f"Learned schedule: γ_min={float(gamma_min):.2f}, γ_max={float(gamma_max):.2f}"
+    )
+
+    # --- Distribution verification via SDE samples and KS tests ---
+    # The key property is that the conditioned density inside the cap is proportional to the
+    # unconditioned density — the constraint should not distort the distribution. Boundary sharpness
+    # is secondary, for embedding generation we don't care if the generated embedding is actually
+    # 0.81 away from the prompt embedding instead of <= 0.8, and if we decide we do we can rejection
+    # sample.
+    cap_center = jnp.zeros(domain_dim).at[0].set(1.0)
+    table = LogitsTable(d=domain_dim - 1, n=8192)
+    d_max_values = [1.0, 0.5]
+    n_gen = 5000
+    n_projections = 20
+
+    for d_max_test in d_max_values:
+        print(f"\n--- Distribution check for d_max={d_max_test} ---")
+
+        # Generate conditioned SDE samples
+        gen_cap_centers = repeat(cap_center, "d -> n d", n=n_gen)
+        gen_d_maxes = jnp.full((n_gen,), d_max_test)
+        gen_rng = jax.random.PRNGKey(int(d_max_test * 1000))
+
+        samples_np = np.asarray(
+            generate_samples_sde(
+                model,
+                eval_params,
+                gen_rng,
+                cap_params=(gen_cap_centers, gen_d_maxes),
+                n_steps=500,
+                eta=1.0,
+            )
+        )
+
+        sample_cos_dists = 1.0 - samples_np @ np.asarray(cap_center)
+
+        # Sanity check: the model is actually conditioning on the cap (most samples are in or very
+        # near it), not ignoring the constraint.
+        in_cap_frac = np.mean(sample_cos_dists <= d_max_test)
+        print(f"  In-cap fraction: {in_cap_frac:.4f}")
+        assert in_cap_frac >= 0.95, (
+            f"Only {in_cap_frac:.1%} of samples inside cap (d_max={d_max_test}), "
+            f"model may not be conditioning correctly"
+        )
+
+        # Any samples outside the cap should be near the boundary, not scattered randomly across the
+        # sphere.
+        outside_mask = sample_cos_dists > d_max_test
+        if np.any(outside_mask):
+            max_overshoot = float(np.max(sample_cos_dists[outside_mask]) - d_max_test)
+            print(f"  Max overshoot past boundary: {max_overshoot:.4f}")
+            assert (
+                max_overshoot < 0.1
+            ), f"Samples too far outside cap: max overshoot {max_overshoot:.4f}"
+
+        # Main assertion: the distribution inside the cap should match the true cap-restricted
+        # distribution. This verifies that conditioning doesn't distort the density.
+        if data_distribution == "uniform":
+            ref_np = np.asarray(
+                sample_from_cap_v(
+                    jax.random.PRNGKey(789), table, cap_center, d_max_test, n_gen
+                )
+            )
+        elif data_distribution == "vmf":
+            # Rejection sampling: generate vMF samples and keep those in the cap
+            cap_area_frac = float(jnp.exp(table.log_cap_size(d_max_test)))
+            # vMF with center orthogonal to cap center — acceptance rate ≈ cap area fraction
+            oversample = max(int(5.0 / cap_area_frac), 10)
+            vmf_pool = vmf_dist.rvs(
+                n_gen * oversample,
+                random_state=np.random.default_rng(789),
+            )
+            pool_cos_dists = 1.0 - vmf_pool @ np.asarray(cap_center)
+            in_cap = pool_cos_dists <= d_max_test
+            ref_np = vmf_pool[in_cap][:n_gen]
+            print(
+                f"  vMF rejection sampling: {np.sum(in_cap)}/{len(vmf_pool)} accepted"
+            )
+            assert len(ref_np) >= n_gen // 2, (
+                f"Too few reference samples from rejection sampling: "
+                f"{len(ref_np)} (need {n_gen // 2})"
+            )
+        else:
+            raise ValueError(f"Unknown data_distribution: {data_distribution}")
+
+        # Filter model samples to those inside the cap for fair KS comparison
+        samples_in_cap = samples_np[~outside_mask]
+
+        # KS test on cosine distance from cap center — checks the radial distribution within the cap
+        # matches the expected distribution.
+        model_cap_cos_dists = sample_cos_dists[~outside_mask]
+        ref_cap_cos_dists = 1.0 - ref_np @ np.asarray(cap_center)
+        cos_dist_ks, _ = stats.ks_2samp(model_cap_cos_dists, ref_cap_cos_dists)
+        print(f"  KS on cosine distance from cap center: {cos_dist_ks:.4f}")
+        assert (
+            cos_dist_ks < 0.05
+        ), f"Cosine distance KS statistic {cos_dist_ks:.4f} too large for d_max={d_max_test}"
+
+        # KS test on random 1D projections
+        proj_rng = np.random.default_rng(456 + int(d_max_test * 1000))
+        directions = proj_rng.standard_normal((n_projections, domain_dim))
+        directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+
+        ks_stats = []
+        for direction in directions:
+            stat, _ = stats.ks_2samp(samples_in_cap @ direction, ref_np @ direction)
+            ks_stats.append(stat)
+
+        max_ks = max(ks_stats)
+        mean_ks = np.mean(ks_stats)
+        print(
+            f"  KS stats over {n_projections} projections: max={max_ks:.4f}, mean={mean_ks:.4f}"
+        )
+        assert (
+            max_ks < 0.05
+        ), f"Max KS statistic {max_ks:.4f} too large for d_max={d_max_test}"
