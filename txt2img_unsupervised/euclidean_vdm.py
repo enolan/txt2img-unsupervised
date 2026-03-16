@@ -39,6 +39,7 @@ from dataclasses import field
 from functools import partial
 from typing import FrozenSet, Literal, Optional
 
+import diffrax
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -501,27 +502,36 @@ def generate_samples_sde(
     return z / jnp.linalg.norm(z, axis=1, keepdims=True)
 
 
-@partial(jax.jit, static_argnames=("model", "n_steps", "batch_size"))
+@partial(
+    jax.jit, static_argnames=("model", "n_steps", "batch_size", "method", "max_steps")
+)
 def generate_samples_ode(
     model: EuclideanDiffusionModel,
     params,
     rng: Array,
     cap_params,
-    n_steps: int = 100,
+    n_steps: Optional[int] = None,
     batch_size: Optional[int] = None,
+    method: str = "diffrax",
+    atol: float = 1e-5,
+    rtol: float = 1e-5,
+    max_steps: int = 4096,
 ) -> Array:
     """Generate samples by integrating the probability flow ODE in log-SNR space.
 
-    Integrates dz/dγ = ½[σ²z − σε̂] from γ_min (noise) to γ_max (data) with
-    RK4 and uniform steps in γ.
+    Integrates dz/dγ = ½[σ²z − σε̂] from γ_min (noise) to γ_max (data).
 
     Args:
         model: Euclidean diffusion model
         params: Model parameters
         rng: JAX random key
         cap_params: None for unconditioned, (cap_centers, d_maxes) for CONDITIONED_SCORE
-        n_steps: Number of RK4 integration steps in γ-space
+        n_steps: Number of RK4 steps (required for method="rk4", forbidden for "diffrax")
         batch_size: Required if cap_params is None
+        method: "diffrax" (adaptive Tsit5) or "rk4" (fixed-step)
+        atol: Absolute tolerance for diffrax adaptive solver
+        rtol: Relative tolerance for diffrax adaptive solver
+        max_steps: Maximum number of solver steps for diffrax
 
     Returns:
         Generated samples on S^{d-1} [batch_size, domain_dim]
@@ -539,16 +549,42 @@ def generate_samples_ode(
         raise ValueError("batch_size must be specified when cap_params is None")
 
     gamma_min, gamma_max = model.apply(params, method=model.gamma_range)
-    d_gamma = (gamma_max - gamma_min) / n_steps
 
     # Start from standard Gaussian
     z = jax.random.normal(rng, (batch_size, model.domain_dim))
 
-    def body_fn(i, z):
-        gamma = gamma_min + i * d_gamma
-        return _gamma_rk4_step(model, params, cap_params, z, gamma, d_gamma)
+    if method == "diffrax":
+        if n_steps is not None:
+            raise ValueError(
+                "n_steps must not be specified when using diffrax adaptive solver"
+            )
+        term = diffrax.ODETerm(_make_sampling_velocity(model))
+        solver = diffrax.Tsit5()
+        controller = diffrax.PIDController(rtol=rtol, atol=atol)
+        sol = diffrax.diffeqsolve(
+            term,
+            solver,
+            t0=gamma_min,
+            t1=gamma_max,
+            dt0=(gamma_max - gamma_min) / 100,
+            y0=z,
+            args=(params, cap_params),
+            stepsize_controller=controller,
+            max_steps=max_steps,
+        )
+        z = sol.ys[0]  # SaveAt default: final value only, leading dim 1
+    elif method == "rk4":
+        if n_steps is None:
+            raise ValueError("n_steps is required for rk4 method")
+        d_gamma = (gamma_max - gamma_min) / n_steps
 
-    z = jax.lax.fori_loop(0, n_steps, body_fn, z)
+        def body_fn(i, z):
+            gamma = gamma_min + i * d_gamma
+            return _gamma_rk4_step(model, params, cap_params, z, gamma, d_gamma)
+
+        z = jax.lax.fori_loop(0, n_steps, body_fn, z)
+    else:
+        raise ValueError(f"Unknown ODE solver method: {method}")
 
     # Normalize to sphere
     return z / jnp.linalg.norm(z, axis=1, keepdims=True)
@@ -563,10 +599,14 @@ def compute_nll(
     model: EuclideanDiffusionModel,
     params,
     batch: dict,
-    n_steps: int = 100,
+    n_steps: Optional[int] = None,
     rng=None,
     n_projections: int = 10,
     cap_params=None,
+    method: str = "diffrax",
+    atol: float = 1e-5,
+    rtol: float = 1e-5,
+    max_steps: int = 4096,
 ) -> Array:
     """Compute spherical NLL via the probability flow ODE.
 
@@ -581,10 +621,14 @@ def compute_nll(
         model: Euclidean diffusion model
         params: Model parameters
         batch: Dict with "point_vec" key containing data [batch_size, dim]
-        n_steps: Number of integration steps
+        n_steps: Number of integration steps (required for "rk4", forbidden for "diffrax")
         rng: JAX random key
         n_projections: Number of projections for divergence estimation
         cap_params: Conditioning parameters
+        method: "diffrax" (adaptive Tsit5) or "rk4" (fixed-step)
+        atol: Absolute tolerance for diffrax adaptive solver
+        rtol: Relative tolerance for diffrax adaptive solver
+        max_steps: Maximum number of solver steps for diffrax
 
     Returns:
         Spherical NLL per example [batch_size]
@@ -598,6 +642,10 @@ def compute_nll(
         n_steps=n_steps,
         rng=rng,
         n_projections=n_projections,
+        method=method,
+        atol=atol,
+        rtol=rtol,
+        max_steps=max_steps,
     )
     offset = jnp.log(model.sigma_radial) + 0.5 * jnp.log(2.0 * jnp.pi)
     return nll_euclidean - offset
@@ -675,6 +723,72 @@ def _gamma_velocity(model, params, cap_params, z, log_snr):
     return model.apply(
         params, z, gamma_vec, cap_params, method=model.gamma_space_velocity
     )
+
+
+def _make_sampling_velocity(model):
+    """Create a diffrax-compatible velocity function for ODE sampling.
+
+    Captures ``model`` (a compile-time constant) in the closure so it doesn't
+    go through diffrax's ``args``.
+
+    Returns:
+        ``f(gamma, z, args)`` where ``args = (params, cap_params)``.
+    """
+
+    def velocity(gamma, z, args):
+        params, cap_params = args
+        return _gamma_velocity(model, params, cap_params, z, gamma)
+
+    return velocity
+
+
+def _z_only_norm(state):
+    """RMS norm over only the z component of an augmented ``(z, div_sum)`` state.
+
+    PIDController applies its norm to the scaled error estimate (same pytree
+    structure as the state).  By ignoring the divergence leaf, step-size
+    decisions are driven entirely by the ODE trajectory accuracy.
+    """
+    z, _div_sum = state
+    return jnp.sqrt(jnp.mean(z**2))
+
+
+def _make_augmented_velocity(model, n_projections):
+    """Create a diffrax-compatible augmented velocity for NLL computation.
+
+    Integrates both the ODE trajectory and the Hutchinson divergence
+    accumulator simultaneously.  ``model`` and ``n_projections`` are captured
+    in the closure because they must be compile-time constants.
+
+    NLL computation integrates backward (gamma_max to gamma_min), but the
+    change-of-variables formula requires ``integral_{gamma_min}^{gamma_max} div dgamma``,
+    so the divergence is negated here to compensate.
+
+    Returns:
+        ``f(gamma, (z, div_sum), args)`` where
+        ``args = (params, cap_params, base_rng)``.
+    """
+
+    def velocity(gamma, state, args):
+        z, _div_sum = state
+        params, cap_params, base_rng = args
+
+        dz_dgamma = _gamma_velocity(model, params, cap_params, z, gamma)
+
+        # Derive a per-evaluation RNG from the base key and the current gamma
+        # value so the Hutchinson estimator gets varying projections without
+        # needing RNG state in the ODE.
+        gamma_bits = jax.lax.bitcast_convert_type(jnp.float32(gamma), jnp.int32)
+        step_rng = jax.random.fold_in(base_rng, gamma_bits)
+        div = _gamma_hutchinson_divergence(
+            model, params, cap_params, z, gamma, step_rng, n_projections
+        )
+
+        # Negate: NLL integrates backward (gamma_max to gamma_min), but
+        # the formula needs integral_{gamma_min}^{gamma_max} div dgamma.
+        return dz_dgamma, -div
+
+    return velocity
 
 
 def _gamma_rk4_step(model, params, cap_params, z, gamma, d_gamma):
@@ -757,15 +871,22 @@ def _gamma_hutchinson_divergence(
     return jax.vmap(single_div, in_axes=(0, 0, cap_in_axes))(z, batch_keys, cap_params)
 
 
-@partial(jax.jit, static_argnames=("model", "n_steps", "n_projections"))
+@partial(
+    jax.jit,
+    static_argnames=("model", "n_steps", "n_projections", "method", "max_steps"),
+)
 def _compute_log_probability(
     model: EuclideanDiffusionModel,
     params,
     samples: Array,
     cap_params,
-    n_steps: int = 100,
+    n_steps: Optional[int] = None,
     rng=None,
     n_projections: int = 10,
+    method: str = "diffrax",
+    atol: float = 1e-5,
+    rtol: float = 1e-5,
+    max_steps: int = 4096,
 ) -> Array:
     """Compute log probability by integrating the ODE backward in log-SNR space.
 
@@ -779,9 +900,13 @@ def _compute_log_probability(
         params: Model parameters
         samples: Points to evaluate [batch_size, dim]
         cap_params: Conditioning parameters
-        n_steps: Number of integration steps in γ-space
+        n_steps: Number of integration steps (required for "rk4", forbidden for "diffrax")
         rng: JAX random key for Hutchinson estimator
         n_projections: Number of random projections for divergence estimation
+        method: "diffrax" (adaptive Tsit5) or "rk4" (fixed-step)
+        atol: Absolute tolerance for diffrax adaptive solver
+        rtol: Relative tolerance for diffrax adaptive solver
+        max_steps: Maximum number of solver steps for diffrax
 
     Returns:
         Log probabilities [batch_size]
@@ -792,26 +917,54 @@ def _compute_log_probability(
     batch_size, dim = samples.shape
 
     gamma_min, gamma_max = model.apply(params, method=model.gamma_range)
-    d_gamma = (gamma_max - gamma_min) / n_steps
 
-    def body_fn(i, state):
-        z, div_sum, rng = state
-        gamma = gamma_max - i * d_gamma  # backward from γ_max
-
-        # Accumulate divergence of dz/dγ
-        step_rng, rng = jax.random.split(rng)
-        div = _gamma_hutchinson_divergence(
-            model, params, cap_params, z, gamma, step_rng, n_projections
+    if method == "diffrax":
+        if n_steps is not None:
+            raise ValueError(
+                "n_steps must not be specified when using diffrax adaptive solver"
+            )
+        term = diffrax.ODETerm(_make_augmented_velocity(model, n_projections))
+        solver = diffrax.Tsit5()
+        controller = diffrax.PIDController(rtol=rtol, atol=atol, norm=_z_only_norm)
+        y0 = (samples, jnp.zeros(batch_size))
+        sol = diffrax.diffeqsolve(
+            term,
+            solver,
+            t0=gamma_max,
+            t1=gamma_min,
+            dt0=-(gamma_max - gamma_min) / 100,
+            y0=y0,
+            args=(params, cap_params, rng),
+            stepsize_controller=controller,
+            max_steps=max_steps,
         )
-        div_sum = div_sum + div * d_gamma
+        z0 = sol.ys[0][0]  # [batch_size, dim]
+        div_sum = sol.ys[1][0]  # [batch_size]
+    elif method == "rk4":
+        if n_steps is None:
+            raise ValueError("n_steps is required for rk4 method")
+        d_gamma = (gamma_max - gamma_min) / n_steps
 
-        # RK4 step backward in γ
-        z = _gamma_rk4_step(model, params, cap_params, z, gamma, -d_gamma)
-        return z, div_sum, rng
+        def body_fn(i, state):
+            z, div_sum, step_rng = state
+            gamma = gamma_max - i * d_gamma  # backward from γ_max
 
-    z0, div_sum, _ = jax.lax.fori_loop(
-        0, n_steps, body_fn, (samples, jnp.zeros(batch_size), rng)
-    )
+            # Accumulate divergence of dz/dγ
+            step_rng, rng_i = jax.random.split(step_rng)
+            div = _gamma_hutchinson_divergence(
+                model, params, cap_params, z, gamma, rng_i, n_projections
+            )
+            div_sum = div_sum + div * d_gamma
+
+            # RK4 step backward in γ
+            z = _gamma_rk4_step(model, params, cap_params, z, gamma, -d_gamma)
+            return z, div_sum, step_rng
+
+        z0, div_sum, _ = jax.lax.fori_loop(
+            0, n_steps, body_fn, (samples, jnp.zeros(batch_size), rng)
+        )
+    else:
+        raise ValueError(f"Unknown ODE solver method: {method}")
 
     # Base density: N(0, I)
     log_p0 = -0.5 * (jnp.sum(z0**2, axis=1) + dim * jnp.log(2.0 * jnp.pi))
@@ -1017,3 +1170,140 @@ def test_train_trivial(domain_dim):
         f"VLB spherical {vlb_spherical:.4f} should be < -5 "
         f"for single-point distribution"
     )
+
+
+def _init_small_model(dim=3):
+    """Initialize a small model and params for diffrax tests."""
+    model = _make_model(dim, d_model=32)
+    params_rng = jax.random.PRNGKey(42)
+    params = model.init(params_rng, *model.dummy_inputs())
+    return model, params
+
+
+def test_diffrax_ode_samples_on_sphere():
+    """Diffrax ODE sampler produces finite outputs on the unit sphere."""
+    model, params = _init_small_model(dim=3)
+    samples = generate_samples_ode(
+        model,
+        params,
+        jax.random.PRNGKey(0),
+        cap_params=None,
+        batch_size=16,
+    )
+    assert samples.shape == (16, 3)
+    assert jnp.all(jnp.isfinite(samples)), "Non-finite samples"
+    norms = jnp.linalg.norm(samples, axis=1)
+    np.testing.assert_allclose(norms, 1.0, atol=1e-5)
+
+
+def test_diffrax_nll_finite():
+    """NLL via diffrax produces finite values."""
+    model, params = _init_small_model(dim=3)
+    x = sample_sphere(jax.random.PRNGKey(1), 8, 3)
+    batch = {"point_vec": x}
+    nll = compute_nll(model, params, batch, rng=jax.random.PRNGKey(2), n_projections=3)
+    assert nll.shape == (8,)
+    assert jnp.all(jnp.isfinite(nll)), f"Non-finite NLL values: {nll}"
+
+
+def _train_vmf_mixture_model():
+    """Train a small model on a two-component vMF mixture for diffrax tests.
+
+    Returns a model trained on a bimodal distribution so that sample comparisons
+    are meaningful (unlike a point mass where all samples collapse together).
+    """
+    from scipy import stats
+
+    from txt2img_unsupervised.training_infra import train_for_tests
+
+    dim = 3
+    model = _make_model(dim, vlb_variance_loss_weight=1e-3, log_snr_max_cap=10.0)
+
+    mu1 = np.array([1.0, 0.0, 0.0])
+    mu2 = np.array([0.0, 1.0, 0.0])
+    kappa = 5.0
+    vmf1 = stats.vonmises_fisher(mu1, kappa)
+    vmf2 = stats.vonmises_fisher(mu2, kappa)
+
+    n_per_component = 12_800
+    points = np.vstack([vmf1.rvs(n_per_component), vmf2.rvs(n_per_component)])
+
+    batch_size = 256
+    dset = Dataset.from_dict({"point_vec": points}).with_format("np")
+    test_dset = Dataset.from_dict({"point_vec": points[:batch_size]}).with_format("np")
+
+    result = train_for_tests(
+        model,
+        dset,
+        batch_size,
+        learning_rate=1e-3,
+        loss_fn=partial(compute_batch_loss, model),
+        fields=["point_vec"],
+        epochs=4,
+        test_dataset=test_dset,
+    )
+    return model, result.state.get_eval_params()
+
+
+@pytest.mark.usefixtures("starts_with_progressbar")
+def test_diffrax_ode_matches_rk4():
+    """Diffrax adaptive and fixed-step RK4 produce similar samples on a bimodal distribution."""
+    model, eval_params = _train_vmf_mixture_model()
+
+    rng = jax.random.PRNGKey(99)
+    n_samples = 128
+
+    samples_diffrax = generate_samples_ode(
+        model, eval_params, rng, cap_params=None, batch_size=n_samples
+    )
+    samples_rk4 = generate_samples_ode(
+        model,
+        eval_params,
+        rng,
+        cap_params=None,
+        batch_size=n_samples,
+        method="rk4",
+        n_steps=200,
+    )
+
+    # Same initial noise + same ODE => nearly identical outputs
+    pairwise_cos = np.sum(np.array(samples_diffrax) * np.array(samples_rk4), axis=1)
+    print(f"Pairwise cosine sim (diffrax vs rk4): mean={pairwise_cos.mean():.4f}")
+    assert pairwise_cos.mean() > 0.99, (
+        f"Diffrax and RK4 samples should be very similar, "
+        f"got mean pairwise cosine {pairwise_cos.mean():.4f}"
+    )
+
+
+@pytest.mark.usefixtures("starts_with_progressbar")
+def test_diffrax_nll_matches_rk4():
+    """Diffrax adaptive and fixed-step RK4 produce similar NLL values."""
+    model, eval_params = _train_vmf_mixture_model()
+
+    # In 3D with n_projections >= dim, the Hutchinson estimator computes the
+    # exact trace (3 orthogonal projections span R^3). So the only source of
+    # difference between the two methods is integration accuracy, and both
+    # should agree closely.
+    test_points = sample_sphere(jax.random.PRNGKey(5), 16, 3)
+    batch = {"point_vec": test_points}
+    rng = jax.random.PRNGKey(7)
+
+    nll_diffrax = compute_nll(model, eval_params, batch, rng=rng, n_projections=10)
+    nll_rk4 = compute_nll(
+        model,
+        eval_params,
+        batch,
+        rng=rng,
+        n_projections=10,
+        method="rk4",
+        n_steps=200,
+    )
+
+    mean_diffrax = float(np.array(nll_diffrax).mean())
+    mean_rk4 = float(np.array(nll_rk4).mean())
+    print(f"NLL diffrax: {mean_diffrax:.4f}")
+    print(f"NLL rk4: {mean_rk4:.4f}")
+    print(f"Mean abs diff: {abs(mean_diffrax - mean_rk4):.4f}")
+    assert (
+        abs(mean_diffrax - mean_rk4) < 0.1
+    ), f"NLL estimates too far apart: diffrax={mean_diffrax:.4f}, rk4={mean_rk4:.4f}"
