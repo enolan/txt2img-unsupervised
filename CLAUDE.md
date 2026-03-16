@@ -16,7 +16,7 @@ allow much better prompt following and image quality.
 
 The image generation model is an autoregressive transformer using a VQGAN for the image tokens. The
 model that generates embeddings is a spherical flow matching model with optimal transport paths, or
-a spherical variational diffusion model.
+a spherical variational diffusion model, or a variational diffusion model in Euclidean space.
 
 ## Code Style Guidelines
 
@@ -205,6 +205,8 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
     inference time. Used to generate CLIP image embeddings for image generation.
   * `txt2img_unsupervised/score_matching.py`. Spherical variational diffusion model. An alternate
     approach. Includes code for cap-conditioned generation. Does not use FunctionWeightedFlowModel.
+  * `txt2img_unsupervised/euclidean_vdm.py`. Standard Euclidean VDM used for spherical data, where
+    points on the sphere have radial noise added to smooth the distribution to a thin shell.
   * `txt2img_unsupervised/cap_sampling.py`. Functions for sampling spherical caps and sampling
     points inside them.
   * `txt2img_unsupervised/transformer_model.py`. The transformer-based image generation model.

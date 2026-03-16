@@ -35,9 +35,9 @@ Then normalize: x = z / ‖z‖.
 
 import math
 
-from dataclasses import field
+from dataclasses import dataclass, field
 from functools import partial
-from typing import FrozenSet, Literal, Optional
+from typing import Callable, FrozenSet, Literal, Optional
 
 import diffrax
 import flax.linen as nn
@@ -48,12 +48,14 @@ import pytest
 from datasets import Dataset
 from einops import repeat
 from jax import Array
+from scipy import stats
 
 from txt2img_unsupervised.cap_sampling import (
     LogitsTable,
     cap_conditioning_dim,
     encode_cap_params,
     sample_cap,
+    sphere_log_inverse_surface_area,
 )
 from txt2img_unsupervised.config import CapConditioningMode
 from txt2img_unsupervised.flow_matching import (
@@ -1172,6 +1174,203 @@ def test_train_trivial(domain_dim):
     )
 
 
+def _sample_sphere_np(n, dim, rng):
+    """Sample uniformly from the unit sphere using numpy."""
+    points = rng.standard_normal((n, dim))
+    points /= np.linalg.norm(points, axis=1, keepdims=True)
+    return points
+
+
+@dataclass
+class _TargetDistribution:
+    """A target distribution on the sphere for training tests.
+
+    Attributes:
+        rvs: Sample function (n, rng) -> [n, dim] array.
+        logpdf: Log-probability function (points) -> [n] array. May return -inf.
+        entropy: Differential entropy of the distribution.
+        interior_mask: Returns True for points well inside the support, far from any boundary,
+            where we expect the model's density to be accurate.
+        exterior_mask: Returns True for points well outside the support, far from any boundary,
+            where we expect the model to assign very low density.
+    """
+
+    rvs: Callable[[int, np.random.Generator], np.ndarray]
+    logpdf: Callable[[np.ndarray], np.ndarray]
+    entropy: float
+    interior_mask: Callable[[np.ndarray], np.ndarray]
+    exterior_mask: Callable[[np.ndarray], np.ndarray]
+
+
+def _make_target_distribution(name, domain_dim):
+    """Create a target distribution for training tests."""
+    _all_true = lambda x: np.ones(x.shape[0], dtype=bool)
+    _all_false = lambda x: np.zeros(x.shape[0], dtype=bool)
+
+    if name == "vmf":
+        mean_direction = np.zeros(domain_dim)
+        mean_direction[0] = 1.0
+        vmf_dist = stats.vonmises_fisher(mean_direction, 2)
+        return _TargetDistribution(
+            rvs=vmf_dist.rvs,
+            logpdf=vmf_dist.logpdf,
+            entropy=vmf_dist.entropy(),
+            interior_mask=_all_true,
+            exterior_mask=_all_false,
+        )
+    elif name == "uniform":
+        log_inv_sa = float(sphere_log_inverse_surface_area(domain_dim))
+        return _TargetDistribution(
+            rvs=lambda n, rng: _sample_sphere_np(n, domain_dim, rng),
+            logpdf=lambda x: np.full(x.shape[0], log_inv_sa),
+            entropy=-log_inv_sa,
+            interior_mask=_all_true,
+            exterior_mask=_all_false,
+        )
+    elif name == "hemisphere":
+        log_inv_sa = float(sphere_log_inverse_surface_area(domain_dim))
+        hemi_logp = log_inv_sa + np.log(2)
+        margin = 0.05
+
+        def hemi_rvs(n, rng):
+            points = _sample_sphere_np(n, domain_dim, rng)
+            points[points[:, 0] < 0] *= -1
+            return points
+
+        def hemi_logpdf(x):
+            result = np.full(x.shape[0], hemi_logp)
+            result[x[:, 0] <= 0] = -np.inf
+            return result
+
+        return _TargetDistribution(
+            rvs=hemi_rvs,
+            logpdf=hemi_logpdf,
+            entropy=-hemi_logp,
+            interior_mask=lambda x: x[:, 0] > margin,
+            exterior_mask=lambda x: x[:, 0] < -margin,
+        )
+    else:
+        raise ValueError(f"Unknown distribution: {name}")
+
+
+@pytest.mark.usefixtures("starts_with_progressbar")
+@pytest.mark.parametrize("domain_dim", [3, 16])
+@pytest.mark.parametrize("dist_name", ["vmf", "uniform", "hemisphere"])
+def test_train_distribution(domain_dim, dist_name):
+    """Train on a distribution and verify SDE samples match the target.
+
+    Uses the SDE sampler (whose distribution the VLB bounds) rather than ODE NLL,
+    because the euclidean VDM's ODE NLL converges much more slowly than its sample
+    quality in higher dimensions.
+    """
+    from txt2img_unsupervised.training_infra import train_for_tests
+
+    dist = _make_target_distribution(dist_name, domain_dim)
+
+    model = _make_model(
+        domain_dim,
+        d_model=256,
+        vlb_variance_loss_weight=1e-3,
+        log_snr_max_cap=10.0,
+    )
+
+    batch_size = 1024
+    n_samples = 32768
+
+    data_rng = np.random.default_rng(42)
+    points = dist.rvs(n_samples, data_rng)
+    dset = Dataset.from_dict({"point_vec": points}).with_format("np")
+
+    test_dset = Dataset.from_dict(
+        {"point_vec": dist.rvs(batch_size * 8, data_rng)}
+    ).with_format("np")
+
+    print(f"Distribution entropy: {dist.entropy:.6f}")
+
+    loss_fn = partial(compute_batch_loss, model)
+
+    match (dist_name, domain_dim):
+        case ("hemisphere", 16):
+            epochs = 40
+        case ("vmf", 16):
+            epochs = 20
+        case _:
+            epochs = 15
+    result = train_for_tests(
+        model,
+        dset,
+        batch_size,
+        learning_rate=1e-3,
+        loss_fn=loss_fn,
+        fields=["point_vec"],
+        epochs=epochs,
+        test_dataset=test_dset,
+    )
+    eval_params = result.state.get_eval_params()
+
+    # Generate SDE samples — these come from the distribution the VLB bounds
+    n_gen = 5000
+    samples_np = np.array(
+        generate_samples_sde(
+            model,
+            eval_params,
+            jax.random.PRNGKey(42),
+            cap_params=None,
+            batch_size=n_gen,
+            n_steps=500,
+            eta=1.0,
+        )
+    )
+    ref_np = dist.rvs(n_gen, np.random.default_rng(123))
+
+    # 1. Most samples should lie in the support
+    log_probs = dist.logpdf(samples_np)
+    in_support = np.isfinite(log_probs)
+    in_support_frac = np.mean(in_support)
+    print(f"In-support fraction: {in_support_frac:.4f}")
+    if not np.all(in_support):
+        assert (
+            in_support_frac > 0.98
+        ), f"Only {in_support_frac:.1%} of samples in support"
+
+    # 2. Cross-entropy under the true density should approximate entropy.
+    # E_model[-log p_true(x)] ≈ H(p_true) when model ≈ true distribution.
+    if np.any(in_support):
+        cross_ent = -np.mean(log_probs[in_support])
+        print(f"Cross-entropy: {cross_ent:.4f}, entropy: {dist.entropy:.4f}")
+        assert (
+            cross_ent < dist.entropy + 1.0
+        ), f"Cross-entropy {cross_ent:.4f} too far from entropy {dist.entropy:.4f}"
+
+    # 3. Very few samples should land in the exterior region
+    exterior_frac = np.mean(dist.exterior_mask(samples_np))
+    if exterior_frac > 0:
+        print(f"Exterior fraction: {exterior_frac:.4f}")
+    assert exterior_frac < 0.05, f"Too many samples in exterior: {exterior_frac:.1%}"
+
+    # 4. KS test on many random 1D projections. Each projection collapses the
+    #    d-dimensional comparison to a scalar, so we test many directions to cover
+    #    the full distribution shape.
+    n_projections = 20
+    proj_rng = np.random.default_rng(456)
+    directions = proj_rng.standard_normal((n_projections, domain_dim))
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+
+    ks_stats = []
+    for direction in directions:
+        stat, _ = stats.ks_2samp(samples_np @ direction, ref_np @ direction)
+        ks_stats.append(stat)
+
+    max_ks = max(ks_stats)
+    mean_ks = np.mean(ks_stats)
+    print(
+        f"KS stats over {n_projections} projections: max={max_ks:.4f}, mean={mean_ks:.4f}"
+    )
+    assert (
+        max_ks < 0.05
+    ), f"Max KS statistic {max_ks:.4f} too large across {n_projections} projections"
+
+
 def _init_small_model(dim=3):
     """Initialize a small model and params for diffrax tests."""
     model = _make_model(dim, d_model=32)
@@ -1212,8 +1411,6 @@ def _train_vmf_mixture_model():
     Returns a model trained on a bimodal distribution so that sample comparisons
     are meaningful (unlike a point mass where all samples collapse together).
     """
-    from scipy import stats
-
     from txt2img_unsupervised.training_infra import train_for_tests
 
     dim = 3
