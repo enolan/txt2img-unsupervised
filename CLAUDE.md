@@ -153,9 +153,10 @@ code is correct.
 Many tests will be numerical, testing to a tolerance or that a result is above a threshold value.
 For example we might train a classifier and assert that accuracy is above 95%. Choosing the
 tolerances/thresholds well is very important! When choosing, think about what level you would expect
-if the implementation were correct and use that. Resist the urge to loosen your constraints if the
-test fails, this can hide bugs. Remember, your goal is to prove the code is correct, not simply make
-the tests pass.
+if the implementation were correct and use that. Never loosen your constraints because a test is
+failing. Remember, the goal of tests is to find out whether the code is correct, not simply make the
+tests pass. Again, do not make the tests easier because they're failing! Fix the code instead, or
+admit that the code can't perform to the specified standard.
 
 Use pytest. Use descriptive test names. When testing something that has multiple code paths, use
 pytest.mark.parametrize to exercise each one.
