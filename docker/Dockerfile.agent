@@ -1,0 +1,40 @@
+FROM nvidia/cuda:13.1.1-runtime-ubuntu24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        fish \
+        git \
+        gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js 22 LTS for Codex CLI
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# Codex CLI
+RUN npm install -g @openai/codex
+
+# Non-root user with configurable UID for host file permission compatibility
+ARG USER_UID=1000
+RUN userdel -r ubuntu 2>/dev/null; \
+    useradd -m -s /usr/bin/fish -u ${USER_UID} devuser \
+    && mkdir -p /run/user/${USER_UID} \
+    && chown devuser:devuser /run/user/${USER_UID}
+ENV XDG_RUNTIME_DIR=/run/user/${USER_UID}
+
+USER devuser
+ENV PATH="/home/devuser/.local/bin:${PATH}"
+
+# Claude Code (native installer, must run as non-root)
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Pre-install project Python so uv sync doesn't have to download it
+ARG PYTHON_VERSION=3.11.14
+RUN uv python install ${PYTHON_VERSION}
+WORKDIR /home/devuser/txt2img-unsupervised
+CMD ["fish"]
