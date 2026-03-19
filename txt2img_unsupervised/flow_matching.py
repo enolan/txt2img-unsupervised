@@ -585,7 +585,17 @@ class VectorField(nn.Module):
         "Sample base distribution x0 for training."
         return sample_sphere(self.make_rng("sample_base"), batch_size, self.domain_dim)
 
-    def __call__(self, x, t, cond_vec):
+    def _forward(self, x, t, cond_vec):
+        """Internal forward pass returning (output, post-norm MLP activations).
+
+        Args:
+            x: Input vectors [batch_size, domain_dim]
+            t: Time parameters [batch_size]
+            cond_vec: Conditioning vectors [batch_size, conditioning_dim]
+
+        Returns:
+            Tuple of (output [batch_size, domain_dim], mlp_out [batch_size, d_model]).
+        """
         batch_size = x.shape[0]
         assert x.shape == (batch_size, self.domain_dim)
         assert t.shape == (batch_size,)
@@ -637,7 +647,19 @@ class VectorField(nn.Module):
 
         domain_scale_factor = (jnp.pi / 2) / expected_magnitude
 
-        return output * domain_scale_factor * self.alpha_output
+        return output * domain_scale_factor * self.alpha_output, mlp_out
+
+    def __call__(self, x, t, cond_vec):
+        output, _ = self._forward(x, t, cond_vec)
+        return output
+
+    def call_with_intermediates(self, x, t, cond_vec):
+        """Like __call__ but also returns the post-norm MLP activations.
+
+        Returns:
+            Tuple of (output [batch_size, domain_dim], mlp_out [batch_size, d_model]).
+        """
+        return self._forward(x, t, cond_vec)
 
 
 def test_vector_field_time_encoding_statistics():

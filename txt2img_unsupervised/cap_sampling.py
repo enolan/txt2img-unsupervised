@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from functools import partial
-from typing import Optional, Tuple
+from typing import FrozenSet, Optional, Tuple
 
 
 @jax.tree_util.register_pytree_node_class
@@ -315,6 +315,16 @@ def sample_from_cap_v(rng, table, v, d_max, n):
     return pts
 
 
+def sample_negative_cap_center(rng, table, v, d_max):
+    """Sample a cap center such that v is NOT inside the resulting cap.
+
+    The set of centers where v is outside the cap (cosine distance > d_max from v)
+    is the complement of the d_max-cap around v, which equals the cap centered
+    on -v with radius 2.0 - d_max.
+    """
+    return sample_from_cap(rng, table, -v, 2.0 - d_max)
+
+
 def process_d_max_dist(
     d_max_dist: list[tuple[float, float]] = None
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
@@ -570,13 +580,14 @@ def test_sample_from_cap():
         assert jnp.all(dists <= max_cos_distances[i])
 
 
-def cap_conditioning_dim(domain_dim: int) -> int:
+def cap_conditioning_dim(domain_dim: int, n_extra_features: int = 0) -> int:
     """Compute the output dimension of cap conditioning vectors.
 
     Args:
         domain_dim: Dimension of the ambient space (e.g. 768 for CLIP).
+        n_extra_features: Number of extra scalar features (e.g. from classifier_extra_features).
     """
-    return domain_dim + 1
+    return domain_dim + 1 + n_extra_features
 
 
 def encode_cap_params(
@@ -584,22 +595,31 @@ def encode_cap_params(
     d_max: jax.Array,
     d_max_dist: Optional[Tuple[Tuple[float, float], ...]],
     domain_dim: int,
+    extra_features: FrozenSet[str] = frozenset(),
+    z: Optional[jax.Array] = None,
+    table: Optional["LogitsTable"] = None,
 ) -> jax.Array:
     """Encode spherical cap parameters into a conditioning vector for a neural network.
 
     Uses absolute encoding: cap center scaled for unit variance, plus normalized d_max.
-    The output has approximately zero mean and unit variance per component when inputs
-    are drawn from the training distribution.
+    Optionally appends extra geometric features that are hard for MLPs to compute from
+    raw inputs (dot products, norms, sharp nonlinearities).
 
     Args:
         cap_center: Unit vectors specifying cap centers, shape (batch, domain_dim).
         d_max: Maximum cosine distances, shape (batch,).
         d_max_dist: Training distribution of d_max values (passed to process_d_max_dist).
         domain_dim: Dimension of the ambient space.
+        extra_features: Set of extra feature names to append. Supported:
+            "log_cap_odds": log(cap_area / complement_area), sharp function of d_max.
+            "cos_sim": cosine similarity between z and cap_center.
+            "z_norm": Euclidean norm of z.
+        z: Points in R^d, required if "cos_sim" or "z_norm" in extra_features.
+        table: LogitsTable, required if "log_cap_odds" in extra_features.
 
     Returns:
-        Conditioning vectors of shape (batch, cap_conditioning_dim(domain_dim))
-        with approximately zero mean and unit variance per component.
+        Conditioning vectors of shape (batch, cap_conditioning_dim(domain_dim, len(extra_features)))
+        with approximately zero mean and unit variance per component (for the base features).
     """
     dir_features = cap_center * jnp.sqrt(domain_dim)
 
@@ -615,7 +635,57 @@ def encode_cap_params(
 
     scalar_features = ((d_max - mixture_mean) / mixture_std)[:, None]
 
-    return jnp.concatenate([dir_features, scalar_features], axis=1)
+    parts = [dir_features, scalar_features]
+
+    if "log_cap_odds" in extra_features:
+        # Log-odds of the cap prior: log(cap_area / complement_area). A sharp
+        # nonlinear function of d_max that varies hugely across dimensions.
+        # Normalize using the mean and std computed from the d_max training distribution
+        # evaluated on a grid.
+        # Local import to break circular dependency: euclidean_vdm imports from cap_sampling.
+        from txt2img_unsupervised.euclidean_vdm import classifier_logit_correction
+
+        raw_log_odds = jax.vmap(lambda d: classifier_logit_correction(table, d))(d_max)
+        log_odds = jnp.clip(raw_log_odds, -20.0, 20.0)
+        # Compute mean/std of log_cap_odds over the d_max training distribution.
+        # Evaluate on a grid, weighted by the piecewise-uniform d_max density.
+        n_grid = 256
+        grid = jnp.linspace(0.01, 1.99, n_grid)
+        grid_log_odds = jnp.clip(
+            jax.vmap(lambda d: classifier_logit_correction(table, d))(grid),
+            -20.0,
+            20.0,
+        )
+        # Vectorized density: sum over mixture components using broadcasting
+        # grid: (n_grid,), range_starts/ends/weights: (n_components,)
+        in_range = (grid[:, None] >= range_starts[None, :]) & (
+            grid[:, None] <= range_ends[None, :]
+        )
+        component_density = weights[None, :] / (range_ends - range_starts)[None, :]
+        grid_density = jnp.sum(jnp.where(in_range, component_density, 0.0), axis=1)
+        grid_weights = grid_density / jnp.sum(grid_density)
+        lo_mean = jnp.sum(grid_weights * grid_log_odds)
+        lo_std = jnp.sqrt(jnp.sum(grid_weights * (grid_log_odds - lo_mean) ** 2))
+        lo_std = jnp.maximum(lo_std, 1e-6)
+        parts.append(((log_odds - lo_mean) / lo_std)[:, None])
+
+    if "cos_sim" in extra_features:
+        # Cosine similarity between z and cap center. The posterior P(x1 in cap | z_t, t)
+        # depends critically on this alignment, but MLPs can't compute dot products.
+        # In expectation over random z and random cap centers, cos_sim has mean ≈ 0.
+        # Variance depends on SNR but is O(1/d), so scale by sqrt(d) for unit variance.
+        cos_sim = jnp.sum(z * cap_center, axis=1) / (
+            jnp.linalg.norm(z, axis=1) * jnp.linalg.norm(cap_center, axis=1)
+        )
+        parts.append((cos_sim * jnp.sqrt(domain_dim))[:, None])
+
+    if "z_norm" in extra_features:
+        # Norm of z. Concentrates around sqrt(domain_dim) by CLT, with std ≈ 1/sqrt(2).
+        # Subtract the mean and scale to roughly unit variance.
+        z_norm = jnp.linalg.norm(z, axis=1)
+        parts.append(((z_norm - jnp.sqrt(domain_dim)) * jnp.sqrt(2.0))[:, None])
+
+    return jnp.concatenate(parts, axis=1)
 
 
 @pytest.mark.parametrize("domain_dim", [3, 16, 768])
@@ -684,3 +754,30 @@ def test_sphere_log_inverse_surface_area_3d():
         atol=1e-5,
         rtol=0,
     )
+
+
+@pytest.mark.parametrize("d", [2, 15, 767])
+@pytest.mark.parametrize("d_max", [0.3, 0.5, 1.0, 1.5])
+def test_negative_cap_sampling(d, d_max):
+    """Verify that sample_negative_cap_center produces centers where v is outside the cap."""
+    table = LogitsTable(d, 8192)
+    rng = jax.random.PRNGKey(42)
+    n_samples = 1000
+
+    # Random unit vector v
+    v = jax.random.normal(jax.random.PRNGKey(0), (d + 1,))
+    v = v / jnp.linalg.norm(v)
+
+    rngs = jax.random.split(rng, n_samples)
+    centers = jax.vmap(lambda r: sample_negative_cap_center(r, table, v, d_max))(rngs)
+
+    # All centers should have cosine distance > d_max from v
+    cos_dists = 1.0 - jnp.sum(centers * v[None, :], axis=1)
+    assert jnp.all(cos_dists > d_max - 1e-4), (
+        f"Found centers with cos_dist <= d_max: min cos_dist={float(jnp.min(cos_dists)):.6f}, "
+        f"d_max={d_max}"
+    )
+
+    # Centers should be on the unit sphere
+    norms = jnp.linalg.norm(centers, axis=1)
+    np.testing.assert_allclose(norms, 1.0, atol=1e-5)

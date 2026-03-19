@@ -471,7 +471,7 @@ class ScoreMatchingModelConfig(VectorFieldConfig):
         elif self.cap_conditioning == CapConditioningMode.CONDITIONED_SCORE:
             return cap_conditioning_dim(self.domain_dim)
         elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
-            return 0
+            return cap_conditioning_dim(self.domain_dim)
         else:
             raise ValueError(f"Unknown cap conditioning mode: {self.cap_conditioning}")
 
@@ -533,9 +533,9 @@ class ScoreMatchingModelConfig(VectorFieldConfig):
                     "d_max_dist must be provided for conditioned_score models"
                 )
         elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
-            if self.d_max_dist is not None:
+            if self.d_max_dist is None:
                 raise ValueError(
-                    "d_max_dist should not be set for classifier_guidance models"
+                    "d_max_dist must be provided for classifier_guidance models"
                 )
         else:
             raise ValueError(f"Unknown cap conditioning mode: {self.cap_conditioning}")
@@ -851,11 +851,11 @@ def test_score_matching_config_validation_conditioned_requires_d_max_dist() -> N
         ).validate()
 
 
-def test_score_matching_config_validation_classifier_guidance_rejects_d_max_dist() -> (
+def test_score_matching_config_validation_classifier_guidance_requires_d_max_dist() -> (
     None
 ):
-    """Classifier guidance config rejects d_max_dist."""
-    with pytest.raises(ValueError, match="d_max_dist should not be set"):
+    """Classifier guidance config requires d_max_dist."""
+    with pytest.raises(ValueError, match="d_max_dist must be provided"):
         ScoreMatchingModelConfig(
             n_layers=2,
             domain_dim=3,
@@ -865,8 +865,19 @@ def test_score_matching_config_validation_classifier_guidance_rejects_d_max_dist
             mlp_dropout_rate=None,
             input_dropout_rate=None,
             cap_conditioning=CapConditioningMode.CLASSIFIER_GUIDANCE,
-            d_max_dist=((1.0, 2.0),),
         ).validate()
+    # Should succeed with d_max_dist
+    ScoreMatchingModelConfig(
+        n_layers=2,
+        domain_dim=3,
+        use_pre_mlp_projection=False,
+        d_model=32,
+        mlp_expansion_factor=2,
+        mlp_dropout_rate=None,
+        input_dropout_rate=None,
+        cap_conditioning=CapConditioningMode.CLASSIFIER_GUIDANCE,
+        d_max_dist=((1.0, 2.0),),
+    ).validate()
 
 
 class LearningRateSchedule(Enum):
