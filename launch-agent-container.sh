@@ -24,7 +24,7 @@ if [ ! -d "${WORKSPACE}/.git" ]; then
     echo "Creating container workspace at ${WORKSPACE}..."
     git clone "${REPO_DIR}" "${WORKSPACE}"
     git -C "${WORKSPACE}" submodule init
-    git -C "${WORKSPACE}" submodule update --reference "${REPO_DIR}"
+    git -C "${WORKSPACE}" submodule update --reference "${REPO_DIR}" --dissociate
 fi
 
 touch "${LOCKFILE}"
