@@ -193,9 +193,9 @@ class EuclideanDiffusionModel(nn.Module):
         self.schedule = LearnedNoiseSchedule(
             hidden_dim=self.schedule_hidden_dim,
             n_quadrature_points=self.schedule_n_quadrature_points,
-            init_log_kappa_min=self.init_log_snr_min,
-            init_log_kappa_max=self.init_log_snr_max,
-            log_kappa_max_cap=self.log_snr_max_cap,
+            init_gamma_min=self.init_log_snr_min,
+            init_gamma_max=self.init_log_snr_max,
+            gamma_max_cap=self.log_snr_max_cap,
         )
 
     @nn.nowrap
@@ -240,7 +240,7 @@ class EuclideanDiffusionModel(nn.Module):
 
     def gamma_range(self):
         """Return the effective (γ_min, γ_max) schedule endpoints."""
-        return self.schedule.log_kappa_min, self.schedule.effective_log_kappa_max
+        return self.schedule.gamma_min, self.schedule.effective_gamma_max
 
     def prepare_training_conditioning(self, batch):
         """Sample cap parameters for each point in the batch."""
@@ -373,7 +373,7 @@ class EuclideanDiffusionModel(nn.Module):
             ODE velocity vectors [batch_size, domain_dim].
         """
         log_snr = self.schedule(t)
-        gamma_prime = self.schedule.log_kappa_derivative(t)
+        gamma_prime = self.schedule.gamma_derivative(t)
         v_gamma = self.gamma_space_velocity(z, log_snr, cap_params)
         # Trigger parameter creation for classifier head (needed for model.init)
         if self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
@@ -431,7 +431,7 @@ class EuclideanDiffusionModel(nn.Module):
 
         log_snr = self.schedule(t)
         alpha, sigma = _snr_to_alpha_sigma(log_snr)
-        gamma_prime = self.schedule.log_kappa_derivative(t)
+        gamma_prime = self.schedule.gamma_derivative(t)
 
         eps = jax.random.normal(noise_rng, x_data.shape)
         z_t = alpha[:, None] * x_data + sigma[:, None] * eps
@@ -461,7 +461,7 @@ class EuclideanDiffusionModel(nn.Module):
         per_sample_sq_err = jnp.sum((eps_hat - eps) ** 2, axis=1)
         diffusion_loss = 0.5 * jnp.mean(gamma_prime * per_sample_sq_err)
 
-        log_snr_min = self.schedule.log_kappa_min
+        log_snr_min = self.schedule.gamma_min
         alpha_T, sigma_T = _snr_to_alpha_sigma(log_snr_min)
         x_data_sq_norm = jnp.mean(jnp.sum(x_data**2, axis=1))
         prior_loss = 0.5 * (
@@ -471,7 +471,7 @@ class EuclideanDiffusionModel(nn.Module):
             - dim * jnp.log(sigma_T**2)
         )
 
-        log_snr_max = self.schedule.effective_log_kappa_max
+        log_snr_max = self.schedule.effective_gamma_max
         recon_loss = 0.5 * dim * (1.0 + jnp.log(2.0 * jnp.pi) - log_snr_max)
 
         vlb_total = diffusion_loss + prior_loss + recon_loss
@@ -1227,7 +1227,7 @@ def _compute_log_probability(
 
 
 def _make_model(domain_dim, **kwargs):
-    """Create an EuclideanDiffusionModel with test-friendly defaults."""
+    """Create a EuclideanDiffusionModel with test-friendly defaults."""
     defaults = dict(
         domain_dim=domain_dim,
         n_layers=2,

@@ -1138,7 +1138,7 @@ def save_checkpoint_and_evaluate_vector_model(
 ) -> None:
     """Save checkpoint and evaluate on test dataset.
 
-    This is the shared evaluation function used by both flow matching and score matching
+    This is the shared evaluation function used by both flow matching and Euclidean VDM
     training scripts.
 
     Args:
