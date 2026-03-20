@@ -1,11 +1,7 @@
 FROM nvidia/cuda:13.1.1-runtime-ubuntu24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        fish \
-        git \
-        gnupg \
+        ca-certificates curl fish git gnupg less lnav \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 22 LTS for Codex CLI
@@ -30,7 +26,8 @@ ENV XDG_RUNTIME_DIR=/run/user/${USER_UID}
 USER devuser
 ENV PATH="/home/devuser/.local/bin:${PATH}"
 
-# Claude Code (native installer, must run as non-root)
+# Install agents as user so they can be autoupdated.
+# Claude Code
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # Pre-install project Python so uv sync doesn't have to download it
