@@ -1,7 +1,10 @@
 FROM nvidia/cuda:13.1.1-runtime-ubuntu24.04
 
+# Restore man pages and docs stripped by Ubuntu's minimized image
+RUN yes | unminimize
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl fish git gnupg less lnav \
+        ca-certificates curl fish git gnupg less lnav man-db \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 22 LTS for Codex CLI
