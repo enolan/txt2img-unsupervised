@@ -580,14 +580,32 @@ def test_sample_from_cap():
         assert jnp.all(dists <= max_cos_distances[i])
 
 
-def cap_conditioning_dim(domain_dim: int, n_extra_features: int = 0) -> int:
+CAP_FEATURES = frozenset({"cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"})
+DEFAULT_CAP_FEATURES = frozenset({"cap_center", "d_max"})
+
+
+def _validate_cap_features(features: FrozenSet[str]) -> None:
+    """Raise ValueError if features contains unknown names."""
+    unknown = features - CAP_FEATURES
+    if unknown:
+        raise ValueError(f"Unknown cap feature(s): {unknown}")
+
+
+def cap_conditioning_dim(
+    domain_dim: int, features: FrozenSet[str] = DEFAULT_CAP_FEATURES
+) -> int:
     """Compute the output dimension of cap conditioning vectors.
+
+    Each feature contributes a known number of dimensions: cap_center contributes
+    domain_dim, all others contribute 1.
 
     Args:
         domain_dim: Dimension of the ambient space (e.g. 768 for CLIP).
-        n_extra_features: Number of extra scalar features (e.g. from classifier_extra_features).
+        features: Set of feature names to include.
     """
-    return domain_dim + 1 + n_extra_features
+    _validate_cap_features(features)
+    scalar_features = features - {"cap_center"}
+    return (domain_dim if "cap_center" in features else 0) + len(scalar_features)
 
 
 def encode_cap_params(
@@ -595,49 +613,53 @@ def encode_cap_params(
     d_max: jax.Array,
     d_max_dist: Optional[Tuple[Tuple[float, float], ...]],
     domain_dim: int,
-    extra_features: FrozenSet[str] = frozenset(),
+    features: FrozenSet[str] = DEFAULT_CAP_FEATURES,
     z: Optional[jax.Array] = None,
     table: Optional["LogitsTable"] = None,
 ) -> jax.Array:
     """Encode spherical cap parameters into a conditioning vector for a neural network.
 
-    Uses absolute encoding: cap center scaled for unit variance, plus normalized d_max.
-    Optionally appends extra geometric features that are hard for MLPs to compute from
-    raw inputs (dot products, norms, sharp nonlinearities).
+    Each feature is independently included or excluded based on the features set.
+    All included features are normalized to approximately zero mean and unit variance.
 
     Args:
         cap_center: Unit vectors specifying cap centers, shape (batch, domain_dim).
         d_max: Maximum cosine distances, shape (batch,).
         d_max_dist: Training distribution of d_max values (passed to process_d_max_dist).
         domain_dim: Dimension of the ambient space.
-        extra_features: Set of extra feature names to append. Supported:
+        features: Set of feature names to include. Supported:
+            "cap_center": cap center direction, scaled for unit variance.
+            "d_max": normalized maximum cosine distance.
             "log_cap_odds": log(cap_area / complement_area), sharp function of d_max.
             "cos_sim": cosine similarity between z and cap_center.
             "z_norm": Euclidean norm of z.
-        z: Points in R^d, required if "cos_sim" or "z_norm" in extra_features.
-        table: LogitsTable, required if "log_cap_odds" in extra_features.
+        z: Points in R^d, required if "cos_sim" or "z_norm" in features.
+        table: LogitsTable, required if "log_cap_odds" in features.
 
     Returns:
-        Conditioning vectors of shape (batch, cap_conditioning_dim(domain_dim, len(extra_features)))
-        with approximately zero mean and unit variance per component (for the base features).
+        Conditioning vectors of shape (batch, cap_conditioning_dim(domain_dim, features))
+        with approximately zero mean and unit variance per component.
     """
-    dir_features = cap_center * jnp.sqrt(domain_dim)
+    _validate_cap_features(features)
+    parts = []
 
-    # Normalize d_max using training distribution statistics
-    weights, range_starts, range_ends = process_d_max_dist(d_max_dist)
-    component_means = (range_starts + range_ends) / 2.0
-    component_vars = (range_ends - range_starts) ** 2 / 12.0
-    mixture_mean = jnp.sum(weights * component_means)
-    mixture_var = jnp.sum(
-        weights * (component_vars + (component_means - mixture_mean) ** 2)
-    )
-    mixture_std = jnp.sqrt(mixture_var)
+    if "cap_center" in features:
+        parts.append(cap_center * jnp.sqrt(domain_dim))
 
-    scalar_features = ((d_max - mixture_mean) / mixture_std)[:, None]
+    if "d_max" in features or "log_cap_odds" in features:
+        weights, range_starts, range_ends = process_d_max_dist(d_max_dist)
 
-    parts = [dir_features, scalar_features]
+    if "d_max" in features:
+        component_means = (range_starts + range_ends) / 2.0
+        component_vars = (range_ends - range_starts) ** 2 / 12.0
+        mixture_mean = jnp.sum(weights * component_means)
+        mixture_var = jnp.sum(
+            weights * (component_vars + (component_means - mixture_mean) ** 2)
+        )
+        mixture_std = jnp.sqrt(mixture_var)
+        parts.append(((d_max - mixture_mean) / mixture_std)[:, None])
 
-    if "log_cap_odds" in extra_features:
+    if "log_cap_odds" in features:
         # Log-odds of the cap prior: log(cap_area / complement_area). A sharp
         # nonlinear function of d_max that varies hugely across dimensions.
         # Normalize using the mean and std computed from the d_max training distribution
@@ -669,7 +691,7 @@ def encode_cap_params(
         lo_std = jnp.maximum(lo_std, 1e-6)
         parts.append(((log_odds - lo_mean) / lo_std)[:, None])
 
-    if "cos_sim" in extra_features:
+    if "cos_sim" in features:
         # Cosine similarity between z and cap center. The posterior P(x1 in cap | z_t, t)
         # depends critically on this alignment, but MLPs can't compute dot products.
         # In expectation over random z and random cap centers, cos_sim has mean ≈ 0.
@@ -679,7 +701,7 @@ def encode_cap_params(
         )
         parts.append((cos_sim * jnp.sqrt(domain_dim))[:, None])
 
-    if "z_norm" in extra_features:
+    if "z_norm" in features:
         # Norm of z. Concentrates around sqrt(domain_dim) by CLT, with std ≈ 1/sqrt(2).
         # Subtract the mean and scale to roughly unit variance.
         z_norm = jnp.linalg.norm(z, axis=1)

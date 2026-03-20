@@ -52,6 +52,7 @@ from jax import Array
 from scipy import stats
 
 from txt2img_unsupervised.cap_sampling import (
+    DEFAULT_CAP_FEATURES,
     LogitsTable,
     cap_conditioning_dim,
     encode_cap_params,
@@ -144,20 +145,19 @@ class EuclideanDiffusionModel(nn.Module):
     d_max_dist: Optional[tuple] = None
     vlb_variance_loss_weight: Optional[float] = None
     classifier_loss_weight: float = 1.0
-    classifier_extra_features: FrozenSet[
-        Literal["log_cap_odds", "cos_sim", "z_norm"]
-    ] = field(default_factory=frozenset)
+    cap_features: FrozenSet[
+        Literal["cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"]
+    ] = field(default_factory=lambda: DEFAULT_CAP_FEATURES)
 
     @property
     def conditioning_dim(self) -> int:
         if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
             return 0
-        elif self.cap_conditioning == CapConditioningMode.CONDITIONED_SCORE:
-            return cap_conditioning_dim(self.domain_dim)
-        elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
-            return cap_conditioning_dim(
-                self.domain_dim, len(self.classifier_extra_features)
-            )
+        elif self.cap_conditioning in (
+            CapConditioningMode.CONDITIONED_SCORE,
+            CapConditioningMode.CLASSIFIER_GUIDANCE,
+        ):
+            return cap_conditioning_dim(self.domain_dim, self.cap_features)
         else:
             raise ValueError(f"Unknown cap conditioning mode: {self.cap_conditioning}")
 
@@ -286,26 +286,21 @@ class EuclideanDiffusionModel(nn.Module):
         Args:
             cap_params: None or (cap_centers, d_maxes).
             batch_size: Number of samples.
-            z: Points in R^d, required for CLASSIFIER_GUIDANCE extra features.
+            z: Points in R^d, required if cap_features includes cos_sim or z_norm.
         """
         if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
             return jnp.zeros((batch_size, 0))
-        elif self.cap_conditioning == CapConditioningMode.CONDITIONED_SCORE:
+        elif self.cap_conditioning in (
+            CapConditioningMode.CONDITIONED_SCORE,
+            CapConditioningMode.CLASSIFIER_GUIDANCE,
+        ):
             cap_centers, d_maxes = cap_params
             return encode_cap_params(
                 cap_center=cap_centers,
                 d_max=d_maxes,
                 d_max_dist=self.d_max_dist,
                 domain_dim=self.domain_dim,
-            )
-        elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
-            cap_centers, d_maxes = cap_params
-            return encode_cap_params(
-                cap_center=cap_centers,
-                d_max=d_maxes,
-                d_max_dist=self.d_max_dist,
-                domain_dim=self.domain_dim,
-                extra_features=self.classifier_extra_features,
+                features=self.cap_features,
                 z=z,
                 table=self.logits_table,
             )
@@ -409,11 +404,13 @@ class EuclideanDiffusionModel(nn.Module):
             z, t_normalized, cond_vecs
         )
         _, d_maxes = cap_params
-        assert d_maxes.ndim == 1, f"d_maxes must be [batch_size], got shape {d_maxes.shape}"
+        assert (
+            d_maxes.ndim == 1
+        ), f"d_maxes must be [batch_size], got shape {d_maxes.shape}"
         raw_logits = self.classifier_head(mlp_out).squeeze(-1)
-        correction = jax.vmap(lambda d: classifier_logit_correction(self.logits_table, d))(
-            d_maxes
-        )
+        correction = jax.vmap(
+            lambda d: classifier_logit_correction(self.logits_table, d)
+        )(d_maxes)
         return raw_logits + correction
 
     def _forward_diffusion(self, x_1, t):
@@ -1726,7 +1723,9 @@ def test_train_cap_conditioned(domain_dim, data_distribution, cap_conditioning):
             d_max_dist=d_max_dist,
             vlb_variance_loss_weight=1e-3,
             classifier_loss_weight=10.0,
-            classifier_extra_features=frozenset({"log_cap_odds", "cos_sim", "z_norm"}),
+            cap_features=frozenset(
+                {"cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"}
+            ),
         )
         match (data_distribution, domain_dim):
             case ("vmf", 16):
