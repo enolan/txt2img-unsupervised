@@ -1,4 +1,4 @@
-"""Train score matching model."""
+"""Train Euclidean VDM."""
 
 import os
 
@@ -15,14 +15,14 @@ from jax.sharding import NamedSharding, PartitionSpec
 from pathlib import Path
 from typing import Optional
 
-from txt2img_unsupervised.checkpoint import ScoreMatchingTrainState
-from txt2img_unsupervised.config import ScoreMatchingModelConfig, TrainingConfig
-from txt2img_unsupervised.flow_matching import create_mollweide_projection_figure
-from txt2img_unsupervised.score_matching import (
+from txt2img_unsupervised.checkpoint import EuclideanVDMTrainState
+from txt2img_unsupervised.config import EuclideanVDMConfig, TrainingConfig
+from txt2img_unsupervised.euclidean_vdm import (
     compute_batch_loss,
     compute_nll,
-    generate_samples,
+    generate_samples_sde,
 )
+from txt2img_unsupervised.flow_matching import create_mollweide_projection_figure
 from txt2img_unsupervised.train_data_loading import get_batch
 from txt2img_unsupervised.training_infra import (
     fast_post_step_hook,
@@ -117,14 +117,14 @@ def parse_arguments():
 
     # Learned noise schedule arguments
     parser.add_argument(
-        "--init-log-kappa-min",
+        "--init-log-snr-min",
         type=float,
-        help="Initial log κ at t=0 (noisy end)",
+        help="Initial log SNR at t=0 (noisy end)",
     )
     parser.add_argument(
-        "--init-log-kappa-max",
+        "--init-log-snr-max",
         type=float,
-        help="Initial log κ at t=1 (data end)",
+        help="Initial log SNR at t=1 (data end)",
     )
     parser.add_argument(
         "--schedule-hidden-dim",
@@ -142,19 +142,43 @@ def parse_arguments():
         help="Weight for VLB variance minimization loss on schedule params (default: disabled)",
     )
 
+    # Euclidean VDM specific arguments
+    parser.add_argument(
+        "--sigma-radial",
+        type=float,
+        help="Standard deviation of radial augmentation noise",
+    )
+    parser.add_argument(
+        "--log-snr-max-cap",
+        type=float,
+        help="Hard ceiling on the learned log-SNR maximum",
+    )
+    parser.add_argument(
+        "--classifier-loss-weight",
+        type=float,
+        help="Weight for classifier cross-entropy loss in classifier guidance mode",
+    )
+    parser.add_argument(
+        "--cap-features",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Cap conditioning features (e.g. cap_center d_max log_cap_odds cos_sim z_norm)",
+    )
+
     args, _unknown = parser.parse_known_args()
     return args
 
 
 def init_train_state(
-    model_cfg: ScoreMatchingModelConfig,
+    model_cfg: EuclideanVDMConfig,
     training_cfg: TrainingConfig,
     total_steps: int,
     resume_checkpoint_path: Optional[Path] = None,
     finetune_checkpoint_path: Optional[Path] = None,
     start_where_finetune_source_left_off: bool = False,
 ):
-    """Set up our initial ScoreMatchingTrainState using the provided configs."""
+    """Set up our initial EuclideanVDMTrainState using the provided configs."""
     (
         global_step,
         checkpoint_manager,
@@ -165,7 +189,7 @@ def init_train_state(
         model_cfg=model_cfg,
         training_cfg=training_cfg,
         total_steps=total_steps,
-        train_state_class=ScoreMatchingTrainState,
+        train_state_class=EuclideanVDMTrainState,
         resume_checkpoint_path=resume_checkpoint_path,
         finetune_checkpoint_path=finetune_checkpoint_path,
         start_where_finetune_source_left_off=start_where_finetune_source_left_off,
@@ -192,7 +216,7 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step):
     for i in range(n_batches):
         batch_rng, rng = jax.random.split(rng)
         this_batch_size = min(batch_size, n_samples - i * batch_size)
-        batch_samples = generate_samples(
+        batch_samples = generate_samples_sde(
             mdl,
             params,
             batch_rng,
@@ -207,7 +231,7 @@ def visualize_model_samples(mdl, params, n_samples, batch_size, rng, step):
     samples = jax.device_get(samples)
 
     fig = create_mollweide_projection_figure(
-        samples, title=f"Score Matching Model Samples at Step {step}"
+        samples, title=f"Euclidean VDM Samples at Step {step}"
     )
 
     wandb.log(
@@ -235,7 +259,7 @@ if __name__ == "__main__":
         args.training_config,
         args,
         wandb_settings,
-        project="txt2img-unsupervised-score",
+        project="txt2img-unsupervised-euclidean-vdm",
     )
 
     train_dataset, test_dataset = load_dataset(args.pq_dir)
@@ -327,8 +351,8 @@ if __name__ == "__main__":
     @partial(jax.jit, static_argnames=("mdl",))
     def loss_fn(params, batch, rng, mdl=None):
         vecs = batch[args.vector_column]
-        score_batch = {"point_vec": vecs}
-        return compute_batch_loss(mdl, params, score_batch, rng)
+        vdm_batch = {"point_vec": vecs}
+        return compute_batch_loss(mdl, params, vdm_batch, rng)
 
     train_state, global_step = train_loop(
         steps_per_epoch=steps_per_epoch,

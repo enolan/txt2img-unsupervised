@@ -1,22 +1,23 @@
-"""Learned noise schedule for VLB-based score matching.
+"""Learned noise schedule for VLB-based diffusion models.
 
-Implements a monotonic function that maps t ∈ [0, 1] to log κ(t), the log-concentration
-of the vMF noise distribution. Monotonicity is guaranteed by construction: we define a
-positive rate function g(t) = softplus(NN(t)) + 1.0 with an unconstrained neural network, then
-integrate to get the normalized CDF F(t) = ∫₀ᵗ g(s)ds / ∫₀¹ g(s)ds. Since g > 0, F is
-strictly increasing. The integral is computed via trapezoidal quadrature on a uniform grid.
+Implements a monotonic function that maps t ∈ [0, 1] to γ(t), a learned log-scale noise
+parameter (log SNR in the Euclidean VDM). Monotonicity is guaranteed by construction: we
+define a positive rate function g(t) = softplus(NN(t)) + 1.0 with an unconstrained neural
+network, then integrate to get the normalized CDF F(t) = ∫₀ᵗ g(s)ds / ∫₀¹ g(s)ds. Since
+g > 0, F is strictly increasing. The integral is computed via trapezoidal quadrature on a
+uniform grid.
 
 Unlike positive-weight MLPs (which can only represent convex monotonic functions), this
 construction can represent arbitrary monotonic functions — both convex and concave — since
 the unconstrained NN can make g increase or decrease freely.
 
 The output exactly hits learned endpoints:
-    log_kappa(0) = log_kappa_min   (noisy end, near uniform)
-    log_kappa(1) = log_kappa_max   (clean end, near data)
+    γ(0) = γ_min   (noisy end)
+    γ(1) = γ_max   (clean end, near data)
 
 This is used in the VLB loss as:
     L_diff = (1/2) E_t [ γ'(t) · ||w_target - w_θ||² ]
-where γ(t) = log κ(t) and γ'(t) is computed via autodiff through this network.
+where γ'(t) is computed via autodiff through this network.
 """
 
 from functools import partial
@@ -32,53 +33,53 @@ from jax import Array
 
 
 class LearnedNoiseSchedule(nn.Module):
-    """Monotonic network mapping t ∈ [0, 1] → log κ ∈ [log_kappa_min, log_kappa_max].
+    """Monotonic network mapping t ∈ [0, 1] → γ ∈ [γ_min, γ_max].
 
     The schedule is parameterized as:
-        log_kappa(t) = log_kappa_min + (log_kappa_max - log_kappa_min) · F(t)
+        γ(t) = γ_min + (γ_max - γ_min) · F(t)
     where F(t) = ∫₀ᵗ g(s)ds / ∫₀¹ g(s)ds is the normalized CDF of a positive rate
     function g(t) = softplus(NN(t)) + 1.0.
 
     Attributes:
         hidden_dim: Width of the hidden layer in the rate network.
         n_quadrature_points: Number of grid points for numerical integration.
-        init_log_kappa_min: Initial value for the learned log_kappa_min endpoint.
-        init_log_kappa_max: Initial value for the learned log_kappa_max endpoint.
+        init_gamma_min: Initial value for the learned γ_min endpoint.
+        init_gamma_max: Initial value for the learned γ_max endpoint.
     """
 
     hidden_dim: int = 32
     n_quadrature_points: int = 1024
-    init_log_kappa_min: float = -0.693  # log(0.5)
-    init_log_kappa_max: float = 9.210  # log(10000)
-    log_kappa_max_cap: Optional[float] = None
+    init_gamma_min: float = -0.693
+    init_gamma_max: float = 9.210
+    gamma_max_cap: Optional[float] = None
 
     def setup(self):
         assert (
             self.n_quadrature_points >= 2
         ), f"n_quadrature_points must be >= 2, got {self.n_quadrature_points}"
-        self.log_kappa_min = self.param(
-            "log_kappa_min",
-            lambda _: jnp.array(self.init_log_kappa_min),
+        self.gamma_min = self.param(
+            "gamma_min",
+            lambda _: jnp.array(self.init_gamma_min),
         )
-        self.log_kappa_max = self.param(
-            "log_kappa_max",
-            lambda _: jnp.array(self.init_log_kappa_max),
+        self.gamma_max = self.param(
+            "gamma_max",
+            lambda _: jnp.array(self.init_gamma_max),
         )
         self.dense0 = nn.Dense(self.hidden_dim)
         self.dense1 = nn.Dense(1)
 
     @property
-    def effective_log_kappa_max(self):
-        """The log_kappa_max value after applying the optional soft cap.
+    def effective_gamma_max(self):
+        """The γ_max value after applying the optional soft cap.
 
         Uses cap - softplus(cap - x) which equals x when x << cap and asymptotes
         to cap from below. Gradients always flow (they shrink but never die),
         so the optimizer can pull the value back down if needed.
         """
-        if self.log_kappa_max_cap is not None:
-            cap = self.log_kappa_max_cap
-            return cap - jax.nn.softplus(cap - self.log_kappa_max)
-        return self.log_kappa_max
+        if self.gamma_max_cap is not None:
+            cap = self.gamma_max_cap
+            return cap - jax.nn.softplus(cap - self.gamma_max)
+        return self.gamma_max
 
     def _rate(self, t: Array) -> Array:
         """Compute the positive rate function g(t) = softplus(NN(t)) + 1.0.
@@ -112,22 +113,22 @@ class LearnedNoiseSchedule(nn.Module):
         return f_grid[idx_lo] * (1 - frac) + f_grid[idx_lo + 1] * frac
 
     def __call__(self, t: Array) -> Array:
-        """Compute log κ(t) for the given time values.
+        """Compute γ(t) for the given time values.
 
         Args:
             t: Time values, any shape. Each element should be in [0, 1].
 
         Returns:
-            log κ(t) values, same shape as t.
+            γ(t) values, same shape as t.
         """
         f = self._normalized_cdf(t)
-        kappa_max = self.effective_log_kappa_max
-        return self.log_kappa_min + (kappa_max - self.log_kappa_min) * f
+        g_max = self.effective_gamma_max
+        return self.gamma_min + (g_max - self.gamma_min) * f
 
-    def log_kappa_derivative(self, t: Array) -> Array:
-        """Compute γ'(t) = d(log κ)/dt for the given time values.
+    def gamma_derivative(self, t: Array) -> Array:
+        """Compute γ'(t) = dγ/dt for the given time values.
 
-        Call via schedule.apply(params, t, method=schedule.log_kappa_derivative).
+        Call via schedule.apply(params, t, method=schedule.gamma_derivative).
 
         Args:
             t: Time values, shape (batch,).
@@ -147,7 +148,7 @@ def visualize_schedule(
 ):
     """Print a terminal chart of the learned schedule using unicode block characters.
 
-    Shows log κ(t) on the y-axis vs t on the x-axis, with axis labels and tick marks.
+    Shows γ(t) on the y-axis vs t on the x-axis, with axis labels and tick marks.
 
     Args:
         schedule: The LearnedNoiseSchedule module.
@@ -156,9 +157,9 @@ def visualize_schedule(
         height: Number of rows for the plot area.
     """
     t_values = jnp.linspace(0.0, 1.0, width)
-    log_kappa_values = np.array(schedule.apply(params, t_values))
+    gamma_values = np.array(schedule.apply(params, t_values))
 
-    y_min, y_max = float(log_kappa_values.min()), float(log_kappa_values.max())
+    y_min, y_max = float(gamma_values.min()), float(gamma_values.max())
     y_pad = (y_max - y_min) * 0.02
     y_min -= y_pad
     y_max += y_pad
@@ -170,7 +171,7 @@ def visualize_schedule(
 
     # Map each value to a sub-row index
     sub_indices = np.clip(
-        ((log_kappa_values - y_min) / (y_max - y_min) * sub_rows).astype(int),
+        ((gamma_values - y_min) / (y_max - y_min) * sub_rows).astype(int),
         0,
         sub_rows - 1,
     )
@@ -208,7 +209,7 @@ def visualize_schedule(
     border = " " * label_width + " └" + "─" * width + "┘"
     x_labels = " " * (label_width + 2) + "0" + " " * (width - 5) + "t=1"
 
-    header = " " * label_width + "  log κ(t)"
+    header = " " * label_width + "  γ(t)"
     print(header)
     for line in lines:
         print(line)
@@ -238,22 +239,22 @@ def test_output_shape():
 
 def test_endpoints():
     """Test that the schedule exactly hits the learned endpoints."""
-    for log_kappa_min, log_kappa_max in [(-0.693, 9.210), (-2.0, 5.0), (0.0, 15.0)]:
+    for gamma_min, gamma_max in [(-0.693, 9.210), (-2.0, 5.0), (0.0, 15.0)]:
         schedule = LearnedNoiseSchedule(
-            init_log_kappa_min=log_kappa_min,
-            init_log_kappa_max=log_kappa_max,
+            init_gamma_min=gamma_min,
+            init_gamma_max=gamma_max,
         )
         params = schedule.init(jax.random.PRNGKey(42), jnp.array(0.5))
 
         val_at_0 = schedule.apply(params, jnp.array(0.0))
         val_at_1 = schedule.apply(params, jnp.array(1.0))
 
-        np.testing.assert_allclose(float(val_at_0), log_kappa_min, atol=1e-5)
-        np.testing.assert_allclose(float(val_at_1), log_kappa_max, atol=1e-5)
+        np.testing.assert_allclose(float(val_at_0), gamma_min, atol=1e-5)
+        np.testing.assert_allclose(float(val_at_1), gamma_max, atol=1e-5)
 
 
-def test_log_kappa_max_cap():
-    """Test that log_kappa_max_cap soft-clamps output and always preserves gradients."""
+def test_gamma_max_cap():
+    """Test that gamma_max_cap soft-clamps output and always preserves gradients."""
     cap = 5.0
 
     def loss_fn(schedule, p):
@@ -261,9 +262,9 @@ def test_log_kappa_max_cap():
 
     # When init is well above cap: effective max ≈ cap, gradient is small but nonzero
     schedule_above = LearnedNoiseSchedule(
-        init_log_kappa_min=-1.0,
-        init_log_kappa_max=9.0,
-        log_kappa_max_cap=cap,
+        init_gamma_min=-1.0,
+        init_gamma_max=9.0,
+        gamma_max_cap=cap,
     )
     params_above = schedule_above.init(jax.random.PRNGKey(0), jnp.array(0.5))
 
@@ -272,21 +273,21 @@ def test_log_kappa_max_cap():
     np.testing.assert_allclose(float(val_above), cap, atol=0.02)
 
     eff_above = schedule_above.apply(
-        params_above, method=lambda self: self.effective_log_kappa_max
+        params_above, method=lambda self: self.effective_gamma_max
     )
     np.testing.assert_allclose(float(eff_above), cap, atol=0.02)
 
     # Gradient should be small but nonzero (soft clamp never kills gradients)
     grads_above = jax.grad(partial(loss_fn, schedule_above))(params_above)
-    g = float(grads_above["params"]["log_kappa_max"])
+    g = float(grads_above["params"]["gamma_max"])
     assert g > 0.0, f"Gradient should be nonzero even above cap, got {g}"
     assert g < 0.1, f"Gradient should be small above cap, got {g}"
 
     # When init is well below cap: effective max ≈ init, gradient ≈ 1
     schedule_below = LearnedNoiseSchedule(
-        init_log_kappa_min=-1.0,
-        init_log_kappa_max=3.0,
-        log_kappa_max_cap=cap,
+        init_gamma_min=-1.0,
+        init_gamma_max=3.0,
+        gamma_max_cap=cap,
     )
     params_below = schedule_below.init(jax.random.PRNGKey(0), jnp.array(0.5))
 
@@ -294,20 +295,20 @@ def test_log_kappa_max_cap():
     np.testing.assert_allclose(float(val_below), 3.0, atol=0.15)
 
     grads_below = jax.grad(partial(loss_fn, schedule_below))(params_below)
-    g_below = float(grads_below["params"]["log_kappa_max"])
+    g_below = float(grads_below["params"]["gamma_max"])
     assert g_below > 0.5, f"Gradient should be near 1 below cap, got {g_below}"
 
 
 def test_monotonicity():
-    """Test that log κ(t) is strictly increasing across many random initializations."""
+    """Test that γ(t) is strictly increasing across many random initializations."""
     t_values = jnp.linspace(0.0, 1.0, 200)
 
     for seed in range(20):
         schedule = LearnedNoiseSchedule()
         params = schedule.init(jax.random.PRNGKey(seed), jnp.array(0.5))
-        log_kappa_values = schedule.apply(params, t_values)
+        gamma_values = schedule.apply(params, t_values)
 
-        diffs = jnp.diff(log_kappa_values)
+        diffs = jnp.diff(gamma_values)
         assert jnp.all(diffs > 0), (
             f"Monotonicity violated at seed {seed}: "
             f"min diff = {float(jnp.min(diffs)):.6e}"
@@ -321,7 +322,7 @@ def test_derivative_positive():
 
     # Avoid exact endpoints where interpolation gradient could be numerically tricky
     t_values = jnp.linspace(0.01, 0.99, 100)
-    derivs = schedule.apply(params, t_values, method=schedule.log_kappa_derivative)
+    derivs = schedule.apply(params, t_values, method=schedule.gamma_derivative)
 
     assert jnp.all(
         derivs > 0
@@ -334,9 +335,7 @@ def test_derivative_matches_finite_differences():
     params = schedule.init(jax.random.PRNGKey(3), jnp.array(0.5))
 
     t_values = jnp.linspace(0.1, 0.9, 50)
-    analytic_derivs = schedule.apply(
-        params, t_values, method=schedule.log_kappa_derivative
-    )
+    analytic_derivs = schedule.apply(params, t_values, method=schedule.gamma_derivative)
 
     # float32 limits FD precision; eps=1e-3 balances truncation vs rounding error
     eps = 1e-3
@@ -358,16 +357,16 @@ def test_jit_compatible():
 
     jitted_apply = jax.jit(schedule.apply)
     jitted_deriv = jax.jit(
-        lambda p, t: schedule.apply(p, t, method=schedule.log_kappa_derivative)
+        lambda p, t: schedule.apply(p, t, method=schedule.gamma_derivative)
     )
 
     t = jnp.array([0.2, 0.5, 0.8])
-    log_kappa = jitted_apply(params, t)
+    gamma = jitted_apply(params, t)
     derivs = jitted_deriv(params, t)
 
-    assert log_kappa.shape == (3,)
+    assert gamma.shape == (3,)
     assert derivs.shape == (3,)
-    assert jnp.all(jnp.isfinite(log_kappa))
+    assert jnp.all(jnp.isfinite(gamma))
     assert jnp.all(jnp.isfinite(derivs))
 
 
@@ -395,10 +394,10 @@ def test_custom_hidden_dim():
         params = schedule.init(jax.random.PRNGKey(0), jnp.array(0.5))
 
         t = jnp.linspace(0.0, 1.0, 50)
-        log_kappa = schedule.apply(params, t)
-        assert log_kappa.shape == (50,)
+        gamma = schedule.apply(params, t)
+        assert gamma.shape == (50,)
 
-        diffs = jnp.diff(log_kappa)
+        diffs = jnp.diff(gamma)
         assert jnp.all(diffs > 0), f"Monotonicity violated with hidden_dim={hidden_dim}"
 
 

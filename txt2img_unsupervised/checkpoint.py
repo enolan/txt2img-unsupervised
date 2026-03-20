@@ -24,12 +24,12 @@ from .config import (
     BaseModelConfig,
     FlowMatchingModelConfig,
     LearningRateSchedule,
-    ScoreMatchingModelConfig,
+    EuclideanVDMConfig,
     TrainingConfig,
     TransformerModelConfig,
 )
 from .function_weighted_flow_model import FunctionWeightedFlowModel
-from .score_matching import ScoreMatchingModel
+from .euclidean_vdm import EuclideanDiffusionModel
 from .muon import muon
 from .transformer_model import ImageModel
 from .triangle_schedule import triangle_schedule
@@ -103,7 +103,7 @@ def setup_optimizer(training_cfg: TrainingConfig, batches_total: int, mdl=None):
                 f"Unknown learning rate schedule {training_cfg.learning_rate_schedule}"
             )
 
-    # Check if model has "schedule" params (e.g., ScoreMatchingModel)
+    # Check if model has "schedule" params (e.g., EuclideanDiffusionModel)
     has_schedule_params = use_mup_scaling and "schedule" in mdl.mk_partition_map(
         use_muon=False
     ).get("params", {})
@@ -451,28 +451,30 @@ class FlowMatchingTrainState(BaseTrainState):
         return FunctionWeightedFlowModel(**model_cfg.__dict__)
 
 
-class ScoreMatchingTrainState(BaseTrainState):
-    """Train state specific to score matching models."""
+class EuclideanVDMTrainState(BaseTrainState):
+    """Train state specific to Euclidean VDM models."""
 
     @classmethod
     def _create_model_from_config(cls, model_cfg):
-        """Create a ScoreMatchingModel instance from configuration."""
-        if not isinstance(model_cfg, ScoreMatchingModelConfig):
-            raise ValueError(
-                f"Expected ScoreMatchingModelConfig, got {type(model_cfg)}"
-            )
+        """Create a EuclideanDiffusionModel instance from configuration."""
+        if not isinstance(model_cfg, EuclideanVDMConfig):
+            raise ValueError(f"Expected EuclideanVDMConfig, got {type(model_cfg)}")
         vf_kwargs = model_cfg.vector_field_kwargs()
-        # conditioning_dim is a computed property in ScoreMatchingModel, not a field
+        # conditioning_dim is a computed property, not a field
         vf_kwargs.pop("conditioning_dim")
-        return ScoreMatchingModel(
+        return EuclideanDiffusionModel(
             **vf_kwargs,
-            init_log_kappa_min=model_cfg.init_log_kappa_min,
-            init_log_kappa_max=model_cfg.init_log_kappa_max,
+            init_log_snr_min=model_cfg.init_log_snr_min,
+            init_log_snr_max=model_cfg.init_log_snr_max,
             schedule_hidden_dim=model_cfg.schedule_hidden_dim,
             schedule_n_quadrature_points=model_cfg.schedule_n_quadrature_points,
             cap_conditioning=model_cfg.cap_conditioning,
             d_max_dist=model_cfg.d_max_dist,
             vlb_variance_loss_weight=model_cfg.vlb_variance_loss_weight,
+            sigma_radial=model_cfg.sigma_radial,
+            log_snr_max_cap=model_cfg.log_snr_max_cap,
+            classifier_loss_weight=model_cfg.classifier_loss_weight,
+            cap_features=model_cfg.cap_features,
         )
 
 
@@ -505,8 +507,8 @@ def get_model_from_checkpoint(checkpoint_dir: Path):
         return model_cfg, TransformerTrainState._create_model_from_config(model_cfg)
     elif isinstance(model_cfg, FlowMatchingModelConfig):
         return model_cfg, FlowMatchingTrainState._create_model_from_config(model_cfg)
-    elif isinstance(model_cfg, ScoreMatchingModelConfig):
-        return model_cfg, ScoreMatchingTrainState._create_model_from_config(model_cfg)
+    elif isinstance(model_cfg, EuclideanVDMConfig):
+        return model_cfg, EuclideanVDMTrainState._create_model_from_config(model_cfg)
     else:
         raise ValueError(f"Unknown model type: {type(model_cfg)}")
 
@@ -645,9 +647,9 @@ def setup_checkpoint_manager_and_initial_state(
         initial_state = FlowMatchingTrainState.new(
             rng, mdl, training_cfg, batches_total
         )
-    elif isinstance(model_cfg, ScoreMatchingModelConfig):
-        mdl = ScoreMatchingTrainState._create_model_from_config(model_cfg)
-        initial_state = ScoreMatchingTrainState.new(
+    elif isinstance(model_cfg, EuclideanVDMConfig):
+        mdl = EuclideanVDMTrainState._create_model_from_config(model_cfg)
+        initial_state = EuclideanVDMTrainState.new(
             rng, mdl, training_cfg, batches_total
         )
     else:

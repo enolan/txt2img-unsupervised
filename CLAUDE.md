@@ -192,22 +192,22 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
 
 * Scripts
   * `train_transformer.py`. Train an image generation model.
-  * `train_flow_matching.py`. Train a flow matching model.
-  * `train_score_matching.py`. Train a score matching model.
+  * `train_flow_matching.py`. Train a flow matching model for embedding generation.
+  * `train_euclidean_vdm.py`. Train a Euclidean VDM for embedding generation.
   * `txt2img_unsupervised/visualize_field.py`. Visualize the field of a flow matching model.
   * `txt2img_unsupervised/rotating_field_animation.py`. Make an animation of the field of a flow
     matching model where the sphere rotates so you can see the field from different angles.
   * `txt2img_unsupervised/coordinate_check.py`. Check the muP implementation in the flow matching
     model is correct by visualizing the activation scale at different model widths.
 * Modules
-  * `txt2img_unsupervised/flow_matching.py`. Spherical flow matching model.
+  * `txt2img_unsupervised/flow_matching.py`. Spherical flow matching model for embedding generation.
   * `txt2img_unsupervised/function_weighted_flow_model.py`. Function-weighted flow matching model:
     models that generate a distribution weighted by a function whose parameters are specified at
     inference time. Used to generate CLIP image embeddings for image generation.
-  * `txt2img_unsupervised/score_matching.py`. Spherical variational diffusion model. An alternate
-    approach. Includes code for cap-conditioned generation. Does not use FunctionWeightedFlowModel.
   * `txt2img_unsupervised/euclidean_vdm.py`. Standard Euclidean VDM used for spherical data, where
-    points on the sphere have radial noise added to smooth the distribution to a thin shell.
+    points on the sphere have radial noise added to smooth the distribution to a thin shell. Used
+    for embedding generation. Supports cap conditioning by making the learned denoiser conditional
+    on a cap or by learning an in-cap classifier and doing classifier guidance. Does not use FWFM.
   * `txt2img_unsupervised/cap_sampling.py`. Functions for sampling spherical caps and sampling
     points inside them.
   * `txt2img_unsupervised/transformer_model.py`. The transformer-based image generation model.

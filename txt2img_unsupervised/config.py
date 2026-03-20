@@ -26,7 +26,7 @@ from typing import (
     Union,
 )
 
-from txt2img_unsupervised.cap_sampling import cap_conditioning_dim
+from txt2img_unsupervised.cap_sampling import DEFAULT_CAP_FEATURES, cap_conditioning_dim
 from txt2img_unsupervised.function_weighted_flow_model import (
     BaseDistribution,
     CapIndicatorExtraParams,
@@ -36,13 +36,13 @@ from txt2img_unsupervised.function_weighted_flow_model import (
 
 
 class CapConditioningMode(Enum):
-    """How a score matching model handles spherical cap conditioning."""
+    """How the Euclidean VDM handles spherical cap conditioning."""
 
     UNCONDITIONED = "unconditioned"
-    """No cap conditioning — unconditional score model."""
+    """No cap conditioning — unconditional model."""
 
     CONDITIONED_SCORE = "conditioned_score"
-    """Score is directly conditioned on cap parameters via the conditioning vector."""
+    """Noise prediction is directly conditioned on cap parameters via the conditioning vector."""
 
     CLASSIFIER_GUIDANCE = "classifier_guidance"
     """Cap conditioning via classifier guidance at inference time (no extra training inputs)."""
@@ -69,7 +69,7 @@ class BaseModelConfig:
             subclass_map = {
                 "transformer": TransformerModelConfig,
                 "flow_matching": FlowMatchingModelConfig,
-                "score_matching": ScoreMatchingModelConfig,
+                "euclidean_vdm": EuclideanVDMConfig,
             }
 
             if model_type in subclass_map:
@@ -192,7 +192,7 @@ class TransformerModelConfig(BaseModelConfig):
 
 @dataclass
 class VectorFieldConfig(BaseModelConfig):
-    """Shared configuration for models built on VectorField (flow matching & score matching)."""
+    """Shared configuration for models built on VectorField."""
 
     n_layers: int
     domain_dim: int
@@ -439,29 +439,37 @@ class FlowMatchingModelConfig(VectorFieldConfig):
 
 
 @dataclass
-class ScoreMatchingModelConfig(VectorFieldConfig):
-    """Configuration for score matching models.
+class EuclideanVDMConfig(VectorFieldConfig):
+    """Configuration for Euclidean VDM models.
 
     Uses a learned noise schedule (VDM design) with VLB loss. The schedule maps
-    t ∈ [0,1] to log κ(t) via a monotonic neural network, with learned endpoints.
+    t ∈ [0,1] to log SNR γ(t) via a monotonic neural network, with learned endpoints.
+    Data on S^{d-1} is augmented with small radial noise so it fills a thin shell in R^d.
     """
 
-    init_log_kappa_min: float = -0.693  # log(0.5)
-    init_log_kappa_max: float = 9.210  # log(10000)
+    init_log_snr_min: float = -10.0
+    init_log_snr_max: float = 10.0
     schedule_hidden_dim: int = 32
     schedule_n_quadrature_points: int = 1024
     vlb_variance_loss_weight: Optional[float] = None
 
+    sigma_radial: float = 0.01
+    log_snr_max_cap: Optional[float] = None
+    classifier_loss_weight: float = 1.0
+
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
     d_max_dist: Optional[Tuple[Tuple[float, float], ...]] = None
+    cap_features: FrozenSet[
+        Literal["cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"]
+    ] = field(default_factory=lambda: DEFAULT_CAP_FEATURES)
 
-    model_type: ClassVar[str] = "score_matching"
+    model_type: ClassVar[str] = "euclidean_vdm"
 
     @property
     def alpha_output(self) -> float:
-        # The domain_scale_factor in VectorField scales outputs relative to π/2. For score
-        # matching, the target is the scaled score P_{x_t}(x_1), whose magnitude is sin(θ) ∈
-        # [0, 1]. Multiplying by 2/π sets the gain to match the maximum target magnitude.
+        # The domain_scale_factor in VectorField scales outputs relative to π/2. For the
+        # Euclidean VDM, the target is the noise ε̂, whose magnitude is O(1). Multiplying
+        # by 2/π sets the gain to match the expected target magnitude.
         return 2.0 / math.pi
 
     @property
@@ -469,15 +477,15 @@ class ScoreMatchingModelConfig(VectorFieldConfig):
         if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
             return 0
         elif self.cap_conditioning == CapConditioningMode.CONDITIONED_SCORE:
-            return cap_conditioning_dim(self.domain_dim)
+            return cap_conditioning_dim(self.domain_dim, self.cap_features)
         elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
-            return cap_conditioning_dim(self.domain_dim)
+            return cap_conditioning_dim(self.domain_dim, self.cap_features)
         else:
             raise ValueError(f"Unknown cap conditioning mode: {self.cap_conditioning}")
 
     @classmethod
-    def from_json_dict(cls, dict: dict[str, Any]) -> "ScoreMatchingModelConfig":
-        """Convert a dictionary parsed from JSON to a ScoreMatchingModelConfig object."""
+    def from_json_dict(cls, dict: dict[str, Any]) -> "EuclideanVDMConfig":
+        """Convert a dictionary parsed from JSON to a EuclideanVDMConfig object."""
         out = cls._parse_vf_json_fields(dict)
 
         if "cap_conditioning" in dict:
@@ -489,6 +497,9 @@ class ScoreMatchingModelConfig(VectorFieldConfig):
 
         if "d_max_dist" in dict and dict["d_max_dist"] is not None:
             out["d_max_dist"] = tuple(tuple(pair) for pair in dict["d_max_dist"])
+
+        if "cap_features" in dict:
+            out["cap_features"] = frozenset(dict["cap_features"])
 
         out = dacite.from_dict(
             data_class=cls, data=out, config=dacite.Config(check_types=False)
@@ -504,14 +515,15 @@ class ScoreMatchingModelConfig(VectorFieldConfig):
             cap_conditioning_mode_to_str,
             "cap conditioning mode",
         )
+        out["cap_features"] = sorted(self.cap_features)
         return out
 
     def validate(self):
-        """Validate score matching specific configuration."""
+        """Validate Euclidean VDM specific configuration."""
         self._validate_vf(self.conditioning_dim)
 
-        if self.init_log_kappa_min >= self.init_log_kappa_max:
-            raise ValueError("init_log_kappa_min must be less than init_log_kappa_max")
+        if self.init_log_snr_min >= self.init_log_snr_max:
+            raise ValueError("init_log_snr_min must be less than init_log_snr_max")
         if self.schedule_hidden_dim <= 0:
             raise ValueError("schedule_hidden_dim must be positive")
         if self.schedule_n_quadrature_points < 2:
@@ -521,6 +533,10 @@ class ScoreMatchingModelConfig(VectorFieldConfig):
             and self.vlb_variance_loss_weight < 0
         ):
             raise ValueError("vlb_variance_loss_weight must be non-negative")
+        if self.sigma_radial <= 0:
+            raise ValueError("sigma_radial must be positive")
+        if self.classifier_loss_weight < 0:
+            raise ValueError("classifier_loss_weight must be non-negative")
 
         if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
             if self.d_max_dist is not None:
@@ -783,9 +799,9 @@ def test_flow_matching_config_instantiates_function_weighted_flow_model() -> Non
     assert isinstance(model, FunctionWeightedFlowModel)
 
 
-def test_score_matching_config_roundtrip_unconditioned() -> None:
-    """ScoreMatchingModelConfig round-trips with default (unconditioned) cap_conditioning."""
-    cfg = ScoreMatchingModelConfig(
+def test_euclidean_vdm_config_roundtrip_unconditioned() -> None:
+    """EuclideanVDMConfig round-trips with default (unconditioned) cap_conditioning."""
+    cfg = EuclideanVDMConfig(
         n_layers=2,
         domain_dim=768,
         use_pre_mlp_projection=True,
@@ -793,18 +809,18 @@ def test_score_matching_config_roundtrip_unconditioned() -> None:
         mlp_expansion_factor=4,
         mlp_dropout_rate=None,
         input_dropout_rate=None,
-        init_log_kappa_min=-2.0,
-        init_log_kappa_max=8.0,
+        init_log_snr_min=-8.0,
+        init_log_snr_max=8.0,
     )
     json_str = json.dumps(cfg.to_json_dict())
-    regenerated = ScoreMatchingModelConfig.from_json_dict(json.loads(json_str))
+    regenerated = EuclideanVDMConfig.from_json_dict(json.loads(json_str))
     assert regenerated == cfg
     assert regenerated.conditioning_dim == 0
 
 
-def test_score_matching_config_roundtrip_conditioned_score() -> None:
-    """ScoreMatchingModelConfig round-trips with conditioned_score and d_max_dist."""
-    cfg = ScoreMatchingModelConfig(
+def test_euclidean_vdm_config_roundtrip_conditioned_score() -> None:
+    """EuclideanVDMConfig round-trips with conditioned_score and d_max_dist."""
+    cfg = EuclideanVDMConfig(
         n_layers=3,
         domain_dim=768,
         use_pre_mlp_projection=True,
@@ -816,15 +832,34 @@ def test_score_matching_config_roundtrip_conditioned_score() -> None:
         d_max_dist=((0.95, 1.0), (0.05, 2.0)),
     )
     json_str = json.dumps(cfg.to_json_dict())
-    regenerated = ScoreMatchingModelConfig.from_json_dict(json.loads(json_str))
+    regenerated = EuclideanVDMConfig.from_json_dict(json.loads(json_str))
     assert regenerated == cfg
     assert regenerated.conditioning_dim == cap_conditioning_dim(768)
 
 
-def test_score_matching_config_validation_unconditioned_rejects_d_max_dist() -> None:
+def test_euclidean_vdm_config_roundtrip_with_cap_features() -> None:
+    """EuclideanVDMConfig round-trips with custom cap_features."""
+    cfg = EuclideanVDMConfig(
+        n_layers=2,
+        domain_dim=768,
+        use_pre_mlp_projection=True,
+        d_model=256,
+        mlp_expansion_factor=4,
+        mlp_dropout_rate=None,
+        input_dropout_rate=None,
+        cap_conditioning=CapConditioningMode.CONDITIONED_SCORE,
+        d_max_dist=((0.95, 1.0), (0.05, 2.0)),
+        cap_features=frozenset({"cap_center", "d_max", "log_cap_odds"}),
+    )
+    json_str = json.dumps(cfg.to_json_dict())
+    regenerated = EuclideanVDMConfig.from_json_dict(json.loads(json_str))
+    assert regenerated == cfg
+
+
+def test_euclidean_vdm_config_validation_unconditioned_rejects_d_max_dist() -> None:
     """Unconditioned config rejects d_max_dist."""
     with pytest.raises(ValueError, match="d_max_dist should not be set"):
-        ScoreMatchingModelConfig(
+        EuclideanVDMConfig(
             n_layers=2,
             domain_dim=3,
             use_pre_mlp_projection=False,
@@ -836,10 +871,10 @@ def test_score_matching_config_validation_unconditioned_rejects_d_max_dist() -> 
         ).validate()
 
 
-def test_score_matching_config_validation_conditioned_requires_d_max_dist() -> None:
-    """Conditioned score config requires d_max_dist."""
+def test_euclidean_vdm_config_validation_conditioned_requires_d_max_dist() -> None:
+    """Conditioned config requires d_max_dist."""
     with pytest.raises(ValueError, match="d_max_dist must be provided"):
-        ScoreMatchingModelConfig(
+        EuclideanVDMConfig(
             n_layers=2,
             domain_dim=3,
             use_pre_mlp_projection=False,
@@ -851,12 +886,12 @@ def test_score_matching_config_validation_conditioned_requires_d_max_dist() -> N
         ).validate()
 
 
-def test_score_matching_config_validation_classifier_guidance_requires_d_max_dist() -> (
+def test_euclidean_vdm_config_validation_classifier_guidance_requires_d_max_dist() -> (
     None
 ):
     """Classifier guidance config requires d_max_dist."""
     with pytest.raises(ValueError, match="d_max_dist must be provided"):
-        ScoreMatchingModelConfig(
+        EuclideanVDMConfig(
             n_layers=2,
             domain_dim=3,
             use_pre_mlp_projection=False,
@@ -867,7 +902,7 @@ def test_score_matching_config_validation_classifier_guidance_requires_d_max_dis
             cap_conditioning=CapConditioningMode.CLASSIFIER_GUIDANCE,
         ).validate()
     # Should succeed with d_max_dist
-    ScoreMatchingModelConfig(
+    EuclideanVDMConfig(
         n_layers=2,
         domain_dim=3,
         use_pre_mlp_projection=False,
