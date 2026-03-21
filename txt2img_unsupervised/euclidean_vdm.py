@@ -333,7 +333,7 @@ class EuclideanDiffusionModel(nn.Module):
         if self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
             cond_vecs = jnp.zeros((z.shape[0], self.conditioning_dim))
         else:
-            cond_vecs = self._cap_params_to_cond_vecs(cap_params, z.shape[0])
+            cond_vecs = self._cap_params_to_cond_vecs(cap_params, z.shape[0], z=z)
         t_normalized = self._normalize_log_snr(log_snr)
         return self.vector_field(z, t_normalized, cond_vecs)
 
@@ -508,7 +508,7 @@ class EuclideanDiffusionModel(nn.Module):
         x_data, z_t, eps, log_snr, alpha, sigma, gamma_prime = self._forward_diffusion(
             x_1, t
         )
-        cond_vecs = self._cap_params_to_cond_vecs(cap_params, batch_size)
+        cond_vecs = self._cap_params_to_cond_vecs(cap_params, batch_size, z=z_t)
         components = self._compute_vlb_components(
             x_data, z_t, eps, log_snr, gamma_prime, cond_vecs
         )
@@ -1682,21 +1682,21 @@ def test_train_distribution(domain_dim, dist_name):
 # All configs use the same model architecture (4 layers, 256 d_model) and training set (2M samples).
 # Step counts target ~4 minutes of training time per config. CG gets fewer steps than CS because
 # each CG training step does 2 forward + 2 backward passes (~1.3x slower per step on GPU).
-# CG thresholds are tighter than CS: classifier guidance should produce higher quality despite fewer
-# training steps, because it separates distribution learning from cap conditioning.
+# CG thresholds are at least as tight as CS. With all cap features enabled, CS quality is
+# close to CG; CG's remaining edge is mainly in_cap in dim=16.
 # Values: (steps, in_cap_threshold, ks_threshold)
 _CAP_CONDITIONED_TEST_CONFIGS: dict[
     tuple[int, str, CapConditioningMode], tuple[int, float, float]
 ] = {
     # fmt: off
     #                                                           steps   in_cap   KS
-    (3,  "uniform", CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.93,    0.06),
+    (3,  "uniform", CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.96,    0.06),
     (3,  "uniform", CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.96,    0.06),
-    (3,  "vmf",     CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.88,    0.06),
-    (3,  "vmf",     CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.93,    0.06),
-    (16, "uniform", CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.90,    0.08),
+    (3,  "vmf",     CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.96,    0.06),
+    (3,  "vmf",     CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.96,    0.06),
+    (16, "uniform", CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.93,    0.06),
     (16, "uniform", CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.95,    0.06),
-    (16, "vmf",     CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.90,    0.08),
+    (16, "vmf",     CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.93,    0.06),
     (16, "vmf",     CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.95,    0.06),
     # fmt: on
 }
@@ -1732,11 +1732,11 @@ def test_train_cap_conditioned(domain_dim, data_distribution, cap_conditioning):
         d_max_dist=d_max_dist,
         vlb_variance_loss_weight=1e-3,
     )
+    model_kwargs["cap_features"] = frozenset(
+        {"cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"}
+    )
     if cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
         model_kwargs["classifier_loss_weight"] = 10.0
-        model_kwargs["cap_features"] = frozenset(
-            {"cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"}
-        )
     model = _make_model(domain_dim, **model_kwargs)
 
     batch_size = 2048
