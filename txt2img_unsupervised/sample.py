@@ -11,7 +11,6 @@ from copy import deepcopy
 from functools import partial
 from pathlib import Path
 from random import randint
-from typing import List, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -78,7 +77,7 @@ def sample_jv(mdl, params, top_p, clip_embeddings, max_cos_distances, rngs):
 def make_grid(
     imgs: list[PIL.Image.Image],
     spacing: int = 4,
-    spacing_color: Tuple[int, int, int] = (255, 255, 255),
+    spacing_color: tuple[int, int, int] = (255, 255, 255),
 ) -> PIL.Image.Image:
     """Make a square grid of square images of equal size."""
     assert can_make_grid(len(imgs))
@@ -449,8 +448,8 @@ def mk_png_metadata(
     logit_filter_threshold: float,
     temperature: float,
     force_f32: bool,
-    cond_imgs: List[Tuple[str, Union[float, None]]],
-    cond_txts: List[Tuple[str, Union[float, None]]],
+    cond_imgs: list[tuple[str, float | None]],
+    cond_txts: list[tuple[str, float | None]],
     checkpoint: str,
     checkpoint_step: int,
 ) -> PngInfo:

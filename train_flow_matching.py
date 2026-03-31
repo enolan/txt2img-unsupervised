@@ -10,7 +10,6 @@ import argparse
 from distutils.util import strtobool
 from functools import partial
 from pathlib import Path
-from typing import Optional
 
 import jax
 import matplotlib.pyplot as plt
@@ -140,8 +139,8 @@ def init_train_state(
     model_cfg: FlowMatchingModelConfig,
     training_cfg: TrainingConfig,
     total_steps: int,
-    resume_checkpoint_path: Optional[Path] = None,
-    finetune_checkpoint_path: Optional[Path] = None,
+    resume_checkpoint_path: Path | None = None,
+    finetune_checkpoint_path: Path | None = None,
     start_where_finetune_source_left_off: bool = False,
 ):
     """Set up our initial FlowMatchingTrainState using the provided configs.

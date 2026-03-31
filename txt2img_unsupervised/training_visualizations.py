@@ -3,7 +3,6 @@ Functions for generating visualizations of training progress.
 """
 
 from functools import partial
-from typing import List
 
 import jax
 import jax.numpy as jnp
@@ -47,7 +46,7 @@ def log_token_loss_visualization(
     train_state: TransformerTrainState,
     mdl: ImageModel,
     images: jax.Array,
-    image_names: List[str],
+    image_names: list[str],
     clip_embeddings: jax.Array,
     max_cos_distances: jax.Array,
     global_step: int,

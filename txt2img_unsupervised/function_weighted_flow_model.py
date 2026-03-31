@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import partial
-from typing import FrozenSet, Literal, Optional, Tuple, Union
+from typing import Literal
 
 import flax.linen as nn
 import jax
@@ -84,7 +84,7 @@ class CapIndicatorExtraParams:
     function.
     """
 
-    d_max_dist: Tuple[Tuple[float, float], ...] = ((0.95, 1.0), (0.05, 2.0))
+    d_max_dist: tuple[tuple[float, float], ...] = ((0.95, 1.0), (0.05, 2.0))
     """
     Training distribution of maximum cosine distances, specified as a mixture of uniform
     distributions. Each tuple contains the weight of the mixture component and the upper d_max
@@ -101,7 +101,7 @@ class SmoothedCapIndicatorExtraParams:
     weighting function.
     """
 
-    d_max_dist: Tuple[Tuple[float, float], ...] = ((0.95, 1.0), (0.05, 2.0))
+    d_max_dist: tuple[tuple[float, float], ...] = ((0.95, 1.0), (0.05, 2.0))
     """
     Training distribution of maximum cosine distances, specified as a mixture of uniform
     distributions. Each tuple contains the weight of the mixture component and the upper d_max
@@ -155,9 +155,9 @@ class FunctionWeightedFlowModel(nn.Module):
     n_layers: int
     d_model: int
     mlp_expansion_factor: int
-    mlp_dropout_rate: Optional[float]
-    input_dropout_rate: Optional[float]
-    mlp_always_inject: FrozenSet[Literal["x", "t", "cond"]] = field(
+    mlp_dropout_rate: float | None
+    input_dropout_rate: float | None
+    mlp_always_inject: frozenset[Literal["x", "t", "cond"]] = field(
         default_factory=frozenset
     )
     activations_dtype: jnp.dtype = jnp.float32
@@ -169,9 +169,9 @@ class FunctionWeightedFlowModel(nn.Module):
 
     # Weighting-related hyperparameters.
     weighting_function: WeightingFunction = WeightingFunction.CONSTANT
-    weighting_function_extra_params: Optional[
-        Union[CapIndicatorExtraParams, SmoothedCapIndicatorExtraParams]
-    ] = None
+    weighting_function_extra_params: (
+        CapIndicatorExtraParams | SmoothedCapIndicatorExtraParams | None
+    ) = None
 
     # Base distribution type for sampling x0
     base_distribution: BaseDistribution = BaseDistribution.SPHERE
@@ -282,7 +282,7 @@ class FunctionWeightedFlowModel(nn.Module):
         )
         return self.logits_table.weighted(weight_vals)
 
-    def dummy_inputs(self) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    def dummy_inputs(self) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         """Create dummy inputs for model initialization with the correct shapes.
 
         Returns:
@@ -482,7 +482,7 @@ class FunctionWeightedFlowModel(nn.Module):
     def compute_weight(
         self,
         x: jax.Array,
-        weighting_function_params: Optional[Tuple[jax.Array, jax.Array]],
+        weighting_function_params: tuple[jax.Array, jax.Array] | None,
     ) -> jax.Array:
         """
         Compute the weight of a point under the weighting function defined by the parameters.
@@ -529,7 +529,7 @@ class FunctionWeightedFlowModel(nn.Module):
 
     def _sample_smoothed_cap_params(
         self, rng: jax.Array, x: jax.Array
-    ) -> Tuple[jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array]:
         """Sample smoothed cap indicator parameters given an explicit RNG key.
 
         Args:
@@ -559,7 +559,7 @@ class FunctionWeightedFlowModel(nn.Module):
 
     def sample_weighting_function_params(
         self, x: jax.Array
-    ) -> Optional[Tuple[jax.Array, jax.Array]]:
+    ) -> tuple[jax.Array, jax.Array] | None:
         """
         Given a point x, sample a set of parameters for the weighting function from a distribution
         that's density is proportional to the weighting function and independent of any attribute of
@@ -886,7 +886,7 @@ def generate_samples(
     params,
     rng,
     weighting_function_params,
-    n_steps: Optional[int] = None,
+    n_steps: int | None = None,
     method="tsit5",
     batch_size=None,
 ):
@@ -964,7 +964,7 @@ def sample_loop(
     weighting_function_params,
     n_samples,
     batch_size,
-    n_steps: Optional[int] = None,
+    n_steps: int | None = None,
     method="tsit5",
 ):
     """
@@ -1715,7 +1715,7 @@ def sample_full_sphere(
     rng,
     n_samples,
     batch_size,
-    n_steps: Optional[int] = None,
+    n_steps: int | None = None,
     method="tsit5",
 ):
     """

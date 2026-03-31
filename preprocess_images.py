@@ -9,7 +9,6 @@ import random
 from copy import copy
 from pathlib import Path
 from threading import Lock, Semaphore, Thread
-from typing import Optional
 
 import CloseableQueue
 import jax
@@ -168,7 +167,7 @@ paths_queuer = Thread(
 paths_queuer.start()
 
 
-def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
+def load_img(img_path: Path) -> PIL.Image.Image | None:
     """Load/crop/scale a single image."""
     try:
         img = PIL.Image.open(img_path)

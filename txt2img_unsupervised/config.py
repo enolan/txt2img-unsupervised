@@ -5,18 +5,14 @@ import importlib
 import json
 import math
 from abc import abstractmethod
+from collections.abc import Callable
 from copy import copy
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from typing import (
     Any,
-    Callable,
     ClassVar,
-    FrozenSet,
     Literal,
-    Optional,
-    Tuple,
-    Union,
 )
 
 import dacite
@@ -103,7 +99,7 @@ class TransformerModelConfig(BaseModelConfig):
     d_model: int
     num_heads: int
     ff_dim: int
-    dropout: Optional[float]
+    dropout: float | None
     image_tokens: int
     use_biases: bool
     activation_function: Callable[[jax.Array], jax.Array]
@@ -114,13 +110,13 @@ class TransformerModelConfig(BaseModelConfig):
     pre_norm: bool = False
     clip_conditioning: bool = False
     clip_caps: bool = False
-    clip_cap_count: Optional[int] = None
+    clip_cap_count: int | None = None
     # Should always be true, defaults to false for backwards compatability
     corrected_cap_projections: bool = False
     do_clip_feedforward: bool = False
     norm_clip_embeddings: bool = False
-    image_dropout: Optional[float] = None
-    clip_dropout: Optional[float] = None
+    image_dropout: float | None = None
+    clip_dropout: float | None = None
 
     # Class variable to store the model type
     model_type: ClassVar[str] = "transformer"
@@ -197,9 +193,9 @@ class VectorFieldConfig(BaseModelConfig):
     use_pre_mlp_projection: bool
     d_model: int
     mlp_expansion_factor: int
-    mlp_dropout_rate: Optional[float]
-    input_dropout_rate: Optional[float]
-    mlp_always_inject: FrozenSet[Literal["x", "t", "cond"]] = field(
+    mlp_dropout_rate: float | None
+    input_dropout_rate: float | None
+    mlp_always_inject: frozenset[Literal["x", "t", "cond"]] = field(
         default_factory=frozenset
     )
     activations_dtype: jnp.dtype = jnp.float32
@@ -299,9 +295,9 @@ class FlowMatchingModelConfig(VectorFieldConfig):
     """Configuration for flow matching models."""
 
     weighting_function: WeightingFunction = WeightingFunction.CONSTANT
-    weighting_function_extra_params: Optional[
-        Union[CapIndicatorExtraParams, SmoothedCapIndicatorExtraParams]
-    ] = None
+    weighting_function_extra_params: (
+        CapIndicatorExtraParams | SmoothedCapIndicatorExtraParams | None
+    ) = None
     base_distribution: BaseDistribution = BaseDistribution.SPHERE
 
     model_type: ClassVar[str] = "flow_matching"
@@ -449,15 +445,15 @@ class EuclideanVDMConfig(VectorFieldConfig):
     init_log_snr_max: float = 10.0
     schedule_hidden_dim: int = 32
     schedule_n_quadrature_points: int = 1024
-    vlb_variance_loss_weight: Optional[float] = None
+    vlb_variance_loss_weight: float | None = None
 
     sigma_radial: float = 0.01
-    log_snr_max_cap: Optional[float] = None
+    log_snr_max_cap: float | None = None
     classifier_loss_weight: float = 1.0
 
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
-    d_max_dist: Optional[Tuple[Tuple[float, float], ...]] = None
-    cap_features: FrozenSet[
+    d_max_dist: tuple[tuple[float, float], ...] | None = None
+    cap_features: frozenset[
         Literal["cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"]
     ] = field(default_factory=lambda: DEFAULT_CAP_FEATURES)
 
@@ -949,27 +945,27 @@ class TrainingConfig:
     epochs: int  # How many epochs to train for
     learning_rate_schedule: LearningRateSchedule
     gradient_accumulation_steps: int
-    gradient_clipping: Optional[float]
-    learning_rate: Optional[float] = None  # peak learning rate when using single lr
+    gradient_clipping: float | None
+    learning_rate: float | None = None  # peak learning rate when using single lr
     # How many steps to linearly increase the learning rate when using WARMUP_PLUS_COSINE_LR. With
     # the other schedules this value must be None
-    warmup_steps: Optional[int] = None
+    warmup_steps: int | None = None
     # How many steps to decay the learning rate over when using CONSTANT_PLUS_LINEAR_DECAY. With
     # the other schedules this value must be None
-    decay_steps: Optional[int] = None
-    schedule_free_beta1: Optional[float] = None
+    decay_steps: int | None = None
+    schedule_free_beta1: float | None = None
     adam_beta2: float = 0.999
     weight_decay: float = 0.0
     training_images: int = 0  # How many images to train for (in addition to epochs)
     adaptive_gradient_clip: bool = False
-    adaptive_gradient_clip_history_len: Optional[int] = None
-    adaptive_gradient_clip_threshold_factor: Optional[float] = None
-    adaptive_gradient_clip_quantile: Optional[float] = None
+    adaptive_gradient_clip_history_len: int | None = None
+    adaptive_gradient_clip_threshold_factor: float | None = None
+    adaptive_gradient_clip_quantile: float | None = None
     # Muon optimizer settings
     use_muon: bool = False
     muon_beta: float = 0.95  # Momentum parameter for Muon optimizer
     # Separate learning rate for the learned noise schedule (VDM). If None, uses the main LR.
-    schedule_learning_rate: Optional[float] = None
+    schedule_learning_rate: float | None = None
 
     @staticmethod
     def from_json_dict(dict: dict[str, Any]) -> "TrainingConfig":

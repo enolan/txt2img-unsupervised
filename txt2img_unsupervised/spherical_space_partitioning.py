@@ -655,7 +655,7 @@ class CapTree:
         dup_check=False,
         center=None,
         max_cos_distance=2.0,
-        found_duplicates=[],
+        found_duplicates=None,
     ):
         assert len(dset) > 0, "CapTree must be initialized with a non-empty dataset"
         self.dset = dset
@@ -681,7 +681,7 @@ class CapTree:
         self.children = []
         self.child_cap_centers = None
         self.child_cap_max_cos_distances = None
-        self.found_duplicates = found_duplicates
+        self.found_duplicates = found_duplicates if found_duplicates is not None else []
         self.ready_for_queries = False
 
     def __len__(self):
@@ -1199,8 +1199,7 @@ class CapTree:
             yield self
         else:
             for child in self.children:
-                for leaf in child.leaves():
-                    yield leaf
+                yield from child.leaves()
 
     def shuffle_leaves(self):
         """Shuffle the leaves of the tree."""
@@ -1956,7 +1955,7 @@ class CapTree:
                 for batch in dset_all.batch_iter(
                     batch_size=4096, drop_last_batch=False, threads=8, readahead=8
                 ):
-                    rows = len(batch[list(batch.keys())[0]])
+                    rows = len(batch[next(iter(batch.keys()))])
                     df_rows = []
                     for i in range(rows):
                         df_rows.append({k: v[i] for k, v in batch.items()})
@@ -2024,7 +2023,7 @@ class CapTree:
     @classmethod
     def load_from_disk(cls, dir, save_cache=True):
         """Load a tree from disk."""
-        with open(dir / "structure.json", "r") as f:
+        with open(dir / "structure.json") as f:
             summary = json.load(f)
 
         out = cls.__new__(cls)

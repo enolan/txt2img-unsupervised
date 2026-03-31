@@ -7,13 +7,14 @@ import datetime
 import importlib.util
 import json
 import signal
+from collections.abc import Callable
 from dataclasses import dataclass
 from distutils.util import strtobool
 from functools import partial
 from math import ceil
 from pathlib import Path
 from sys import exit
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -53,7 +54,7 @@ def plan_steps(
     epochs: int = 0,
     examples: int = 0,
     steps: int = 0,
-) -> Tuple[int, int, int, int, Optional[int]]:
+) -> tuple[int, int, int, int, int | None]:
     """
     Plan the number of epochs and steps to train for. Given a requested number of epochs, examples,
     and steps, this function calculates the steps and epochs needed to train for the sum of all
@@ -130,7 +131,7 @@ class SignalHandler:
         self.early_checkpoint_requested = False
 
 
-def argparse_from_dict(d: Dict[str, Any]) -> Callable[[str], Any]:
+def argparse_from_dict(d: dict[str, Any]) -> Callable[[str], Any]:
     """Create an argparse argument type from a dictionary."""
 
     def f(x: str) -> Any:
@@ -252,10 +253,11 @@ def init_common_train_state(
     training_cfg: TrainingConfig,
     total_steps: int,
     train_state_class: type,
-    resume_checkpoint_path: Optional[Path] = None,
-    finetune_checkpoint_path: Optional[Path] = None,
+    resume_checkpoint_path: Path | None = None,
+    finetune_checkpoint_path: Path | None = None,
     start_where_finetune_source_left_off: bool = False,
-    create_model_fn: Callable = None,  # Kept for backward compatibility but no longer needed
+    create_model_fn: Callable
+    | None = None,  # Kept for backward compatibility but no longer needed
 ):
     """
     Set up our initial TrainState using the provided configs.
@@ -383,7 +385,7 @@ def init_common_train_state(
     )
 
 
-def load_dataset(dir: Path) -> Tuple[Dataset, Dataset]:
+def load_dataset(dir: Path) -> tuple[Dataset, Dataset]:
     """
     Load dataset and split into train/test sets.
 
@@ -636,7 +638,7 @@ def make_train_step_with_metrics(loss_fn):
     @partial(jax.jit, donate_argnames=["state"])
     def _train_step_with_metrics(
         state: BaseTrainState, batch: Any
-    ) -> Tuple[BaseTrainState, float, float, Dict[str, Any]]:
+    ) -> tuple[BaseTrainState, float, float, dict[str, Any]]:
         """
         Performs a single training step, extracting metrics before donation.
 
@@ -694,16 +696,16 @@ def train_loop_async(
     total_steps: int,
     complete_epochs: int,
     total_epochs: int,
-    steps_in_partial_epoch: Optional[int],
+    steps_in_partial_epoch: int | None,
     initial_step: int,
     initial_train_state: BaseTrainState,
     get_batch_fn: Callable[[int], Any],
     loss_fn: Callable[[Any, Any, jax.random.PRNGKey], float],
-    fast_post_step_hook_fn: Callable[[float, Dict[str, Any], int, float], None],
+    fast_post_step_hook_fn: Callable[[float, dict[str, Any], int, float], None],
     slow_post_step_hook_fn: Callable[[float, BaseTrainState, int, float], bool],
     slow_path_condition_fn: Callable[[int], bool],
-    post_epoch_hook_fn: Optional[Callable[[BaseTrainState, int, int], None]] = None,
-) -> Tuple[Any, int]:
+    post_epoch_hook_fn: Callable[[BaseTrainState, int, int], None] | None = None,
+) -> tuple[Any, int]:
     """
     Runs an asynchronous training loop that maximizes GPU utilization. In general, this keeps at
     least one batch in flight on the GPU at all times, enqueueing the next batch before using the
@@ -886,16 +888,16 @@ def train_loop(
     total_steps: int,
     complete_epochs: int,
     total_epochs: int,
-    steps_in_partial_epoch: Optional[int],
+    steps_in_partial_epoch: int | None,
     initial_step: int,
     initial_train_state: BaseTrainState,
     get_batch_fn: Callable[[int], Any],
     loss_fn: Callable[[Any, Any, jax.random.PRNGKey], float],
-    fast_post_step_hook_fn: Callable[[float, Dict[str, Any], int, float], None],
+    fast_post_step_hook_fn: Callable[[float, dict[str, Any], int, float], None],
     slow_post_step_hook_fn: Callable[[float, BaseTrainState, int, float], bool],
     slow_path_condition_fn: Callable[[int], bool],
-    post_epoch_hook_fn: Optional[Callable[[BaseTrainState, int, int], None]] = None,
-) -> Tuple[Any, int]:
+    post_epoch_hook_fn: Callable[[BaseTrainState, int, int], None] | None = None,
+) -> tuple[Any, int]:
     """
     Entry point for asynchronous training loop that maximizes GPU utilization.
 
@@ -1064,8 +1066,8 @@ def fast_post_step_hook(loss, metrics, global_step, norm):
 
 def make_checkpoint_hooks(
     save_and_eval_fn: Callable,
-    save_and_eval_kwargs: Dict[str, Any],
-) -> Tuple[
+    save_and_eval_kwargs: dict[str, Any],
+) -> tuple[
     Callable[[int], bool],
     Callable[[float, BaseTrainState, int, float], bool],
     Callable[[BaseTrainState, int, int], None],
@@ -1129,7 +1131,7 @@ def save_checkpoint_and_evaluate_vector_model(
     visualize_fn: Callable[[dict, int], None],
     compute_nll_fn: Callable[[dict, dict, jax.random.PRNGKey, Any], jax.Array],
     nll_setup_fn: Callable[[dict, jax.random.PRNGKey], Any],
-    nll_batch_size: Optional[int] = None,
+    nll_batch_size: int | None = None,
     max_nll_examples: int = 1000,
 ) -> None:
     """Save checkpoint and evaluate on test dataset.
@@ -1254,9 +1256,9 @@ class TrainResult:
 
     state: BaseTrainState
     step: int
-    test_loss: Optional[float] = None
-    test_nll: Optional[float] = None
-    test_aux: Optional[dict[str, float]] = None
+    test_loss: float | None = None
+    test_nll: float | None = None
+    test_aux: dict[str, float] | None = None
 
 
 def train_for_tests(
@@ -1265,20 +1267,20 @@ def train_for_tests(
     batch_size: int,
     learning_rate: float,
     loss_fn: Callable,
-    fields: List[str],
+    fields: list[str],
     epochs: int = 0,
     steps: int = 0,
     weight_decay: float = 0.001,
-    warmup_steps: Optional[int] = None,
-    gradient_clipping: Optional[float] = None,
-    schedule_free_beta1: Optional[float] = None,
+    warmup_steps: int | None = None,
+    gradient_clipping: float | None = None,
+    schedule_free_beta1: float | None = None,
     adam_beta2: float = 0.999,
     rng_seed: int = 7357,
-    test_dataset: Optional[Dataset] = None,
-    nll_fn: Optional[Callable] = None,
-    nll_max_batches: Optional[int] = None,
-    nll_eval_fields: Optional[List[str]] = None,
-    schedule_learning_rate: Optional[float] = None,
+    test_dataset: Dataset | None = None,
+    nll_fn: Callable | None = None,
+    nll_max_batches: int | None = None,
+    nll_eval_fields: list[str] | None = None,
+    schedule_learning_rate: float | None = None,
     use_muon: bool = False,
     muon_beta: float = 0.95,
 ) -> TrainResult:

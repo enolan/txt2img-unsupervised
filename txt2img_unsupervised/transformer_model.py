@@ -1,9 +1,10 @@
+from collections.abc import Callable
 from copy import copy
 from dataclasses import replace
 from enum import Enum
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Optional, Tuple
+from typing import Any
 
 import flash_attention_jax  # Pure JAX flash attention implementation by lucidrains
 import flax.core
@@ -31,14 +32,14 @@ class ImageModel(nn.Module):
     d_model: int
     num_heads: int
     ff_dim: int
-    dropout: Optional[float]
-    image_dropout: Optional[float]
-    clip_dropout: Optional[float]
+    dropout: float | None
+    image_dropout: float | None
+    clip_dropout: float | None
     n_layers: int
     image_tokens: int
     clip_conditioning: bool
     clip_caps: bool
-    clip_cap_count: Optional[int]
+    clip_cap_count: int | None
     corrected_cap_projections: bool
     do_clip_feedforward: bool
     norm_clip_embeddings: bool
@@ -48,7 +49,7 @@ class ImageModel(nn.Module):
     weights_dtype: jnp.dtype
     pre_norm: bool
     decode: bool = False
-    attn_method: Optional[AttnMethod] = None
+    attn_method: AttnMethod | None = None
     record_attention_weights: bool = (
         False  # whether to record attention weights for visualization
     )
@@ -820,10 +821,10 @@ def test_cap_cond_tokens_and_vqgan_embeds_are_same_distribution(
 def _setup_test_sample(
     clip_conditioning: bool = False,
     clip_caps: bool = False,
-    clip_cap_count: Optional[int] = None,
+    clip_cap_count: int | None = None,
     pre_norm: bool = False,
     image_tokens: int = 256,
-) -> Tuple[ImageModel, ImageModel, dict, jax.Array, jax.Array]:
+) -> tuple[ImageModel, ImageModel, dict, jax.Array, jax.Array]:
     """Shared setup code for iterative sampling tests."""
     cfg_nodec = copy(gpt_1_config)
     cfg_nodec.dropout = None
@@ -909,7 +910,7 @@ def _setup_test_sample(
 def test_sample_tok_0(
     clip_conditioning: bool,
     clip_caps: bool,
-    clip_cap_count: Optional[int],
+    clip_cap_count: int | None,
     pre_norm: bool,
 ) -> None:
     """Test that step-by-step decoding is equivalent to all at once for image token 0."""
@@ -1499,7 +1500,7 @@ class TransformerLayer(nn.Module):
     d_model: int
     num_heads: int
     ff_dim: int
-    dropout: Optional[float]
+    dropout: float | None
     use_biases: bool
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
@@ -1560,12 +1561,10 @@ class TransformerLayer(nn.Module):
                 except TypeError as e:
                     if "cannot reshape array of shape" in str(e):
                         raise ValueError(
-                            (
-                                "Got an exception from causal_flash_attention: {}. You may have "
-                                "run into its bug with sequence lengths that are not a multiple of "
-                                "the chunk size."
-                            ).format(e)
-                        )
+                            f"Got an exception from causal_flash_attention: {e}. You may have "
+                            "run into its bug with sequence lengths that are not a multiple of "
+                            "the chunk size."
+                        ) from e
                     else:
                         raise e
                 if dtype is not None:

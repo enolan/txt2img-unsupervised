@@ -51,17 +51,14 @@ geometry of the sphere, ensuring flows remain on the manifold.
 
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from functools import partial
 from math import ceil
 from typing import (
     Any,
-    Callable,
-    FrozenSet,
     Literal,
     NamedTuple,
-    Optional,
-    Tuple,
 )
 
 import jax
@@ -91,14 +88,14 @@ class MLPBlock(nn.Module):
 
     bottleneck_dim: int
     expansion_factor: int
-    dropout_rate: Optional[float]
+    dropout_rate: float | None
 
     activations_dtype: jnp.dtype
     weights_dtype: jnp.dtype
     param_variance: float
 
     # Extra features injected in addition to main bottleneck_dim input.
-    inj_features: FrozenSet[str] = field(default_factory=frozenset)
+    inj_features: frozenset[str] = field(default_factory=frozenset)
 
     def setup(self) -> None:
         self.norm = nn.LayerNorm(
@@ -232,13 +229,13 @@ class VectorField(nn.Module):
     # MLP expansion factor
     mlp_expansion_factor: int
     # Dropout rate for the MLP
-    mlp_dropout_rate: Optional[float]
+    mlp_dropout_rate: float | None
     # Dropout rate for the input
-    input_dropout_rate: Optional[float]
+    input_dropout_rate: float | None
 
     # Which original inputs to inject at every MLP block. When a feature is injected,
     # it is omitted from the initial MLP input.
-    mlp_always_inject: FrozenSet[Literal["x", "t", "cond"]] = field(
+    mlp_always_inject: frozenset[Literal["x", "t", "cond"]] = field(
         default_factory=frozenset
     )
 
@@ -916,7 +913,7 @@ def slerp(x, y, t):
 
 
 def _default_antipodal_dir_fn(
-    point: jax.Array, _extra: Optional[jax.Array] = None
+    point: jax.Array, _extra: jax.Array | None = None
 ) -> jax.Array:
     return get_consistent_tangent_direction(point)
 
@@ -926,9 +923,9 @@ def spherical_ot_field(
     x1,
     t,
     antipodal_dir_fn: Callable[
-        [jax.Array, Optional[jax.Array]], jax.Array
+        [jax.Array, jax.Array | None], jax.Array
     ] = _default_antipodal_dir_fn,
-    antipodal_dir_extra: Optional[jax.Array] = None,
+    antipodal_dir_extra: jax.Array | None = None,
 ):
     """
     Compute position and velocity field for spherical OT paths. The code that defines the paths is
@@ -1014,9 +1011,9 @@ def compute_psi_t_spherical(
     x1,
     t,
     antipodal_dir_fn: Callable[
-        [jax.Array, Optional[jax.Array]], jax.Array
+        [jax.Array, jax.Array | None], jax.Array
     ] = _default_antipodal_dir_fn,
-    antipodal_dir_extra: Optional[jax.Array] = None,
+    antipodal_dir_extra: jax.Array | None = None,
 ):
     """
     Compute the flow map for the spherical OT field.
@@ -1195,7 +1192,7 @@ def compute_batch_loss(
     rng,
     capture_intermediates=False,
     antipodal_dir_fn: Callable[
-        [jax.Array, Optional[jax.Array]], jax.Array
+        [jax.Array, jax.Array | None], jax.Array
     ] = _default_antipodal_dir_fn,
 ):
     """
@@ -1890,7 +1887,7 @@ def _tsit5_build_endpoints(
     t: jax.Array,
     dt: jax.Array,
     k1: jax.Array,
-    rng: Optional[jax.Array] = None,
+    rng: jax.Array | None = None,
 ):
     """Build Tsit5 stages on the sphere and return 5th/4th endpoints and FSAL derivative.
 
@@ -2041,7 +2038,7 @@ class _PolynomialETAEstimator:
         indices = np.arange(n)
         return np.exp(self.weight_decay * (indices - n + 1) / n)
 
-    def eta_seconds(self) -> Optional[float]:
+    def eta_seconds(self) -> float | None:
         """Estimate seconds remaining until progress reaches 1.0."""
         n = len(self.progress_values)
         if n <= self.degree:
@@ -2172,7 +2169,7 @@ class Tsit5Settings:
     grow: float = 10.0
 
     # Integration control
-    initial_dt: Optional[float] = None  # If None, auto-estimate from tolerances
+    initial_dt: float | None = None  # If None, auto-estimate from tolerances
     max_iterations: int = 2000
     auto_dt_estimation: bool = True  # Enable automatic initial step size estimation
 
@@ -2212,11 +2209,11 @@ def _tsit5_integrate_core(
     dt_initial: jax.Array,
     forward: bool,
     settings: "Tsit5Settings",
-    rng: Optional[jax.Array] = None,
-    step_callback: Optional[Callable] = None,
-    step_carry_init: Optional[jax.Array] = None,
-    callback_n_projections: Optional[int] = None,
-) -> Tuple[jax.Array, jax.Array, int, jax.Array, jax.Array]:
+    rng: jax.Array | None = None,
+    step_callback: Callable | None = None,
+    step_carry_init: jax.Array | None = None,
+    callback_n_projections: int | None = None,
+) -> tuple[jax.Array, jax.Array, int, jax.Array, jax.Array]:
     """
     Core Tsit5 integration loop with optional shrinking batch optimization.
 
@@ -2653,7 +2650,7 @@ def _estimate_initial_dt(atol: float, rtol: float, domain_dim: int) -> float:
 
 def _tsit5_update_dt(
     dt: jax.Array, err_ratio: jax.Array, safety: float, dfactor: float, ifactor: float
-) -> Tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array]:
     """Compute per-path acceptance and new dt based on error ratio."""
     accept = err_ratio <= 1.0
     safe_ratio = jnp.clip(err_ratio, 1e-12, 1e12)
@@ -2700,7 +2697,7 @@ def _tsit5_step_jitted(
     vector_field_fn_fixed_params,
     vector_field_fn_per_sample_params,
     step_callback,
-    n_projections: Optional[int] = None,
+    n_projections: int | None = None,
 ):
     step_rng, cb_rng = jax.random.split(rng)
     final_time = 1.0 if forward else 0.0
@@ -2852,7 +2849,7 @@ def divergence_step_callback(
     if reuse_start:
         need_new = jnp.logical_not(cache_valid)
 
-        def _recompute_start(_: None) -> Tuple[jax.Array, jax.Array]:
+        def _recompute_start(_: None) -> tuple[jax.Array, jax.Array]:
             new_start, new_err = hutchinson_estimator(
                 vector_field_fn,
                 vector_field_fn_fixed_static_params,
@@ -2966,7 +2963,7 @@ def _noop_step_callback(
     cache_valid,
     reuse_start,
     *,
-    n_projections: Optional[int] = None,
+    n_projections: int | None = None,
 ):
     del (
         x_current,
@@ -3135,7 +3132,7 @@ def generate_samples(
     params,
     rng,
     cond_vecs,
-    n_steps: Optional[int] = None,
+    n_steps: int | None = None,
     method="tsit5",
 ):
     """
@@ -3171,7 +3168,7 @@ def generate_samples(
 
 def generate_samples_inner(
     rng,
-    n_steps: Optional[int],
+    n_steps: int | None,
     batch_size,
     method,
     vector_field_fn,
@@ -3179,8 +3176,8 @@ def generate_samples_inner(
     vector_field_fn_fixed_params,
     vector_field_fn_per_sample_params,
     domain_dim,
-    initial_x0: Optional[jax.Array] = None,
-    tsit5_settings: Optional[Tsit5Settings] = None,
+    initial_x0: jax.Array | None = None,
+    tsit5_settings: Tsit5Settings | None = None,
 ):
     """
     Generate samples from a flow matching model by solving the ODE, generic over the method of
@@ -3323,7 +3320,7 @@ def sample_loop(
     batch_size,
     rng,
     cond_vecs,
-    n_steps: Optional[int] = None,
+    n_steps: int | None = None,
     method="tsit5",
 ):
     """
@@ -3687,7 +3684,7 @@ def reverse_path_and_compute_divergence_tsit5(
     rng,
     n_projections=10,
     compute_divergence: bool = True,
-    tsit5_settings: Optional[Tsit5Settings] = None,
+    tsit5_settings: Tsit5Settings | None = None,
 ):
     """
     Adaptive reverse path integration with Tsitouras 5/4 (non-jitted).
@@ -3732,11 +3729,11 @@ def reverse_path_and_compute_divergence(
     vector_field_fn_fixed_params,
     vector_field_fn_per_sample_params,
     samples,
-    n_steps: Optional[int],
+    n_steps: int | None,
     rng,
     n_projections=10,
     method: str = "tsit5",
-    tsit5_settings: Optional[Tsit5Settings] = None,
+    tsit5_settings: Tsit5Settings | None = None,
 ):
     """
     Compute the reverse path and integrate the divergence.
@@ -3791,7 +3788,7 @@ def compute_log_probability(
     params,
     samples,
     cond_vecs,
-    n_steps: Optional[int] = None,
+    n_steps: int | None = None,
     rng=None,
     n_projections=10,
     method: str = "tsit5",
@@ -4388,7 +4385,7 @@ def test_tsit5_step_callback_controls_step_size():
         cache_valid,
         reuse_start,
         *,
-        n_projections: Optional[int] = None,
+        n_projections: int | None = None,
     ) -> StepCallbackResult:
         del (
             x_current,

@@ -21,7 +21,6 @@ where γ'(t) is computed via autodiff through this network.
 """
 
 from functools import partial
-from typing import Optional
 
 import flax.linen as nn
 import jax
@@ -51,7 +50,7 @@ class LearnedNoiseSchedule(nn.Module):
     n_quadrature_points: int = 1024
     init_gamma_min: float = -0.693
     init_gamma_max: float = 9.210
-    gamma_max_cap: Optional[float] = None
+    gamma_max_cap: float | None = None
 
     def setup(self):
         assert self.n_quadrature_points >= 2, (

@@ -1,7 +1,6 @@
 """von Mises-Fisher distributions in JAX."""
 
 from functools import partial
-from typing import Tuple
 
 import jax
 import jax.numpy as jnp
@@ -23,7 +22,7 @@ _GL_WEIGHTS = jnp.array(_GL_WEIGHTS_NP, dtype=jnp.float32)
 
 def _prepare_sample_inputs(
     mu: Array, kappa, n_samples: int
-) -> Tuple[Array, Array, int]:
+) -> tuple[Array, Array, int]:
     """Normalize and broadcast inputs for vMF sampling.
 
     Args:

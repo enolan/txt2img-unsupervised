@@ -93,7 +93,7 @@ def label_images(imgs, out):
 def format_as_json(url_prefix, path, nsfw):
     stat = path.stat()
     return {
-        "url": f"{url_prefix}/{str(path)}",
+        "url": f"{url_prefix}/{path!s}",
         "nsfw": nsfw,
         "timestamp": int(stat.st_mtime),
     }

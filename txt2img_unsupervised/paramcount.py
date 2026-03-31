@@ -1,7 +1,6 @@
 from dataclasses import replace
 from functools import partial
 from math import prod
-from typing import Union
 
 import jax
 from flax import linen as nn
@@ -42,7 +41,7 @@ def find_optimal_attribute_value(
     attribute_name: str,
     *dummy_args,
     **dummy_kwargs,
-) -> Union[int, float]:
+) -> int | float:
     """Find the optimal value for a module attribute to get close to target parameter count.
 
     Uses binary search to efficiently find the attribute value that results in a module

@@ -3,7 +3,7 @@ Implementation of the Muon optimizer.
 Adapted from https://kellerjordan.github.io/posts/muon/
 """
 
-from typing import NamedTuple, Optional, Tuple, Union
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -312,8 +312,8 @@ def muonize(beta: float) -> optax.GradientTransformation:
         return MuonState(mu=otu.tree_zeros_like(params))
 
     def update_fn(
-        updates: optax.Updates, state: MuonState, params: Optional[optax.Params] = None
-    ) -> Tuple[optax.Updates, MuonState]:
+        updates: optax.Updates, state: MuonState, params: optax.Params | None = None
+    ) -> tuple[optax.Updates, MuonState]:
         del params
         new_state = MuonState(mu=optax.update_moment(updates, state.mu, beta, 1))
 
@@ -600,7 +600,7 @@ def test_muon_toy_neural_network(weight_decay):
 
 
 def muon(
-    learning_rate: Union[float, optax.Schedule],
+    learning_rate: float | optax.Schedule,
     beta: float = 0.95,
     weight_decay: float = 0.0,
 ) -> optax.GradientTransformation:

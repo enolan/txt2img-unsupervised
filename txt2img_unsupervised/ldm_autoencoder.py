@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import flax.core.frozen_dict as frozen_dict
 import flax.linen as nn
@@ -34,7 +34,7 @@ class LDMAutoencoder(nn.Module):
         self.decoder: LDMDecoder = LDMDecoder(cfg=self.cfg["ddconfig"])
         self.encoder: LDMEncoder = LDMEncoder(cfg=self.cfg["ddconfig"])
 
-    def embed(self, x: jax.Array, shape: Optional[tuple[int, int]] = None) -> jax.Array:
+    def embed(self, x: jax.Array, shape: tuple[int, int] | None = None) -> jax.Array:
         """Embed the codes, reshaping them to (height, width), where height and width are
         the height and width of the compressed representation. You must pass the shape parameter
         for decoding to work."""
@@ -309,7 +309,7 @@ class UpsamplingBlock(nn.Module):
 
         if self.do_upsample:
             # Whether there's a convolutional layer here is also optional, but always true in vq-f4.
-            self.upconv: Optional[nn.Conv] = nn.Conv(
+            self.upconv: nn.Conv | None = nn.Conv(
                 features=self.out_channels, kernel_size=[3, 3], padding=1
             )
         else:
@@ -407,7 +407,7 @@ class DownsamplingBlock(nn.Module):
         self.rn_blocks = nn.Sequential(rn_blocks)
 
         if self.do_downsample:
-            self.downconv: Optional[nn.Conv] = nn.Conv(
+            self.downconv: nn.Conv | None = nn.Conv(
                 features=self.out_channels,
                 kernel_size=[3, 3],
                 padding=[(0, 1), (0, 1)],
@@ -444,7 +444,7 @@ class ResnetBlock(nn.Module):
             features=self.out_channels, kernel_size=[3, 3], padding=1
         )
         if self.in_channels != self.out_channels:
-            self.nin_shortcut: Optional[nn.Conv] = nn.Conv(
+            self.nin_shortcut: nn.Conv | None = nn.Conv(
                 features=self.out_channels, kernel_size=[1, 1], padding=0
             )
         else:
@@ -546,7 +546,7 @@ decode_jv = jax.jit(
 
 def _setup_comparison_test(
     name: str,
-) -> Tuple[Path, Path, LDMAutoencoder, FrozenDict[str, Any]]:
+) -> tuple[Path, Path, LDMAutoencoder, FrozenDict[str, Any]]:
     """Load stuff to compare Flax & Torch behavior."""
     src_dir = Path(__file__).parent.parent
     path_prefix = src_dir / f"test-images/{name}"

@@ -1,7 +1,6 @@
 """Functions for loading training data."""
 
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple
 
 import jax
 import numpy as np
@@ -14,7 +13,7 @@ _MAX_SHUFFLED_DATASET_CACHE_SIZE = 4
 
 @lru_cache(maxsize=_MAX_SHUFFLED_DATASET_CACHE_SIZE)
 def _prepare_shuffled_dataset(
-    dataset: Dataset, epoch: int, columns: Tuple[str, ...]
+    dataset: Dataset, epoch: int, columns: tuple[str, ...]
 ) -> Dataset:
     """
     Reproducibly shuffle a dataset and select the specified columns.
@@ -35,9 +34,9 @@ def get_batch(
     dataset: Dataset,
     batch_size: int,
     global_step: int,
-    fields: List[str],
-    sharding: Optional[jax.sharding.Sharding] = None,
-) -> Dict[str, jax.Array]:
+    fields: list[str],
+    sharding: jax.sharding.Sharding | None = None,
+) -> dict[str, jax.Array]:
     """
     Get a batch of examples from a Dataset. Handles shuffling internally. If the length of the
     dataset is not a multiple of the batch size, the extra examples are discarded.
@@ -100,7 +99,7 @@ def _mk_mock_batch_dataset():
 )
 def test_get_batch_shapes(
     global_step: int,
-    fields: List[str],
+    fields: list[str],
 ):
     dset = _mk_mock_batch_dataset()
     batch = get_batch(dset, 3, global_step, fields)

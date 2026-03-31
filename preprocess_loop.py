@@ -6,7 +6,6 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
 
 from tqdm import tqdm
 
@@ -16,7 +15,7 @@ class DatasetMetadata:
     """Description of a preprocessed image dataset."""
 
     resolution: int
-    tag: Optional[str]
+    tag: str | None
 
     def __str__(self):
         return f"{self.resolution}x{self.resolution}" + (
@@ -71,7 +70,7 @@ def get_preprocessed_parquets(metadata: DatasetMetadata):
     return ret
 
 
-def get_unprocessed_tarballs(metadata: DatasetMetadata) -> List[dict]:
+def get_unprocessed_tarballs(metadata: DatasetMetadata) -> list[dict]:
     """Get a list of tarballs that have not been preprocessed to a given resolution."""
     original_tarballs = get_file_info("original-tarballs")
     existing_parquets = get_preprocessed_parquets(metadata)
@@ -172,7 +171,7 @@ def upload_pqs(pqs: list[Path], metadata: DatasetMetadata) -> None:
     assert_all_same_parent(pqs)
     with tempfile.NamedTemporaryFile(mode="w", delete=False) as files_from:
         for pq in pqs:
-            files_from.write(f"{str(pq.relative_to(parent))}\n")
+            files_from.write(f"{pq.relative_to(parent)!s}\n")
         files_from.flush()
         print(f"Wrote files-from to {files_from.name}")
         subprocess.check_call(

@@ -34,9 +34,10 @@ Then normalize: x = z / ‖z‖.
 """
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Callable, FrozenSet, Literal, Optional
+from typing import Literal
 
 import diffrax
 import flax.linen as nn
@@ -113,9 +114,9 @@ class EuclideanDiffusionModel(nn.Module):
     n_layers: int
     d_model: int
     mlp_expansion_factor: int
-    mlp_dropout_rate: Optional[float]
-    input_dropout_rate: Optional[float]
-    mlp_always_inject: FrozenSet[Literal["x", "t", "cond"]] = field(
+    mlp_dropout_rate: float | None
+    input_dropout_rate: float | None
+    mlp_always_inject: frozenset[Literal["x", "t", "cond"]] = field(
         default_factory=frozenset
     )
     activations_dtype: jnp.dtype = jnp.float32
@@ -137,13 +138,13 @@ class EuclideanDiffusionModel(nn.Module):
     # Hard ceiling on the learned log-SNR maximum. Prevents the schedule from pushing
     # γ_max to extreme values where float32 precision degrades and the recon term
     # dominates the VLB without improving actual sample quality.
-    log_snr_max_cap: Optional[float] = None
+    log_snr_max_cap: float | None = None
 
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
-    d_max_dist: Optional[tuple] = None
-    vlb_variance_loss_weight: Optional[float] = None
+    d_max_dist: tuple | None = None
+    vlb_variance_loss_weight: float | None = None
     classifier_loss_weight: float = 1.0
-    cap_features: FrozenSet[
+    cap_features: frozenset[
         Literal["cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"]
     ] = field(default_factory=lambda: DEFAULT_CAP_FEATURES)
 
@@ -662,7 +663,7 @@ def generate_samples_sde(
     rng: Array,
     cap_params,
     n_steps: int = 200,
-    batch_size: Optional[int] = None,
+    batch_size: int | None = None,
     eta: float = 1.0,
 ) -> Array:
     """Generate samples using the DDPM ancestral sampler in log-SNR space.
@@ -756,8 +757,8 @@ def generate_samples_ode(
     params,
     rng: Array,
     cap_params,
-    n_steps: Optional[int] = None,
-    batch_size: Optional[int] = None,
+    n_steps: int | None = None,
+    batch_size: int | None = None,
     method: str = "diffrax",
     atol: float = 1e-5,
     rtol: float = 1e-5,
@@ -849,7 +850,7 @@ def compute_nll(
     model: EuclideanDiffusionModel,
     params,
     batch: dict,
-    n_steps: Optional[int] = None,
+    n_steps: int | None = None,
     rng=None,
     n_projections: int = 10,
     cap_params=None,
@@ -1127,7 +1128,7 @@ def _compute_log_probability(
     params,
     samples: Array,
     cap_params,
-    n_steps: Optional[int] = None,
+    n_steps: int | None = None,
     rng=None,
     n_projections: int = 10,
     method: str = "diffrax",

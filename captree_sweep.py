@@ -118,7 +118,7 @@ def gen_examples(tree_path, k):
 def main():
     used_params = set()
     try:
-        with open("/mnt/sweeps/results-2024-02-10.json", "r") as f:
+        with open("/mnt/sweeps/results-2024-02-10.json") as f:
             for line in f:
                 params = json.loads(line)["params"]
                 used_params.add(

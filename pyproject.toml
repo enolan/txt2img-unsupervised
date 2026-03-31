@@ -58,8 +58,17 @@ infinidata = { url = "https://github.com/enolan/infinidata/releases/download/v0.
 torch = { url = "https://download.pytorch.org/whl/cpu/torch-2.0.1%2Bcpu-cp311-cp311-linux_x86_64.whl" }
 
 [tool.ruff.lint]
-extend-select = ["I"]
-ignore = ["E731"]
+extend-select = ["I", "B", "UP", "RUF"]
+ignore = [
+    "E731",
+    "B007",  # unused-loop-control-variable — rename to _ is just style
+    "B011",  # assert-false — we use assert False as unreachable markers
+    "B023",  # function-uses-loop-variable — false positives with jax.vmap lambdas
+    "B905",  # zip-without-explicit-strict — too noisy for JAX code
+    "RUF001", "RUF002", "RUF003",  # ambiguous unicode — intentional math symbols
+    "RUF005",  # collection-literal-concatenation — stylistic
+    "RUF059",  # unused-unpacked-variable — rename to _ is just style
+]
 
 [build-system]
 requires = ["hatchling"]
