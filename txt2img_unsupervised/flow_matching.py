@@ -22,22 +22,22 @@ On the sphere, we adapt this paradigm by:
    probability paths, but not used in when calculating the target vector field or flow map. We leave
    it out of the definitions of our models.
 
-2. **Geodesic Trajectories**: While Euclidean FM-OT follows straight lines, spherical FM-OT follows 
-   geodesics (great circles) - the spherical equivalent of straight lines. These paths represent the 
+2. **Geodesic Trajectories**: While Euclidean FM-OT follows straight lines, spherical FM-OT follows
+   geodesics (great circles) - the spherical equivalent of straight lines. These paths represent the
    optimal transport solution on the sphere, minimizing the distance traveled along the manifold.
 
-3. **Vector Field**: The vector field at point x points toward the target x1 along the geodesic 
+3. **Vector Field**: The vector field at point x points toward the target x1 along the geodesic
    connecting them, and has magnitude equal to the length of the geodesic connecting the origin
    sample x0 from the base distribution to the target x1. Mathematically, this is achieved by
    projecting x1 onto the tangent space at x: u_t(x|x1) = acos(x1·x0) * normalize(x1 - (x1·x)x)
-   
+
    This field has two key properties:
    - It is always tangent to the sphere (orthogonal to x)
    - It points along the geodesic toward x1
    - Integrating it from t=0 to t=1 generates a geodesic connecting x0 to x1
 
-4. **Flow Map**: The flow map represents the position at time t of a particle starting at x0 
-   and flowing toward x1. In Euclidean space, this is a linear interpolation; on the sphere, 
+4. **Flow Map**: The flow map represents the position at time t of a particle starting at x0
+   and flowing toward x1. In Euclidean space, this is a linear interpolation; on the sphere,
    it's the spherical linear interpolation (slerp):
    ψ_t(x0) = sin((1-t)θ)/sin(θ) · x0 + sin(tθ)/sin(θ) · x1
    where θ is the angle between x0 and x1.
@@ -48,6 +48,7 @@ guarantees from continuous normalizing flows. The difference is that all computa
 geometry of the sphere, ensuring flows remain on the manifold.
 
 """
+
 import os
 import time
 from dataclasses import dataclass, field, replace
@@ -325,12 +326,12 @@ class VectorField(nn.Module):
             }
             # Optional per-feature injection projections
             for inj_key in self.mlp_always_inject:
-                params_map["mlp_blocks"][
-                    f"gate_proj_{inj_key}"
-                ] = muon_dense_layer_partition_map_biasless
-                params_map["mlp_blocks"][
-                    f"value_proj_{inj_key}"
-                ] = muon_dense_layer_partition_map_biasless
+                params_map["mlp_blocks"][f"gate_proj_{inj_key}"] = (
+                    muon_dense_layer_partition_map_biasless
+                )
+                params_map["mlp_blocks"][f"value_proj_{inj_key}"] = (
+                    muon_dense_layer_partition_map_biasless
+                )
 
             if self.use_pre_mlp_projection:
                 # pre_mlp_proj uses Adam with appropriate muP scaling
@@ -359,12 +360,12 @@ class VectorField(nn.Module):
                 },
             }
             for inj_key in self.mlp_always_inject:
-                params_map["mlp_blocks"][
-                    f"gate_proj_{inj_key}"
-                ] = dense_layer_partition_map_biasless
-                params_map["mlp_blocks"][
-                    f"value_proj_{inj_key}"
-                ] = dense_layer_partition_map_biasless
+                params_map["mlp_blocks"][f"gate_proj_{inj_key}"] = (
+                    dense_layer_partition_map_biasless
+                )
+                params_map["mlp_blocks"][f"value_proj_{inj_key}"] = (
+                    dense_layer_partition_map_biasless
+                )
             if self.use_pre_mlp_projection:
                 # pre_mlp_proj should have its learning rate scaled by 1/m_d because it feeds into the
                 # MLP and gradients go backwards but its initialization should be determined by
@@ -808,39 +809,39 @@ def test_vector_field_projections_normalization(domain_dim, conditioning_dim):
 
     # Check if means are close to 0
     mean_tol = 0.02
-    assert (
-        abs(input_features_mean) < mean_tol
-    ), f"input_features mean should be close to 0, got {input_features_mean}"
-    assert (
-        abs(input_features_variance - 1.0) < 0.05
-    ), f"input_features variance should be close to 1.0, got {input_features_variance}"
-    assert (
-        abs(time_encoding_mean) < mean_tol
-    ), f"time_encoding mean should be close to 0, got {time_encoding_mean}"
-    assert (
-        abs(time_encoding_variance - 1.0) < 0.05
-    ), f"time_encoding variance should be close to 1.0, got {time_encoding_variance}"
+    assert abs(input_features_mean) < mean_tol, (
+        f"input_features mean should be close to 0, got {input_features_mean}"
+    )
+    assert abs(input_features_variance - 1.0) < 0.05, (
+        f"input_features variance should be close to 1.0, got {input_features_variance}"
+    )
+    assert abs(time_encoding_mean) < mean_tol, (
+        f"time_encoding mean should be close to 0, got {time_encoding_mean}"
+    )
+    assert abs(time_encoding_variance - 1.0) < 0.05, (
+        f"time_encoding variance should be close to 1.0, got {time_encoding_variance}"
+    )
 
     if conditioning_dim > 0:
-        assert (
-            abs(cond_vec_mean) < mean_tol
-        ), f"cond_vec mean should be close to 0, got {cond_vec_mean}"
-        assert (
-            abs(cond_vec_variance - 1.0) < 0.05
-        ), f"cond_vec variance should be close to 1.0, got {cond_vec_variance}"
+        assert abs(cond_vec_mean) < mean_tol, (
+            f"cond_vec mean should be close to 0, got {cond_vec_mean}"
+        )
+        assert abs(cond_vec_variance - 1.0) < 0.05, (
+            f"cond_vec variance should be close to 1.0, got {cond_vec_variance}"
+        )
 
-    assert (
-        abs(unpadded_mlp_input_mean) < mean_tol
-    ), f"Unpadded MLP input mean should be close to 0, got {unpadded_mlp_input_mean}"
-    assert (
-        abs(unpadded_mlp_input_variance - 1.0) < 0.05
-    ), f"Unpadded MLP input variance should be close to 1.0, got {unpadded_mlp_input_variance}"
-    assert (
-        abs(padded_mlp_input_mean) < 0.05
-    ), f"Padded MLP input mean should be close to 0, got {padded_mlp_input_mean}"
-    assert (
-        abs(padded_mlp_input_variance - 1.0) < 0.1
-    ), f"Padded MLP input variance should be close to 1.0, got {padded_mlp_input_variance}"
+    assert abs(unpadded_mlp_input_mean) < mean_tol, (
+        f"Unpadded MLP input mean should be close to 0, got {unpadded_mlp_input_mean}"
+    )
+    assert abs(unpadded_mlp_input_variance - 1.0) < 0.05, (
+        f"Unpadded MLP input variance should be close to 1.0, got {unpadded_mlp_input_variance}"
+    )
+    assert abs(padded_mlp_input_mean) < 0.05, (
+        f"Padded MLP input mean should be close to 0, got {padded_mlp_input_mean}"
+    )
+    assert abs(padded_mlp_input_variance - 1.0) < 0.1, (
+        f"Padded MLP input variance should be close to 1.0, got {padded_mlp_input_variance}"
+    )
 
 
 @pytest.mark.parametrize("dim", [3, 16])
@@ -895,9 +896,9 @@ def test_optimal_transport_field_direction(dim):
     print(f"Minimum alignment: {min_similarity:.4f}")
 
     # Assertion to verify alignment
-    assert jnp.all(
-        similarities > 0.99
-    ), "Some vectors are not well aligned with the tangent direction"
+    assert jnp.all(similarities > 0.99), (
+        "Some vectors are not well aligned with the tangent direction"
+    )
 
 
 def slerp(x, y, t):
@@ -1521,9 +1522,9 @@ def test_train_vmf(domain_dim, inject_keys):
         )
 
     # Allow some tolerance due to sampling variability
-    assert (
-        abs(sample_nll - differential_entropy) < 1.0
-    ), f"Sample NLL {sample_nll} too far from differential entropy {differential_entropy}"
+    assert abs(sample_nll - differential_entropy) < 1.0, (
+        f"Sample NLL {sample_nll} too far from differential entropy {differential_entropy}"
+    )
 
 
 @pytest.mark.parametrize("domain_dim", [3, 16])
@@ -1700,19 +1701,19 @@ def test_train_conditional_vmf(domain_dim, inject_keys):
     )
 
     # Samples should align more closely with their respective directions that the other directions
-    assert (
-        cos_sim_0_dir1 > cos_sim_0_dir2
-    ), "Samples with cond=0 don't align more closely with direction1 than direction2"
+    assert cos_sim_0_dir1 > cos_sim_0_dir2, (
+        "Samples with cond=0 don't align more closely with direction1 than direction2"
+    )
     # Samples with cond=1 should align better with direction2
-    assert (
-        cos_sim_1_dir2 > cos_sim_1_dir1
-    ), "Samples with cond=1 don't align more closely with direction2 than direction1"
+    assert cos_sim_1_dir2 > cos_sim_1_dir1, (
+        "Samples with cond=1 don't align more closely with direction2 than direction1"
+    )
 
     # Verify that conditioning makes a significant difference
     diff = (cos_sim_0_dir1 - cos_sim_0_dir2) + (cos_sim_1_dir2 - cos_sim_1_dir1)
-    assert (
-        diff > 0.5
-    ), "Conditioning did not produce sufficiently different distributions"
+    assert diff > 0.5, (
+        "Conditioning did not produce sufficiently different distributions"
+    )
 
     # Additional check: negative log-likelihood (samples should match their respective distributions)
     samples_0_np = np.array(samples_0)
@@ -1723,12 +1724,12 @@ def test_train_conditional_vmf(domain_dim, inject_keys):
     nll_1_from_vmf1 = -np.mean(vmf1.logpdf(samples_1_np))
     nll_1_from_vmf2 = -np.mean(vmf2.logpdf(samples_1_np))
 
-    assert (
-        nll_0_from_vmf1 < nll_0_from_vmf2
-    ), "Samples with cond=0 don't match distribution 1"
-    assert (
-        nll_1_from_vmf2 < nll_1_from_vmf1
-    ), "Samples with cond=1 don't match distribution 2"
+    assert nll_0_from_vmf1 < nll_0_from_vmf2, (
+        "Samples with cond=0 don't match distribution 1"
+    )
+    assert nll_1_from_vmf2 < nll_1_from_vmf1, (
+        "Samples with cond=1 don't match distribution 2"
+    )
 
     distribution_nll = vmf1.entropy()
     print(f"Theoretical NLL: {distribution_nll:.4f}")
@@ -1736,12 +1737,12 @@ def test_train_conditional_vmf(domain_dim, inject_keys):
     print(f"NLL with cond=0 from vmf2: {nll_0_from_vmf2:.4f}")
     print(f"NLL with cond=1 from vmf1: {nll_1_from_vmf1:.4f}")
     print(f"NLL with cond=1 from vmf2: {nll_1_from_vmf2:.4f}")
-    assert (
-        abs(nll_0_from_vmf1 - distribution_nll) < 0.5
-    ), "NLL with cond=0 from vmf1 is not close to the theoretical NLL"
-    assert (
-        abs(nll_1_from_vmf2 - distribution_nll) < 0.5
-    ), "NLL with cond=1 from vmf2 is not close to the theoretical NLL"
+    assert abs(nll_0_from_vmf1 - distribution_nll) < 0.5, (
+        "NLL with cond=0 from vmf1 is not close to the theoretical NLL"
+    )
+    assert abs(nll_1_from_vmf2 - distribution_nll) < 0.5, (
+        "NLL with cond=1 from vmf2 is not close to the theoretical NLL"
+    )
 
 
 @partial(jax.jit, inline=True)
@@ -2115,16 +2116,16 @@ def _filter_and_pad_to_size(
         # Filter to live trajectories using the boolean mask directly
         if padding_axis_len is None:
             padding_axis_len = arr.shape[0]
-            assert (
-                live_mask.shape[0] == padding_axis_len
-            ), f"Live mask length mismatch: {live_mask.shape[0]=} {padding_axis_len=}"
-            assert (
-                jnp.sum(live_mask) <= target_size
-            ), f"Input array too long, padding would be negative: {jnp.sum(live_mask)=} {target_size=}"
+            assert live_mask.shape[0] == padding_axis_len, (
+                f"Live mask length mismatch: {live_mask.shape[0]=} {padding_axis_len=}"
+            )
+            assert jnp.sum(live_mask) <= target_size, (
+                f"Input array too long, padding would be negative: {jnp.sum(live_mask)=} {target_size=}"
+            )
         else:
-            assert (
-                padding_axis_len == arr.shape[0]
-            ), f"Padding axis length mismatch: {padding_axis_len=} {arr.shape[0]=}"
+            assert padding_axis_len == arr.shape[0], (
+                f"Padding axis length mismatch: {padding_axis_len=} {arr.shape[0]=}"
+            )
         filtered = arr[live_mask]
 
         # Pad to target size if needed
@@ -2585,20 +2586,20 @@ def _tsit5_integrate_core(
     final_iteration_counts = all_iteration_counts[sort_indices]
 
     # Assert correct output shapes
-    assert (
-        final_x.shape == x0.shape
-    ), f"final_x shape {final_x.shape} != x0 shape {x0.shape}"
-    assert (
-        final_t.shape == dt_initial.shape
-    ), f"final_t shape {final_t.shape} != dt_initial shape {dt_initial.shape}"
+    assert final_x.shape == x0.shape, (
+        f"final_x shape {final_x.shape} != x0 shape {x0.shape}"
+    )
+    assert final_t.shape == dt_initial.shape, (
+        f"final_t shape {final_t.shape} != dt_initial shape {dt_initial.shape}"
+    )
     if step_carry_init is not None:
-        assert (
-            final_step_carry.shape == step_carry_init.shape
-        ), f"final_step_carry shape {final_step_carry.shape} != step_carry_init shape {step_carry_init.shape}"
+        assert final_step_carry.shape == step_carry_init.shape, (
+            f"final_step_carry shape {final_step_carry.shape} != step_carry_init shape {step_carry_init.shape}"
+        )
     else:
-        assert final_step_carry.shape == (
-            initial_batch_size,
-        ), f"final_step_carry shape {final_step_carry.shape} != expected shape ({initial_batch_size},)"
+        assert final_step_carry.shape == (initial_batch_size,), (
+            f"final_step_carry shape {final_step_carry.shape} != expected shape ({initial_batch_size},)"
+        )
     final_done = jnp.abs(final_t - target_time) < 1e-6  # Check if reached target time
 
     # Diagnostic information
@@ -3423,9 +3424,9 @@ def hutchinson_estimator(
         if t.ndim == 0:
             t_vec = jnp.full((batch_size,), t)
         elif t.ndim == 1:
-            assert (
-                t.shape[0] == batch_size
-            ), "Per-sample time vector must match batch size"
+            assert t.shape[0] == batch_size, (
+                "Per-sample time vector must match batch size"
+            )
             t_vec = t
         else:
             raise ValueError("Unsupported t shape for hutchinson_estimator")
@@ -3439,9 +3440,9 @@ def hutchinson_estimator(
         # Handle both single values and tree structures
         if isinstance(per_sample_leading_dims, int):
             # Single array case
-            assert (
-                per_sample_leading_dims == batch_size
-            ), "Per-sample leading dim must equal batch_size"
+            assert per_sample_leading_dims == batch_size, (
+                "Per-sample leading dim must equal batch_size"
+            )
         else:
             # Tree structure case
             assert all(
@@ -3561,9 +3562,9 @@ def exact_divergence(
         if t.ndim == 0:
             t_vec = jnp.full((batch_size,), t)
         elif t.ndim == 1:
-            assert (
-                t.shape[0] == batch_size
-            ), "Per-sample time vector must match batch size"
+            assert t.shape[0] == batch_size, (
+                "Per-sample time vector must match batch size"
+            )
             t_vec = t
         else:
             raise ValueError("Unsupported t shape for exact_divergence")
@@ -3928,9 +3929,9 @@ def test_divergence_estimate(divergence_fn, n_projections, field):
         )
     else:
         # Check if the estimate is within 10% of expected value
-        assert (
-            abs(mean_error) < 0.2
-        ), f"Hutchinson estimator not calculating correct divergence: got {mean_error}, expected {expected_divergence}"
+        assert abs(mean_error) < 0.2, (
+            f"Hutchinson estimator not calculating correct divergence: got {mean_error}, expected {expected_divergence}"
+        )
         if div_std is not None:
             assert jnp.all(div_std >= 0)
 
@@ -4333,9 +4334,9 @@ def test_tsit5_adaptive_requires_fewer_steps_than_rk4():
     rk4_total_evals = (
         int(rk4_eval_counts[0]) * batch_size
     )  # RK4 uses same count for all trajectories
-    assert (
-        tsit5_total_evals < rk4_total_evals
-    ), f"Adaptive Tsit5 used too many evals: {tsit5_total_evals} vs RK4 {rk4_total_evals}"
+    assert tsit5_total_evals < rk4_total_evals, (
+        f"Adaptive Tsit5 used too many evals: {tsit5_total_evals} vs RK4 {rk4_total_evals}"
+    )
 
     print(
         f"\nTsit5 test passed! Used {tsit5_total_evals} calls vs RK4's {rk4_total_evals} calls"
@@ -4873,9 +4874,9 @@ def test_train_hemisphere_density(inject_keys):
         f"South hemisphere log-prob stats: min={south_log_probs.min():.4f}, max={south_log_probs.max():.4f}, threshold={threshold:.4f}"
     )
     too_high = jnp.sum(south_log_probs > threshold)
-    assert (
-        too_high / n_test < 0.05
-    ), f"{too_high} south-hemisphere points have log prob >= threshold"
+    assert too_high / n_test < 0.05, (
+        f"{too_high} south-hemisphere points have log prob >= threshold"
+    )
 
 
 @pytest.mark.parametrize(
@@ -5087,22 +5088,22 @@ def test_shrinking_batch_reduces_work():
         )
 
         # Check that both integrations completed successfully
-        assert jnp.all(
-            jnp.abs(t_batched - 1.0) < 1e-6
-        ), "Batched integration should reach t=1.0"
-        assert jnp.all(
-            jnp.abs(t_no_batching - 1.0) < 1e-6
-        ), "Non-batched integration should reach t=1.0"
+        assert jnp.all(jnp.abs(t_batched - 1.0) < 1e-6), (
+            "Batched integration should reach t=1.0"
+        )
+        assert jnp.all(jnp.abs(t_no_batching - 1.0) < 1e-6), (
+            "Non-batched integration should reach t=1.0"
+        )
 
         # Check that all points remain on the sphere
         norms_batched = jnp.linalg.norm(x_batched, axis=1)
         norms_no_batching = jnp.linalg.norm(x_no_batching, axis=1)
-        assert jnp.all(
-            jnp.abs(norms_batched - 1.0) < 1e-5
-        ), "Batched points should remain on unit sphere"
-        assert jnp.all(
-            jnp.abs(norms_no_batching - 1.0) < 1e-5
-        ), "Non-batched points should remain on unit sphere"
+        assert jnp.all(jnp.abs(norms_batched - 1.0) < 1e-5), (
+            "Batched points should remain on unit sphere"
+        )
+        assert jnp.all(jnp.abs(norms_no_batching - 1.0) < 1e-5), (
+            "Non-batched points should remain on unit sphere"
+        )
 
         # Compare work done
         print(f"Work with batching: {work_batched} work units")
@@ -5242,12 +5243,12 @@ def test_shrinking_batch_disabled_fallback():
     )
 
     # Both integrations should reach t=1.0
-    assert jnp.all(
-        jnp.abs(t_disabled - 1.0) < 1e-6
-    ), f"Disabled integration should reach t=1.0, got {jnp.min(t_disabled):.6f} to {jnp.max(t_disabled):.6f}"
-    assert jnp.all(
-        jnp.abs(t_enabled - 1.0) < 1e-6
-    ), f"Enabled integration should reach t=1.0, got {jnp.min(t_enabled):.6f} to {jnp.max(t_enabled):.6f}"
+    assert jnp.all(jnp.abs(t_disabled - 1.0) < 1e-6), (
+        f"Disabled integration should reach t=1.0, got {jnp.min(t_disabled):.6f} to {jnp.max(t_disabled):.6f}"
+    )
+    assert jnp.all(jnp.abs(t_enabled - 1.0) < 1e-6), (
+        f"Enabled integration should reach t=1.0, got {jnp.min(t_enabled):.6f} to {jnp.max(t_enabled):.6f}"
+    )
 
     # Results should be similar (both use adaptive integration but may take different paths)
     position_error = jnp.max(jnp.linalg.norm(x_disabled - x_enabled, axis=1))
@@ -5271,9 +5272,9 @@ def test_polynomial_eta_estimator_with_linear_data(degree):
     eta = est.eta_seconds()
     assert eta is not None
     # 20 more iterations needed at 0.5s each → ETA ≈ 10s
-    assert (
-        8.0 < eta < 12.0
-    ), f"degree={degree}: Expected ETA ~10s for linear data, got {eta:.2f}"
+    assert 8.0 < eta < 12.0, (
+        f"degree={degree}: Expected ETA ~10s for linear data, got {eta:.2f}"
+    )
 
 
 @pytest.mark.parametrize("degree", [2, 3, 4])
@@ -5322,9 +5323,9 @@ def test_polynomial_eta_format():
     eta2 = est2.eta_seconds()
     assert eta2 is not None and eta2 >= 3600, f"Expected ETA > 1hr, got {eta2}"
     formatted2 = est2.format_eta()
-    assert (
-        len(formatted2.split(":")) == 3
-    ), f"Expected HH:MM:SS format, got {formatted2}"
+    assert len(formatted2.split(":")) == 3, (
+        f"Expected HH:MM:SS format, got {formatted2}"
+    )
 
 
 def test_polynomial_eta_weighting_emphasizes_recent_data():

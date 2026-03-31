@@ -140,7 +140,7 @@ dataclasses where they make sense. Use type hints.
 ## Formatting
 
 * Follow PEP 8 naming conventions
-* Format code with Black
+* Format code with `ruff format`
 * Import order: external libraries, then local, both in alphabetical order. Always at the top of a
   source file, after any docstrings. Never put imports inside functions or classes.
 
@@ -248,7 +248,7 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
   - `uv run python path/to/file.py`
   - `uv run python -m txt2img_unsupervised.module_name`
   - `uv run python -c 'print("Hello, Claude!")'`
-- Code formatting: `uv run black *.py txt2img_unsupervised/*.py`
+- Code formatting: `uv run ruff format *.py txt2img_unsupervised/*.py`
 
 ## JAX-specific reminders
 - Pay attention to the special requirements for traced JAX functions:

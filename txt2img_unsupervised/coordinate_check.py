@@ -474,7 +474,7 @@ def main():
             tqdm.write(f"Starting training with {args.n_seeds} seeds")
 
             for seed_idx in trange(args.n_seeds, desc="Seeds", leave=False):
-                tqdm.write(f"Training with seed {seed_idx+1}/{args.n_seeds}")
+                tqdm.write(f"Training with seed {seed_idx + 1}/{args.n_seeds}")
 
                 init_key, train_key = jax.random.split(seed_keys[seed_idx])
 
@@ -495,7 +495,7 @@ def main():
                 activations_this_seed = []
                 for i, batch in tenumerate(
                     dset_train.iter(args.batch_size, drop_last_batch=True),
-                    desc=f"Seed {seed_idx+1} steps",
+                    desc=f"Seed {seed_idx + 1} steps",
                     total=args.n_train_steps,
                 ):
                     loss, processed_intermediates, params, opt_state, rng = train_step(
@@ -527,7 +527,7 @@ def main():
                 seed_test_losses[seed_idx] = np.array(test_loss)
                 tqdm.write(f"Test loss: {test_loss}")
 
-                tqdm.write(f"Seed {seed_idx+1} training complete")
+                tqdm.write(f"Seed {seed_idx + 1} training complete")
                 all_seed_activations.append(activations_this_seed)
                 del processed_intermediates, params, opt_state, rng
                 gc.collect()
@@ -621,7 +621,7 @@ def generate_activation_charts(d_model_values, activations, n_layers, args):
                 values,
                 marker="o",
                 color=colors[step],
-                label=f"Step {step+1}",
+                label=f"Step {step + 1}",
             )
 
         # Configure the main chart
@@ -747,7 +747,7 @@ def generate_loss_charts(d_model_values, lr_combinations, losses, test_losses, a
         plt.ylim(bottom=0)
         plt.xlabel("Adam Learning Rate (log scale)")
         plt.ylabel("Loss")
-        title = f"Loss vs Learning Rate at Step {step_idx+1}/{args.n_train_steps}"
+        title = f"Loss vs Learning Rate at Step {step_idx + 1}/{args.n_train_steps}"
         if args.use_muon:
             title += " (Mixed Adam/Muon)"
         plt.title(title)
@@ -1063,11 +1063,13 @@ def generate_3d_loss_plots(d_model_values, lr_combinations, test_losses, args):
             return f"{10**x:.1e}"
 
         # Create custom ticks at reasonable intervals
-        adam_log_min, adam_log_max = np.log10(min(unique_adam_lrs)), np.log10(
-            max(unique_adam_lrs)
+        adam_log_min, adam_log_max = (
+            np.log10(min(unique_adam_lrs)),
+            np.log10(max(unique_adam_lrs)),
         )
-        muon_log_min, muon_log_max = np.log10(min(unique_muon_lrs)), np.log10(
-            max(unique_muon_lrs)
+        muon_log_min, muon_log_max = (
+            np.log10(min(unique_muon_lrs)),
+            np.log10(max(unique_muon_lrs)),
         )
 
         adam_ticks = np.linspace(
@@ -1148,11 +1150,13 @@ def generate_3d_loss_plots(d_model_values, lr_combinations, test_losses, args):
     ax.legend(loc="upper left", bbox_to_anchor=(0.02, 0.98))
 
     # Set custom ticks
-    adam_log_min, adam_log_max = np.log10(min(unique_adam_lrs)), np.log10(
-        max(unique_adam_lrs)
+    adam_log_min, adam_log_max = (
+        np.log10(min(unique_adam_lrs)),
+        np.log10(max(unique_adam_lrs)),
     )
-    muon_log_min, muon_log_max = np.log10(min(unique_muon_lrs)), np.log10(
-        max(unique_muon_lrs)
+    muon_log_min, muon_log_max = (
+        np.log10(min(unique_muon_lrs)),
+        np.log10(max(unique_muon_lrs)),
     )
 
     adam_ticks = np.linspace(adam_log_min, adam_log_max, min(5, len(unique_adam_lrs)))

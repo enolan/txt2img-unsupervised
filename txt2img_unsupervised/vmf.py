@@ -34,9 +34,9 @@ def _prepare_sample_inputs(
     Returns:
         (mu, kappa, dim) where mu is (n_samples, d) normalized, kappa is (n_samples,)
     """
-    assert jnp.issubdtype(
-        mu.dtype, jnp.floating
-    ), f"mu must have float dtype, got {mu.dtype}"
+    assert jnp.issubdtype(mu.dtype, jnp.floating), (
+        f"mu must have float dtype, got {mu.dtype}"
+    )
 
     if mu.ndim == 1:
         dim = mu.shape[0]
@@ -46,12 +46,12 @@ def _prepare_sample_inputs(
     elif mu.ndim == 2:
         batch_size, dim = mu.shape
         kappa = jnp.asarray(kappa)
-        assert (
-            batch_size == n_samples
-        ), f"mu batch size ({batch_size}) must match n_samples ({n_samples})"
-        assert kappa.shape == (
-            n_samples,
-        ), f"kappa must have shape ({n_samples},), got {kappa.shape}"
+        assert batch_size == n_samples, (
+            f"mu batch size ({batch_size}) must match n_samples ({n_samples})"
+        )
+        assert kappa.shape == (n_samples,), (
+            f"kappa must have shape ({n_samples},), got {kappa.shape}"
+        )
         mu = mu / jnp.linalg.norm(mu, axis=1, keepdims=True)
     else:
         raise ValueError(f"mu must be 1D or 2D, got {mu.ndim}D")

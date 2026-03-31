@@ -108,9 +108,9 @@ class ImageModel(nn.Module):
 
         # When training, we generate caps for each image in ImageModel.gen_training_caps.
 
-        assert (
-            self.clip_conditioning or not self.clip_caps
-        ), "Can't use clip_caps without clip_conditioning"
+        assert self.clip_conditioning or not self.clip_caps, (
+            "Can't use clip_caps without clip_conditioning"
+        )
 
         if self.clip_caps:
             assert self.clip_cap_count is not None, "clip_cap_count must be set"
@@ -414,9 +414,9 @@ class ImageModel(nn.Module):
         when this is done."""
         assert self.decode
         # TODO test CPP flash attention, maybe it works.
-        assert (
-            self.attn_method == AttnMethod.STANDARD
-        ), "Only standard attention works with decoding."
+        assert self.attn_method == AttnMethod.STANDARD, (
+            "Only standard attention works with decoding."
+        )
 
         batch_size = clip_embeddings.shape[0]
 
@@ -430,7 +430,9 @@ class ImageModel(nn.Module):
         else:
             assert (
                 clip_embeddings.shape == max_cos_distances.shape == (batch_size, 0)
-            ), f"Expected empty shapes, got {clip_embeddings.shape} and {max_cos_distances.shape}"
+            ), (
+                f"Expected empty shapes, got {clip_embeddings.shape} and {max_cos_distances.shape}"
+            )
 
         cond_tokens = self.gen_conditioning_tokens(clip_embeddings, max_cos_distances)
         assert cond_tokens.shape == (batch_size, self.prepended_tokens(), self.d_model)
@@ -456,12 +458,12 @@ class ImageModel(nn.Module):
         """Do a step of iterative decoding from the model. Returns the logits for the next set of
         tokens. See below tests for usage examples.
         """
-        assert (
-            self.decode
-        ), "Can't call decode_step on a model that wasn't set up for decoding."
-        assert (
-            self.attn_method == AttnMethod.STANDARD
-        ), "Only standard attention works with decoding."
+        assert self.decode, (
+            "Can't call decode_step on a model that wasn't set up for decoding."
+        )
+        assert self.attn_method == AttnMethod.STANDARD, (
+            "Only standard attention works with decoding."
+        )
         assert len(toks.shape) == 1
         batch_size = toks.shape[0]
         assert toks.dtype == jnp.int32 or toks.dtype == jnp.int64
@@ -581,9 +583,9 @@ def calculate_discrete_power_law_pmf(n_max, alpha):
 @pytest.mark.parametrize("alpha", [0.5, 1.0, 4.0])
 def test_calculate_discrete_power_law_pmf_increasing(n_caps: int, alpha: float):
     probs = calculate_discrete_power_law_pmf(n_caps, alpha)
-    assert jnp.all(
-        jnp.diff(probs) >= 0
-    ), "Probabilities must be monotonically increasing"
+    assert jnp.all(jnp.diff(probs) >= 0), (
+        "Probabilities must be monotonically increasing"
+    )
 
 
 @pytest.mark.parametrize("n_caps", [1, 2, 3, 4, 10])
@@ -1103,7 +1105,7 @@ def test_batched_decode_consistency() -> None:
         params_1 = flax.core.copy(params_1, new_cache)
         for j in trange(
             mdl_nodec.image_tokens - 1,
-            desc=f"Processing tokens for image {i+1}",
+            desc=f"Processing tokens for image {i + 1}",
             leave=False,
         ):
             logits_1[i, j + 1], new_cache = decode_step_j(
@@ -1407,9 +1409,9 @@ def test_filter_top_p_10() -> None:
     """Test that filter_top_p is the identity function when top_p = 1.0."""
     logits = jnp.arange(10, dtype=jnp.float32)
     filtered_logits = _filter_top_p(logits, 1.0)
-    assert jnp.allclose(
-        filtered_logits, logits
-    ), "filter_top_p doesn't match the identity function when top_p = 1.0"
+    assert jnp.allclose(filtered_logits, logits), (
+        "filter_top_p doesn't match the identity function when top_p = 1.0"
+    )
 
 
 @pytest.mark.parametrize("offset", [0.0, 1.0, -1.0, -0.25, 500.0])
@@ -1528,12 +1530,12 @@ class TransformerLayer(nn.Module):
                 dtype=None,
                 precision=None,
             ):
-                assert (
-                    len(q.shape) == len(k.shape) == len(v.shape) == 4
-                ), f"q k v shapes: {q.shape} {k.shape} {v.shape}, expected: (batch, seq_len, heads, head_dim)"
-                assert (
-                    q.shape[0] == k.shape[0] == v.shape[0]
-                ), "batch dimensions must match"
+                assert len(q.shape) == len(k.shape) == len(v.shape) == 4, (
+                    f"q k v shapes: {q.shape} {k.shape} {v.shape}, expected: (batch, seq_len, heads, head_dim)"
+                )
+                assert q.shape[0] == k.shape[0] == v.shape[0], (
+                    "batch dimensions must match"
+                )
                 batch_size = q.shape[0]
                 assert q.shape[1] == k.shape[1] == v.shape[1], "seq_len must match"
                 seq_len = q.shape[1]
@@ -1548,9 +1550,9 @@ class TransformerLayer(nn.Module):
                 q, k, v = map(rearrange_qkv, (q, k, v))
 
                 assert bias is None, "attention bias not implemented"
-                assert (
-                    mask is None
-                ), "attention mask is redundant with causal_flash_attention"
+                assert mask is None, (
+                    "attention mask is redundant with causal_flash_attention"
+                )
                 assert dropout_rate == 0.0, "attention dropout not implemented"
 
                 try:
@@ -1591,9 +1593,9 @@ class TransformerLayer(nn.Module):
                 precision=None,
             ):
                 assert mask is None, "attention mask should be None for cudnn attention"
-                assert (
-                    dropout_rate == 0.0
-                ), "attention dropout not implemented for cudnn attention"
+                assert dropout_rate == 0.0, (
+                    "attention dropout not implemented for cudnn attention"
+                )
                 assert dtype in [
                     jnp.bfloat16,
                     jnp.float16,
@@ -1750,7 +1752,9 @@ def loss_batch_tokens(
     assert batch_imgs.shape == (
         batch_size,
         model.image_tokens,
-    ), f"batch_img.shape: {batch_imgs.shape}, expected: {(batch_size, model.image_tokens)}"
+    ), (
+        f"batch_img.shape: {batch_imgs.shape}, expected: {(batch_size, model.image_tokens)}"
+    )
     if model.clip_conditioning and not model.clip_caps:
         assert batch_clips.shape == (batch_size, 768)
         assert batch_max_cos_distances.shape == (batch_size, 0)

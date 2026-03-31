@@ -68,9 +68,9 @@ def get_batch(
     for field in fields:
         assert field in batch_dict, f"Field {field} not found in dataset"
         data = batch_dict[field]
-        assert (
-            data.shape[0] == batch_size
-        ), f"Expected batch size {batch_size}, got {data.shape[0]}"
+        assert data.shape[0] == batch_size, (
+            f"Expected batch size {batch_size}, got {data.shape[0]}"
+        )
         result[field] = jax.device_put(data, sharding)
 
     return result

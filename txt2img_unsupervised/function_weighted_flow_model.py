@@ -232,7 +232,7 @@ class FunctionWeightedFlowModel(nn.Module):
             for i in range(1, len(d_max_values)):
                 if d_max_values[i] <= d_max_values[i - 1]:
                     raise ValueError(
-                        f"d_max_dist upper bounds must be in ascending order, but got {d_max_values[i-1]:.3f} >= {d_max_values[i]:.3f}"
+                        f"d_max_dist upper bounds must be in ascending order, but got {d_max_values[i - 1]:.3f} >= {d_max_values[i]:.3f}"
                     )
 
             # Sanity check: verify d_max_dist compatibility with base distribution
@@ -355,9 +355,9 @@ class FunctionWeightedFlowModel(nn.Module):
         """
         rng = self.make_rng("sample_base")
         if self.base_distribution == BaseDistribution.CAP:
-            assert (
-                self.weighting_function == WeightingFunction.CAP_INDICATOR
-            ), "CAP base distribution only supported with CAP_INDICATOR weighting"
+            assert self.weighting_function == WeightingFunction.CAP_INDICATOR, (
+                "CAP base distribution only supported with CAP_INDICATOR weighting"
+            )
             assert (
                 isinstance(weighting_function_params, tuple)
                 and len(weighting_function_params) == 2
@@ -426,13 +426,15 @@ class FunctionWeightedFlowModel(nn.Module):
             batch_size,
             self.domain_dim,
         ), f"cond_vecs.shape: {cond_vecs.shape}"
-        assert cond_scalars.shape == (
-            batch_size,
-        ), f"cond_scalars.shape: {cond_scalars.shape}"
+        assert cond_scalars.shape == (batch_size,), (
+            f"cond_scalars.shape: {cond_scalars.shape}"
+        )
         assert self.weighting_function in [
             WeightingFunction.CAP_INDICATOR,
             WeightingFunction.SMOOTHED_CAP_INDICATOR,
-        ], f"process_weighting_function_params called with unsupported weighting function: {self.weighting_function}"
+        ], (
+            f"process_weighting_function_params called with unsupported weighting function: {self.weighting_function}"
+        )
 
         processed_cond_vecs = encode_cap_params(
             cap_center=cond_vecs,
@@ -791,9 +793,9 @@ def test_fwfm_base_distribution_sampling(base_distribution, domain_dim):
 
     if base_distribution == BaseDistribution.HEMISPHERE:
         # All samples should have first coordinate >= 0
-        assert jnp.all(
-            samples[:, 0] >= 0
-        ), "All samples should be in northern hemisphere"
+        assert jnp.all(samples[:, 0] >= 0), (
+            "All samples should be in northern hemisphere"
+        )
     elif base_distribution == BaseDistribution.SPHERE:
         # For full sphere, roughly half should be positive, half negative
         positive_count = jnp.sum(samples[:, 0] >= 0)
@@ -1034,9 +1036,9 @@ def compute_log_probability(
     Compute the log probability of samples under a function-weighted flow model.
     """
     if model.base_distribution == BaseDistribution.CAP:
-        assert (
-            model.weighting_function == WeightingFunction.CAP_INDICATOR
-        ), "CAP base distribution only supported with CAP_INDICATOR weighting"
+        assert model.weighting_function == WeightingFunction.CAP_INDICATOR, (
+            "CAP base distribution only supported with CAP_INDICATOR weighting"
+        )
         assert (
             isinstance(weighting_function_params, tuple)
             and len(weighting_function_params) == 2
@@ -1343,7 +1345,7 @@ def test_train_trivial_distribution(
         raise ValueError(f"Unknown weighting function: {weighting_function}")
     # Test each parameter set
     for i, params in enumerate(param_sets):
-        print(f"Testing parameter set {i+1}/{len(param_sets)}: {params}")
+        print(f"Testing parameter set {i + 1}/{len(param_sets)}: {params}")
 
         # Compute true weights
         if params is None:
@@ -1495,9 +1497,9 @@ def test_train_trivial_distribution(
                 f"    Mean diff: {jnp.mean(model_valid_probs_for_positive_weights - expected_log_probs):.3f}"
             )
 
-            assert count_diffs_over_15pct < 0.2 * len(
-                absdiffs
-            ), f"Too many likelihoods differ by more than 15%: {count_diffs_over_15pct}/{len(absdiffs)}"
+            assert count_diffs_over_15pct < 0.2 * len(absdiffs), (
+                f"Too many likelihoods differ by more than 15%: {count_diffs_over_15pct}/{len(absdiffs)}"
+            )
         else:
             print(f"  WARNING: No positive weights found for parameter set {params}")
 
@@ -1537,9 +1539,9 @@ def test_train_trivial_distribution(
                 f"    Number of points with log prob > {sufficiently_negative_logprob}: {num_too_high}/{len(zero_weight_log_probs)}"
             )
 
-            assert (
-                num_too_high / len(zero_weight_log_probs) < 0.20
-            ), f"{num_too_high} zero-weight points have log prob >= {sufficiently_negative_logprob}"
+            assert num_too_high / len(zero_weight_log_probs) < 0.20, (
+                f"{num_too_high} zero-weight points have log prob >= {sufficiently_negative_logprob}"
+            )
 
 
 def compute_hemisphere_probability_masses(model, params, rng, n_samples, n_projections):

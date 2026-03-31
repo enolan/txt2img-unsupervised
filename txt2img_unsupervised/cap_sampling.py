@@ -327,7 +327,7 @@ def sample_negative_cap_center(rng, table, v, d_max):
 
 
 def process_d_max_dist(
-    d_max_dist: list[tuple[float, float]] = None
+    d_max_dist: list[tuple[float, float]] = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
     """Process a d_max_dist parameter into normalized weights, range starts, and range ends. Used
     when sampling maximum cosine distances from mixtures of uniform distributions.

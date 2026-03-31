@@ -151,9 +151,9 @@ def find_sfw_indices(clip_mdl, clip_processor, dset, n: int):
     ok_sims = sims < 0.2
     print(f"Found {ok_sims.sum()} images with similarity < 0.2")
     ok_indices = jnp.where(ok_sims)[0]
-    assert (
-        len(ok_indices) >= n
-    ), f"Found {len(ok_indices)} images with similarity < 0.2, expected at least {n}"
+    assert len(ok_indices) >= n, (
+        f"Found {len(ok_indices)} images with similarity < 0.2, expected at least {n}"
+    )
     return jax.device_get(ok_indices[:n])
 
 
@@ -391,9 +391,9 @@ def sample_and_log(
             # pixel arrays so we use this dumb hack.
             imgs = np.empty((len(imgs_list),), dtype=object)
             imgs[:] = imgs_list
-            assert imgs.shape == (
-                len(all_centers_for_sampling),
-            ), f"imgs.shape {imgs.shape}"
+            assert imgs.shape == (len(all_centers_for_sampling),), (
+                f"imgs.shape {imgs.shape}"
+            )
 
             img_imgs = imgs[: len(img_centers_for_sampling)]
             text_imgs = imgs[len(img_centers_for_sampling) :]
@@ -424,9 +424,9 @@ def sample_and_log(
                     grid_pil = sample.make_grid(
                         [img for img in img_imgs[i, j]],
                     )
-                    to_log[
-                        f"samples/imgprompts/{name}/max_dist{dist:.2f}"
-                    ] = wandb.Image(grid_pil)
+                    to_log[f"samples/imgprompts/{name}/max_dist{dist:.2f}"] = (
+                        wandb.Image(grid_pil)
+                    )
 
             for i, name in enumerate(text_prompt_clips["name"]):
                 grid_pil = sample.make_grid(
@@ -470,9 +470,9 @@ def sample_and_log(
 
             imgs = np.empty((len(imgs_list),), dtype=object)
             imgs[:] = imgs_list
-            assert imgs.shape == (
-                len(all_clip_embeddings_for_sampling),
-            ), f"imgs.shape {imgs.shape}"
+            assert imgs.shape == (len(all_clip_embeddings_for_sampling),), (
+                f"imgs.shape {imgs.shape}"
+            )
 
             img_imgs = imgs[: len(img_clip_embeddings_for_sampling)]
             text_imgs = imgs[len(img_clip_embeddings_for_sampling) :]

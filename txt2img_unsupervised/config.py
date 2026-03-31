@@ -1,4 +1,5 @@
 """Serializable configuration for the model and training parameters."""
+
 import argparse
 import importlib
 import json
@@ -365,9 +366,9 @@ class FlowMatchingModelConfig(VectorFieldConfig):
                 )
             elif weighting_function == WeightingFunction.SMOOTHED_CAP_INDICATOR:
                 processed_params = _convert_d_max_dist_to_tuples(extra_params)
-                out[
-                    "weighting_function_extra_params"
-                ] = SmoothedCapIndicatorExtraParams(**processed_params)
+                out["weighting_function_extra_params"] = (
+                    SmoothedCapIndicatorExtraParams(**processed_params)
+                )
             else:
                 raise ValueError(
                     "weighting_function_extra_params provided for unsupported weighting function"

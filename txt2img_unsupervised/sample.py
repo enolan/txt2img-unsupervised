@@ -56,9 +56,9 @@ def batches_split(batch_size: int, n: int) -> list[int]:
 
 @partial(jax.jit, static_argnums=(0,))
 def sample_jv(mdl, params, top_p, clip_embeddings, max_cos_distances, rngs):
-    assert (
-        clip_embeddings.shape[0] == max_cos_distances.shape[0] == rngs.shape[0]
-    ), "Number of clip embeddings, max cosine distances, and random keys should be equal"
+    assert clip_embeddings.shape[0] == max_cos_distances.shape[0] == rngs.shape[0], (
+        "Number of clip embeddings, max cosine distances, and random keys should be equal"
+    )
     return jax.vmap(
         lambda clip_embedding, max_cos_distance, rng: sample(
             mdl,
@@ -404,9 +404,9 @@ def test_sample_loop_batch_equivalence():
     samples_64 = sample_bs(64)
 
     # check
-    assert (
-        len(samples_1) == len(samples_64) == n_samples
-    ), "Number of samples should be equal"
+    assert len(samples_1) == len(samples_64) == n_samples, (
+        "Number of samples should be equal"
+    )
     close_samples, far_samples = [], []
     for idx, (s1, s64) in enumerate(zip(samples_1, samples_64)):
         s1_arr, s64_arr = np.asarray(s1), np.asarray(s64)
@@ -420,9 +420,9 @@ def test_sample_loop_batch_equivalence():
     if len(far_samples) > 0:
         print(f"Far samples: {far_samples}")
         print(f"Close samples: {close_samples}")
-        assert (
-            len(close_samples) >= 0.95 * n_samples
-        ), "Too many substantially different samples"
+        assert len(close_samples) >= 0.95 * n_samples, (
+            "Too many substantially different samples"
+        )
 
 
 def mk_filler_caps(model, n_cap_sets, n_used_caps, rng):
@@ -800,15 +800,15 @@ def main():
         # Handle conditioning inputs (both single-stage and two-stage)
         if args.flow_model is not None:
             # Flow models act like they have a single cap constraint
-            assert (
-                len(cond_dicts) == 1
-            ), "Flow models support only one CLIP embedding (like clip_cap_count=1)"
+            assert len(cond_dicts) == 1, (
+                "Flow models support only one CLIP embedding (like clip_cap_count=1)"
+            )
             clip_embedding = cond_dicts[0]["clip_embedding"]
             max_cos_distance = cond_dicts[0]["max_cos_distance"]
             assert clip_embedding.shape == (768,)
-            assert (
-                max_cos_distance is not None
-            ), "Must specify max cosine distance for flow model"
+            assert max_cos_distance is not None, (
+                "Must specify max cosine distance for flow model"
+            )
 
             # Flow model expects cap centers and distances for n images
             cap_centers = repeat(clip_embedding, "clip -> n clip", n=args.n)
@@ -816,12 +816,12 @@ def main():
         elif im_mdl.clip_caps:
             # Single-stage sampling with caps
             total_conds = len(cond_dicts)
-            assert all(
-                [d["max_cos_distance"] is not None for d in cond_dicts]
-            ), "Must specify max cosine distance"
-            assert (
-                total_conds <= im_mdl.clip_cap_count
-            ), "Too many CLIP embeddings for the number of caps"
+            assert all([d["max_cos_distance"] is not None for d in cond_dicts]), (
+                "Must specify max cosine distance"
+            )
+            assert total_conds <= im_mdl.clip_cap_count, (
+                "Too many CLIP embeddings for the number of caps"
+            )
 
             clip_embeddings_cond = np.stack([d["clip_embedding"] for d in cond_dicts])
             max_cos_distances_cond = np.stack(
@@ -854,14 +854,14 @@ def main():
             max_cos_distances = repeat(max_cos_distances, "cap -> n cap", n=args.n)
         else:
             # Single-stage sampling without caps
-            assert (
-                len(cond_dicts) == 1
-            ), "Can only specify one CLIP embedding without clip caps"
+            assert len(cond_dicts) == 1, (
+                "Can only specify one CLIP embedding without clip caps"
+            )
             clip_embeddings = cond_dicts[0]["clip_embedding"]
             assert clip_embeddings.shape == (768,)
-            assert all(
-                [d["max_cos_distance"] is None for d in cond_dicts]
-            ), "Can't specify max cosine distance without clip caps"
+            assert all([d["max_cos_distance"] is None for d in cond_dicts]), (
+                "Can't specify max cosine distance without clip caps"
+            )
             cap_centers = repeat(clip_embeddings, "clip -> n clip", n=args.n)
             max_cos_distances = None
     else:
@@ -884,9 +884,9 @@ def main():
                 cap_centers, max_cos_distances = mk_filler_caps(im_mdl, args.n, 0, rng2)
             else:
                 # Models that expect a single CLIP embedding don't support unconditioned sampling
-                assert (
-                    False
-                ), "Unconditioned sampling with single CLIP embedding models doesn't make sense"
+                assert False, (
+                    "Unconditioned sampling with single CLIP embedding models doesn't make sense"
+                )
         else:
             # Single-stage unconditioned sampling without CLIP conditioning
             cap_centers = np.zeros((args.n, 0), dtype=np.float32)
@@ -911,9 +911,7 @@ def main():
     print("Loading autoencoder model...")
     ae_res = int(im_mdl.image_tokens**0.5)
     assert ae_res**2 == im_mdl.image_tokens, "Image tokens must be a square number"
-    ae_cfg = OmegaConf.load(args.autoencoder_cfg)["model"][
-        "params"
-    ]  # type:ignore[index]
+    ae_cfg = OmegaConf.load(args.autoencoder_cfg)["model"]["params"]  # type:ignore[index]
     ae_mdl = LDMAutoencoder(ae_cfg)
     ae_params = LDMAutoencoder.params_from_torch(
         torch.load(args.autoencoder_checkpoint, map_location="cpu"), cfg=ae_cfg

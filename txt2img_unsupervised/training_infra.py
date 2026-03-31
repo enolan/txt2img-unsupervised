@@ -659,9 +659,9 @@ def make_train_step_with_metrics(loss_fn):
             ):
                 metrics["clip_count"] = state.opt_state.inner_state.clip_count.copy()
                 if hasattr(state.opt_state.inner_state, "clipped_last"):
-                    metrics[
-                        "clipped_last"
-                    ] = state.opt_state.inner_state.clipped_last.copy()
+                    metrics["clipped_last"] = (
+                        state.opt_state.inner_state.clipped_last.copy()
+                    )
 
         grad_fn = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
         (loss, aux), grads = grad_fn(state.params, batch, step_rng)

@@ -369,9 +369,9 @@ class LDMEncoder(nn.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        assert (
-            len(x.shape) == 3 and x.shape[0] == x.shape[1]
-        ), f"expected h w c array, got {x.shape}"
+        assert len(x.shape) == 3 and x.shape[0] == x.shape[1], (
+            f"expected h w c array, got {x.shape}"
+        )
         height, width, c = x.shape
         h = self.conv_in(x)
         h = self.downsample_blocks(h)
@@ -451,9 +451,9 @@ class ResnetBlock(nn.Module):
             self.nin_shortcut = None
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        assert (
-            len(x.shape) == 3 and x.shape[-1] == self.in_channels
-        ), f"resnet block should be called with shape h w c and {self.in_channels} channels, got {x.shape}"
+        assert len(x.shape) == 3 and x.shape[-1] == self.in_channels, (
+            f"resnet block should be called with shape h w c and {self.in_channels} channels, got {x.shape}"
+        )
         h = self.norm1(x)
         # no idea why mypy thinks nn.activation doesn't export swish
         h = nn.activation.swish(h)  # type:ignore[attr-defined]
@@ -634,7 +634,7 @@ def _test_mid_resnet_block_1(name: str) -> None:
         rearrange(computed_mid_resnet_1, "h w c -> c h w"),
         golden_mid_resnet_1,
         atol=1e-3,
-        rtol=0
+        rtol=0,
         # TBH not sure if the error here is a bug or not. we see up to 57% difference in some
         # values. very small in absolute terms though.
     )

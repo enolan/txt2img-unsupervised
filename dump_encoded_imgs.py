@@ -1,4 +1,5 @@
 """Load a dataset from parquet files and decode it to PNGs."""
+
 import argparse
 from itertools import islice
 from pathlib import Path

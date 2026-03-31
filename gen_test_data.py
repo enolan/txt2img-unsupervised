@@ -1,6 +1,7 @@
 """
 Generate some test data for testing the Jax implementation of the autoencoder.
 """
+
 import argparse
 from pathlib import Path
 

@@ -176,9 +176,10 @@ def gen_training_examples_from_tree(
 
                 rng, rng2 = jax.random.split(rng)
                 this_cap_centers, this_max_cos_distances = gen_slerp_caps(embeds, rng2)
-                this_cap_centers, this_max_cos_distances = np.array(
-                    this_cap_centers
-                ), np.array(this_max_cos_distances)
+                this_cap_centers, this_max_cos_distances = (
+                    np.array(this_cap_centers),
+                    np.array(this_max_cos_distances),
+                )
 
                 # The vectors from the dset that we used to generate the caps
                 cap_sources_a = shuffle_inverse[

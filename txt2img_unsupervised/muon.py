@@ -86,14 +86,14 @@ def test_newton_schulz_approximate_orthogonality(shape, steps):
 
     # Verify orthogonalization actually happens
     improvement = input_error / (result_error + 1e-8)
-    assert (
-        improvement > min_improvement
-    ), f"Expected {min_improvement}x improvement with {steps} steps, got {improvement:.3f}x (input: {input_error:.3f}, result: {result_error:.3f})"
+    assert improvement > min_improvement, (
+        f"Expected {min_improvement}x improvement with {steps} steps, got {improvement:.3f}x (input: {input_error:.3f}, result: {result_error:.3f})"
+    )
 
     # Verify result is reasonably orthogonal
-    assert (
-        result_error < max_error
-    ), f"Result should be reasonably orthogonal with {steps} steps, got error {result_error:.3f}"
+    assert result_error < max_error, (
+        f"Result should be reasonably orthogonal with {steps} steps, got error {result_error:.3f}"
+    )
 
 
 def test_newton_schulz_assertion_non_matrix():
@@ -121,9 +121,9 @@ def test_newton_schulz_identity_matrix():
 
     # Identity should remain very close to orthogonal (it's already orthogonal)
     orthogonality_error = _compute_orthogonality_error(result)
-    assert (
-        orthogonality_error < 1.0
-    ), f"Identity matrix result should stay orthogonal, got error {orthogonality_error:.3f}"
+    assert orthogonality_error < 1.0, (
+        f"Identity matrix result should stay orthogonal, got error {orthogonality_error:.3f}"
+    )
 
 
 def test_newton_schulz_small_matrix():
@@ -136,9 +136,9 @@ def test_newton_schulz_small_matrix():
 
     # Should achieve reasonable orthogonality even for small matrices
     orthogonality_error = _compute_orthogonality_error(result)
-    assert (
-        orthogonality_error < 1.5
-    ), f"Small matrix should be reasonably orthogonal, got error {orthogonality_error:.3f}"
+    assert orthogonality_error < 1.5, (
+        f"Small matrix should be reasonably orthogonal, got error {orthogonality_error:.3f}"
+    )
 
 
 def test_newton_schulz_rectangular_matrices():
@@ -154,9 +154,9 @@ def test_newton_schulz_rectangular_matrices():
 
     # Should orthogonalize columns for tall matrix
     orthogonality_error_tall = _compute_orthogonality_error(result_tall)
-    assert (
-        orthogonality_error_tall < 1.2
-    ), f"Tall matrix should be reasonably orthogonal, got error {orthogonality_error_tall:.3f}"
+    assert orthogonality_error_tall < 1.2, (
+        f"Tall matrix should be reasonably orthogonal, got error {orthogonality_error_tall:.3f}"
+    )
 
     # Test wide matrix (more columns than rows)
     G_wide = jax.random.normal(rng, (3, 7)) + 0.1 * jnp.eye(3, 7)[:3, :]
@@ -167,9 +167,9 @@ def test_newton_schulz_rectangular_matrices():
 
     # Should orthogonalize rows for wide matrix
     orthogonality_error_wide = _compute_orthogonality_error(result_wide)
-    assert (
-        orthogonality_error_wide < 1.2
-    ), f"Wide matrix should be reasonably orthogonal, got error {orthogonality_error_wide:.3f}"
+    assert orthogonality_error_wide < 1.2, (
+        f"Wide matrix should be reasonably orthogonal, got error {orthogonality_error_wide:.3f}"
+    )
 
 
 def test_newton_schulz_oscillation_property():
@@ -206,9 +206,9 @@ def test_newton_schulz_numerical_stability():
 
     # Should still orthogonalize despite small input values
     orthogonality_error = _compute_orthogonality_error(result_small)
-    assert (
-        orthogonality_error < 1.5
-    ), f"Should handle small values and orthogonalize, got error {orthogonality_error:.3f}"
+    assert orthogonality_error < 1.5, (
+        f"Should handle small values and orthogonalize, got error {orthogonality_error:.3f}"
+    )
 
     # Test with matrix close to singular (but not singular due to eps parameter)
     singular_like = jnp.array([[1.0, 1.0], [1.0, 1.0001]])
@@ -217,9 +217,9 @@ def test_newton_schulz_numerical_stability():
     # Should handle gracefully and still produce orthogonal result
     assert jnp.all(jnp.isfinite(result_singular))
     orthogonality_error_sing = _compute_orthogonality_error(result_singular)
-    assert (
-        orthogonality_error_sing < 2.0
-    ), f"Should handle near-singular matrices, got error {orthogonality_error_sing:.3f}"
+    assert orthogonality_error_sing < 2.0, (
+        f"Should handle near-singular matrices, got error {orthogonality_error_sing:.3f}"
+    )
 
 
 @pytest.mark.parametrize("eps", [1e-12, 1e-7, 1e-3])
@@ -235,9 +235,9 @@ def test_newton_schulz_eps_parameter(eps):
 
     # Should orthogonalize regardless of eps value
     orthogonality_error = _compute_orthogonality_error(result)
-    assert (
-        orthogonality_error < 1.2
-    ), f"Should orthogonalize with eps={eps}, got error {orthogonality_error:.3f}"
+    assert orthogonality_error < 1.2, (
+        f"Should orthogonalize with eps={eps}, got error {orthogonality_error:.3f}"
+    )
 
 
 def test_newton_schulz_normalization():
@@ -254,9 +254,9 @@ def test_newton_schulz_normalization():
 
         # Should orthogonalize regardless of input scale
         orthogonality_error = _compute_orthogonality_error(result)
-        assert (
-            orthogonality_error < 1.2
-        ), f"Should orthogonalize with scale={scale}, got error {orthogonality_error:.3f}"
+        assert orthogonality_error < 1.2, (
+            f"Should orthogonalize with scale={scale}, got error {orthogonality_error:.3f}"
+        )
 
 
 def test_newton_schulz_transpose_logic():
@@ -278,12 +278,12 @@ def test_newton_schulz_transpose_logic():
     # Both should be reasonably orthogonal
     error_tall = _compute_orthogonality_error(result_tall)
     error_wide = _compute_orthogonality_error(result_wide)
-    assert (
-        error_tall < 1.2
-    ), f"Tall matrix should be orthogonal, got error {error_tall:.3f}"
-    assert (
-        error_wide < 1.2
-    ), f"Wide matrix should be orthogonal, got error {error_wide:.3f}"
+    assert error_tall < 1.2, (
+        f"Tall matrix should be orthogonal, got error {error_tall:.3f}"
+    )
+    assert error_wide < 1.2, (
+        f"Wide matrix should be orthogonal, got error {error_wide:.3f}"
+    )
 
 
 def test_newton_schulz_jit_compatibility():
@@ -369,9 +369,9 @@ def test_muonize_2d_parameters():
     # Normalize out the RMS scaling before checking orthogonality
     normalized = updates["weight"] / jnp.linalg.norm(updates["weight"])
     orthogonality_error = _compute_orthogonality_error(normalized)
-    assert (
-        orthogonality_error < 1.5
-    ), f"2D parameter should be orthogonalized, got error {orthogonality_error:.3f}"
+    assert orthogonality_error < 1.5, (
+        f"2D parameter should be orthogonalized, got error {orthogonality_error:.3f}"
+    )
 
 
 def test_muonize_higher_dimensional_parameters():
@@ -409,9 +409,9 @@ def test_muonize_higher_dimensional_parameters():
         slice_2d = updates["weight_3d"][i]
         normalized = slice_2d / jnp.linalg.norm(slice_2d)
         orthogonality_error = _compute_orthogonality_error(normalized)
-        assert (
-            orthogonality_error < 1.5
-        ), f"3D parameter slice {i} should be orthogonalized, got error {orthogonality_error:.3f}"
+        assert orthogonality_error < 1.5, (
+            f"3D parameter slice {i} should be orthogonalized, got error {orthogonality_error:.3f}"
+        )
 
     # For 4D parameter, check each 2D slice is orthogonalized (normalize out RMS scaling first)
     for i in range(2):
@@ -419,9 +419,9 @@ def test_muonize_higher_dimensional_parameters():
             slice_2d = updates["weight_4d"][i, j]
             normalized = slice_2d / jnp.linalg.norm(slice_2d)
             orthogonality_error = _compute_orthogonality_error(normalized)
-            assert (
-                orthogonality_error < 1.5
-            ), f"4D parameter slice [{i},{j}] should be orthogonalized, got error {orthogonality_error:.3f}"
+            assert orthogonality_error < 1.5, (
+                f"4D parameter slice [{i},{j}] should be orthogonalized, got error {orthogonality_error:.3f}"
+            )
 
 
 def test_muonize_momentum_accumulation():
@@ -447,9 +447,9 @@ def test_muonize_momentum_accumulation():
         # Each should be reasonably orthogonal (normalize out RMS scaling first)
         normalized = updates["weight"] / jnp.linalg.norm(updates["weight"])
         orthogonality_error = _compute_orthogonality_error(normalized)
-        assert (
-            orthogonality_error < 1.5
-        ), f"Updates should be orthogonalized, got error {orthogonality_error:.3f}"
+        assert orthogonality_error < 1.5, (
+            f"Updates should be orthogonalized, got error {orthogonality_error:.3f}"
+        )
 
 
 def test_muonize_assertion_1d_parameter():
@@ -583,11 +583,11 @@ def test_muon_toy_neural_network(weight_decay):
     assert jnp.isfinite(final_loss), f"Final loss should be finite, got {final_loss}"
     assert final_loss < initial_loss * 0.5, (
         f"Loss should decrease significantly: initial={initial_loss:.4f}, "
-        f"final={final_loss:.4f}, reduction factor={final_loss/initial_loss:.3f}"
+        f"final={final_loss:.4f}, reduction factor={final_loss / initial_loss:.3f}"
     )
-    assert (
-        final_loss < 0.3
-    ), f"Final loss should be reasonably small, got {final_loss:.4f}"
+    assert final_loss < 0.3, (
+        f"Final loss should be reasonably small, got {final_loss:.4f}"
+    )
 
     # Verify loss generally decreased over time (allowing for some oscillation)
     mid_point = len(losses) // 2
