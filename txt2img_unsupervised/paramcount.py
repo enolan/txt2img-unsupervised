@@ -1,10 +1,10 @@
-import jax
-import jax.numpy as jnp
-from flax import linen as nn
-from functools import partial
-from typing import Any, Dict, Union
-from math import prod
 from dataclasses import replace
+from functools import partial
+from math import prod
+from typing import Union
+
+import jax
+from flax import linen as nn
 
 
 @partial(jax.jit, static_argnames=["module"])

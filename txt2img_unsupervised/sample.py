@@ -6,33 +6,33 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
 
 import argparse
 import gc
+import subprocess
+from copy import deepcopy
+from functools import partial
+from pathlib import Path
+from random import randint
+from typing import List, Tuple, Union
+
 import jax
 import jax.numpy as jnp
 import numpy as np
-import orbax.checkpoint as ocp
 import PIL.Image
 import PIL.ImageDraw
-import subprocess
 import torch
 import transformers
-from copy import deepcopy
 from einops import rearrange, repeat
-from functools import partial
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from omegaconf import OmegaConf
-from pathlib import Path
 from PIL.PngImagePlugin import PngInfo
-from random import randint
-from tqdm import tqdm, trange
-from typing import List, Tuple, Union
+from tqdm import tqdm
 
 from . import flow_matching, ldm_autoencoder
+from .checkpoint import get_model_from_checkpoint, load_params
 from .function_weighted_flow_model import (
     FunctionWeightedFlowModel,
     WeightingFunction,
 )
-from .checkpoint import get_model_from_checkpoint, load_params
 from .ldm_autoencoder import LDMAutoencoder
 from .transformer_model import (
     ImageModel,

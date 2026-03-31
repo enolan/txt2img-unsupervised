@@ -1,11 +1,11 @@
 import argparse
+from pathlib import Path
+
 import jax
 import numpy as np
 import PIL.Image
 import torch
-
 from omegaconf import OmegaConf
-from pathlib import Path
 from tqdm import tqdm
 
 from txt2img_unsupervised import ldm_autoencoder

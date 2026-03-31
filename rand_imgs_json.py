@@ -6,8 +6,8 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
-
 from pathlib import Path
+
 from tqdm import tqdm
 
 
@@ -39,7 +39,7 @@ def get_warcs(warcs):
                 "16",
                 "--files-from",
                 files_from.name,
-                f"r2:txt2img-unsupervised-dataset/original-tarballs",
+                "r2:txt2img-unsupervised-dataset/original-tarballs",
                 "warcs",
             ],
             check=True,
@@ -101,7 +101,7 @@ def format_as_json(url_prefix, path, nsfw):
 
 def main():
     parser = argparse.ArgumentParser()
-    subparsers = parser.add_subparsers(dest="command")
+    parser.add_subparsers(dest="command")
     parser.add_argument(
         "--db", type=str, required=True, help="Path to the sqlite3 database"
     )

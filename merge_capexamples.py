@@ -2,11 +2,11 @@
 for each image with all the caps."""
 
 import argparse
-import numpy as np
 import tempfile
-
-from datasets import Dataset
 from pathlib import Path
+
+import numpy as np
+from datasets import Dataset
 from tqdm import tqdm, trange
 
 from txt2img_unsupervised.load_pq_dir import load_pq_dir
@@ -232,7 +232,7 @@ def test_merging_same_caps_fails():
         out_dir = Path(tmpdir)
         try:
             merge_dsets([dset, dset], out_dir, 8192, 2)
-        except AssertionError as e:
+        except AssertionError:
             return
         assert False, "Merging the same dataset twice should raise an AssertionError"
 

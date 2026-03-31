@@ -5,16 +5,17 @@ import os
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
 
 import argparse
-import jax
-import jax.numpy as jnp
-import wandb
-import matplotlib.pyplot as plt
 from distutils.util import strtobool
 from functools import partial
-from jax.sharding import NamedSharding, PartitionSpec
 from pathlib import Path
 from typing import Optional
 
+import jax
+import jax.numpy as jnp
+import matplotlib.pyplot as plt
+from jax.sharding import NamedSharding, PartitionSpec
+
+import wandb
 from txt2img_unsupervised.checkpoint import EuclideanVDMTrainState
 from txt2img_unsupervised.config import EuclideanVDMConfig, TrainingConfig
 from txt2img_unsupervised.euclidean_vdm import (

@@ -5,10 +5,10 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
-from jax import Array, random
 import numpy as np
 import pytest
 import scipy.special as sps
+from jax import Array, random
 
 from txt2img_unsupervised.cap_sampling import sphere_log_inverse_surface_area
 

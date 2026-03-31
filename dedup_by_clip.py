@@ -3,9 +3,9 @@
 # If that becomes a problem this could be adapted to do it with sqlite or something.
 import argparse
 import json
-import numpy as np
-
 from pathlib import Path
+
+import numpy as np
 from tqdm import tqdm
 
 from txt2img_unsupervised.load_pq_dir import load_pq_dir_to_infinidata

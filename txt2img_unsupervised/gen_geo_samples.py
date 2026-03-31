@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 
 import argparse
+from pathlib import Path
+
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import rasterio
-from pathlib import Path
-from typing import Tuple, List, Dict, Any
-import urllib.parse
 from tqdm import tqdm
 
 
@@ -284,7 +282,7 @@ def main():
         )
 
         print(
-            f"\nSamples are unit vectors in 3D space representing points on Earth's surface."
+            "\nSamples are unit vectors in 3D space representing points on Earth's surface."
         )
         print(f"Data saved to: {args.output}")
     except Exception as e:

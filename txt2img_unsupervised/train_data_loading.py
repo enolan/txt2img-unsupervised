@@ -1,15 +1,13 @@
 """Functions for loading training data."""
 
+from functools import lru_cache
+from typing import Dict, List, Optional, Tuple
+
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from datasets import Dataset
-from einops import rearrange
-from functools import lru_cache
 from tqdm import tqdm
-from typing import Dict, List, Optional, Tuple
 
 _MAX_SHUFFLED_DATASET_CACHE_SIZE = 4
 

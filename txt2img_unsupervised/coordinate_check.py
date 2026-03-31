@@ -1,30 +1,29 @@
 "Coordinate check for flow matching models to check whether muP is working."
 
-from datasets import Dataset
-from functools import partial
-from pathlib import Path
-from tqdm import tqdm, trange
-from tqdm.contrib import tenumerate
 import argparse
 import gc
+import math
+from contextlib import nullcontext
+from functools import partial
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
-import math
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
 import optax.transforms
-from contextlib import nullcontext
-from mpl_toolkits.mplot3d import Axes3D
+from datasets import Dataset
+from tqdm import tqdm, trange
+from tqdm.contrib import tenumerate
 
-from .cap_sampling import LogitsTable
-from .function_weighted_flow_model import (
-    FunctionWeightedFlowModel,
-    WeightingFunction,
-    CapIndicatorExtraParams,
-    SmoothedCapIndicatorExtraParams,
-)
 from . import flow_matching
+from .function_weighted_flow_model import (
+    CapIndicatorExtraParams,
+    FunctionWeightedFlowModel,
+    SmoothedCapIndicatorExtraParams,
+    WeightingFunction,
+)
 from .muon import muon
 
 
@@ -488,7 +487,7 @@ def main():
                     tqdm.write("Initializing parameters")
                     params = init_model_params(model, init_key)
 
-                    tqdm.write(f"Initializing optimizer state")
+                    tqdm.write("Initializing optimizer state")
                     opt_state = init_opt_state(params)
 
                 tqdm.write("Training")
@@ -822,7 +821,7 @@ def generate_loss_charts(d_model_values, lr_combinations, losses, test_losses, a
                         x_values.append(adam_lr)
 
                 if test_losses_for_muon_lr:  # Only plot if we have data
-                    line = plt.plot(
+                    plt.plot(
                         x_values,
                         test_losses_for_muon_lr,
                         marker="o",
@@ -847,7 +846,7 @@ def generate_loss_charts(d_model_values, lr_combinations, losses, test_losses, a
                             )
         else:
             # For Adam-only optimization
-            line = plt.plot(
+            plt.plot(
                 adam_lrs,
                 model_test_losses,
                 marker="o",
@@ -1016,7 +1015,7 @@ def generate_3d_loss_plots(d_model_values, lr_combinations, test_losses, args):
         muon_log = [np.log10(combo[1]) for combo in lr_combinations]
         losses_flat = test_losses[d_idx, :]
 
-        scatter = ax.scatter(
+        ax.scatter(
             adam_log,
             muon_log,
             losses_flat,
@@ -1108,7 +1107,7 @@ def generate_3d_loss_plots(d_model_values, lr_combinations, test_losses, args):
         muon_log = [np.log10(combo[1]) for combo in lr_combinations]
         losses_flat = test_losses[d_idx, :]
 
-        scatter = ax.scatter(
+        ax.scatter(
             adam_log,
             muon_log,
             losses_flat,

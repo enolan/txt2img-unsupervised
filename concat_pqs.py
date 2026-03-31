@@ -1,7 +1,6 @@
 """Concatenate training example parquets into a single file."""
 
 import argparse
-
 from pathlib import Path
 
 from txt2img_unsupervised.load_pq_dir import load_pq_dir

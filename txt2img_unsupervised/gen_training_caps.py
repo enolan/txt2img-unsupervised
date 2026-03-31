@@ -7,23 +7,23 @@ embeddings will be within a cap.
 """
 
 import argparse
+from datetime import timedelta
+from functools import partial
+from pathlib import Path
+
 import hypothesis as hyp
-import hypothesis.extra.numpy as hyp_np
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-from datetime import timedelta
-from functools import partial
-from hypothesis import given, strategies as st
+from hypothesis import given
+from hypothesis import strategies as st
 from infinidata import TableView
-from pathlib import Path
 from tqdm import tqdm
 
-from .spherical_space_partitioning import _unit_vecs, CapTree
+from .spherical_space_partitioning import CapTree, _unit_vecs
 
 
 @partial(jax.jit, inline=True)

@@ -1,21 +1,12 @@
 # Conveniences for ipython
 
-import jax
-import jax.numpy as jnp
-import numpy as np
-import orbax.checkpoint
-import PIL.Image
-import random
-import torch
-import transformer_model
-from config import ModelConfig, TrainingConfig
 from copy import copy
-from einops import rearrange, repeat
+
+import orbax.checkpoint
+import torch
 from ldm_autoencoder import LDMAutoencoder
 from omegaconf import OmegaConf
-from pathlib import Path
-from transformer_model import ImageModel, gpt_1_config
-from typing import Any, Optional, Tuple, Union
+from transformer_model import gpt_1_config
 
 gpt_1_config_no_dropout = copy(gpt_1_config)
 gpt_1_config_no_dropout.dropout = None

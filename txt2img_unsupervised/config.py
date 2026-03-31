@@ -1,30 +1,27 @@
 """Serializable configuration for the model and training parameters."""
 import argparse
 import importlib
-import math
-
-import dacite
-import jax
-import jax.numpy as jnp
 import json
-import pytest
+import math
 from abc import abstractmethod
 from copy import copy
-from enum import Enum
 from dataclasses import asdict, dataclass, field, fields
+from enum import Enum
 from typing import (
     Any,
     Callable,
     ClassVar,
-    Dict,
     FrozenSet,
-    List,
     Literal,
     Optional,
     Tuple,
-    Type,
     Union,
 )
+
+import dacite
+import jax
+import jax.numpy as jnp
+import pytest
 
 from txt2img_unsupervised.cap_sampling import DEFAULT_CAP_FEATURES, cap_conditioning_dim
 from txt2img_unsupervised.function_weighted_flow_model import (

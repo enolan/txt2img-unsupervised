@@ -48,42 +48,36 @@ guarantees from continuous normalizing flows. The difference is that all computa
 geometry of the sphere, ensuring flows remain on the manifold.
 
 """
+import os
+import time
 from dataclasses import dataclass, field, replace
-from datasets import Dataset
-from einops import repeat
-from flax import linen as nn
 from functools import partial
 from math import ceil
-from scipy import stats
 from typing import (
     Any,
     Callable,
-    Dict,
-    Literal,
-    Optional,
-    Sequence,
-    Tuple,
-    Union,
     FrozenSet,
+    Literal,
     NamedTuple,
+    Optional,
+    Tuple,
 )
-from tqdm import tqdm, trange
+
 import jax
 import jax.lax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
-import optax
-import os
 import pytest
-import time
+from datasets import Dataset
+from einops import repeat
+from flax import linen as nn
+from scipy import stats
+from tqdm import tqdm, trange
 
 from .cap_sampling import (
     LogitsTable,
-    process_d_max_dist,
-    random_pt_with_cosine_similarity,
-    sample_cap,
     sample_from_cap,
     sphere_log_inverse_surface_area,
 )
@@ -713,7 +707,7 @@ def test_vector_field_time_encoding_statistics():
     np.testing.assert_allclose(overall_mean, expected_mean, atol=0.02)
     np.testing.assert_allclose(overall_std, expected_std, atol=0.02)
 
-    print(f"Time encoding test passed")
+    print("Time encoding test passed")
     print(f"  Mean: {overall_mean:.6f} (expected {expected_mean:.6f})")
     print(f"  Std: {overall_std:.6f} (expected {expected_std:.6f})")
 
@@ -1629,7 +1623,6 @@ def test_train_conditional_vmf(domain_dim, inject_keys):
     vmf2 = stats.vonmises_fisher(mean_direction2, vmf_kappa)
 
     # Sample from our distributions
-    np_rng = np.random.Generator(np.random.PCG64(seed=42))
     total_samples = 60_000
     points1 = vmf1.rvs(total_samples // 2)
     points2 = vmf2.rvs(total_samples // 2)
@@ -3351,7 +3344,6 @@ def sample_loop(
     """
     samples = []
     samples_so_far = 0
-    from tqdm import trange
 
     for i in trange(
         ceil(n_samples / batch_size), unit="batch", desc="Generating samples"
@@ -3906,8 +3898,6 @@ def test_divergence_estimate(divergence_fn, n_projections, field):
 
     # Compute divergence estimate
     t = 0.5
-    cond_vecs = jnp.zeros((batch_size, 0))
-
     # Call the appropriate divergence function
     div_estimates = divergence_fn(
         _compute_vector_field_for_sampling,
@@ -4120,11 +4110,6 @@ def test_vector_field_evaluation():
         # Check if point is near the north pole
         is_near_pole = jnp.abs(jnp.dot(point, north_pole) - 1.0) < 1e-6
 
-        # If near north pole, use south pole as reference instead
-        reference_pole = jnp.where(
-            is_near_pole, -north_pole, north_pole  # Use south pole  # Use north pole
-        )
-
         # Determine which coordinate to use for projection
         proj_index = dim - 1
 
@@ -4203,13 +4188,6 @@ def test_vector_field_evaluation():
     print(
         f"Average absolute dot product with point (should be ~0): {jnp.mean(jnp.abs(dot_products)):.6f}"
     )
-
-    # Sort all data by x coordinate (first component of the point)
-    sort_indices = jnp.argsort(points[:, 0])
-    sorted_points = points[sort_indices]
-    sorted_times = times[sort_indices]
-    sorted_magnitudes = magnitudes[sort_indices]
-    sorted_projected_directions = projected_directions[sort_indices]
 
 
 @pytest.mark.usefixtures("starts_with_progressbar")
@@ -4672,7 +4650,7 @@ def create_mollweide_projection_figure(samples, title=None):
     longitude = np.arctan2(samples[:, 1], samples[:, 0])  # atan2(y, x) for longitude
     latitude = np.arcsin(samples[:, 2])  # z-coordinate gives latitude (arcsin)
 
-    scatter = ax.scatter(longitude, latitude, s=8, alpha=0.25)
+    ax.scatter(longitude, latitude, s=8, alpha=0.25)
 
     ax.grid(True, alpha=0.3)
 
@@ -5276,7 +5254,7 @@ def test_shrinking_batch_disabled_fallback():
 
     assert position_error < 1e-3, f"Position error too large: {position_error}"
 
-    print(f"Batch shrinking disabled/enabled give identical results")
+    print("Batch shrinking disabled/enabled give identical results")
     print(f"Iterations - Disabled: {iter_disabled}, Enabled: {iter_enabled}")
 
 

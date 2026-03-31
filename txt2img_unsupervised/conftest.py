@@ -17,11 +17,9 @@ def starts_with_progressbar(request):
         return
 
     writer = getattr(terminal_reporter, "_tw", None)
-    wrote_newline = False
     if writer and getattr(writer, "isatty", False):
         terminal_reporter.ensure_newline()
         terminal_reporter.write_line("")
-        wrote_newline = True
 
     # tqdm defaults to stderr; ensure we also start on a fresh line there.
     if sys.stderr is not None and sys.stderr.isatty():

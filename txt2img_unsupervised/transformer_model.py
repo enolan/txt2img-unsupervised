@@ -1,28 +1,26 @@
+from copy import copy
+from dataclasses import replace
+from enum import Enum
+from functools import partial
+from pathlib import Path
+from typing import Any, Callable, Optional, Tuple
+
 import flash_attention_jax  # Pure JAX flash attention implementation by lucidrains
 import flax.core
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import jax.tree_util as jtu
 import numpy as np
 import optax  # type: ignore[import]
 import pytest
-from copy import copy
-from dataclasses import dataclass, replace
 from datasets import Dataset
-from enum import Enum
-from einops import rearrange, reduce, repeat
-from flax import struct
-from functools import partial
-from pathlib import Path
-from typing import Any, Callable, Optional, Tuple
+from einops import rearrange, reduce
 from tqdm import tqdm, trange
 
 from .cap_sampling import LogitsTable, random_pt_with_cosine_similarity, sample_cap
 from .config import TransformerModelConfig
 from .gpu_check import gpu_is_ampere_or_newer
 from .load_pq_dir import load_pq_to_infinidata
-
 
 AttnMethod = Enum("AttnMethod", ["STANDARD", "FLASH_JAX", "CUDNN"])
 
@@ -1542,16 +1540,16 @@ class TransformerLayer(nn.Module):
                 assert q.shape[2] == k.shape[2] == v.shape[2], "num_heads must match"
                 num_heads = q.shape[2]
                 assert q.shape[3] == k.shape[3], "q & k head_dim must match"
-                qk_head_dim, v_head_dim = q.shape[3], v.shape[3]
+                v_head_dim = v.shape[3]
 
                 rearrange_qkv = lambda x: rearrange(
                     x, "batch seq_len heads head_dim -> batch heads seq_len head_dim"
                 )
                 q, k, v = map(rearrange_qkv, (q, k, v))
 
-                assert bias == None, "attention bias not implemented"
+                assert bias is None, "attention bias not implemented"
                 assert (
-                    mask == None
+                    mask is None
                 ), "attention mask is redundant with causal_flash_attention"
                 assert dropout_rate == 0.0, "attention dropout not implemented"
 
@@ -1568,7 +1566,7 @@ class TransformerLayer(nn.Module):
                         )
                     else:
                         raise e
-                if dtype != None:
+                if dtype is not None:
                     assert res.dtype == dtype
                 assert res.shape == (batch_size, num_heads, seq_len, v_head_dim)
                 res = rearrange(

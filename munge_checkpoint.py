@@ -1,7 +1,8 @@
 import argparse
+from pathlib import Path
+
 import jax
 import orbax.checkpoint as ocp
-from pathlib import Path
 
 from txt2img_unsupervised.checkpoint import TrainState, mk_checkpoint_manager
 

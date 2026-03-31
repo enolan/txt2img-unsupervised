@@ -4,6 +4,7 @@ Adapted from https://kellerjordan.github.io/posts/muon/
 """
 
 from typing import NamedTuple, Optional, Tuple, Union
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -112,8 +113,8 @@ def test_newton_schulz_assertion_non_matrix():
 
 def test_newton_schulz_identity_matrix():
     """Test that newton_schulz handles identity matrix reasonably."""
-    I = jnp.eye(4)
-    result = newton_schulz(I)
+    eye = jnp.eye(4)
+    result = newton_schulz(eye)
 
     assert result.shape == (4, 4)
     assert jnp.all(jnp.isfinite(result))

@@ -2,18 +2,19 @@
 Functions for generating visualizations of training progress.
 """
 
+from functools import partial
+from typing import List
+
 import jax
 import jax.numpy as jnp
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
-import wandb
-
 from einops import reduce
-from functools import partial
 from tqdm import tqdm
-from typing import List
+
+import wandb
 
 from .checkpoint import TransformerTrainState
 from .transformer_model import ImageModel

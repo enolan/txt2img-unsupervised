@@ -1,19 +1,19 @@
 from dataclasses import dataclass, field, replace
-from datasets import Dataset
-from einops import repeat
 from enum import Enum
 from functools import partial
-from scipy import stats
-from tqdm import tqdm
 from typing import FrozenSet, Literal, Optional, Tuple, Union
+
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from datasets import Dataset
+from einops import repeat
+from scipy import stats
+from tqdm import tqdm
 
 from . import flow_matching
-from . import vmf
 from .cap_sampling import (
     LogitsTable,
     cap_conditioning_dim,

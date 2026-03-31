@@ -1,16 +1,15 @@
 """Find images from parquet files by name and decode them"""
 
 import argparse
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import PIL.Image
 import torch
-
 from datasets import Dataset
-from einops import rearrange
 from omegaconf import OmegaConf
-from pathlib import Path
 from tqdm import tqdm
-from typing import Any
 
 from txt2img_unsupervised import ldm_autoencoder
 from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder

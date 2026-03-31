@@ -2,30 +2,28 @@
 Given a source of images, scale them, crop them, and encode them with LDM encoder.
 """
 import argparse
+import os
+import queue
+import random
+from copy import copy
+from pathlib import Path
+from threading import Lock, Semaphore, Thread
+from typing import Optional
+
 import CloseableQueue
-import gc
-import itertools
 import jax
 import jax.numpy as jnp
 import numpy as np
-import os
 import pandas as pd
 import PIL.Image
 import pyarrow as pa
 import pyarrow.parquet as pq
-import queue
-import random
 import torch
 import transformers
 from CloseableQueue import CloseableQueue as CQueue
-from concurrent import futures
-from copy import copy
 from einops import rearrange
 from omegaconf import OmegaConf
-from pathlib import Path
-from threading import Lock, Semaphore, Thread
 from tqdm import tqdm
-from typing import Optional
 
 from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
 

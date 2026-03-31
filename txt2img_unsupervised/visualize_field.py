@@ -1,12 +1,11 @@
-import matplotlib.pyplot as plt
-from matplotlib import cm
-import numpy as np
+import argparse
+import os
+
 import jax
 import jax.numpy as jnp
-from mpl_toolkits.mplot3d import Axes3D
-import argparse
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
-import os
 
 # Import the necessary components from flow_matching.py
 from .flow_matching import (

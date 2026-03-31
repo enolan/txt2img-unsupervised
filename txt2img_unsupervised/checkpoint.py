@@ -1,35 +1,33 @@
 """Create, load, and save TrainStates and checkpoints."""
 
 import gc
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, Literal, Optional, Tuple, Union
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import pytest
-import time
-import subprocess
-
-from contextlib import nullcontext
-from copy import copy
 from flax.training import train_state
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from pathlib import Path
 from tqdm import tqdm
-from typing import Any, Literal, Optional, Tuple, Union
 
 from .adaptive_gradient_clip import AdaptiveGradientClipState, adaptive_gradient_clip
 from .config import (
     BaseModelConfig,
+    EuclideanVDMConfig,
     FlowMatchingModelConfig,
     LearningRateSchedule,
-    EuclideanVDMConfig,
     TrainingConfig,
     TransformerModelConfig,
 )
-from .function_weighted_flow_model import FunctionWeightedFlowModel
 from .euclidean_vdm import EuclideanDiffusionModel
+from .function_weighted_flow_model import FunctionWeightedFlowModel
 from .muon import muon
 from .transformer_model import ImageModel
 from .triangle_schedule import triangle_schedule

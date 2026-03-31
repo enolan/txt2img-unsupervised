@@ -1,12 +1,12 @@
-from matplotlib import cm, animation
-from mpl_toolkits.mplot3d import Axes3D
-from tqdm import tqdm
 import argparse
+import os
+
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-import os
+from matplotlib import animation
+from tqdm import tqdm
 
 from .flow_matching import VectorField, sample_sphere
 
@@ -115,7 +115,7 @@ def create_rotating_animation(
         time_values = np.linspace(time_start, time_end, n_frames)
 
     # Create initial surface and quiver plots
-    surface = ax.plot_surface(
+    ax.plot_surface(
         sphere_x,
         sphere_y,
         sphere_z,

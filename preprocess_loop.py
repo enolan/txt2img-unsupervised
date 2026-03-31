@@ -1,12 +1,13 @@
 """Automate downloading, preprocessing, and uploading images"""
-from dataclasses import dataclass
-from pathlib import Path
-from tqdm import tqdm
-from typing import List, Optional
 import json
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional
+
+from tqdm import tqdm
 
 
 @dataclass
@@ -71,7 +72,7 @@ def get_preprocessed_parquets(metadata: DatasetMetadata):
 
 def get_unprocessed_tarballs(metadata: DatasetMetadata) -> List[dict]:
     """Get a list of tarballs that have not been preprocessed to a given resolution."""
-    original_tarballs = get_file_info(f"original-tarballs")
+    original_tarballs = get_file_info("original-tarballs")
     existing_parquets = get_preprocessed_parquets(metadata)
 
     already_processed = {pq["Name"] for pq in existing_parquets}

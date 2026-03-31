@@ -16,12 +16,13 @@ a given point."""
 # centers). The code for the preprocessing version is in gen_training_caps.py and
 # spherical_space_partitioning.py
 
+from functools import partial
+from typing import FrozenSet, Optional, Tuple
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from functools import partial
-from typing import FrozenSet, Optional, Tuple
 
 
 @jax.tree_util.register_pytree_node_class

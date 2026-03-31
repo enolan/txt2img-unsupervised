@@ -34,7 +34,6 @@ Then normalize: x = z / ‖z‖.
 """
 
 import math
-
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Callable, FrozenSet, Literal, Optional
@@ -68,7 +67,6 @@ from txt2img_unsupervised.flow_matching import (
     stratified_time_sample,
 )
 from txt2img_unsupervised.learned_schedule import LearnedNoiseSchedule
-
 
 # =============================================================================
 # Model

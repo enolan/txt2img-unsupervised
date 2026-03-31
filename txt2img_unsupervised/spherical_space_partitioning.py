@@ -3,17 +3,8 @@ to enable efficient sampling from arbitrary caps."""
 
 import base64
 import concurrent.futures
-import hypothesis as hyp
-import hypothesis.extra.numpy as hyp_np
-import infinidata
-import jax
-import jax.numpy as jnp
 import json
-import numpy as np
 import os
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 import queue
 import tempfile
 import threading
@@ -21,14 +12,24 @@ import time
 import traceback
 import types
 import weakref
-
 from collections import namedtuple
 from datetime import timedelta
-from einops import rearrange
 from enum import Enum
 from functools import partial
-from hypothesis import given, strategies as st
 from pathlib import Path
+
+import hypothesis as hyp
+import hypothesis.extra.numpy as hyp_np
+import infinidata
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from einops import rearrange
+from hypothesis import given
+from hypothesis import strategies as st
 from sortedcontainers import SortedList
 from tqdm import tqdm
 
@@ -1151,7 +1152,8 @@ class CapTree:
 
         else:
             assert self.center.shape == self.dset[0]["clip_embedding"].shape
-            assert self.child_cap_centers == self.child_cap_max_cos_distances == None
+            assert self.child_cap_centers is None
+            assert self.child_cap_max_cos_distances is None
 
         assert self.max_cos_distance <= 2
         assert np.isclose(np.linalg.norm(self.center), 1.0)

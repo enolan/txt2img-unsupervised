@@ -5,31 +5,31 @@ Infrastructure code for training models.
 import argparse
 import datetime
 import importlib.util
-import jax
-import jax.numpy as jnp
 import json
-import numpy as np
-import optax
-import orbax.checkpoint as ocp
 import signal
-import wandb
-from copy import copy
 from dataclasses import dataclass
-from datasets import Dataset
 from distutils.util import strtobool
 from functools import partial
-from jax.experimental import mesh_utils
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from math import ceil
 from pathlib import Path
 from sys import exit
-from tqdm import tqdm, trange
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+import orbax.checkpoint as ocp
+import pytest
+from datasets import Dataset
+from jax.experimental import mesh_utils
+from jax.sharding import Mesh
+from tqdm import tqdm, trange
+
+import txt2img_unsupervised.config as config
+import wandb
 from txt2img_unsupervised.checkpoint import (
     BaseTrainState,
-    FlowMatchingTrainState,
-    TransformerTrainState,
     get_model_from_checkpoint,
     mk_checkpoint_manager,
     setup_checkpoint_manager_and_initial_state,
@@ -45,8 +45,6 @@ from txt2img_unsupervised.config import (
 )
 from txt2img_unsupervised.load_pq_dir import load_pq_dir
 from txt2img_unsupervised.train_data_loading import get_batch
-import txt2img_unsupervised.config as config
-import pytest
 
 
 def plan_steps(
@@ -749,7 +747,7 @@ def train_loop_async(
         total_epochs,
         initial=start_epoch,
         total=total_epochs,
-        desc=f"Epoch",
+        desc="Epoch",
         unit="epoch",
         leave=True,
         position=0,
@@ -777,8 +775,6 @@ def train_loop_async(
         )
 
         epoch_start_step = current_epoch_idx * steps_per_epoch
-        epoch_end_step = epoch_start_step + steps_in_this_epoch
-
         start_step_in_epoch = 0
         if global_step > epoch_start_step:
             start_step_in_epoch = global_step - epoch_start_step
@@ -788,7 +784,7 @@ def train_loop_async(
             steps_in_this_epoch,
             initial=start_step_in_epoch,
             total=steps_in_this_epoch,
-            desc=f"Step",
+            desc="Step",
             unit="step",
             leave=False,
             position=1,

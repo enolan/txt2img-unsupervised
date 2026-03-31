@@ -1,9 +1,6 @@
 """Process imgur archives from ArchiveTeam/Internet Archive"""
-import CloseableQueue
 import concurrent.futures
 import hashlib
-import imageio_ffmpeg  # type: ignore[import]
-import internetarchive as ia
 import os
 import random
 import re
@@ -12,12 +9,16 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
-from CloseableQueue import CloseableQueue as CQueue
 from pathlib import Path
-from PIL import Image
 from threading import Thread
-from tqdm import tqdm
 from typing import Tuple, Union
+
+import CloseableQueue
+import imageio_ffmpeg  # type: ignore[import]
+import internetarchive as ia
+from CloseableQueue import CloseableQueue as CQueue
+from PIL import Image
+from tqdm import tqdm
 
 
 def setup_db(db_path: Path) -> sqlite3.Connection:
@@ -188,7 +189,7 @@ def extract_from_dir(in_path: Path, out_path: Path) -> Tuple[list[Path], list[Pa
     paths_map = dict([(path, None) for path in paths])
     rejected_paths = []
     for path in in_path.iterdir():
-        if not (path in paths_map):
+        if path not in paths_map:
             rejected_paths.append(path)
 
     # Move the files to the output directory
