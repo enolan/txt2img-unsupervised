@@ -22,13 +22,13 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import pytest
+import wandb
 from datasets import Dataset
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh
 from tqdm import tqdm, trange
 
 import txt2img_unsupervised.config as config
-import wandb
 from txt2img_unsupervised.checkpoint import (
     BaseTrainState,
     get_model_from_checkpoint,

@@ -10,10 +10,9 @@ import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
+import wandb
 from einops import reduce
 from tqdm import tqdm
-
-import wandb
 
 from .checkpoint import TransformerTrainState
 from .transformer_model import ImageModel

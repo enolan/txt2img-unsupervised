@@ -13,9 +13,9 @@ from pathlib import Path
 
 import jax
 import matplotlib.pyplot as plt
+import wandb
 from jax.sharding import NamedSharding, PartitionSpec
 
-import wandb
 from txt2img_unsupervised.checkpoint import FlowMatchingTrainState
 from txt2img_unsupervised.config import (
     FlowMatchingModelConfig,

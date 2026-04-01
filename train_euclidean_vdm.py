@@ -12,9 +12,9 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import wandb
 from jax.sharding import NamedSharding, PartitionSpec
 
-import wandb
 from txt2img_unsupervised.checkpoint import EuclideanVDMTrainState
 from txt2img_unsupervised.config import EuclideanVDMConfig, TrainingConfig
 from txt2img_unsupervised.euclidean_vdm import (

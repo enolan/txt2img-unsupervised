@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 import transformers
+import wandb
 from einops import rearrange, repeat
 from jax.sharding import NamedSharding, PartitionSpec
 from omegaconf import OmegaConf
@@ -26,7 +27,6 @@ from tqdm import tqdm, trange
 import txt2img_unsupervised.cap_sampling as cap_sampling
 import txt2img_unsupervised.sample as sample
 import txt2img_unsupervised.transformer_model as transformer_model
-import wandb
 from txt2img_unsupervised.checkpoint import TransformerTrainState
 from txt2img_unsupervised.config import (
     LearningRateSchedule,

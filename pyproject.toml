@@ -70,6 +70,10 @@ ignore = [
     "RUF059",  # unused-unpacked-variable — rename to _ is just style
 ]
 
+[tool.ruff.lint.isort]
+# wandb creates a wandb/ directory that confuses ruff's third vs first party detection
+known-third-party = ["wandb"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
