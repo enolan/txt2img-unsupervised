@@ -2,18 +2,18 @@
 Functions for generating visualizations of training progress.
 """
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
-import wandb
-
 from einops import reduce
-from functools import partial
 from tqdm import tqdm
-from typing import List
+
+import wandb
 
 from .checkpoint import TransformerTrainState
 from .transformer_model import ImageModel
@@ -46,7 +46,7 @@ def log_token_loss_visualization(
     train_state: TransformerTrainState,
     mdl: ImageModel,
     images: jax.Array,
-    image_names: List[str],
+    image_names: list[str],
     clip_embeddings: jax.Array,
     max_cos_distances: jax.Array,
     global_step: int,

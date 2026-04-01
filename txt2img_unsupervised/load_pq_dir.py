@@ -1,12 +1,11 @@
-from datasets import Dataset
-from pathlib import Path
-from tqdm import tqdm
-from xdg_base_dirs import xdg_cache_home
-
 import hashlib
+
 import infinidata
 import numpy as np
 import pyarrow.parquet as pq
+from datasets import Dataset
+from tqdm import tqdm
+from xdg_base_dirs import xdg_cache_home
 
 
 def load_pq_dir(dir_path):

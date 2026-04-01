@@ -1,31 +1,29 @@
 """
 Given a source of images, scale them, crop them, and encode them with LDM encoder.
 """
+
 import argparse
+import os
+import queue
+import random
+from copy import copy
+from pathlib import Path
+from threading import Lock, Semaphore, Thread
+
 import CloseableQueue
-import gc
-import itertools
 import jax
 import jax.numpy as jnp
 import numpy as np
-import os
 import pandas as pd
 import PIL.Image
 import pyarrow as pa
 import pyarrow.parquet as pq
-import queue
-import random
 import torch
 import transformers
 from CloseableQueue import CloseableQueue as CQueue
-from concurrent import futures
-from copy import copy
 from einops import rearrange
 from omegaconf import OmegaConf
-from pathlib import Path
-from threading import Lock, Semaphore, Thread
 from tqdm import tqdm
-from typing import Optional
 
 from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
 
@@ -129,12 +127,12 @@ def encode(ae_params, clip_params, img_ae: jax.Array, img_clip: jax.Array) -> ja
     )[0].astype(jnp.float32)
     img_clip_emb = img_clip_emb / jnp.linalg.norm(img_clip_emb)
 
-    assert img_enc.shape == (
-        token_count,
-    ), f"encoded image shape is {img_enc.shape}, should be ({token_count},)"
-    assert img_clip_emb.shape == (
-        768,
-    ), f"CLIP embedding shape is {img_clip_emb.shape}, should be (768,)"
+    assert img_enc.shape == (token_count,), (
+        f"encoded image shape is {img_enc.shape}, should be ({token_count},)"
+    )
+    assert img_clip_emb.shape == (768,), (
+        f"CLIP embedding shape is {img_clip_emb.shape}, should be (768,)"
+    )
     return img_enc, img_clip_emb
 
 
@@ -169,7 +167,7 @@ paths_queuer = Thread(
 paths_queuer.start()
 
 
-def load_img(img_path: Path) -> Optional[PIL.Image.Image]:
+def load_img(img_path: Path) -> PIL.Image.Image | None:
     """Load/crop/scale a single image."""
     try:
         img = PIL.Image.open(img_path)
@@ -426,9 +424,9 @@ with tqdm(total=len(in_dirs), desc="directories") as dirs_pbar:
                     tqdm.write(
                         f"embedded_imgs dtype: {embedded_imgs.dtype}, shape: {embedded_imgs.shape}"
                     )
-                    assert len(encoded_imgs) == len(
-                        encoded_imgs_paths[i]
-                    ), f"{len(encoded_imgs)} encoded images but {len(encoded_imgs_paths[i])} paths"
+                    assert len(encoded_imgs) == len(encoded_imgs_paths[i]), (
+                        f"{len(encoded_imgs)} encoded images but {len(encoded_imgs_paths[i])} paths"
+                    )
                     tqdm.write(
                         f"Writing {len(encoded_imgs)} encoded images to {out_paths[i]} for dir #{i}"
                     )

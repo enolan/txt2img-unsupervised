@@ -2,16 +2,16 @@
 """Compare sampling results with different step counts."""
 
 import argparse
+import time
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from pathlib import Path
 from tqdm import tqdm
-import time
-from scipy import stats
 
 from txt2img_unsupervised.checkpoint import load_params
 from txt2img_unsupervised.flow_matching import sample_loop

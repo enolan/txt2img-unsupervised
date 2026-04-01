@@ -2,11 +2,11 @@
 for each image with all the caps."""
 
 import argparse
-import numpy as np
 import tempfile
-
-from datasets import Dataset
 from pathlib import Path
+
+import numpy as np
+from datasets import Dataset
 from tqdm import tqdm, trange
 
 from txt2img_unsupervised.load_pq_dir import load_pq_dir
@@ -68,13 +68,13 @@ def merge_dsets(dsets, out_dir, out_chunk_size, cap_count):
             # Create the output row from the matches
             keys = dsets[matching_idxs[0]].column_names
             assert "cap_center" in keys, "All datasets must have a 'cap_center' column"
-            assert (
-                "cap_max_cos_distance" in keys
-            ), "All datasets must have a 'cap_max_cos_distance' column"
+            assert "cap_max_cos_distance" in keys, (
+                "All datasets must have a 'cap_max_cos_distance' column"
+            )
             for i in matching_idxs[1:]:
-                assert (
-                    dsets[i].column_names == keys
-                ), "All datasets must have the same schema"
+                assert dsets[i].column_names == keys, (
+                    "All datasets must have the same schema"
+                )
             # Parquet doesn't support multi-dimensional arrays so we need to flatten the caps
             out_cap_centers = [rows[i]["cap_center"] for i in matching_idxs]
             assert all(
@@ -82,12 +82,12 @@ def merge_dsets(dsets, out_dir, out_chunk_size, cap_count):
                 for cap_center in out_cap_centers[1:]
             ), "cap centers are identical :("
             out_cap_centers = np.concatenate(out_cap_centers)
-            assert out_cap_centers.shape == (
-                cap_count * 768,
-            ), f"out_cap_centers shape {out_cap_centers.shape}"
-            assert (
-                out_cap_centers.dtype == np.float32
-            ), f"out_cap_centers dtype {out_cap_centers.dtype}"
+            assert out_cap_centers.shape == (cap_count * 768,), (
+                f"out_cap_centers shape {out_cap_centers.shape}"
+            )
+            assert out_cap_centers.dtype == np.float32, (
+                f"out_cap_centers dtype {out_cap_centers.dtype}"
+            )
 
             out_cap_max_cos_distances = [
                 rows[i]["cap_max_cos_distance"] for i in matching_idxs
@@ -109,20 +109,20 @@ def merge_dsets(dsets, out_dir, out_chunk_size, cap_count):
                 max_dist.dtype == np.float32 for max_dist in out_cap_max_cos_distances
             )
             out_cap_max_cos_distances = np.array(out_cap_max_cos_distances)
-            assert out_cap_max_cos_distances.shape == (
-                cap_count,
-            ), f"out_cap_max_cos_distances shape {out_cap_max_cos_distances.shape}"
-            assert (
-                out_cap_max_cos_distances.dtype == np.float32
-            ), f"out_cap_max_cos_distances dtype {out_cap_max_cos_distances.dtype}"
+            assert out_cap_max_cos_distances.shape == (cap_count,), (
+                f"out_cap_max_cos_distances shape {out_cap_max_cos_distances.shape}"
+            )
+            assert out_cap_max_cos_distances.dtype == np.float32, (
+                f"out_cap_max_cos_distances dtype {out_cap_max_cos_distances.dtype}"
+            )
 
             # Check that everything except the caps is equal across the matches
             keys_to_copy = set(keys) - {"cap_center", "cap_max_cos_distance"}
             for k in keys_to_copy:
                 vals = [rows[i][k] for i in matching_idxs]
-                assert all(
-                    np.array_equal(vals[0], v) for v in vals
-                ), f"Values for key {k} do not match across matches"
+                assert all(np.array_equal(vals[0], v) for v in vals), (
+                    f"Values for key {k} do not match across matches"
+                )
 
             # Create the output row
             first_matching_row = rows[0]
@@ -232,7 +232,7 @@ def test_merging_same_caps_fails():
         out_dir = Path(tmpdir)
         try:
             merge_dsets([dset, dset], out_dir, 8192, 2)
-        except AssertionError as e:
+        except AssertionError:
             return
         assert False, "Merging the same dataset twice should raise an AssertionError"
 
@@ -262,9 +262,9 @@ def main():
     print(
         f"Loaded {len(dsets)} datasets with {sum(len(dset) for dset in dsets)} total rows"
     )
-    assert all(
-        len(dset) > 0 for dset in dsets
-    ), "All datasets must have at least one row"
+    assert all(len(dset) > 0 for dset in dsets), (
+        "All datasets must have at least one row"
+    )
 
     merge_dsets(dsets, args.output_dir, args.out_chunk_size, args.cap_count)
 

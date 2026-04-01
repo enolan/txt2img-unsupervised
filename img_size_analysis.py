@@ -2,12 +2,11 @@
 
 import argparse
 import concurrent.futures
-import jax.numpy as jnp
-import numpy as np
-import pandas as pd
-import PIL.Image
 import random
 from pathlib import Path
+
+import pandas as pd
+import PIL.Image
 from tqdm import tqdm
 
 parser = argparse.ArgumentParser()

@@ -1,9 +1,9 @@
 import argparse
 import json
-import numpy as np
-
 from datetime import datetime
 from pathlib import Path
+
+import numpy as np
 
 from txt2img_unsupervised.load_pq_dir import load_pq_dir_to_infinidata
 from txt2img_unsupervised.spherical_space_partitioning import CapTree
@@ -38,7 +38,7 @@ def main():
     print(f"Loaded dataset with {len(dset)} rows")
 
     if args.read_dup_blacklist is not None:
-        with open(args.read_dup_blacklist, "r") as f:
+        with open(args.read_dup_blacklist) as f:
             found_duplicates = json.load(f)
         blacklist = [
             item

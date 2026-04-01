@@ -1,16 +1,15 @@
 """
 Generate some test data for testing the Jax implementation of the autoencoder.
 """
-import PIL
-import numpy as np
-import torch
-import sys
-from pathlib import Path
-import argparse
-from omegaconf import OmegaConf
-from einops import rearrange
 
+import argparse
+from pathlib import Path
+
+import numpy as np
+import PIL
+import torch
 from ldm.models.autoencoder import VQModel
+from omegaconf import OmegaConf
 
 # Parse the arguments
 parser = argparse.ArgumentParser()

@@ -5,12 +5,13 @@ and break or set back learning. Won't help if your training is unstable for reas
 fixed with a larger batch size.
 """
 
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from typing import NamedTuple
 
 
 class AdaptiveGradientClipState(NamedTuple):

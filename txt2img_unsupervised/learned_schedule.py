@@ -21,7 +21,6 @@ where γ'(t) is computed via autodiff through this network.
 """
 
 from functools import partial
-from typing import Optional
 
 import flax.linen as nn
 import jax
@@ -51,12 +50,12 @@ class LearnedNoiseSchedule(nn.Module):
     n_quadrature_points: int = 1024
     init_gamma_min: float = -0.693
     init_gamma_max: float = 9.210
-    gamma_max_cap: Optional[float] = None
+    gamma_max_cap: float | None = None
 
     def setup(self):
-        assert (
-            self.n_quadrature_points >= 2
-        ), f"n_quadrature_points must be >= 2, got {self.n_quadrature_points}"
+        assert self.n_quadrature_points >= 2, (
+            f"n_quadrature_points must be >= 2, got {self.n_quadrature_points}"
+        )
         self.gamma_min = self.param(
             "gamma_min",
             lambda _: jnp.array(self.init_gamma_min),
@@ -324,9 +323,9 @@ def test_derivative_positive():
     t_values = jnp.linspace(0.01, 0.99, 100)
     derivs = schedule.apply(params, t_values, method=schedule.gamma_derivative)
 
-    assert jnp.all(
-        derivs > 0
-    ), f"Derivative not positive everywhere: min = {float(jnp.min(derivs)):.6e}"
+    assert jnp.all(derivs > 0), (
+        f"Derivative not positive everywhere: min = {float(jnp.min(derivs)):.6e}"
+    )
 
 
 def test_derivative_matches_finite_differences():
@@ -510,9 +509,9 @@ def test_learn_function(target_name, target_fn):
     )
 
     # The schedule should closely match the isotonic regression
-    assert (
-        relative_rmse < 0.02
-    ), f"{target_name}: relative RMSE vs isotonic {relative_rmse:.4f} too high"
+    assert relative_rmse < 0.02, (
+        f"{target_name}: relative RMSE vs isotonic {relative_rmse:.4f} too high"
+    )
 
     # Check endpoints converged (tolerance scales with range)
     endpoint_atol = max(0.1, isotonic_range * 0.02)

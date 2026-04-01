@@ -7,35 +7,31 @@ import os
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
 
 import argparse
-import jax
-import wandb
-import matplotlib.pyplot as plt
 from distutils.util import strtobool
 from functools import partial
-from jax.sharding import NamedSharding, PartitionSpec
 from pathlib import Path
-from typing import Optional
 
+import jax
+import matplotlib.pyplot as plt
+from jax.sharding import NamedSharding, PartitionSpec
+
+import wandb
 from txt2img_unsupervised.checkpoint import FlowMatchingTrainState
 from txt2img_unsupervised.config import (
     FlowMatchingModelConfig,
     TrainingConfig,
 )
 from txt2img_unsupervised.flow_matching import (
-    compute_batch_loss,
     LogitsTable,
+    compute_batch_loss,
     create_mollweide_projection_figure,
 )
 from txt2img_unsupervised.function_weighted_flow_model import (
-    BaseDistribution,
-    generate_samples,
-    compute_nll,
-    compute_hemisphere_masses,
     WeightingFunction,
-    CapIndicatorExtraParams,
-    SmoothedCapIndicatorExtraParams,
-    sample_loop,
+    compute_hemisphere_masses,
+    compute_nll,
     sample_full_sphere,
+    sample_loop,
 )
 from txt2img_unsupervised.train_data_loading import get_batch
 from txt2img_unsupervised.training_infra import (
@@ -143,8 +139,8 @@ def init_train_state(
     model_cfg: FlowMatchingModelConfig,
     training_cfg: TrainingConfig,
     total_steps: int,
-    resume_checkpoint_path: Optional[Path] = None,
-    finetune_checkpoint_path: Optional[Path] = None,
+    resume_checkpoint_path: Path | None = None,
+    finetune_checkpoint_path: Path | None = None,
     start_where_finetune_source_left_off: bool = False,
 ):
     """Set up our initial FlowMatchingTrainState using the provided configs.

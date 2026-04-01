@@ -34,10 +34,10 @@ Then normalize: x = z / ‖z‖.
 """
 
 import math
-
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Callable, FrozenSet, Literal, Optional
+from typing import Literal
 
 import diffrax
 import flax.linen as nn
@@ -68,7 +68,6 @@ from txt2img_unsupervised.flow_matching import (
     stratified_time_sample,
 )
 from txt2img_unsupervised.learned_schedule import LearnedNoiseSchedule
-
 
 # =============================================================================
 # Model
@@ -115,9 +114,9 @@ class EuclideanDiffusionModel(nn.Module):
     n_layers: int
     d_model: int
     mlp_expansion_factor: int
-    mlp_dropout_rate: Optional[float]
-    input_dropout_rate: Optional[float]
-    mlp_always_inject: FrozenSet[Literal["x", "t", "cond"]] = field(
+    mlp_dropout_rate: float | None
+    input_dropout_rate: float | None
+    mlp_always_inject: frozenset[Literal["x", "t", "cond"]] = field(
         default_factory=frozenset
     )
     activations_dtype: jnp.dtype = jnp.float32
@@ -139,13 +138,13 @@ class EuclideanDiffusionModel(nn.Module):
     # Hard ceiling on the learned log-SNR maximum. Prevents the schedule from pushing
     # γ_max to extreme values where float32 precision degrades and the recon term
     # dominates the VLB without improving actual sample quality.
-    log_snr_max_cap: Optional[float] = None
+    log_snr_max_cap: float | None = None
 
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
-    d_max_dist: Optional[tuple] = None
-    vlb_variance_loss_weight: Optional[float] = None
+    d_max_dist: tuple | None = None
+    vlb_variance_loss_weight: float | None = None
     classifier_loss_weight: float = 1.0
-    cap_features: FrozenSet[
+    cap_features: frozenset[
         Literal["cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"]
     ] = field(default_factory=lambda: DEFAULT_CAP_FEATURES)
 
@@ -404,9 +403,9 @@ class EuclideanDiffusionModel(nn.Module):
             z, t_normalized, cond_vecs
         )
         _, d_maxes = cap_params
-        assert (
-            d_maxes.ndim == 1
-        ), f"d_maxes must be [batch_size], got shape {d_maxes.shape}"
+        assert d_maxes.ndim == 1, (
+            f"d_maxes must be [batch_size], got shape {d_maxes.shape}"
+        )
         raw_logits = self.classifier_head(mlp_out).squeeze(-1)
         correction = jax.vmap(
             lambda d: classifier_logit_correction(self.logits_table, d)
@@ -664,7 +663,7 @@ def generate_samples_sde(
     rng: Array,
     cap_params,
     n_steps: int = 200,
-    batch_size: Optional[int] = None,
+    batch_size: int | None = None,
     eta: float = 1.0,
 ) -> Array:
     """Generate samples using the DDPM ancestral sampler in log-SNR space.
@@ -758,8 +757,8 @@ def generate_samples_ode(
     params,
     rng: Array,
     cap_params,
-    n_steps: Optional[int] = None,
-    batch_size: Optional[int] = None,
+    n_steps: int | None = None,
+    batch_size: int | None = None,
     method: str = "diffrax",
     atol: float = 1e-5,
     rtol: float = 1e-5,
@@ -851,7 +850,7 @@ def compute_nll(
     model: EuclideanDiffusionModel,
     params,
     batch: dict,
-    n_steps: Optional[int] = None,
+    n_steps: int | None = None,
     rng=None,
     n_projections: int = 10,
     cap_params=None,
@@ -1129,7 +1128,7 @@ def _compute_log_probability(
     params,
     samples: Array,
     cap_params,
-    n_steps: Optional[int] = None,
+    n_steps: int | None = None,
     rng=None,
     n_projections: int = 10,
     method: str = "diffrax",
@@ -1268,9 +1267,9 @@ def test_vlb_loss_components():
         assert jnp.isfinite(components[key]), f"VLB component '{key}' is not finite"
 
     # Diffusion loss should be non-negative
-    assert (
-        float(components["diffusion"]) >= 0
-    ), f"Diffusion loss should be non-negative, got {components['diffusion']}"
+    assert float(components["diffusion"]) >= 0, (
+        f"Diffusion loss should be non-negative, got {components['diffusion']}"
+    )
 
     # Prior loss should be small for very low SNR_min
     print(f"Prior: {float(components['prior']):.6f}")
@@ -1402,9 +1401,9 @@ def test_train_trivial(domain_dim):
         f"{n_close_95}/{n_gen_samples} at cosine>0.95, "
         f"{n_close_90}/{n_gen_samples} at cosine>0.9 (mean {cosine_sims.mean():.4f})"
     )
-    assert (
-        n_close_99 >= 0.9 * n_gen_samples
-    ), f"Only {n_close_99}/{n_gen_samples} samples have cosine > 0.99"
+    assert n_close_99 >= 0.9 * n_gen_samples, (
+        f"Only {n_close_99}/{n_gen_samples} samples have cosine > 0.99"
+    )
 
     # Print schedule endpoints and VLB diagnostics
     gamma_min, gamma_max = model.apply(eval_params, method=model.gamma_range)
@@ -1623,18 +1622,18 @@ def test_train_distribution(domain_dim, dist_name):
         # most mass near the boundary). Use a softer sanity check for it;
         # the KS test below is the main distributional assertion.
         in_support_threshold = 0.95 if dist_name == "cap" else 0.98
-        assert (
-            in_support_frac > in_support_threshold
-        ), f"Only {in_support_frac:.1%} of samples in support"
+        assert in_support_frac > in_support_threshold, (
+            f"Only {in_support_frac:.1%} of samples in support"
+        )
 
     # 2. Cross-entropy under the true density should approximate entropy.
     # E_model[-log p_true(x)] ≈ H(p_true) when model ≈ true distribution.
     if np.any(in_support):
         cross_ent = -np.mean(log_probs[in_support])
         print(f"Cross-entropy: {cross_ent:.4f}, entropy: {dist.entropy:.4f}")
-        assert (
-            cross_ent < dist.entropy + 1.0
-        ), f"Cross-entropy {cross_ent:.4f} too far from entropy {dist.entropy:.4f}"
+        assert cross_ent < dist.entropy + 1.0, (
+            f"Cross-entropy {cross_ent:.4f} too far from entropy {dist.entropy:.4f}"
+        )
 
     # 3. Very few samples should land in the exterior region
     exterior_frac = np.mean(dist.exterior_mask(samples_np))
@@ -1660,9 +1659,9 @@ def test_train_distribution(domain_dim, dist_name):
     print(
         f"KS stats over {n_projections} projections: max={max_ks:.4f}, mean={mean_ks:.4f}"
     )
-    assert (
-        max_ks < 0.05
-    ), f"Max KS statistic {max_ks:.4f} too large across {n_projections} projections"
+    assert max_ks < 0.05, (
+        f"Max KS statistic {max_ks:.4f} too large across {n_projections} projections"
+    )
 
     # 5. For distributions with a natural center (cap, hemisphere), compare
     #    cosine distance from that center — tests the radial profile.
@@ -1673,9 +1672,9 @@ def test_train_distribution(domain_dim, dist_name):
         ref_cos_dists = 1.0 - ref_np @ center_np
         cos_dist_ks, _ = stats.ks_2samp(model_cos_dists, ref_cos_dists)
         print(f"KS on cosine distance from center: {cos_dist_ks:.4f}")
-        assert (
-            cos_dist_ks < 0.05
-        ), f"Cosine distance KS statistic {cos_dist_ks:.4f} too large"
+        assert cos_dist_ks < 0.05, (
+            f"Cosine distance KS statistic {cos_dist_ks:.4f} too large"
+        )
 
 
 # Per-config test parameters for test_train_cap_conditioned.
@@ -1685,10 +1684,10 @@ def test_train_distribution(domain_dim, dist_name):
 # CG thresholds are at least as tight as CS. With all cap features enabled, CS quality is
 # close to CG; CG's remaining edge is mainly in_cap in dim=16.
 # Values: (steps, in_cap_threshold, ks_threshold)
+# fmt: off
 _CAP_CONDITIONED_TEST_CONFIGS: dict[
     tuple[int, str, CapConditioningMode], tuple[int, float, float]
 ] = {
-    # fmt: off
     #                                                           steps   in_cap   KS
     (3,  "uniform", CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.96,    0.06),
     (3,  "uniform", CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.96,    0.06),
@@ -1698,8 +1697,8 @@ _CAP_CONDITIONED_TEST_CONFIGS: dict[
     (16, "uniform", CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.95,    0.06),
     (16, "vmf",     CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.93,    0.06),
     (16, "vmf",     CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.95,    0.06),
-    # fmt: on
 }
+# fmt: on
 
 
 @pytest.mark.usefixtures("starts_with_progressbar")
@@ -1879,9 +1878,9 @@ def test_train_cap_conditioned(domain_dim, data_distribution, cap_conditioning):
             f"  KS on cosine distance from cap center: {cos_dist_ks:.4f} "
             f"(threshold: {ks_threshold:.4f}, margin: {cos_dist_ks_margin:+.4f})"
         )
-        assert (
-            cos_dist_ks < ks_threshold
-        ), f"Cosine distance KS statistic {cos_dist_ks:.4f} >= {ks_threshold:.4f} for d_max={d_max_test}"
+        assert cos_dist_ks < ks_threshold, (
+            f"Cosine distance KS statistic {cos_dist_ks:.4f} >= {ks_threshold:.4f} for d_max={d_max_test}"
+        )
 
         # KS test on random 1D projections
         proj_rng = np.random.default_rng(456 + int(d_max_test * 1000))
@@ -1901,9 +1900,9 @@ def test_train_cap_conditioned(domain_dim, data_distribution, cap_conditioning):
             f"max={max_ks:.4f}, mean={mean_ks:.4f} "
             f"(threshold: {ks_threshold:.4f}, margin: {proj_ks_margin:+.4f})"
         )
-        assert (
-            max_ks < ks_threshold
-        ), f"Max KS statistic {max_ks:.4f} >= {ks_threshold:.4f} for d_max={d_max_test}"
+        assert max_ks < ks_threshold, (
+            f"Max KS statistic {max_ks:.4f} >= {ks_threshold:.4f} for d_max={d_max_test}"
+        )
 
 
 def _init_small_model(dim=3):
@@ -2036,9 +2035,9 @@ def test_diffrax_nll_matches_rk4():
     print(f"NLL diffrax: {mean_diffrax:.4f}")
     print(f"NLL rk4: {mean_rk4:.4f}")
     print(f"Mean abs diff: {abs(mean_diffrax - mean_rk4):.4f}")
-    assert (
-        abs(mean_diffrax - mean_rk4) < 0.1
-    ), f"NLL estimates too far apart: diffrax={mean_diffrax:.4f}, rk4={mean_rk4:.4f}"
+    assert abs(mean_diffrax - mean_rk4) < 0.1, (
+        f"NLL estimates too far apart: diffrax={mean_diffrax:.4f}, rk4={mean_rk4:.4f}"
+    )
 
 
 # =============================================================================
@@ -2071,9 +2070,9 @@ def test_classifier_loss_gradients_flow():
 
     # Loss should be finite
     assert jnp.isfinite(loss), f"Loss is not finite: {loss}"
-    assert jnp.isfinite(
-        components["classifier"]
-    ), f"Classifier loss is not finite: {components['classifier']}"
+    assert jnp.isfinite(components["classifier"]), (
+        f"Classifier loss is not finite: {components['classifier']}"
+    )
     assert components["classifier"] > 0, "Classifier loss should be positive"
 
     # Backbone should receive gradients
@@ -2088,9 +2087,7 @@ def test_classifier_loss_gradients_flow():
 
     # Schedule should receive gradients
     sched_grads = grads["params"]["schedule"]
-    sched_grad_norm = jnp.sqrt(
-        sum(jnp.sum(x**2) for x in jax.tree.leaves(sched_grads))
-    )
+    sched_grad_norm = jnp.sqrt(sum(jnp.sum(x**2) for x in jax.tree.leaves(sched_grads)))
     assert sched_grad_norm > 0, "No gradients flowing to schedule"
 
 
@@ -2266,9 +2263,9 @@ def test_classifier_guidance_768d():
 
     # Guided prediction should differ from unguided (classifier gradient is non-zero)
     unguided_eps = _predict_eps(model, params, None, z, 0.0)
-    assert not jnp.allclose(
-        guided_eps, unguided_eps, atol=1e-6
-    ), "Guided and unguided predictions are identical — classifier gradient may be zero"
+    assert not jnp.allclose(guided_eps, unguided_eps, atol=1e-6), (
+        "Guided and unguided predictions are identical — classifier gradient may be zero"
+    )
 
     # Verify SDE sampling with guidance produces finite on-sphere outputs
     samples = generate_samples_sde(

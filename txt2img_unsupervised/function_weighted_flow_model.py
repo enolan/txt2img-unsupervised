@@ -1,19 +1,19 @@
 from dataclasses import dataclass, field, replace
-from datasets import Dataset
-from einops import repeat
 from enum import Enum
 from functools import partial
-from scipy import stats
-from tqdm import tqdm
-from typing import FrozenSet, Literal, Optional, Tuple, Union
+from typing import Literal
+
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from datasets import Dataset
+from einops import repeat
+from scipy import stats
+from tqdm import tqdm
 
 from . import flow_matching
-from . import vmf
 from .cap_sampling import (
     LogitsTable,
     cap_conditioning_dim,
@@ -84,7 +84,7 @@ class CapIndicatorExtraParams:
     function.
     """
 
-    d_max_dist: Tuple[Tuple[float, float], ...] = ((0.95, 1.0), (0.05, 2.0))
+    d_max_dist: tuple[tuple[float, float], ...] = ((0.95, 1.0), (0.05, 2.0))
     """
     Training distribution of maximum cosine distances, specified as a mixture of uniform
     distributions. Each tuple contains the weight of the mixture component and the upper d_max
@@ -101,7 +101,7 @@ class SmoothedCapIndicatorExtraParams:
     weighting function.
     """
 
-    d_max_dist: Tuple[Tuple[float, float], ...] = ((0.95, 1.0), (0.05, 2.0))
+    d_max_dist: tuple[tuple[float, float], ...] = ((0.95, 1.0), (0.05, 2.0))
     """
     Training distribution of maximum cosine distances, specified as a mixture of uniform
     distributions. Each tuple contains the weight of the mixture component and the upper d_max
@@ -155,9 +155,9 @@ class FunctionWeightedFlowModel(nn.Module):
     n_layers: int
     d_model: int
     mlp_expansion_factor: int
-    mlp_dropout_rate: Optional[float]
-    input_dropout_rate: Optional[float]
-    mlp_always_inject: FrozenSet[Literal["x", "t", "cond"]] = field(
+    mlp_dropout_rate: float | None
+    input_dropout_rate: float | None
+    mlp_always_inject: frozenset[Literal["x", "t", "cond"]] = field(
         default_factory=frozenset
     )
     activations_dtype: jnp.dtype = jnp.float32
@@ -169,9 +169,9 @@ class FunctionWeightedFlowModel(nn.Module):
 
     # Weighting-related hyperparameters.
     weighting_function: WeightingFunction = WeightingFunction.CONSTANT
-    weighting_function_extra_params: Optional[
-        Union[CapIndicatorExtraParams, SmoothedCapIndicatorExtraParams]
-    ] = None
+    weighting_function_extra_params: (
+        CapIndicatorExtraParams | SmoothedCapIndicatorExtraParams | None
+    ) = None
 
     # Base distribution type for sampling x0
     base_distribution: BaseDistribution = BaseDistribution.SPHERE
@@ -232,7 +232,7 @@ class FunctionWeightedFlowModel(nn.Module):
             for i in range(1, len(d_max_values)):
                 if d_max_values[i] <= d_max_values[i - 1]:
                     raise ValueError(
-                        f"d_max_dist upper bounds must be in ascending order, but got {d_max_values[i-1]:.3f} >= {d_max_values[i]:.3f}"
+                        f"d_max_dist upper bounds must be in ascending order, but got {d_max_values[i - 1]:.3f} >= {d_max_values[i]:.3f}"
                     )
 
             # Sanity check: verify d_max_dist compatibility with base distribution
@@ -282,7 +282,7 @@ class FunctionWeightedFlowModel(nn.Module):
         )
         return self.logits_table.weighted(weight_vals)
 
-    def dummy_inputs(self) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    def dummy_inputs(self) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         """Create dummy inputs for model initialization with the correct shapes.
 
         Returns:
@@ -355,9 +355,9 @@ class FunctionWeightedFlowModel(nn.Module):
         """
         rng = self.make_rng("sample_base")
         if self.base_distribution == BaseDistribution.CAP:
-            assert (
-                self.weighting_function == WeightingFunction.CAP_INDICATOR
-            ), "CAP base distribution only supported with CAP_INDICATOR weighting"
+            assert self.weighting_function == WeightingFunction.CAP_INDICATOR, (
+                "CAP base distribution only supported with CAP_INDICATOR weighting"
+            )
             assert (
                 isinstance(weighting_function_params, tuple)
                 and len(weighting_function_params) == 2
@@ -426,13 +426,15 @@ class FunctionWeightedFlowModel(nn.Module):
             batch_size,
             self.domain_dim,
         ), f"cond_vecs.shape: {cond_vecs.shape}"
-        assert cond_scalars.shape == (
-            batch_size,
-        ), f"cond_scalars.shape: {cond_scalars.shape}"
+        assert cond_scalars.shape == (batch_size,), (
+            f"cond_scalars.shape: {cond_scalars.shape}"
+        )
         assert self.weighting_function in [
             WeightingFunction.CAP_INDICATOR,
             WeightingFunction.SMOOTHED_CAP_INDICATOR,
-        ], f"process_weighting_function_params called with unsupported weighting function: {self.weighting_function}"
+        ], (
+            f"process_weighting_function_params called with unsupported weighting function: {self.weighting_function}"
+        )
 
         processed_cond_vecs = encode_cap_params(
             cap_center=cond_vecs,
@@ -480,7 +482,7 @@ class FunctionWeightedFlowModel(nn.Module):
     def compute_weight(
         self,
         x: jax.Array,
-        weighting_function_params: Optional[Tuple[jax.Array, jax.Array]],
+        weighting_function_params: tuple[jax.Array, jax.Array] | None,
     ) -> jax.Array:
         """
         Compute the weight of a point under the weighting function defined by the parameters.
@@ -527,7 +529,7 @@ class FunctionWeightedFlowModel(nn.Module):
 
     def _sample_smoothed_cap_params(
         self, rng: jax.Array, x: jax.Array
-    ) -> Tuple[jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array]:
         """Sample smoothed cap indicator parameters given an explicit RNG key.
 
         Args:
@@ -557,7 +559,7 @@ class FunctionWeightedFlowModel(nn.Module):
 
     def sample_weighting_function_params(
         self, x: jax.Array
-    ) -> Optional[Tuple[jax.Array, jax.Array]]:
+    ) -> tuple[jax.Array, jax.Array] | None:
         """
         Given a point x, sample a set of parameters for the weighting function from a distribution
         that's density is proportional to the weighting function and independent of any attribute of
@@ -791,9 +793,9 @@ def test_fwfm_base_distribution_sampling(base_distribution, domain_dim):
 
     if base_distribution == BaseDistribution.HEMISPHERE:
         # All samples should have first coordinate >= 0
-        assert jnp.all(
-            samples[:, 0] >= 0
-        ), "All samples should be in northern hemisphere"
+        assert jnp.all(samples[:, 0] >= 0), (
+            "All samples should be in northern hemisphere"
+        )
     elif base_distribution == BaseDistribution.SPHERE:
         # For full sphere, roughly half should be positive, half negative
         positive_count = jnp.sum(samples[:, 0] >= 0)
@@ -884,7 +886,7 @@ def generate_samples(
     params,
     rng,
     weighting_function_params,
-    n_steps: Optional[int] = None,
+    n_steps: int | None = None,
     method="tsit5",
     batch_size=None,
 ):
@@ -962,7 +964,7 @@ def sample_loop(
     weighting_function_params,
     n_samples,
     batch_size,
-    n_steps: Optional[int] = None,
+    n_steps: int | None = None,
     method="tsit5",
 ):
     """
@@ -1034,9 +1036,9 @@ def compute_log_probability(
     Compute the log probability of samples under a function-weighted flow model.
     """
     if model.base_distribution == BaseDistribution.CAP:
-        assert (
-            model.weighting_function == WeightingFunction.CAP_INDICATOR
-        ), "CAP base distribution only supported with CAP_INDICATOR weighting"
+        assert model.weighting_function == WeightingFunction.CAP_INDICATOR, (
+            "CAP base distribution only supported with CAP_INDICATOR weighting"
+        )
         assert (
             isinstance(weighting_function_params, tuple)
             and len(weighting_function_params) == 2
@@ -1343,7 +1345,7 @@ def test_train_trivial_distribution(
         raise ValueError(f"Unknown weighting function: {weighting_function}")
     # Test each parameter set
     for i, params in enumerate(param_sets):
-        print(f"Testing parameter set {i+1}/{len(param_sets)}: {params}")
+        print(f"Testing parameter set {i + 1}/{len(param_sets)}: {params}")
 
         # Compute true weights
         if params is None:
@@ -1495,9 +1497,9 @@ def test_train_trivial_distribution(
                 f"    Mean diff: {jnp.mean(model_valid_probs_for_positive_weights - expected_log_probs):.3f}"
             )
 
-            assert count_diffs_over_15pct < 0.2 * len(
-                absdiffs
-            ), f"Too many likelihoods differ by more than 15%: {count_diffs_over_15pct}/{len(absdiffs)}"
+            assert count_diffs_over_15pct < 0.2 * len(absdiffs), (
+                f"Too many likelihoods differ by more than 15%: {count_diffs_over_15pct}/{len(absdiffs)}"
+            )
         else:
             print(f"  WARNING: No positive weights found for parameter set {params}")
 
@@ -1537,9 +1539,9 @@ def test_train_trivial_distribution(
                 f"    Number of points with log prob > {sufficiently_negative_logprob}: {num_too_high}/{len(zero_weight_log_probs)}"
             )
 
-            assert (
-                num_too_high / len(zero_weight_log_probs) < 0.20
-            ), f"{num_too_high} zero-weight points have log prob >= {sufficiently_negative_logprob}"
+            assert num_too_high / len(zero_weight_log_probs) < 0.20, (
+                f"{num_too_high} zero-weight points have log prob >= {sufficiently_negative_logprob}"
+            )
 
 
 def compute_hemisphere_probability_masses(model, params, rng, n_samples, n_projections):
@@ -1713,7 +1715,7 @@ def sample_full_sphere(
     rng,
     n_samples,
     batch_size,
-    n_steps: Optional[int] = None,
+    n_steps: int | None = None,
     method="tsit5",
 ):
     """

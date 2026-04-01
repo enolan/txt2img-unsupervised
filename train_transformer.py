@@ -9,38 +9,38 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
 import argparse
 import datetime
 import gc
+from distutils.util import strtobool
+from functools import partial
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax  # type:ignore[import]
-import orbax.checkpoint as ocp
 import torch
 import transformers
-import wandb
-from copy import copy
-from distutils.util import strtobool
 from einops import rearrange, repeat
-from functools import partial
 from jax.sharding import NamedSharding, PartitionSpec
 from omegaconf import OmegaConf
-from pathlib import Path
 from tqdm import tqdm, trange
-from typing import Optional, Tuple
 
+import txt2img_unsupervised.cap_sampling as cap_sampling
+import txt2img_unsupervised.sample as sample
+import txt2img_unsupervised.transformer_model as transformer_model
+import wandb
 from txt2img_unsupervised.checkpoint import TransformerTrainState
 from txt2img_unsupervised.config import (
     LearningRateSchedule,
-    TransformerModelConfig,
     TrainingConfig,
+    TransformerModelConfig,
 )
 from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
 from txt2img_unsupervised.train_data_loading import get_batch
 from txt2img_unsupervised.training_infra import (
+    IntervalTimer,
+    SignalHandler,
     fast_post_step_hook,
     init_common_train_state,
     init_wandb_training,
-    IntervalTimer,
-    leading_dims_to_subtrees,
     load_dataset,
     plan_steps,
     save_checkpoint,
@@ -48,17 +48,12 @@ from txt2img_unsupervised.training_infra import (
     setup_jax_for_training,
     setup_profiling_server,
     setup_sharding,
-    SignalHandler,
     train_loop,
 )
 from txt2img_unsupervised.training_visualizations import (
     log_attention_maps,
     log_token_loss_visualization,
 )
-import txt2img_unsupervised.cap_sampling as cap_sampling
-import txt2img_unsupervised.sample as sample
-import txt2img_unsupervised.transformer_model as transformer_model
-import txt2img_unsupervised.training_infra as training_infra
 
 
 def parse_arguments():
@@ -87,9 +82,9 @@ def init_train_state(
     model_cfg: TransformerModelConfig,
     training_cfg: TrainingConfig,
     total_steps: int,
-    resume_checkpoint_path: Optional[Path] = None,
-    finetune_checkpoint_path: Optional[Path] = None,
-    sample_batch_size: Optional[int] = None,
+    resume_checkpoint_path: Path | None = None,
+    finetune_checkpoint_path: Path | None = None,
+    sample_batch_size: int | None = None,
     start_where_finetune_source_left_off: bool = False,
 ):
     """Set up our initial TransformerTrainState using the provided configs.
@@ -155,9 +150,9 @@ def find_sfw_indices(clip_mdl, clip_processor, dset, n: int):
     ok_sims = sims < 0.2
     print(f"Found {ok_sims.sum()} images with similarity < 0.2")
     ok_indices = jnp.where(ok_sims)[0]
-    assert (
-        len(ok_indices) >= n
-    ), f"Found {len(ok_indices)} images with similarity < 0.2, expected at least {n}"
+    assert len(ok_indices) >= n, (
+        f"Found {len(ok_indices)} images with similarity < 0.2, expected at least {n}"
+    )
     return jax.device_get(ok_indices[:n])
 
 
@@ -395,9 +390,9 @@ def sample_and_log(
             # pixel arrays so we use this dumb hack.
             imgs = np.empty((len(imgs_list),), dtype=object)
             imgs[:] = imgs_list
-            assert imgs.shape == (
-                len(all_centers_for_sampling),
-            ), f"imgs.shape {imgs.shape}"
+            assert imgs.shape == (len(all_centers_for_sampling),), (
+                f"imgs.shape {imgs.shape}"
+            )
 
             img_imgs = imgs[: len(img_centers_for_sampling)]
             text_imgs = imgs[len(img_centers_for_sampling) :]
@@ -428,9 +423,9 @@ def sample_and_log(
                     grid_pil = sample.make_grid(
                         [img for img in img_imgs[i, j]],
                     )
-                    to_log[
-                        f"samples/imgprompts/{name}/max_dist{dist:.2f}"
-                    ] = wandb.Image(grid_pil)
+                    to_log[f"samples/imgprompts/{name}/max_dist{dist:.2f}"] = (
+                        wandb.Image(grid_pil)
+                    )
 
             for i, name in enumerate(text_prompt_clips["name"]):
                 grid_pil = sample.make_grid(
@@ -474,9 +469,9 @@ def sample_and_log(
 
             imgs = np.empty((len(imgs_list),), dtype=object)
             imgs[:] = imgs_list
-            assert imgs.shape == (
-                len(all_clip_embeddings_for_sampling),
-            ), f"imgs.shape {imgs.shape}"
+            assert imgs.shape == (len(all_clip_embeddings_for_sampling),), (
+                f"imgs.shape {imgs.shape}"
+            )
 
             img_imgs = imgs[: len(img_clip_embeddings_for_sampling)]
             text_imgs = imgs[len(img_clip_embeddings_for_sampling) :]

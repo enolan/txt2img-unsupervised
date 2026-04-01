@@ -16,12 +16,13 @@ a given point."""
 # centers). The code for the preprocessing version is in gen_training_caps.py and
 # spherical_space_partitioning.py
 
+from functools import partial
+from typing import Optional
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from functools import partial
-from typing import FrozenSet, Optional, Tuple
 
 
 @jax.tree_util.register_pytree_node_class
@@ -326,8 +327,8 @@ def sample_negative_cap_center(rng, table, v, d_max):
 
 
 def process_d_max_dist(
-    d_max_dist: list[tuple[float, float]] = None
-) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    d_max_dist: tuple[tuple[float, float], ...] | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Process a d_max_dist parameter into normalized weights, range starts, and range ends. Used
     when sampling maximum cosine distances from mixtures of uniform distributions.
 
@@ -363,8 +364,8 @@ def sample_cap(
     table: LogitsTable,
     rng: jax.Array,
     v: jax.Array,
-    d_max_dist: list[tuple[float, float]] = None,
-) -> Tuple[jax.Array, jax.Array]:
+    d_max_dist: tuple[tuple[float, float], ...] | None = None,
+) -> tuple[jax.Array, jax.Array]:
     """Given a unit vector v, sample a spherical cap that contains it. The max cosine distance will be
     drawn from a mixture of uniform distributions specified by d_max_dist. If d_max_dist is None,
     defaults to uniform U[0, 2]. Important properties:
@@ -584,7 +585,7 @@ CAP_FEATURES = frozenset({"cap_center", "d_max", "log_cap_odds", "cos_sim", "z_n
 DEFAULT_CAP_FEATURES = frozenset({"cap_center", "d_max"})
 
 
-def _validate_cap_features(features: FrozenSet[str]) -> None:
+def _validate_cap_features(features: frozenset[str]) -> None:
     """Raise ValueError if features contains unknown names."""
     unknown = features - CAP_FEATURES
     if unknown:
@@ -592,7 +593,7 @@ def _validate_cap_features(features: FrozenSet[str]) -> None:
 
 
 def cap_conditioning_dim(
-    domain_dim: int, features: FrozenSet[str] = DEFAULT_CAP_FEATURES
+    domain_dim: int, features: frozenset[str] = DEFAULT_CAP_FEATURES
 ) -> int:
     """Compute the output dimension of cap conditioning vectors.
 
@@ -611,10 +612,10 @@ def cap_conditioning_dim(
 def encode_cap_params(
     cap_center: jax.Array,
     d_max: jax.Array,
-    d_max_dist: Optional[Tuple[Tuple[float, float], ...]],
+    d_max_dist: tuple[tuple[float, float], ...] | None,
     domain_dim: int,
-    features: FrozenSet[str] = DEFAULT_CAP_FEATURES,
-    z: Optional[jax.Array] = None,
+    features: frozenset[str] = DEFAULT_CAP_FEATURES,
+    z: jax.Array | None = None,
     table: Optional["LogitsTable"] = None,
 ) -> jax.Array:
     """Encode spherical cap parameters into a conditioning vector for a neural network.

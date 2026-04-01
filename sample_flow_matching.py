@@ -2,12 +2,13 @@
 """Sample from a flow matching checkpoint and save a visualization."""
 
 import argparse
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
-from pathlib import Path
 
 from txt2img_unsupervised.checkpoint import load_params
 from txt2img_unsupervised.flow_matching import (
@@ -105,7 +106,7 @@ def create_mollweide_with_cap(samples, cap_center_latlon, cap_radius_deg, title=
     longitude = np.arctan2(samples[:, 1], samples[:, 0])  # atan2(y, x) for longitude
     latitude = np.arcsin(samples[:, 2])  # z-coordinate gives latitude (arcsin)
 
-    scatter = ax.scatter(longitude, latitude, s=8, alpha=0.7)
+    ax.scatter(longitude, latitude, s=8, alpha=0.7)
 
     # Draw cap boundary
     lat_center, lon_center = cap_center_latlon

@@ -7,13 +7,13 @@ import numpy as np
 import pytest
 import scipy.special
 import scipy.stats
+
 from txt2img_unsupervised.vmf import (
+    _compute_dw_dkappa,
     log_normalization_constant,
     log_prob,
-    sample,
     mean_resultant_length,
-    _compute_dw_dkappa,
-    _sample_w_single,
+    sample,
 )
 
 

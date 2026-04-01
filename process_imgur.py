@@ -1,9 +1,7 @@
 """Process imgur archives from ArchiveTeam/Internet Archive"""
-import CloseableQueue
+
 import concurrent.futures
 import hashlib
-import imageio_ffmpeg  # type: ignore[import]
-import internetarchive as ia
 import os
 import random
 import re
@@ -12,12 +10,15 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
-from CloseableQueue import CloseableQueue as CQueue
 from pathlib import Path
-from PIL import Image
 from threading import Thread
+
+import CloseableQueue
+import imageio_ffmpeg  # type: ignore[import]
+import internetarchive as ia
+from CloseableQueue import CloseableQueue as CQueue
+from PIL import Image
 from tqdm import tqdm
-from typing import Tuple, Union
 
 
 def setup_db(db_path: Path) -> sqlite3.Connection:
@@ -132,7 +133,7 @@ def decompress_and_extract_warc(compressed_warc_path: Path, dest_dir: Path) -> N
         tqdm.write(f"No html in {compressed_warc_path} 🤷")
 
 
-def extract_from_dir(in_path: Path, out_path: Path) -> Tuple[list[Path], list[Path]]:
+def extract_from_dir(in_path: Path, out_path: Path) -> tuple[list[Path], list[Path]]:
     """Extract the full-resolution original images and mp4s from a directory extracted from a warc.
     in_path should be the i.imgur.com subdir created after extracting a WARC. out_path will be
     filled with images and videos. Returns lists of what was selected and rejected."""
@@ -188,7 +189,7 @@ def extract_from_dir(in_path: Path, out_path: Path) -> Tuple[list[Path], list[Pa
     paths_map = dict([(path, None) for path in paths])
     rejected_paths = []
     for path in in_path.iterdir():
-        if not (path in paths_map):
+        if path not in paths_map:
             rejected_paths.append(path)
 
     # Move the files to the output directory
@@ -224,7 +225,7 @@ def hash_dir(path: Path, conn: sqlite3.Connection, warc: str) -> None:
 
 def dedup_dir(
     src_path: Path, dest_path: Path, conn: sqlite3.Connection
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     """Go through a directory of images and videos, moving them to the destination if they aren't
     duplicates."""
     taken, skipped = 0, 0
@@ -319,7 +320,7 @@ class SQLiteConnectionPool:
 
 def process_warc(
     warc: Path, warc_id: str, workdir: Path, pool: SQLiteConnectionPool
-) -> Tuple[Path, Path, Path]:
+) -> tuple[Path, Path, Path]:
     """Run all processing steps on a warc, resulting in a directory full of original
     still images, a directory full of stills extracted from videos and a directory full of the
     original videos. Workdir should be an empty directory used specifically for this warc.
@@ -370,7 +371,7 @@ def ia_id_from_warc_filename(filename: str) -> str:
 
 def dl_and_process_warc(
     id: str, workdir: Path, pool: SQLiteConnectionPool
-) -> Tuple[Path, Path, Path]:
+) -> tuple[Path, Path, Path]:
     """Download and process a warc. Returns paths to a directory containing the original images,
     a directory containing stills extracted from videos, and a directory containing the original
     videos files. same as proces_warc"""
@@ -419,7 +420,7 @@ def upload_tar(pool: SQLiteConnectionPool, tar_path: Path, log_path: Path) -> No
 
 def process_warcs(
     pool: SQLiteConnectionPool,
-    warcs: list[Union[Path, str]],
+    warcs: list[Path | str],
     workdir: Path,
     outdir: Path,
 ) -> None:

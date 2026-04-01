@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 
 import argparse
+from pathlib import Path
+
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import rasterio
-from pathlib import Path
-from typing import Tuple, List, Dict, Any
-import urllib.parse
 from tqdm import tqdm
 
 
@@ -239,7 +237,7 @@ def sample_and_save(
                 maps_url = f"https://www.google.com/maps/place/{lat:.6f},{lon:.6f}"
 
                 print(
-                    f"Sample {i+1}: Lat: {lat:.6f}, Lon: {lon:.6f} | Unit vector: [{vector[0]:.6f}, {vector[1]:.6f}, {vector[2]:.6f}]"
+                    f"Sample {i + 1}: Lat: {lat:.6f}, Lon: {lon:.6f} | Unit vector: [{vector[0]:.6f}, {vector[1]:.6f}, {vector[2]:.6f}]"
                 )
                 print(f"  Maps: {maps_url}")
             pbar.update(1)
@@ -284,7 +282,7 @@ def main():
         )
 
         print(
-            f"\nSamples are unit vectors in 3D space representing points on Earth's surface."
+            "\nSamples are unit vectors in 3D space representing points on Earth's surface."
         )
         print(f"Data saved to: {args.output}")
     except Exception as e:

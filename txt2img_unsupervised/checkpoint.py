@@ -1,35 +1,33 @@
 """Create, load, and save TrainStates and checkpoints."""
 
 import gc
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, Literal
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import pytest
-import time
-import subprocess
-
-from contextlib import nullcontext
-from copy import copy
 from flax.training import train_state
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from pathlib import Path
 from tqdm import tqdm
-from typing import Any, Literal, Optional, Tuple, Union
 
 from .adaptive_gradient_clip import AdaptiveGradientClipState, adaptive_gradient_clip
 from .config import (
     BaseModelConfig,
+    EuclideanVDMConfig,
     FlowMatchingModelConfig,
     LearningRateSchedule,
-    EuclideanVDMConfig,
     TrainingConfig,
     TransformerModelConfig,
 )
-from .function_weighted_flow_model import FunctionWeightedFlowModel
 from .euclidean_vdm import EuclideanDiffusionModel
+from .function_weighted_flow_model import FunctionWeightedFlowModel
 from .muon import muon
 from .transformer_model import ImageModel
 from .triangle_schedule import triangle_schedule
@@ -297,7 +295,7 @@ class BaseTrainState(train_state.TrainState):
         cls,
         checkpoint_manager: ocp.CheckpointManager,
         step: int,
-        batches_total: Optional[int] = None,
+        batches_total: int | None = None,
     ):
         """
         Load a train state from a checkpoint.
@@ -480,7 +478,7 @@ class EuclideanVDMTrainState(BaseTrainState):
 
 def mk_checkpoint_manager(
     checkpoint_dir: Path,
-    checkpoint_manager_options: Optional[ocp.CheckpointManagerOptions] = None,
+    checkpoint_manager_options: ocp.CheckpointManagerOptions | None = None,
     for_training: bool = True,
 ) -> ocp.CheckpointManager:
     """Create a CheckpointManager for a directory that already has checkpoints in it."""
@@ -531,9 +529,9 @@ def _init_model_with_dummy_inputs(mdl, rng=None):
 
 def load_params(
     checkpoint_dir: Path,
-    step: Optional[int] = None,
+    step: int | None = None,
     device: Literal["gpu", "cpu"] = "gpu",
-) -> Tuple[dict, int, Any]:
+) -> tuple[dict, int, Any]:
     """Load the evaluation parameters from a checkpoint.
     Args:
         checkpoint_dir: The directory path containing the checkpoints.
@@ -587,8 +585,8 @@ def setup_checkpoint_manager_and_initial_state(
     rng: jax.random.PRNGKey,
     batches_total: int,
     data_offset: int = 0,
-    extra_metadata: Optional[Tuple[str, Any]] = None,
-) -> Tuple[ocp.CheckpointManager, Union[TransformerTrainState, FlowMatchingTrainState]]:
+    extra_metadata: tuple[str, Any] | None = None,
+) -> tuple[ocp.CheckpointManager, TransformerTrainState | FlowMatchingTrainState]:
     """
     Set up a CheckpointManager and create an initial TrainState. Does NOT save an initial
     checkpoint.

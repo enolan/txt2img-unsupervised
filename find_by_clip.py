@@ -1,21 +1,18 @@
 """Search captrees by CLIP embedding"""
 
 import argparse
+from pathlib import Path
+
 import jax
-import jax.numpy as jnp
 import numpy as np
 import PIL.Image
 import torch
 import transformers
-
 from einops import repeat
 from omegaconf import OmegaConf
-from pathlib import Path
 from tqdm import tqdm
-from tqdm.contrib import tenumerate
 
 import txt2img_unsupervised.ldm_autoencoder as ldm_autoencoder
-
 from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
 from txt2img_unsupervised.sample import batches_split
 from txt2img_unsupervised.spherical_space_partitioning import CapTree

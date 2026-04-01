@@ -5,16 +5,16 @@ import os
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
 
 import argparse
-import jax
-import jax.numpy as jnp
-import wandb
-import matplotlib.pyplot as plt
 from distutils.util import strtobool
 from functools import partial
-from jax.sharding import NamedSharding, PartitionSpec
 from pathlib import Path
-from typing import Optional
 
+import jax
+import jax.numpy as jnp
+import matplotlib.pyplot as plt
+from jax.sharding import NamedSharding, PartitionSpec
+
+import wandb
 from txt2img_unsupervised.checkpoint import EuclideanVDMTrainState
 from txt2img_unsupervised.config import EuclideanVDMConfig, TrainingConfig
 from txt2img_unsupervised.euclidean_vdm import (
@@ -174,8 +174,8 @@ def init_train_state(
     model_cfg: EuclideanVDMConfig,
     training_cfg: TrainingConfig,
     total_steps: int,
-    resume_checkpoint_path: Optional[Path] = None,
-    finetune_checkpoint_path: Optional[Path] = None,
+    resume_checkpoint_path: Path | None = None,
+    finetune_checkpoint_path: Path | None = None,
     start_where_finetune_source_left_off: bool = False,
 ):
     """Set up our initial EuclideanVDMTrainState using the provided configs."""

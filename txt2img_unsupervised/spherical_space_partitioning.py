@@ -3,17 +3,8 @@ to enable efficient sampling from arbitrary caps."""
 
 import base64
 import concurrent.futures
-import hypothesis as hyp
-import hypothesis.extra.numpy as hyp_np
-import infinidata
-import jax
-import jax.numpy as jnp
 import json
-import numpy as np
 import os
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 import queue
 import tempfile
 import threading
@@ -21,14 +12,24 @@ import time
 import traceback
 import types
 import weakref
-
 from collections import namedtuple
 from datetime import timedelta
-from einops import rearrange
 from enum import Enum
 from functools import partial
-from hypothesis import given, strategies as st
 from pathlib import Path
+
+import hypothesis as hyp
+import hypothesis.extra.numpy as hyp_np
+import infinidata
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from einops import rearrange
+from hypothesis import given
+from hypothesis import strategies as st
 from sortedcontainers import SortedList
 from tqdm import tqdm
 
@@ -44,9 +45,7 @@ def find_k_means(dset, batch_size, k, iters):
 
     # Initialize centroids
     tqdm.write(f"Initializing centroids with {k} random samples")
-    centroids = dset.shuffle(seed=np.random.randint(0, 2**63 - 1))[:k][
-        "clip_embedding"
-    ]
+    centroids = dset.shuffle(seed=np.random.randint(0, 2**63 - 1))[:k]["clip_embedding"]
 
     # To make batch sizes even, we drop the last batch if it's smaller than batch_size, since
     # shuffling means we can see every example either way.
@@ -364,7 +363,9 @@ def test_assign_centroids_high_distances(
             np.array([distance for distance, _ in high_distances[i]]),
             rtol=0,
             atol=1e-5,
-        ), f"cluster {i} failed, centroid: {centroids[i]}, actual high distances idxs: {sorted_dset_indices[-n_distances:]}, values: {this_cluster_distances[sorted_this_cluster_indices[-n_distances:]]}, returned from assign_centroids: {high_distances[i]}"
+        ), (
+            f"cluster {i} failed, centroid: {centroids[i]}, actual high distances idxs: {sorted_dset_indices[-n_distances:]}, values: {this_cluster_distances[sorted_this_cluster_indices[-n_distances:]]}, returned from assign_centroids: {high_distances[i]}"
+        )
 
 
 def cosine_distance(x, y):
@@ -654,7 +655,7 @@ class CapTree:
         dup_check=False,
         center=None,
         max_cos_distance=2.0,
-        found_duplicates=[],
+        found_duplicates=None,
     ):
         assert len(dset) > 0, "CapTree must be initialized with a non-empty dataset"
         self.dset = dset
@@ -680,7 +681,7 @@ class CapTree:
         self.children = []
         self.child_cap_centers = None
         self.child_cap_max_cos_distances = None
-        self.found_duplicates = found_duplicates
+        self.found_duplicates = found_duplicates if found_duplicates is not None else []
         self.ready_for_queries = False
 
     def __len__(self):
@@ -909,9 +910,7 @@ class CapTree:
                 keys = [
                     vec.tobytes() if ~nans[i] else "NaN"
                     for i, vec in enumerate(
-                        np.clip(clips * 2**15, -1 * 2**15, 2**15 - 1).astype(
-                            np.int16
-                        )
+                        np.clip(clips * 2**15, -1 * 2**15, 2**15 - 1).astype(np.int16)
                     )
                 ]
                 for i, key in enumerate(keys):
@@ -998,9 +997,9 @@ class CapTree:
 
         if len(self.children) == 0:
             sorted_idxs = np.sort(idxs)
-            assert len(np.unique(sorted_idxs)) == len(
-                sorted_idxs
-            ), "indices to delete must be unique"
+            assert len(np.unique(sorted_idxs)) == len(sorted_idxs), (
+                "indices to delete must be unique"
+            )
 
             # We could instead concatenate a bunch of slices of the TableView, which would save us
             # some memory (in situations when we're removing relatively few items), but cost us more
@@ -1039,9 +1038,9 @@ class CapTree:
                             child_idxs_to_delete
                         )
             if len(children_to_delete) == len(self.children):
-                assert (
-                    False
-                ), "We somehow deleted all the children despite having fewer indices to delete than are in this subtree"
+                assert False, (
+                    "We somehow deleted all the children despite having fewer indices to delete than are in this subtree"
+                )
             if len(children_to_delete) > 0:
                 deleted_so_far = 0
                 for child_idx in children_to_delete:
@@ -1151,7 +1150,8 @@ class CapTree:
 
         else:
             assert self.center.shape == self.dset[0]["clip_embedding"].shape
-            assert self.child_cap_centers == self.child_cap_max_cos_distances == None
+            assert self.child_cap_centers is None
+            assert self.child_cap_max_cos_distances is None
 
         assert self.max_cos_distance <= 2
         assert np.isclose(np.linalg.norm(self.center), 1.0)
@@ -1173,9 +1173,9 @@ class CapTree:
             assert distances.shape == (len(self),)
             valid_distances_mask = distances <= max_cos_distance + self.EPSILON
             invalid_distances = distances[~valid_distances_mask]
-            assert np.all(
-                valid_distances_mask
-            ), f"invalid distances: {invalid_distances}"
+            assert np.all(valid_distances_mask), (
+                f"invalid distances: {invalid_distances}"
+            )
         else:
             for child in tqdm(
                 self.children, leave=False, desc="Checking subtree vecs are in cap"
@@ -1199,8 +1199,7 @@ class CapTree:
             yield self
         else:
             for child in self.children:
-                for leaf in child.leaves():
-                    yield leaf
+                yield from child.leaves()
 
     def shuffle_leaves(self):
         """Shuffle the leaves of the tree."""
@@ -1219,9 +1218,9 @@ class CapTree:
         that contain few matching vectors, and becomes less biased as density_estimate_samples
         increases.
         """
-        assert (
-            self.ready_for_queries
-        ), "Load tree from disk or call tree.prepare_for_queries."
+        assert self.ready_for_queries, (
+            "Load tree from disk or call tree.prepare_for_queries."
+        )
         assert len(query_centers.shape) == 2
         assert query_centers.shape[1] == self.center.shape[0]
         assert len(query_max_cos_distances.shape) == 1
@@ -1297,9 +1296,9 @@ class CapTree:
             )
             assert in_caps.shape == (density_estimate_samples, len(query_caps_to_test))
             matching_cnts = jnp.sum(in_caps, axis=0)
-            assert matching_cnts.shape == (
-                len(query_caps_to_test),
-            ), f"{matching_cnts.shape}"
+            assert matching_cnts.shape == (len(query_caps_to_test),), (
+                f"{matching_cnts.shape}"
+            )
             positive_samples[query_caps_to_test, i] = in_caps.T
             densities[query_caps_to_test, j] = matching_cnts / density_estimate_samples
             del in_caps
@@ -1330,9 +1329,9 @@ class CapTree:
             exact_results = np.array([], dtype=np.int64)
             exact_idxs = np.array([], dtype=np.int64)
         assert exact_results.shape == exact_idxs.shape == (need_exact_cnt,)
-        assert (
-            exact_results.dtype == exact_idxs.dtype == np.int64
-        ), f"{exact_results.dtype}, {exact_idxs.dtype}"
+        assert exact_results.dtype == exact_idxs.dtype == np.int64, (
+            f"{exact_results.dtype}, {exact_idxs.dtype}"
+        )
 
         known_empty = np.all(~intersecting & ~contained, axis=1)
         assert known_empty.shape == (query_cnt,)
@@ -1684,9 +1683,9 @@ class CapTree:
                 ]
                 with cache_lock:
                     query_centers_cache[k] = query_centers_this_subtree
-                    query_max_cos_distances_cache[
-                        k
-                    ] = query_max_cos_distances_this_subtree
+                    query_max_cos_distances_cache[k] = (
+                        query_max_cos_distances_this_subtree
+                    )
                 return (
                     query_idxs_this_subtree,
                     query_centers_this_subtree,
@@ -1797,9 +1796,9 @@ class CapTree:
         # mapping is a numpy array of indices, which maps indices in the input to indices in the
         # output. mapping[x] is the index in the output that corresponds to index x in the input.
         out_top = []
-        assert isinstance(
-            res.top, list
-        ), f"unexpected top type {type(res.top)}, did you run _resolve_subtrees_in_caps_result_deferred?"
+        assert isinstance(res.top, list), (
+            f"unexpected top type {type(res.top)}, did you run _resolve_subtrees_in_caps_result_deferred?"
+        )
         for entry in res.top:
             assert isinstance(entry, cls._subtrees_in_caps_top_entry)
             if mapping is not None:
@@ -1859,9 +1858,9 @@ class CapTree:
             assert isinstance(v, list)
             for entry in v:
                 if isinstance(entry, cls._subtrees_in_caps_rec_entry_checked):
-                    assert (
-                        len(entry.query_idxs) == 0
-                    ), "found query index mapping, did you run _resolve_subtrees_in_caps_result_query_idxs?"
+                    assert len(entry.query_idxs) == 0, (
+                        "found query index mapping, did you run _resolve_subtrees_in_caps_result_query_idxs?"
+                    )
                     for (
                         query_idx,
                         matches,
@@ -1943,9 +1942,9 @@ class CapTree:
             dset_all = dset_all.select_columns({"clip_embedding"})
 
         for k, v in dset_all[0].items():
-            assert (
-                len(v.shape) < 2
-            ), f"serializing multidimensional arrays is not supported yet, got shape {v.shape} for column {k}"
+            assert len(v.shape) < 2, (
+                f"serializing multidimensional arrays is not supported yet, got shape {v.shape} for column {k}"
+            )
 
         df = pd.DataFrame([dset_all[0]])
         pq_schema = pa.Schema.from_pandas(df)
@@ -1956,7 +1955,7 @@ class CapTree:
                 for batch in dset_all.batch_iter(
                     batch_size=4096, drop_last_batch=False, threads=8, readahead=8
                 ):
-                    rows = len(batch[list(batch.keys())[0]])
+                    rows = len(batch[next(iter(batch.keys()))])
                     df_rows = []
                     for i in range(rows):
                         df_rows.append({k: v[i] for k, v in batch.items()})
@@ -1980,9 +1979,9 @@ class CapTree:
         self.is_contiguous = False
 
         self.len = node_json["len"]
-        assert (
-            "center" in node_json
-        ), "centers must be included in summary if you want to load a tree"
+        assert "center" in node_json, (
+            "centers must be included in summary if you want to load a tree"
+        )
         self.center = np.frombuffer(
             base64.b64decode(node_json["center"]), dtype=np.float32
         )
@@ -2024,7 +2023,7 @@ class CapTree:
     @classmethod
     def load_from_disk(cls, dir, save_cache=True):
         """Load a tree from disk."""
-        with open(dir / "structure.json", "r") as f:
+        with open(dir / "structure.json") as f:
             summary = json.load(f)
 
         out = cls.__new__(cls)
@@ -2400,13 +2399,13 @@ class QuantitySemaphore:
 
     def release(self, amount, q):
         with self._lock:
-            assert (
-                self._values[q] + amount <= self._initial
-            ), f"QSem: tried to release {amount} when value was {self._value} which would exceed the initial value of {self._initial}"
+            assert self._values[q] + amount <= self._initial, (
+                f"QSem: tried to release {amount} when value was {self._value} which would exceed the initial value of {self._initial}"
+            )
             self._values[q] += amount
-            assert (
-                self._values[q] <= self._initial
-            ), "QSem: can't release more than the initial amount"
+            assert self._values[q] <= self._initial, (
+                "QSem: can't release more than the initial amount"
+            )
             self._condition.notify_all()
 
 
@@ -2478,9 +2477,10 @@ def test_async_leaf_checker_multiple(vals):
         for queries, max_cos_distances in query_blocks
     ]
     res_immediates = jax.device_get(res_immediates)
-    res_immediates_tight, res_immediates_loose = [res for res, _ in res_immediates], [
-        res for _, res in res_immediates
-    ]
+    res_immediates_tight, res_immediates_loose = (
+        [res for res, _ in res_immediates],
+        [res for _, res in res_immediates],
+    )
     res_async_done_tight = [f() for f in res_async_tight]
     res_async_done_loose = [f() for f in res_async_loose]
 
@@ -2512,9 +2512,9 @@ def test_remove_outliers_with_level_1_doesnt_make_outlier_cluster(vecs):
     tree.split_once()
     # There should mostly be 4 clusters but occassionally we'll end up with fewer. If it makes an
     # outlier cluster, there will mostly be 5, though we can still end up with less.
-    assert (
-        len(tree.children) <= 4
-    ), f"Got more than 4 children: {len(tree.children)}. Centers: {tree.child_cap_centers}, max cos distances: {tree.child_cap_max_cos_distances}, values: {[child.dset[:]['clip_embedding'] for child in tree.children]}, distances: {[cosine_distance_many_to_one(child.dset[:]['clip_embedding'], child.center) for child in tree.children]}"
+    assert len(tree.children) <= 4, (
+        f"Got more than 4 children: {len(tree.children)}. Centers: {tree.child_cap_centers}, max cos distances: {tree.child_cap_max_cos_distances}, values: {[child.dset[:]['clip_embedding'] for child in tree.children]}, distances: {[cosine_distance_many_to_one(child.dset[:]['clip_embedding'], child.center) for child in tree.children]}"
+    )
 
 
 def test_remove_outliers_with_level_0_makes_outlier_cluster():

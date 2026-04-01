@@ -1,12 +1,13 @@
 """Automate downloading, preprocessing, and uploading images"""
-from dataclasses import dataclass
-from pathlib import Path
-from tqdm import tqdm
-from typing import List, Optional
+
 import json
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+from tqdm import tqdm
 
 
 @dataclass
@@ -14,7 +15,7 @@ class DatasetMetadata:
     """Description of a preprocessed image dataset."""
 
     resolution: int
-    tag: Optional[str]
+    tag: str | None
 
     def __str__(self):
         return f"{self.resolution}x{self.resolution}" + (
@@ -63,15 +64,15 @@ def get_preprocessed_parquets(metadata: DatasetMetadata):
     """Get a list of parquet files that have been preprocessed for a given resolution."""
     ret = get_file_info(f"preprocessed/{metadata}")
     for file in ret:
-        assert file["Name"].endswith(
-            ".parquet"
-        ), "Got a non-parquet file in preprocessed directory"
+        assert file["Name"].endswith(".parquet"), (
+            "Got a non-parquet file in preprocessed directory"
+        )
     return ret
 
 
-def get_unprocessed_tarballs(metadata: DatasetMetadata) -> List[dict]:
+def get_unprocessed_tarballs(metadata: DatasetMetadata) -> list[dict]:
     """Get a list of tarballs that have not been preprocessed to a given resolution."""
-    original_tarballs = get_file_info(f"original-tarballs")
+    original_tarballs = get_file_info("original-tarballs")
     existing_parquets = get_preprocessed_parquets(metadata)
 
     already_processed = {pq["Name"] for pq in existing_parquets}
@@ -82,9 +83,9 @@ def get_unprocessed_tarballs(metadata: DatasetMetadata) -> List[dict]:
         if name.startswith("reddit_"):
             print(f"Skipping {name} because it's a reddit tarball")
             continue
-        assert name.endswith(
-            ".tar"
-        ), "Got a non-tarball file in original-tarballs directory"
+        assert name.endswith(".tar"), (
+            "Got a non-tarball file in original-tarballs directory"
+        )
         name = name[:-4]
         has_stills = f"{name}-deduped.parquet" in already_processed
         has_video_stills = f"{name}-video_stills.parquet" in already_processed
@@ -134,9 +135,9 @@ def get_dirs(path: Path):
 def assert_all_same_parent(paths: list[Path]) -> None:
     parent = paths[0].parent
     for path in paths:
-        assert (
-            path.parent == parent
-        ), f"Expected all paths to have the same parent ({parent}), but {path} does not."
+        assert path.parent == parent, (
+            f"Expected all paths to have the same parent ({parent}), but {path} does not."
+        )
 
 
 def preprocess_images(dirs: list[Path], res: int, batch_size: int) -> list[Path]:
@@ -170,7 +171,7 @@ def upload_pqs(pqs: list[Path], metadata: DatasetMetadata) -> None:
     assert_all_same_parent(pqs)
     with tempfile.NamedTemporaryFile(mode="w", delete=False) as files_from:
         for pq in pqs:
-            files_from.write(f"{str(pq.relative_to(parent))}\n")
+            files_from.write(f"{pq.relative_to(parent)!s}\n")
         files_from.flush()
         print(f"Wrote files-from to {files_from.name}")
         subprocess.check_call(

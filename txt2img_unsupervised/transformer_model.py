@@ -1,28 +1,27 @@
+from collections.abc import Callable
+from copy import copy
+from dataclasses import replace
+from enum import Enum
+from functools import partial
+from pathlib import Path
+from typing import Any
+
 import flash_attention_jax  # Pure JAX flash attention implementation by lucidrains
 import flax.core
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import jax.tree_util as jtu
 import numpy as np
 import optax  # type: ignore[import]
 import pytest
-from copy import copy
-from dataclasses import dataclass, replace
 from datasets import Dataset
-from enum import Enum
-from einops import rearrange, reduce, repeat
-from flax import struct
-from functools import partial
-from pathlib import Path
-from typing import Any, Callable, Optional, Tuple
+from einops import rearrange, reduce
 from tqdm import tqdm, trange
 
 from .cap_sampling import LogitsTable, random_pt_with_cosine_similarity, sample_cap
 from .config import TransformerModelConfig
 from .gpu_check import gpu_is_ampere_or_newer
 from .load_pq_dir import load_pq_to_infinidata
-
 
 AttnMethod = Enum("AttnMethod", ["STANDARD", "FLASH_JAX", "CUDNN"])
 
@@ -33,14 +32,14 @@ class ImageModel(nn.Module):
     d_model: int
     num_heads: int
     ff_dim: int
-    dropout: Optional[float]
-    image_dropout: Optional[float]
-    clip_dropout: Optional[float]
+    dropout: float | None
+    image_dropout: float | None
+    clip_dropout: float | None
     n_layers: int
     image_tokens: int
     clip_conditioning: bool
     clip_caps: bool
-    clip_cap_count: Optional[int]
+    clip_cap_count: int | None
     corrected_cap_projections: bool
     do_clip_feedforward: bool
     norm_clip_embeddings: bool
@@ -50,7 +49,7 @@ class ImageModel(nn.Module):
     weights_dtype: jnp.dtype
     pre_norm: bool
     decode: bool = False
-    attn_method: Optional[AttnMethod] = None
+    attn_method: AttnMethod | None = None
     record_attention_weights: bool = (
         False  # whether to record attention weights for visualization
     )
@@ -110,9 +109,9 @@ class ImageModel(nn.Module):
 
         # When training, we generate caps for each image in ImageModel.gen_training_caps.
 
-        assert (
-            self.clip_conditioning or not self.clip_caps
-        ), "Can't use clip_caps without clip_conditioning"
+        assert self.clip_conditioning or not self.clip_caps, (
+            "Can't use clip_caps without clip_conditioning"
+        )
 
         if self.clip_caps:
             assert self.clip_cap_count is not None, "clip_cap_count must be set"
@@ -416,9 +415,9 @@ class ImageModel(nn.Module):
         when this is done."""
         assert self.decode
         # TODO test CPP flash attention, maybe it works.
-        assert (
-            self.attn_method == AttnMethod.STANDARD
-        ), "Only standard attention works with decoding."
+        assert self.attn_method == AttnMethod.STANDARD, (
+            "Only standard attention works with decoding."
+        )
 
         batch_size = clip_embeddings.shape[0]
 
@@ -432,7 +431,9 @@ class ImageModel(nn.Module):
         else:
             assert (
                 clip_embeddings.shape == max_cos_distances.shape == (batch_size, 0)
-            ), f"Expected empty shapes, got {clip_embeddings.shape} and {max_cos_distances.shape}"
+            ), (
+                f"Expected empty shapes, got {clip_embeddings.shape} and {max_cos_distances.shape}"
+            )
 
         cond_tokens = self.gen_conditioning_tokens(clip_embeddings, max_cos_distances)
         assert cond_tokens.shape == (batch_size, self.prepended_tokens(), self.d_model)
@@ -458,12 +459,12 @@ class ImageModel(nn.Module):
         """Do a step of iterative decoding from the model. Returns the logits for the next set of
         tokens. See below tests for usage examples.
         """
-        assert (
-            self.decode
-        ), "Can't call decode_step on a model that wasn't set up for decoding."
-        assert (
-            self.attn_method == AttnMethod.STANDARD
-        ), "Only standard attention works with decoding."
+        assert self.decode, (
+            "Can't call decode_step on a model that wasn't set up for decoding."
+        )
+        assert self.attn_method == AttnMethod.STANDARD, (
+            "Only standard attention works with decoding."
+        )
         assert len(toks.shape) == 1
         batch_size = toks.shape[0]
         assert toks.dtype == jnp.int32 or toks.dtype == jnp.int64
@@ -583,9 +584,9 @@ def calculate_discrete_power_law_pmf(n_max, alpha):
 @pytest.mark.parametrize("alpha", [0.5, 1.0, 4.0])
 def test_calculate_discrete_power_law_pmf_increasing(n_caps: int, alpha: float):
     probs = calculate_discrete_power_law_pmf(n_caps, alpha)
-    assert jnp.all(
-        jnp.diff(probs) >= 0
-    ), "Probabilities must be monotonically increasing"
+    assert jnp.all(jnp.diff(probs) >= 0), (
+        "Probabilities must be monotonically increasing"
+    )
 
 
 @pytest.mark.parametrize("n_caps", [1, 2, 3, 4, 10])
@@ -820,10 +821,10 @@ def test_cap_cond_tokens_and_vqgan_embeds_are_same_distribution(
 def _setup_test_sample(
     clip_conditioning: bool = False,
     clip_caps: bool = False,
-    clip_cap_count: Optional[int] = None,
+    clip_cap_count: int | None = None,
     pre_norm: bool = False,
     image_tokens: int = 256,
-) -> Tuple[ImageModel, ImageModel, dict, jax.Array, jax.Array]:
+) -> tuple[ImageModel, ImageModel, dict, jax.Array, jax.Array]:
     """Shared setup code for iterative sampling tests."""
     cfg_nodec = copy(gpt_1_config)
     cfg_nodec.dropout = None
@@ -909,7 +910,7 @@ def _setup_test_sample(
 def test_sample_tok_0(
     clip_conditioning: bool,
     clip_caps: bool,
-    clip_cap_count: Optional[int],
+    clip_cap_count: int | None,
     pre_norm: bool,
 ) -> None:
     """Test that step-by-step decoding is equivalent to all at once for image token 0."""
@@ -1105,7 +1106,7 @@ def test_batched_decode_consistency() -> None:
         params_1 = flax.core.copy(params_1, new_cache)
         for j in trange(
             mdl_nodec.image_tokens - 1,
-            desc=f"Processing tokens for image {i+1}",
+            desc=f"Processing tokens for image {i + 1}",
             leave=False,
         ):
             logits_1[i, j + 1], new_cache = decode_step_j(
@@ -1409,9 +1410,9 @@ def test_filter_top_p_10() -> None:
     """Test that filter_top_p is the identity function when top_p = 1.0."""
     logits = jnp.arange(10, dtype=jnp.float32)
     filtered_logits = _filter_top_p(logits, 1.0)
-    assert jnp.allclose(
-        filtered_logits, logits
-    ), "filter_top_p doesn't match the identity function when top_p = 1.0"
+    assert jnp.allclose(filtered_logits, logits), (
+        "filter_top_p doesn't match the identity function when top_p = 1.0"
+    )
 
 
 @pytest.mark.parametrize("offset", [0.0, 1.0, -1.0, -0.25, 500.0])
@@ -1499,7 +1500,7 @@ class TransformerLayer(nn.Module):
     d_model: int
     num_heads: int
     ff_dim: int
-    dropout: Optional[float]
+    dropout: float | None
     use_biases: bool
     activations_dtype: jnp.dtype
     activation_function: Callable[[jax.Array], jax.Array]
@@ -1530,29 +1531,29 @@ class TransformerLayer(nn.Module):
                 dtype=None,
                 precision=None,
             ):
-                assert (
-                    len(q.shape) == len(k.shape) == len(v.shape) == 4
-                ), f"q k v shapes: {q.shape} {k.shape} {v.shape}, expected: (batch, seq_len, heads, head_dim)"
-                assert (
-                    q.shape[0] == k.shape[0] == v.shape[0]
-                ), "batch dimensions must match"
+                assert len(q.shape) == len(k.shape) == len(v.shape) == 4, (
+                    f"q k v shapes: {q.shape} {k.shape} {v.shape}, expected: (batch, seq_len, heads, head_dim)"
+                )
+                assert q.shape[0] == k.shape[0] == v.shape[0], (
+                    "batch dimensions must match"
+                )
                 batch_size = q.shape[0]
                 assert q.shape[1] == k.shape[1] == v.shape[1], "seq_len must match"
                 seq_len = q.shape[1]
                 assert q.shape[2] == k.shape[2] == v.shape[2], "num_heads must match"
                 num_heads = q.shape[2]
                 assert q.shape[3] == k.shape[3], "q & k head_dim must match"
-                qk_head_dim, v_head_dim = q.shape[3], v.shape[3]
+                v_head_dim = v.shape[3]
 
                 rearrange_qkv = lambda x: rearrange(
                     x, "batch seq_len heads head_dim -> batch heads seq_len head_dim"
                 )
                 q, k, v = map(rearrange_qkv, (q, k, v))
 
-                assert bias == None, "attention bias not implemented"
-                assert (
-                    mask == None
-                ), "attention mask is redundant with causal_flash_attention"
+                assert bias is None, "attention bias not implemented"
+                assert mask is None, (
+                    "attention mask is redundant with causal_flash_attention"
+                )
                 assert dropout_rate == 0.0, "attention dropout not implemented"
 
                 try:
@@ -1560,15 +1561,13 @@ class TransformerLayer(nn.Module):
                 except TypeError as e:
                     if "cannot reshape array of shape" in str(e):
                         raise ValueError(
-                            (
-                                "Got an exception from causal_flash_attention: {}. You may have "
-                                "run into its bug with sequence lengths that are not a multiple of "
-                                "the chunk size."
-                            ).format(e)
-                        )
+                            f"Got an exception from causal_flash_attention: {e}. You may have "
+                            "run into its bug with sequence lengths that are not a multiple of "
+                            "the chunk size."
+                        ) from e
                     else:
                         raise e
-                if dtype != None:
+                if dtype is not None:
                     assert res.dtype == dtype
                 assert res.shape == (batch_size, num_heads, seq_len, v_head_dim)
                 res = rearrange(
@@ -1593,9 +1592,9 @@ class TransformerLayer(nn.Module):
                 precision=None,
             ):
                 assert mask is None, "attention mask should be None for cudnn attention"
-                assert (
-                    dropout_rate == 0.0
-                ), "attention dropout not implemented for cudnn attention"
+                assert dropout_rate == 0.0, (
+                    "attention dropout not implemented for cudnn attention"
+                )
                 assert dtype in [
                     jnp.bfloat16,
                     jnp.float16,
@@ -1752,7 +1751,9 @@ def loss_batch_tokens(
     assert batch_imgs.shape == (
         batch_size,
         model.image_tokens,
-    ), f"batch_img.shape: {batch_imgs.shape}, expected: {(batch_size, model.image_tokens)}"
+    ), (
+        f"batch_img.shape: {batch_imgs.shape}, expected: {(batch_size, model.image_tokens)}"
+    )
     if model.clip_conditioning and not model.clip_caps:
         assert batch_clips.shape == (batch_size, 768)
         assert batch_max_cos_distances.shape == (batch_size, 0)

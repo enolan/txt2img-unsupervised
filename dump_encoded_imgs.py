@@ -1,18 +1,18 @@
 """Load a dataset from parquet files and decode it to PNGs."""
+
 import argparse
+from itertools import islice
+from pathlib import Path
+
 import numpy as np
 import PIL.Image
 import torch
-import tqdm
-from datasets import Dataset
-from itertools import islice
 from omegaconf import OmegaConf
-from pathlib import Path
 from tqdm import tqdm
 
+import txt2img_unsupervised.ldm_autoencoder as ldm_autoencoder
 from txt2img_unsupervised.ldm_autoencoder import LDMAutoencoder
 from txt2img_unsupervised.load_pq_dir import load_pq_dir
-import txt2img_unsupervised.ldm_autoencoder as ldm_autoencoder
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--pq-dir", type=Path, required=True)

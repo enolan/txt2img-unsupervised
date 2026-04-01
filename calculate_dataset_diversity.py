@@ -3,10 +3,12 @@ A simple and fast way to evaluate the diversity of a dataset by computing the me
 between CLIP embeddings. The expected distance is 1.0 for a uniformly distributed set of embeddings.
 The upper bound is actually higher than 1.0 but it decreases rapidly with n.
 """
+
 import argparse
+from pathlib import Path
+
 import numpy as np
 from einops import rearrange
-from pathlib import Path
 
 from txt2img_unsupervised.load_pq_dir import load_pq_dir
 
