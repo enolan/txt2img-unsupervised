@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import scipy.special as sps
 from jax import Array, random
+from scipy.integrate import quad as scipy_quad
 
 from txt2img_unsupervised.cap_sampling import sphere_log_inverse_surface_area
 
@@ -715,6 +716,123 @@ def log_prob(x: Array, mu: Array, kappa: float) -> Array:
     return log_c + kappa * dot_product
 
 
+def _log_scaled_bessel(nu: float, x: Array) -> Array:
+    """Compute log(I_nu(x) / x^nu), well-defined at x=0.
+
+    I_nu(x)/x^nu is an entire function with value 1/(2^nu * Gamma(nu+1))
+    at x=0. This ratio arises when integrating the vMF density over spherical
+    caps, after factoring out the surface element (1-h^2)^nu.
+
+    Args:
+        nu: Order of the Bessel function (Python float, >= 0).
+        x: Argument (JAX array, any shape).
+
+    Returns:
+        log(I_nu(x) / x^nu), same shape as x.
+    """
+    nu_arr = jnp.float32(nu)
+    x_safe = jnp.maximum(x, 1e-20)
+    result_nonzero = log_bessel_iv(nu_arr, x_safe) - nu_arr * jnp.log(x_safe)
+    result_zero = -nu_arr * jnp.log(2.0) - jax.lax.lgamma(nu_arr + 1.0)
+    return jnp.where(x < 1e-10, result_zero, result_nonzero)
+
+
+@partial(jax.jit, static_argnames=("dim",))
+def vmf_cap_log_prob(kappa: Array, cos_angle: Array, d_max: Array, dim: int) -> Array:
+    """Log probability that a vMF sample falls inside a spherical cap.
+
+    Computes log P(x^T c >= 1 - d_max) where x ~ vMF(mu, kappa) on S^{d-1}
+    and cos_angle = mu^T c.
+
+    The full sphere integral decomposes as x = h*c + sqrt(1-h^2)*v with
+    h = x^T c and v on S^{d-2}. Integrating out v analytically yields a
+    1D integral over h involving I_nu(kappa_tilde)/kappa_tilde^nu where
+    kappa_tilde = kappa * sin(angle) * sqrt(1-h^2) and nu = (d-3)/2.
+    This 1D integral is evaluated via Gauss-Legendre quadrature in log space.
+
+    Differentiable w.r.t. kappa, cos_angle, and d_max.
+
+    Args:
+        kappa: Concentration parameter (scalar, >= 0).
+        cos_angle: mu^T c, cosine similarity between mean and cap center.
+        d_max: Cosine distance threshold (scalar, in [0, 2]).
+        dim: Ambient space dimension (static int, >= 3).
+
+    Returns:
+        Log probability (scalar).
+    """
+    nu = (dim - 3) / 2.0
+
+    # Safe sin_angle: avoid NaN gradient from sqrt(0) at cos_angle = ±1.
+    # The "safe where" pattern ensures the sqrt branch uses a dummy positive
+    # value when sin_angle_sq = 0, so its gradient is never evaluated.
+    sin_angle_sq = jnp.maximum(1.0 - cos_angle**2, 0.0)
+    sin_angle_sq_safe = jnp.where(sin_angle_sq > 0, sin_angle_sq, 1.0)
+    sin_angle = jnp.where(sin_angle_sq > 0, jnp.sqrt(sin_angle_sq_safe), 0.0)
+
+    # Map GL nodes from [-1, 1] to [1 - d_max, 1] via u = 1 - h.
+    half_range = d_max / 2.0
+    u = half_range * (1.0 - _GL_NODES)  # u = 1 - h, in [0, d_max]
+    h = 1.0 - u
+
+    # Compute 1-h² = (1-h)(1+h) = u(2-u) to avoid catastrophic cancellation
+    # near h=1. Direct 1-h*h loses all significant digits for tiny caps in
+    # high dimensions, where nu*log(1-h²) dominates the integrand.
+    one_minus_h_sq = u * (2.0 - u)
+
+    # Log integrand: kappa*cos_angle*h + nu*log(1-h²) + log(I_nu(kt)/kt^nu)
+    # where kt = kappa * sin_angle * sqrt(1-h²).
+    # Split log(u*(2-u)) = log(u) + log(2-u) for stability when u is tiny.
+    log_one_minus_h_sq = jnp.log(jnp.maximum(u, jnp.finfo(jnp.float32).tiny)) + jnp.log(
+        2.0 - u
+    )
+    kappa_tilde = kappa * sin_angle * jnp.sqrt(jnp.maximum(one_minus_h_sq, 0.0))
+
+    log_integrand = (
+        kappa * cos_angle * h
+        + nu * log_one_minus_h_sq
+        + _log_scaled_bessel(nu, kappa_tilde)
+    )
+
+    # Gauss-Legendre quadrature in log space
+    log_weights = jnp.log(_GL_WEIGHTS)
+    log_integral = jax.scipy.special.logsumexp(log_integrand + log_weights) + jnp.log(
+        jnp.maximum(half_range, jnp.finfo(jnp.float32).tiny)
+    )
+
+    # Prefactor: log C_d(kappa) + (d-1)/2 * log(2*pi)
+    log_c = log_normalization_constant(kappa, dim)
+    log_prefactor = log_c + (dim - 1) / 2.0 * jnp.log(2.0 * jnp.pi)
+
+    result = log_prefactor + log_integral
+    # Clamp: log P can't exceed 0 (probability can't exceed 1)
+    result = jnp.minimum(result, 0.0)
+    # Empty cap has zero probability
+    return jnp.where(d_max <= 0.0, -jnp.inf, result)
+
+
+@partial(jax.jit, static_argnames=("dim",))
+def vmf_cap_logit(kappa: Array, cos_angle: Array, d_max: Array, dim: int) -> Array:
+    """Logit of the vMF cap probability: log P(in cap) - log P(out of cap).
+
+    Numerically stable for all P by computing the cap and complement
+    probabilities via separate quadratures. The complement of cap(c, d_max)
+    is cap(-c, 2 - d_max), so log(1-P) = vmf_cap_log_prob(kappa, -cos_angle, 2-d_max).
+
+    Args:
+        kappa: Concentration parameter (scalar, >= 0).
+        cos_angle: mu^T c, cosine similarity between mean and cap center.
+        d_max: Cosine distance threshold (scalar, in [0, 2]).
+        dim: Ambient space dimension (static int, >= 3).
+
+    Returns:
+        Logit (scalar).
+    """
+    log_p = vmf_cap_log_prob(kappa, cos_angle, d_max, dim)
+    log_1_minus_p = vmf_cap_log_prob(kappa, -cos_angle, 2.0 - d_max, dim)
+    return log_p - log_1_minus_p
+
+
 # =============================================================================
 # Tests for JAX-differentiable vMF utilities
 # =============================================================================
@@ -975,3 +1093,274 @@ def test_kl_no_dead_zone_near_zero():
         grad = float(jax.grad(lambda k: kl_vmf_uniform(k, 768))(jnp.array(kappa_val)))
         if kappa_val >= 1e-9:
             assert grad > 0, f"gradient should be positive at κ={kappa_val}, got {grad}"
+
+
+# =============================================================================
+# Tests for vMF cap probability
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    "dim,d_max",
+    [
+        (3, 0.5),
+        (3, 1.0),
+        (3, 1.5),
+        (16, 0.5),
+        (16, 1.0),
+        (16, 1.5),
+        (768, 1.0),
+        (768, 1.05),
+    ],
+)
+def test_vmf_cap_log_prob_uniform(dim, d_max):
+    """At kappa=0 (uniform on sphere), cap probability equals fractional cap area."""
+    log_p = float(
+        vmf_cap_log_prob(jnp.float32(0.0), jnp.float32(0.0), jnp.float32(d_max), dim)
+    )
+
+    nu = (dim - 3) / 2.0
+    integrand = lambda h: (max(1 - h**2, 0.0)) ** nu
+    cap_integral, _ = scipy_quad(integrand, 1 - d_max, 1.0, limit=200)
+    full_integral, _ = scipy_quad(integrand, -1, 1, limit=200)
+    expected = np.log(cap_integral / full_integral)
+
+    np.testing.assert_allclose(
+        log_p, expected, atol=0.02, err_msg=f"dim={dim}, d_max={d_max}"
+    )
+
+
+@pytest.mark.parametrize(
+    "dim,kappa,cos_angle",
+    [
+        (3, 1.0, 0.5),
+        (3, 10.0, -0.3),
+        (16, 5.0, 0.3),
+        (768, 100.0, 0.5),
+    ],
+)
+def test_vmf_cap_log_prob_full_sphere(dim, kappa, cos_angle):
+    """At d_max=2 (full sphere), probability is 1."""
+    log_p = float(
+        vmf_cap_log_prob(
+            jnp.float32(kappa), jnp.float32(cos_angle), jnp.float32(2.0), dim
+        )
+    )
+    np.testing.assert_allclose(
+        log_p, 0.0, atol=0.01, err_msg=f"dim={dim}, kappa={kappa}"
+    )
+
+
+@pytest.mark.parametrize(
+    "kappa,d_max",
+    [
+        (1.0, 0.5),
+        (5.0, 0.3),
+        (10.0, 1.0),
+        (0.5, 1.5),
+        (2.0, 1.0),
+    ],
+)
+def test_vmf_cap_log_prob_d3_aligned(kappa, d_max):
+    """For d=3, cos_angle=1, compare to analytical formula.
+
+    When mu = c (cos_angle=1), the cap probability for d=3 is
+    [exp(kappa) - exp(kappa*(1-d_max))] / (2*sinh(kappa)).
+    """
+    log_p = float(
+        vmf_cap_log_prob(jnp.float32(kappa), jnp.float32(1.0), jnp.float32(d_max), 3)
+    )
+    expected_p = (np.exp(kappa) - np.exp(kappa * (1 - d_max))) / (2 * np.sinh(kappa))
+    expected = np.log(expected_p)
+    np.testing.assert_allclose(
+        log_p, expected, atol=0.01, err_msg=f"kappa={kappa}, d_max={d_max}"
+    )
+
+
+@pytest.mark.parametrize(
+    "dim,kappa",
+    [
+        (3, 1.0),
+        (3, 10.0),
+        (16, 5.0),
+        (768, 50.0),
+    ],
+)
+def test_vmf_cap_log_prob_hemisphere_perpendicular(dim, kappa):
+    """For d_max=1 and cos_angle=0, P=0.5 by symmetry.
+
+    When mu is perpendicular to c, the vMF distribution is symmetric about
+    the equator x^T c = 0, so exactly half the mass is in the hemisphere.
+    """
+    log_p = float(
+        vmf_cap_log_prob(jnp.float32(kappa), jnp.float32(0.0), jnp.float32(1.0), dim)
+    )
+    np.testing.assert_allclose(
+        log_p, np.log(0.5), atol=0.01, err_msg=f"dim={dim}, kappa={kappa}"
+    )
+
+
+@pytest.mark.parametrize(
+    "dim,kappa,cos_angle,d_max",
+    [
+        (3, 2.0, 0.5, 0.5),
+        (3, 5.0, -0.3, 1.0),
+        (3, 1.0, 0.0, 0.8),
+        (16, 3.0, 0.2, 0.8),
+        (16, 5.0, 0.0, 1.0),
+    ],
+)
+def test_vmf_cap_log_prob_mc(dim, kappa, cos_angle, d_max):
+    """Compare to Monte Carlo estimate from vMF samples."""
+    n_samples = 200_000
+    mu = jnp.zeros(dim, dtype=jnp.float32).at[0].set(1.0)
+    sin_a = np.sqrt(max(1 - cos_angle**2, 0.0))
+    cap_center = jnp.zeros(dim, dtype=jnp.float32).at[0].set(cos_angle).at[1].set(sin_a)
+    cap_center = cap_center / jnp.linalg.norm(cap_center)
+
+    key = jax.random.PRNGKey(42)
+    samples = sample(key, mu, jnp.float32(kappa), n_samples)
+    in_cap = jnp.sum(samples * cap_center, axis=1) >= 1 - d_max
+    mc_prob = float(jnp.mean(in_cap.astype(jnp.float32)))
+
+    computed_log_p = float(
+        vmf_cap_log_prob(
+            jnp.float32(kappa), jnp.float32(cos_angle), jnp.float32(d_max), dim
+        )
+    )
+    computed_p = float(np.exp(computed_log_p))
+
+    mc_se = np.sqrt(mc_prob * (1 - mc_prob) / n_samples)
+    np.testing.assert_allclose(
+        computed_p,
+        mc_prob,
+        atol=max(5 * mc_se, 0.005),
+        err_msg=f"dim={dim}, κ={kappa}, cos_angle={cos_angle}, d_max={d_max}",
+    )
+
+
+def test_vmf_cap_log_prob_gradient_flows():
+    """Gradients w.r.t. kappa, cos_angle, and d_max are finite and non-zero."""
+    grad_kappa = jax.grad(
+        lambda k: vmf_cap_log_prob(k, jnp.float32(0.5), jnp.float32(1.0), 3)
+    )
+    grad_cos = jax.grad(
+        lambda c: vmf_cap_log_prob(jnp.float32(5.0), c, jnp.float32(1.0), 3)
+    )
+    grad_dmax = jax.grad(
+        lambda d: vmf_cap_log_prob(jnp.float32(5.0), jnp.float32(0.5), d, 3)
+    )
+
+    g_k = grad_kappa(jnp.float32(5.0))
+    g_c = grad_cos(jnp.float32(0.5))
+    g_d = grad_dmax(jnp.float32(1.0))
+
+    for name, g in [("kappa", g_k), ("cos_angle", g_c), ("d_max", g_d)]:
+        assert jnp.isfinite(g), f"gradient w.r.t. {name} is not finite"
+        assert g != 0.0, f"gradient w.r.t. {name} is zero"
+
+
+def test_vmf_cap_logit_consistency():
+    """vmf_cap_logit matches log P - log(1-P) from vmf_cap_log_prob."""
+    kappa = jnp.float32(5.0)
+    cos_angle = jnp.float32(0.3)
+    d_max = jnp.float32(0.8)
+
+    logit = float(vmf_cap_logit(kappa, cos_angle, d_max, 16))
+    log_p = float(vmf_cap_log_prob(kappa, cos_angle, d_max, 16))
+    log_1_minus_p = float(vmf_cap_log_prob(kappa, -cos_angle, 2.0 - d_max, 16))
+
+    np.testing.assert_allclose(logit, log_p - log_1_minus_p, atol=1e-5)
+
+
+@pytest.mark.parametrize("dim", [3, 16, 768])
+def test_vmf_cap_logit_hemisphere_zero(dim):
+    """Logit of the hemisphere probability is 0 when mu perpendicular to c."""
+    logit = float(
+        vmf_cap_logit(jnp.float32(10.0), jnp.float32(0.0), jnp.float32(1.0), dim)
+    )
+    np.testing.assert_allclose(logit, 0.0, atol=0.02, err_msg=f"dim={dim}")
+
+
+@pytest.mark.parametrize(
+    "dim,d_max",
+    [
+        (16, 1e-4),
+        (768, 1e-4),
+        (768, 1e-6),
+        (768, 1e-8),
+    ],
+)
+def test_vmf_cap_log_prob_tiny_cap(dim, d_max):
+    """Tiny caps in high dims: 1-h^2 must be computed without cancellation.
+
+    For kappa=0 and small d_max, the asymptotic cap probability is
+    P ~ 2^nu * d_max^(nu+1) / ((nu+1) * B(1/2, nu+1)), so
+    log P ~ nu*log(2) + (nu+1)*log(d_max) + const.
+    """
+    log_p = float(
+        vmf_cap_log_prob(jnp.float32(0.0), jnp.float32(0.0), jnp.float32(d_max), dim)
+    )
+    # Float64 reference via the small-cap asymptotic
+    nu = (dim - 3) / 2.0
+    log_cap = nu * np.log(2) + (nu + 1) * np.log(d_max) - np.log(nu + 1)
+    log_full = float(sps.betaln(0.5, nu + 1))
+    expected = log_cap - log_full
+    np.testing.assert_allclose(
+        log_p, expected, rtol=0.01, err_msg=f"dim={dim}, d_max={d_max}"
+    )
+
+
+def test_vmf_cap_log_prob_tiny_cap_gradient():
+    """d/d(d_max) log P for tiny caps should match the asymptotic (d-1)/(2*d_max)."""
+    d_max_val = 1e-6
+    grad_fn = jax.grad(
+        lambda d: vmf_cap_log_prob(jnp.float32(0.0), jnp.float32(0.0), d, 768)
+    )
+    g = float(grad_fn(jnp.float32(d_max_val)))
+    # Asymptotic: d/d(d_max) log P = (nu+1)/d_max = (d-1)/(2*d_max)
+    expected = (768 - 1) / 2.0 / d_max_val
+    np.testing.assert_allclose(g, expected, rtol=0.05, err_msg=f"d_max={d_max_val}")
+
+
+@pytest.mark.parametrize("cos_angle", [1.0, -1.0])
+def test_vmf_cap_log_prob_gradient_aligned(cos_angle):
+    """Gradient w.r.t. cos_angle at ±1 must be finite, not NaN."""
+    grad_fn = jax.grad(
+        lambda c: vmf_cap_log_prob(jnp.float32(10.0), c, jnp.float32(0.5), 768)
+    )
+    g_exact = float(grad_fn(jnp.float32(cos_angle)))
+    assert jnp.isfinite(jnp.float32(g_exact)), (
+        f"gradient at cos_angle={cos_angle} is {g_exact}"
+    )
+    # Should be close to the nearby limit
+    eps = 1e-5
+    g_near = float(grad_fn(jnp.float32(cos_angle * (1.0 - eps))))
+    np.testing.assert_allclose(g_exact, g_near, rtol=0.05)
+
+
+def test_vmf_cap_log_prob_empty_cap():
+    """d_max=0 must give -inf (zero probability)."""
+    log_p = vmf_cap_log_prob(jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0), 768)
+    assert log_p == -jnp.inf, f"expected -inf for empty cap, got {float(log_p)}"
+
+
+def test_vmf_cap_log_prob_full_sphere_not_positive():
+    """d_max=2 must give log P <= 0 (probability <= 1)."""
+    log_p = float(
+        vmf_cap_log_prob(jnp.float32(0.0), jnp.float32(0.0), jnp.float32(2.0), 768)
+    )
+    assert log_p <= 0.0, f"log probability must be <= 0, got {log_p}"
+    np.testing.assert_allclose(log_p, 0.0, atol=0.01)
+
+
+def test_vmf_cap_logit_empty_cap():
+    """Empty cap logit must be -inf."""
+    logit = vmf_cap_logit(jnp.float32(5.0), jnp.float32(0.5), jnp.float32(0.0), 3)
+    assert logit == -jnp.inf, f"expected -inf, got {float(logit)}"
+
+
+def test_vmf_cap_logit_full_sphere():
+    """Full sphere logit must be +inf."""
+    logit = vmf_cap_logit(jnp.float32(5.0), jnp.float32(0.5), jnp.float32(2.0), 3)
+    assert logit == jnp.inf, f"expected +inf, got {float(logit)}"
