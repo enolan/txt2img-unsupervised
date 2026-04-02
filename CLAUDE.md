@@ -218,7 +218,7 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
   * `txt2img_unsupervised/training_infra.py`. Common infrastructure code for training models.
 
 ## Build/Test/Lint Commands
-- Setup: `uv sync --group dev --group cuda`
+- Setup: `uv sync`
 - Tests:
   - This is a machine learning project, which means there are lots of slow tests. Try to run only
     the tests that could be affected by your changes.

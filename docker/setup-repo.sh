@@ -6,7 +6,7 @@ set -euo pipefail
 git clone --recursive https://github.com/enolan/txt2img-unsupervised.git /root/txt2img-unsupervised
 ln -sf /root/vq-f4/model.ckpt /root/txt2img-unsupervised/vq-f4.ckpt
 cd /root/txt2img-unsupervised
-uv sync --group dev --group cuda
+uv sync
 
 # mark success
 touch /root/setup-repo.success

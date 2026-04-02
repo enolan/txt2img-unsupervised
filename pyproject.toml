@@ -52,6 +52,9 @@ dev = [
     "ruff>=0.15.8",
 ]
 
+[tool.uv]
+default-groups = ["dev", "cuda"]
+
 [tool.uv.sources]
 flash-attention-jax = { git = "https://github.com/enolan/flash-attention-jax.git", rev = "20621388795614de137c159a5c07abec5c475388" }
 infinidata = { url = "https://github.com/enolan/infinidata/releases/download/v0.0.1-alpha2/infinidata-0.0.1a2-cp311-cp311-manylinux_2_34_x86_64.whl" }
