@@ -68,6 +68,8 @@ from txt2img_unsupervised.flow_matching import (
     stratified_time_sample,
 )
 from txt2img_unsupervised.learned_schedule import LearnedNoiseSchedule
+from txt2img_unsupervised.vmf import fb_cap_logit, vmf_cap_logit
+from txt2img_unsupervised.vmf import sample as vmf_sample
 
 # =============================================================================
 # Model
@@ -99,6 +101,41 @@ def classifier_logit_correction(table, d_max):
     log_F = table.log_cap_size(d_max)
     log_one_minus_F = table.log_cap_size(2.0 - d_max)
     return log_F - log_one_minus_F
+
+
+def _uniform_baseline_logit(z, alpha, sigma, cap_params, domain_dim, sigma_radial):
+    """Exact logit of P(x1 in cap | z, t) assuming x1 ~ Uniform(S^{d-1}).
+
+    The forward process z = alpha*r*x1 + sigma*eps with r ~ N(1, sigma_radial^2)
+    gives a Fisher-Bingham posterior over x1:
+
+        p(x1 | z) ∝ exp(kappa_eff * (z_hat . x1) + lambda_eff * (z_hat . x1)^2)
+
+    where kappa_eff = alpha*||z|| / (alpha^2*sigma_r^2 + sigma^2)
+    and lambda_eff = alpha^2*sigma_r^2*||z||^2 / (2*sigma^2*(alpha^2*sigma_r^2 + sigma^2)).
+
+    This computes the exact log-odds via fb_cap_logit (double GL quadrature).
+
+    Args:
+        z: Noisy points [batch_size, domain_dim].
+        alpha: Signal coefficient [batch_size].
+        sigma: Noise coefficient [batch_size].
+        cap_params: (cap_centers [batch_size, domain_dim], d_maxes [batch_size]).
+        domain_dim: Ambient space dimension (Python int).
+        sigma_radial: Radial augmentation noise std (Python float).
+
+    Returns:
+        Logits [batch_size].
+    """
+    cap_centers, d_maxes = cap_params
+    z_norm = jnp.linalg.norm(z, axis=-1)
+    denom = alpha**2 * sigma_radial**2 + sigma**2
+    kappa_eff = alpha * z_norm / denom
+    lambda_eff = alpha**2 * sigma_radial**2 * z_norm**2 / (2.0 * sigma**2 * denom)
+    cos_angle = jnp.sum(z * cap_centers, axis=-1) / jnp.maximum(z_norm, 1e-8)
+    return jax.vmap(lambda k, le, c, d: fb_cap_logit(k, le, c, d, domain_dim))(
+        kappa_eff, lambda_eff, cos_angle, d_maxes
+    )
 
 
 class EuclideanDiffusionModel(nn.Module):
@@ -187,7 +224,9 @@ class EuclideanDiffusionModel(nn.Module):
             self.logits_table = LogitsTable(self.domain_dim - 1, 8192)
         elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
             self.logits_table = LogitsTable(self.domain_dim - 1, 8192)
-            self.classifier_head = nn.Dense(1, name="classifier_head")
+            self.classifier_head = nn.Dense(
+                1, name="classifier_head", kernel_init=nn.initializers.zeros
+            )
         self.vector_field = self.mk_vector_field()
         self.schedule = LearnedNoiseSchedule(
             hidden_dim=self.schedule_hidden_dim,
@@ -259,15 +298,15 @@ class EuclideanDiffusionModel(nn.Module):
             rng = self.make_rng("sample_cap_params")
 
             def sample_one(rng, x1):
-                label_rng, cap_rng = jax.random.split(rng)
+                label_rng, pos_cap_rng, neg_cap_rng = jax.random.split(rng, 3)
                 is_positive = jax.random.bernoulli(label_rng, 0.5)
 
                 # Sample d_max from d_max_dist (same for positive and negative)
                 pos_center, d_max = sample_cap(
-                    self.logits_table, cap_rng, x1, self.d_max_dist
+                    self.logits_table, pos_cap_rng, x1, self.d_max_dist
                 )
                 neg_center = sample_negative_cap_center(
-                    cap_rng, self.logits_table, x1, d_max
+                    neg_cap_rng, self.logits_table, x1, d_max
                 )
 
                 center = jnp.where(is_positive, pos_center, neg_center)
@@ -380,10 +419,14 @@ class EuclideanDiffusionModel(nn.Module):
         return gamma_prime[:, None] * v_gamma
 
     def classifier_forward(self, z, log_snr, cap_params):
-        """Forward pass for the classifier: backbone with cap conditioning → linear head.
+        """Forward pass for the classifier: backbone with cap conditioning → linear head → residual
+        vs uniform-sphere baseline.
 
-        Runs the backbone with cap information in the conditioning vector, then
-        projects the post-norm MLP activations to a scalar logit per sample.
+        Runs the backbone with cap information in the conditioning vector, then projects the
+        post-norm MLP activations to a scalar logit per sample, then adds the logit a perfect
+        classifier trained on a uniform-sphere distribution would output. The idea is that the model
+        needs only to learn about the data distribution (how it differs from uniform), and not
+        anything known ahead of time like the geometry.
 
         Args:
             z: Points in R^d [batch_size, domain_dim]
@@ -391,26 +434,20 @@ class EuclideanDiffusionModel(nn.Module):
             cap_params: (cap_centers, d_maxes) specifying the cap to classify against
 
         Returns:
-            Corrected logits [batch_size] — positive means "x1 likely in cap".
-            Includes a logit correction for the training sampling bias: positive
-            caps are sampled from a region of area A while negative caps come
-            from area S-A, shifting the raw logit by log((S-A)/A). The
-            correction adds log(A/(S-A)) to recover calibrated log-odds.
+            Logits [batch_size] — positive means "x1 likely in cap".
         """
         cond_vecs = self._cap_params_to_cond_vecs(cap_params, z.shape[0], z=z)
         t_normalized = self._normalize_log_snr(log_snr)
         _, mlp_out = self.vector_field.call_with_intermediates(
             z, t_normalized, cond_vecs
         )
-        _, d_maxes = cap_params
-        assert d_maxes.ndim == 1, (
-            f"d_maxes must be [batch_size], got shape {d_maxes.shape}"
+        residual = self.classifier_head(mlp_out).squeeze(-1)
+
+        alpha, sigma = _snr_to_alpha_sigma(log_snr)
+        baseline = _uniform_baseline_logit(
+            z, alpha, sigma, cap_params, self.domain_dim, self.sigma_radial
         )
-        raw_logits = self.classifier_head(mlp_out).squeeze(-1)
-        correction = jax.vmap(
-            lambda d: classifier_logit_correction(self.logits_table, d)
-        )(d_maxes)
-        return raw_logits + correction
+        return baseline + residual
 
     def _forward_diffusion(self, x_1, t):
         """Shared forward diffusion setup for VLB and classifier losses.
@@ -514,12 +551,46 @@ class EuclideanDiffusionModel(nn.Module):
         total_loss = components["vlb_total"] + components["variance"]
         return total_loss, components
 
+    def _classifier_forward_diffusion(self, x_1):
+        """Forward diffusion for the classifier, with γ sampled uniformly.
+
+        Unlike the VLB pass (which uses t mapped through the learned schedule), classifier training
+        samples γ uniformly in [γ_min, γ_max]. Since we always integrate in gamma-space during
+        sampling, this matches where the classifier quality matters. The schedule exists solely to
+        reduce diffusion loss variance, it's irrelevant in this context. γ-uniform sampling also
+        prevents the classifier loss from improving passively as the schedule evolves — any
+        improvement must come from the residual learning real signal.
+
+        Returns:
+            (z_t, log_snr, alpha, sigma)
+        """
+        batch_size = x_1.shape[0]
+        radial_rng, noise_rng, gamma_rng = jax.random.split(self.make_rng("noise"), 3)
+
+        r = 1.0 + self.sigma_radial * jax.random.normal(radial_rng, (batch_size, 1))
+        x_data = x_1 * r
+
+        gamma_min, gamma_max = self.gamma_range()
+        log_snr = gamma_min + (gamma_max - gamma_min) * jax.random.uniform(
+            gamma_rng, (batch_size,)
+        )
+        alpha, sigma = _snr_to_alpha_sigma(log_snr)
+
+        eps = jax.random.normal(noise_rng, x_data.shape)
+        z_t = alpha[:, None] * x_data + sigma[:, None] * eps
+        return z_t, log_snr, alpha, sigma
+
     def compute_vlb_and_classifier_loss(self, x_1, t, classifier_cap_params):
         """Compute VLB loss + classifier cross-entropy loss for CLASSIFIER_GUIDANCE.
 
         Two forward passes through the backbone:
-        1. VLB pass: zeros conditioning → eps_hat → VLB loss
-        2. Classifier pass: cap conditioning → mlp_out → linear → logit → cross-entropy
+        1. VLB pass: zeros conditioning → eps_hat → VLB loss.
+           Uses t mapped through the learned schedule.
+        2. Classifier pass: cap conditioning → mlp_out → linear → logit → BCE.
+           Uses γ sampled uniformly in [γ_min, γ_max] with its own forward
+           diffusion, so the classifier's noise distribution doesn't couple
+           to the schedule's shape. This ensures the classifier loss reflects
+           actual classifier quality, not schedule evolution.
 
         Args:
             x_1: Data points on S^{d-1} [batch_size, dim]
@@ -540,18 +611,36 @@ class EuclideanDiffusionModel(nn.Module):
             x_data, z_t, eps, log_snr, gamma_prime, zero_cond
         )
 
-        # Pass 2: classifier with cap conditioning
+        # Pass 2: classifier with cap conditioning and independent γ-uniform noise.
+        # stop_gradient on the forward diffusion so the classifier loss doesn't
+        # push the noise schedule toward easier classification — the schedule
+        # should be optimized by the VLB only. Gradients to the backbone and
+        # classifier head weights are unaffected.
         cap_centers = classifier_cap_params["cap_centers"]
         d_maxes = classifier_cap_params["d_maxes"]
         labels = classifier_cap_params["labels"]
         cap_params = (cap_centers, d_maxes)
 
-        cond_vecs = self._cap_params_to_cond_vecs(cap_params, batch_size, z=z_t)
-        t_normalized = self._normalize_log_snr(log_snr)
-        _, mlp_out = self.vector_field.call_with_intermediates(
-            z_t, t_normalized, cond_vecs
+        cls_z_t, cls_log_snr, _, _ = jax.lax.stop_gradient(
+            self._classifier_forward_diffusion(x_1)
         )
-        logits = self.classifier_head(mlp_out).squeeze(-1)
+        # classifier_forward returns baseline + residual (the posterior logit).
+        # For training with 50/50 positive/negative caps, the optimal logit is
+        # the log-likelihood ratio = posterior_logit - prior_logit. Subtract
+        # the prior logit (cap area log-odds at kappa=0) as a correction.
+        posterior_logit = self.classifier_forward(cls_z_t, cls_log_snr, cap_params)
+        correction = jax.lax.stop_gradient(
+            jax.vmap(
+                lambda d: vmf_cap_logit(
+                    jnp.float32(0.0), jnp.float32(0.0), d, self.domain_dim
+                )
+            )(d_maxes)
+        )
+        # posterior - correction is the log-likelihood ratio P(z|in cap)/P(z|out).
+        # Both can be -inf for extreme caps at high SNR; their difference is
+        # well-behaved but inf - inf = nan, so replace nan with 0.
+        logits = posterior_logit - correction
+        logits = jnp.where(jnp.isnan(logits), 0.0, logits)
 
         classifier_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, labels))
 
@@ -1678,11 +1767,17 @@ def test_train_distribution(domain_dim, dist_name):
 
 
 # Per-config test parameters for test_train_cap_conditioned.
-# All configs use the same model architecture (4 layers, 256 d_model) and training set (2M samples).
-# Step counts target ~4 minutes of training time per config. CG gets fewer steps than CS because
-# each CG training step does 2 forward + 2 backward passes (~1.3x slower per step on GPU).
-# CG thresholds are at least as tight as CS. With all cap features enabled, CS quality is
-# close to CG; CG's remaining edge is mainly in_cap in dim=16.
+#
+# These thresholds document approximate performance at matched hyperparameters and
+# ~4 minutes of training time per config. They are NOT pass/fail gates — they record
+# what each configuration achieves so regressions are caught. When the code changes,
+# re-measure and update.
+#
+# All configs use the same model architecture (4 layers, 256 d_model) and training set
+# (2M samples). Step counts target ~4 minutes of training time per config. CG gets
+# fewer steps than CS because each CG training step does 2 forward + 2 backward passes
+# (~1.3x slower per step on GPU).
+#
 # Values: (steps, in_cap_threshold, ks_threshold)
 # fmt: off
 _CAP_CONDITIONED_TEST_CONFIGS: dict[
@@ -1690,19 +1785,23 @@ _CAP_CONDITIONED_TEST_CONFIGS: dict[
 ] = {
     #                                                           steps   in_cap   KS
     (3,  "uniform", CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.96,    0.06),
-    (3,  "uniform", CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.96,    0.06),
+    (3,  "uniform", CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.99,    0.04),
     (3,  "vmf",     CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.96,    0.06),
-    (3,  "vmf",     CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.96,    0.06),
+    (3,  "vmf",     CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.98,    0.05),
     (16, "uniform", CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.93,    0.06),
-    (16, "uniform", CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.95,    0.06),
+    (16, "uniform", CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.96,    0.05),
     (16, "vmf",     CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.93,    0.06),
-    (16, "vmf",     CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.95,    0.06),
+    (16, "vmf",     CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.96,    0.05),
+    (64, "uniform", CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.82,    0.09),
+    (64, "uniform", CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.85,    0.09),
+    (64, "vmf",     CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.82,    0.09),
+    (64, "vmf",     CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.85,    0.09),
 }
 # fmt: on
 
 
 @pytest.mark.usefixtures("starts_with_progressbar")
-@pytest.mark.parametrize("domain_dim", [3, 16])
+@pytest.mark.parametrize("domain_dim", [3, 16, 64])
 @pytest.mark.parametrize("data_distribution", ["uniform", "vmf"])
 @pytest.mark.parametrize(
     "cap_conditioning",
@@ -1749,12 +1848,12 @@ def test_train_cap_conditioned(domain_dim, data_distribution, cap_conditioning):
             sample_sphere(rng, n_train_samples + n_test_samples, domain_dim)
         )
     elif data_distribution == "vmf":
-        mean_direction = np.zeros(domain_dim)
-        # Axis 1 so vmf center differs from cap center (axis 0)
-        mean_direction[1] = 1.0
-        vmf_dist = stats.vonmises_fisher(mean_direction, 5.0)
-        np_seed = int(jax.random.randint(rng, (), 0, 2**31 - 1))
-        points = vmf_dist.rvs(n_train_samples + n_test_samples, random_state=np_seed)
+        mean_direction = jnp.zeros(domain_dim).at[1].set(1.0)
+        # Use our JAX vMF sampler instead of scipy — scipy's rejection sampler
+        # can OOM at high dimensions due to large intermediate arrays.
+        points = np.asarray(
+            vmf_sample(rng, mean_direction, 5.0, n_train_samples + n_test_samples)
+        )
     else:
         raise ValueError(f"Unknown data_distribution: {data_distribution}")
 
@@ -1844,24 +1943,21 @@ def test_train_cap_conditioned(domain_dim, data_distribution, cap_conditioning):
                 )
             )
         elif data_distribution == "vmf":
-            # Rejection sampling: generate vMF samples and keep those in the cap
-            cap_area_frac = float(jnp.exp(table.log_cap_size(d_max_test)))
-            # vMF with center orthogonal to cap center — acceptance rate ≈ cap area fraction
-            oversample = max(int(5.0 / cap_area_frac), 10)
-            vmf_pool = vmf_dist.rvs(
-                n_gen * oversample,
-                random_state=np.random.default_rng(789),
+            # Sample uniformly from the cap, then resample with vMF density
+            # weights. This works at any dimension and cap size, unlike
+            # rejection sampling which needs ~1/cap_area_frac candidates.
+            vmf_mu = jnp.zeros(domain_dim).at[1].set(1.0)
+            vmf_kappa = 5.0
+            n_pool = n_gen * 10
+            ref_rng = jax.random.PRNGKey(789)
+            pool_rng, resample_rng = jax.random.split(ref_rng)
+            pool = sample_from_cap_v(pool_rng, table, cap_center, d_max_test, n_pool)
+            log_weights = vmf_kappa * (pool @ vmf_mu)
+            log_weights = log_weights - jax.scipy.special.logsumexp(log_weights)
+            indices = jax.random.choice(
+                resample_rng, n_pool, shape=(n_gen,), p=jnp.exp(log_weights)
             )
-            pool_cos_dists = 1.0 - vmf_pool @ np.asarray(cap_center)
-            in_cap = pool_cos_dists <= d_max_test
-            ref_np = vmf_pool[in_cap][:n_gen]
-            print(
-                f"  vMF rejection sampling: {np.sum(in_cap)}/{len(vmf_pool)} accepted"
-            )
-            assert len(ref_np) >= n_gen // 2, (
-                f"Too few reference samples from rejection sampling: "
-                f"{len(ref_np)} (need {n_gen // 2})"
-            )
+            ref_np = np.asarray(pool[indices])
         else:
             raise ValueError(f"Unknown data_distribution: {data_distribution}")
 

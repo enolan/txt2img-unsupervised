@@ -1,4 +1,4 @@
-"""von Mises-Fisher distributions in JAX."""
+"""von Mises-Fisher and Fisher-Bingham distributions in JAX."""
 
 from functools import partial
 
@@ -811,6 +811,110 @@ def vmf_cap_log_prob(kappa: Array, cos_angle: Array, d_max: Array, dim: int) -> 
     return jnp.where(d_max <= 0.0, -jnp.inf, result)
 
 
+def _fb_cap_unnorm_log_integral(
+    kappa_eff: Array, lambda_eff: Array, cos_angle: Array, d_max: Array, dim: int
+) -> Array:
+    """Log of unnormalized Fisher-Bingham integral over a spherical cap.
+
+    For the zonal distribution p(x) ∝ exp(κ ẑ·x + λ (ẑ·x)²) on S^{d-1},
+    computes log ∫_cap p(x) dS(x) up to an additive constant that depends
+    only on (κ, λ, d) and cancels in the logit.
+
+    Uses the zonal decomposition x = h·c + √(1-h²)·v. The outer integral
+    over h uses Gauss-Legendre quadrature on [1-d_max, 1]. The inner
+    integral over t = ẑ_⊥·v uses Gauss-Jacobi quadrature with weight
+    (1-t²)^{(d-4)/2}, which automatically concentrates nodes where the
+    spherical measure is large and handles the full range [-1, 1].
+
+    Args:
+        kappa_eff: Linear concentration (scalar).
+        lambda_eff: Quadratic concentration (scalar, >= 0).
+        cos_angle: ẑ^T c, cosine between distribution axis and cap center.
+        d_max: Cosine distance threshold (scalar, in [0, 2]).
+        dim: Ambient space dimension (static int, >= 3).
+    """
+    tiny = jnp.finfo(jnp.float32).tiny
+
+    # sin(ψ) where ψ = angle(ẑ, c). Safe-where avoids NaN grad at ±1.
+    sin_angle_sq = jnp.maximum(1.0 - cos_angle**2, 0.0)
+    sin_angle = jnp.where(
+        sin_angle_sq > 0, jnp.sqrt(jnp.where(sin_angle_sq > 0, sin_angle_sq, 1.0)), 0.0
+    )
+
+    # --- Outer GL quadrature: h ∈ [1 - d_max, 1] via u = 1 - h ---
+    half_range_h = d_max / 2.0
+    u = half_range_h * (1.0 - _GL_NODES)  # [N]
+    h = 1.0 - u
+    one_minus_h_sq = u * (2.0 - u)
+    sqrt_omh = jnp.sqrt(jnp.maximum(one_minus_h_sq, 0.0))
+    log_omh = jnp.log(jnp.maximum(u, tiny)) + jnp.log(2.0 - u)
+
+    # --- Inner Gauss-Jacobi quadrature: t ∈ [-1, 1] ---
+    # The inner integral is ∫_{-1}^{1} exp(a·t + b·t²) (1-t²)^{(d-4)/2} dt.
+    # Gauss-Jacobi with α = β = (d-4)/2 absorbs the (1-t²)^{(d-4)/2} weight,
+    # so the integrand reduces to exp(a·t + b·t²). This covers the full range
+    # and concentrates nodes where the weight is large.
+    _N_INNER = 256  # More nodes than outer: the exp(λf²) peak can be sharper
+    jac_alpha = (dim - 4) / 2.0
+    inner_nodes_np, inner_weights_np = sps.roots_jacobi(_N_INNER, jac_alpha, jac_alpha)
+    inner_nodes = jnp.array(inner_nodes_np, dtype=jnp.float32)
+    # Compute log-weights in float64 before casting — weights near t=±1 can be
+    # as small as 1e-90 for dim=768, far below float32's 1e-38 minimum.
+    log_inner_weights = jnp.array(
+        np.log(np.maximum(inner_weights_np, np.finfo(np.float64).tiny)),
+        dtype=jnp.float32,
+    )
+
+    # f(h, t) = ẑ·x = cos(ψ)·h + sin(ψ)·√(1-h²)·t
+    f = cos_angle * h[:, None] + sin_angle * sqrt_omh[:, None] * inner_nodes[None, :]
+
+    # Inner log integrand: κ·f + λ·f² (weight already in quadrature)
+    log_inner = kappa_eff * f + lambda_eff * f**2
+
+    # Inner integral via logsumexp over t → [N_outer]
+    log_inner_int = jax.scipy.special.logsumexp(
+        log_inner + log_inner_weights[None, :], axis=1
+    )
+
+    # Outer log integrand: (d-3)/2 · log(1-h²) + log(inner integral)
+    log_outer = (dim - 3) / 2.0 * log_omh + log_inner_int
+
+    # Outer integral via logsumexp over h
+    log_gl_w = jnp.log(_GL_WEIGHTS)
+    return jax.scipy.special.logsumexp(log_outer + log_gl_w) + jnp.log(
+        jnp.maximum(half_range_h, tiny)
+    )
+
+
+@partial(jax.jit, static_argnames=("dim",))
+def fb_cap_logit(
+    kappa_eff: Array, lambda_eff: Array, cos_angle: Array, d_max: Array, dim: int
+) -> Array:
+    """Logit of the Fisher-Bingham cap probability via double GL quadrature.
+
+    For p(x) ∝ exp(κ ẑ·x + λ (ẑ·x)²) on S^{d-1}, returns
+    log P(x ∈ cap) - log P(x ∉ cap).
+
+    Reduces to the vMF cap logit when λ = 0.
+
+    Args:
+        kappa_eff: Linear concentration (scalar).
+        lambda_eff: Quadratic concentration (scalar, >= 0).
+        cos_angle: ẑ^T c, cosine between distribution axis and cap center.
+        d_max: Cosine distance threshold (scalar, in [0, 2]).
+        dim: Ambient space dimension (static int, >= 3).
+
+    Returns:
+        Logit (scalar).
+    """
+    log_p = _fb_cap_unnorm_log_integral(kappa_eff, lambda_eff, cos_angle, d_max, dim)
+    log_1_minus_p = _fb_cap_unnorm_log_integral(
+        kappa_eff, lambda_eff, -cos_angle, 2.0 - d_max, dim
+    )
+    logit = log_p - log_1_minus_p
+    return jnp.where(d_max <= 0.0, -jnp.inf, jnp.where(d_max >= 2.0, jnp.inf, logit))
+
+
 @partial(jax.jit, static_argnames=("dim",))
 def vmf_cap_logit(kappa: Array, cos_angle: Array, d_max: Array, dim: int) -> Array:
     """Logit of the vMF cap probability: log P(in cap) - log P(out of cap).
@@ -1364,3 +1468,194 @@ def test_vmf_cap_logit_full_sphere():
     """Full sphere logit must be +inf."""
     logit = vmf_cap_logit(jnp.float32(5.0), jnp.float32(0.5), jnp.float32(2.0), 3)
     assert logit == jnp.inf, f"expected +inf, got {float(logit)}"
+
+
+# =============================================================================
+# Tests for Fisher-Bingham cap logit
+# =============================================================================
+
+
+@pytest.mark.parametrize("dim", [3, 16, 64])
+@pytest.mark.parametrize("kappa", [0.0, 1.0, 10.0, 50.0])
+@pytest.mark.parametrize("cos_angle", [0.0, 0.5, 0.9])
+@pytest.mark.parametrize("d_max", [0.5, 1.0, 1.5])
+def test_fb_cap_logit_matches_vmf_at_lambda_zero(dim, kappa, cos_angle, d_max):
+    """With lambda_eff=0 the Fisher-Bingham reduces to vMF."""
+    vmf_result = float(
+        vmf_cap_logit(
+            jnp.float32(kappa), jnp.float32(cos_angle), jnp.float32(d_max), dim
+        )
+    )
+    fb_result = float(
+        fb_cap_logit(
+            jnp.float32(kappa),
+            jnp.float32(0.0),
+            jnp.float32(cos_angle),
+            jnp.float32(d_max),
+            dim,
+        )
+    )
+    if not np.isfinite(vmf_result):
+        assert not np.isfinite(fb_result) or abs(fb_result) > 30, (
+            f"vmf={vmf_result}, fb={fb_result}"
+        )
+        return
+    np.testing.assert_allclose(
+        fb_result,
+        vmf_result,
+        atol=0.15,
+        rtol=0.05,
+        err_msg=f"dim={dim} κ={kappa} cos={cos_angle} d={d_max}",
+    )
+
+
+@pytest.mark.parametrize("dim", [3, 16, 64])
+def test_fb_cap_logit_mc(dim):
+    """Monte Carlo reference for Fisher-Bingham cap logit."""
+    kappa_eff = 5.0
+    lambda_eff = 2.0
+    d_max = 1.0
+    cos_angle = 0.5
+
+    # Sample from the FB distribution via rejection sampling from uniform sphere
+    rng = np.random.default_rng(42)
+    n = 500_000
+    # Uniform samples on S^{d-1}
+    x = rng.standard_normal((n, dim))
+    x /= np.linalg.norm(x, axis=1, keepdims=True)
+
+    # Distribution axis ẑ and cap center c
+    z_hat = np.zeros(dim)
+    z_hat[0] = 1.0
+    c = np.zeros(dim)
+    c[0] = cos_angle
+    c[1] = np.sqrt(1 - cos_angle**2)
+
+    # FB log-density (unnormalized)
+    dots = x @ z_hat  # ẑ · x
+    log_w = kappa_eff * dots + lambda_eff * dots**2
+    log_w -= log_w.max()
+    w = np.exp(log_w)
+
+    # Cap membership
+    cos_dists = 1.0 - x @ c
+    in_cap = cos_dists <= d_max
+
+    p_in = np.average(in_cap, weights=w)
+    mc_logit = np.log(p_in / (1.0 - p_in))
+
+    fb_result = float(
+        fb_cap_logit(
+            jnp.float32(kappa_eff),
+            jnp.float32(lambda_eff),
+            jnp.float32(cos_angle),
+            jnp.float32(d_max),
+            dim,
+        )
+    )
+    np.testing.assert_allclose(
+        fb_result,
+        mc_logit,
+        atol=0.1,
+        err_msg=f"dim={dim} mc={mc_logit:.4f} fb={fb_result:.4f}",
+    )
+
+
+def _fb_cap_logit_f64_reference(kappa_eff, lambda_eff, cos_angle, d_max, dim):
+    """Compute FB cap logit via high-resolution Gauss-Jacobi quadrature in float64.
+
+    Uses 256 Gauss-Jacobi inner nodes (max stable for high-alpha scipy)
+    and 256 Gauss-Legendre outer nodes, all in float64.
+    """
+    n_quad = 256
+    nu_outer = (dim - 3) / 2.0
+    sin_angle = np.sqrt(max(1.0 - cos_angle**2, 0.0))
+
+    # Inner: Gauss-Jacobi with α = (d-4)/2
+    jac_alpha = (dim - 4) / 2.0
+    inner_nodes, inner_weights = sps.roots_jacobi(n_quad, jac_alpha, jac_alpha)
+    log_inner_weights = np.log(np.maximum(inner_weights, 1e-300))
+
+    # Outer: Gauss-Legendre
+    outer_nodes, outer_weights = np.polynomial.legendre.leggauss(n_quad)
+    log_outer_weights = np.log(outer_weights)
+
+    def _log_integral(h_lo, h_hi):
+        """Log of unnormalized FB integral over h ∈ [h_lo, h_hi]."""
+        half = (h_hi - h_lo) / 2.0
+        mid = (h_hi + h_lo) / 2.0
+        h = mid + half * outer_nodes  # [N]
+        u = 1.0 - h
+        omh2 = u * (2.0 - u)
+        sqrt_omh = np.sqrt(np.maximum(omh2, 0.0))
+        log_omh = np.log(np.maximum(u, 1e-300)) + np.log(2.0 - u)
+
+        f = (
+            cos_angle * h[:, None]
+            + sin_angle * sqrt_omh[:, None] * inner_nodes[None, :]
+        )
+        log_inner = kappa_eff * f + lambda_eff * f**2
+
+        # logsumexp for inner integral
+        log_vals = log_inner + log_inner_weights[None, :]
+        max_vals = np.max(log_vals, axis=1, keepdims=True)
+        log_inner_int = (
+            np.log(np.sum(np.exp(log_vals - max_vals), axis=1)) + max_vals[:, 0]
+        )
+
+        log_outer_vals = (
+            nu_outer * log_omh + log_inner_int + log_outer_weights + np.log(half)
+        )
+        max_outer = np.max(log_outer_vals)
+        return np.log(np.sum(np.exp(log_outer_vals - max_outer))) + max_outer
+
+    log_cap = _log_integral(1.0 - d_max, 1.0)
+    log_comp = _log_integral(-1.0, 1.0 - d_max)
+    return log_cap - log_comp
+
+
+@pytest.mark.parametrize(
+    "dim, kappa_eff, lambda_eff, cos_angle, d_max",
+    [
+        # Low-dim, moderate parameters
+        (3, 5.0, 2.0, 0.5, 1.0),
+        (16, 10.0, 5.0, 0.3, 0.5),
+        # High-dim, parameters from actual baseline at γ=8 and γ=10
+        (64, 2296.0, 342.0, 0.5, 0.5),
+        (64, 6878.0, 7574.0, 0.5, 0.5),
+        (768, 2296.0, 342.0, 0.5, 0.5),
+        (768, 6878.0, 7574.0, 0.5, 0.5),
+        # Off-axis cases where the quadratic term shifts the peak
+        (768, 2296.0, 342.0, 0.1, 1.0),
+        (768, 6878.0, 7574.0, 0.9, 0.5),
+    ],
+)
+def test_fb_cap_logit_scipy_reference(dim, kappa_eff, lambda_eff, cos_angle, d_max):
+    """Verify fb_cap_logit against float64 high-resolution reference."""
+    ref = _fb_cap_logit_f64_reference(kappa_eff, lambda_eff, cos_angle, d_max, dim)
+    result = float(
+        fb_cap_logit(
+            jnp.float32(kappa_eff),
+            jnp.float32(lambda_eff),
+            jnp.float32(cos_angle),
+            jnp.float32(d_max),
+            dim,
+        )
+    )
+    # Both should agree on sign and magnitude. Allow generous float32 tolerance
+    # for very large logits, but the sign must be correct.
+    if abs(ref) > 100:
+        assert np.sign(result) == np.sign(ref), (
+            f"Sign mismatch: fb={result:.2f} ref={ref:.2f} "
+            f"(dim={dim} κ={kappa_eff} λ={lambda_eff})"
+        )
+        np.testing.assert_allclose(result, ref, rtol=0.15, atol=1.0)
+    else:
+        np.testing.assert_allclose(result, ref, atol=0.5, rtol=0.1)
+
+
+def test_fb_cap_logit_edge_cases():
+    """Empty and full sphere edge cases."""
+    k, le, c = jnp.float32(5.0), jnp.float32(1.0), jnp.float32(0.5)
+    assert fb_cap_logit(k, le, c, jnp.float32(0.0), 3) == -jnp.inf
+    assert fb_cap_logit(k, le, c, jnp.float32(2.0), 3) == jnp.inf
