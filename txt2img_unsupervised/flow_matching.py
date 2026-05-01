@@ -1344,68 +1344,6 @@ def _vmf_differential_entropy(kappa):
     return np.log(4 * np.pi * sinh_k / kappa) - kappa * coth_k + 1
 
 
-def vmf_scale_kappa(kappa_src, dim_src, dim_target):
-    """
-    Scale the von Mises-Fisher concentration parameter from a source dimension to a target
-    dimension. The resulting kappa value, when used to specify a vMF distribution in dim_target
-    dimensions, will have the same mean similarity to the distribution's mean direction as a
-    distribution with the source kappa in dim_src dimensions.
-    """
-    if dim_src == dim_target:
-        return kappa_src
-
-    n_samples = 16_384
-    eps = 0.01
-    max_iters = 100
-
-    np_rng = np.random.Generator(np.random.PCG64(seed=20250317))
-
-    def get_mean_similarity(kappa, north):
-        # There are non-stochastic methods of doing this but they have numerical issues and give bad
-        # results. This is slower, but reliable.
-        vmf_distribution = stats.vonmises_fisher(north, kappa)
-        samples = vmf_distribution.rvs(n_samples, random_state=np_rng)
-        return (samples @ north).mean()
-
-    src_north = np.zeros(dim_src)
-    src_north[0] = 1.0
-    src_mean_similarity = get_mean_similarity(kappa_src, src_north)
-    print(f"src mean similarity: {src_mean_similarity:.6f}")
-
-    target_north = np.zeros(dim_target)
-    target_north[0] = 1.0
-
-    low = kappa_src if dim_src < dim_target else kappa_src * (dim_src / dim_target)
-    incr = 200
-    while get_mean_similarity(low, target_north) > src_mean_similarity:
-        print(f"find lower bound: {low:.6f}")
-        low -= incr
-        incr *= 2
-    high = kappa_src if dim_src > dim_target else kappa_src * (dim_target / dim_src)
-    incr = 200
-    while get_mean_similarity(high, target_north) < src_mean_similarity:
-        print(f"find upper bound: {high:.6f}")
-        high += incr
-        incr *= 2
-
-    for i in range(max_iters):
-        test_kappa = (low + high) / 2.0
-        test_mean_similarity = get_mean_similarity(test_kappa, target_north)
-        error = test_mean_similarity - src_mean_similarity
-        print(
-            f"Iteration {i}, low: {low:.6f}, high: {high:.6f}, test kappa: {test_kappa:.6f}, similarity: {test_mean_similarity:.6f}, error: {error:.6f}"
-        )
-        if jnp.abs(error) < eps:
-            return test_kappa
-        if test_mean_similarity > src_mean_similarity:
-            high = test_kappa
-        else:
-            low = test_kappa
-    raise ValueError(
-        f"Failed to find kappa for dim_src={dim_src} and dim_target={dim_target}, final error: {error:.6f}"
-    )
-
-
 @pytest.mark.parametrize(
     "inject_keys",
     [

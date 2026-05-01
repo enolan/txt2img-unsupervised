@@ -8,13 +8,7 @@ a given point."""
 # cap that contains its embedding, so the model can learn to generate things conditioned on their
 # embedding being within a given cap. It's important that the caps not tell the model anything
 # beyond the fact that the embedding is inside the cap. The code in this file supports a method of
-# generating the caps that is run *per-example at training time*. It's easier to prove that the
-# caps don't contain any information they're not supposed to if you generate the caps in a
-# preprocessing step, sampling the caps and then sampling the examples with embeddings inside them.
-# But it's *way* slower and has its own bias problems (mostly that with uniformly distributed
-# centers small caps are disproportionately empty, so you have to bias the selection of the cap
-# centers). The code for the preprocessing version is in gen_training_caps.py and
-# spherical_space_partitioning.py
+# generating the caps that is run *per-example at training time*.
 
 from functools import partial
 from typing import Optional

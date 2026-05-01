@@ -57,52 +57,6 @@ def save_vector_field_to_csv(points, times, vector_field_values, output_csv):
     print(f"Vector field data saved to {output_csv}")
 
 
-def save_trajectory_data_to_csv(trajectory_points, time_values, output_csv):
-    """
-    Save trajectory data to a CSV file.
-
-    Args:
-        trajectory_points: List of arrays of trajectory points
-        time_values: List of arrays of time values for each trajectory
-        output_csv: Path to save the CSV file
-    """
-    os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
-
-    traj_data = []
-
-    for traj_idx, (points, times) in enumerate(zip(trajectory_points, time_values)):
-        domain_dim = points.shape[1]
-
-        for step_idx, (point, t) in enumerate(zip(points, times)):
-            point_data = {
-                "trajectory_id": traj_idx + 1,
-                "step": step_idx,
-                "time": t,
-            }
-
-            if domain_dim == 2:
-                point_data.update(
-                    {
-                        "x": point[0],
-                        "y": point[1],
-                    }
-                )
-            else:
-                point_data.update(
-                    {
-                        "x": point[0],
-                        "y": point[1],
-                        "z": point[2],
-                    }
-                )
-
-            traj_data.append(point_data)
-
-    df = pd.DataFrame(traj_data)
-    df.to_csv(output_csv, index=False)
-    print(f"Trajectory data saved to {output_csv}")
-
-
 def visualize_vector_field(
     model_config=None,
     seed=42,
