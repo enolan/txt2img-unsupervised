@@ -20,6 +20,13 @@ _GL_NODES_NP, _GL_WEIGHTS_NP = np.polynomial.legendre.leggauss(_N_QUAD)
 _GL_NODES = jnp.array(_GL_NODES_NP, dtype=jnp.float32)
 _GL_WEIGHTS = jnp.array(_GL_WEIGHTS_NP, dtype=jnp.float32)
 
+# Higher-resolution GL for fb_zonal_moments, where the adaptive window can extend
+# close to u=±1 and the log-density varies rapidly.
+_N_QUAD_HI = 512
+_GL_HI_NODES_NP, _GL_HI_WEIGHTS_NP = np.polynomial.legendre.leggauss(_N_QUAD_HI)
+_GL_HI_NODES = jnp.array(_GL_HI_NODES_NP, dtype=jnp.float32)
+_GL_HI_LOG_WEIGHTS = jnp.array(np.log(_GL_HI_WEIGHTS_NP), dtype=jnp.float32)
+
 
 def _prepare_sample_inputs(
     mu: Array, kappa, n_samples: int
@@ -812,7 +819,12 @@ def vmf_cap_log_prob(kappa: Array, cos_angle: Array, d_max: Array, dim: int) -> 
 
 
 def _fb_cap_unnorm_log_integral(
-    kappa_eff: Array, lambda_eff: Array, cos_angle: Array, d_max: Array, dim: int
+    kappa_eff: Array,
+    lambda_eff: Array,
+    cos_angle: Array,
+    d_max: Array,
+    dim: int,
+    log_shift: Array = 0.0,
 ) -> Array:
     """Log of unnormalized Fisher-Bingham integral over a spherical cap.
 
@@ -822,9 +834,15 @@ def _fb_cap_unnorm_log_integral(
 
     Uses the zonal decomposition x = h·c + √(1-h²)·v. The outer integral
     over h uses Gauss-Legendre quadrature on [1-d_max, 1]. The inner
-    integral over t = ẑ_⊥·v uses Gauss-Jacobi quadrature with weight
-    (1-t²)^{(d-4)/2}, which automatically concentrates nodes where the
-    spherical measure is large and handles the full range [-1, 1].
+    integral over t = ẑ_⊥·v uses adaptive Gauss-Legendre quadrature with
+    mode-finding: for each outer node h, we locate the peak of the full
+    log-integrand ν·log(1-t²) + κ·f + λ·f² (with ν=(d-4)/2 and
+    f = cos_ψ·h + sin_ψ·√(1-h²)·t) and concentrate GL nodes on a ±6σ
+    window around it.
+
+    This avoids the failure mode of Gauss-Jacobi quadrature at high κ in
+    high dimension, where the exp(κf) peak near t≈1 falls in the gap
+    between the last GJ node and the boundary.
 
     Args:
         kappa_eff: Linear concentration (scalar).
@@ -832,6 +850,10 @@ def _fb_cap_unnorm_log_integral(
         cos_angle: ẑ^T c, cosine between distribution axis and cap center.
         d_max: Cosine distance threshold (scalar, in [0, 2]).
         dim: Ambient space dimension (static int, >= 3).
+        log_shift: Common additive shift subtracted from the full log-integrand.
+            This is used by ``fb_cap_logit`` to evaluate the cap and complement
+            integrals in the same log-space and avoid catastrophic cancellation
+            when ``lambda_eff`` is very large.
     """
     tiny = jnp.finfo(jnp.float32).tiny
 
@@ -849,32 +871,63 @@ def _fb_cap_unnorm_log_integral(
     sqrt_omh = jnp.sqrt(jnp.maximum(one_minus_h_sq, 0.0))
     log_omh = jnp.log(jnp.maximum(u, tiny)) + jnp.log(2.0 - u)
 
-    # --- Inner Gauss-Jacobi quadrature: t ∈ [-1, 1] ---
-    # The inner integral is ∫_{-1}^{1} exp(a·t + b·t²) (1-t²)^{(d-4)/2} dt.
-    # Gauss-Jacobi with α = β = (d-4)/2 absorbs the (1-t²)^{(d-4)/2} weight,
-    # so the integrand reduces to exp(a·t + b·t²). This covers the full range
-    # and concentrates nodes where the weight is large.
-    _N_INNER = 256  # More nodes than outer: the exp(λf²) peak can be sharper
-    jac_alpha = (dim - 4) / 2.0
-    inner_nodes_np, inner_weights_np = sps.roots_jacobi(_N_INNER, jac_alpha, jac_alpha)
-    inner_nodes = jnp.array(inner_nodes_np, dtype=jnp.float32)
-    # Compute log-weights in float64 before casting — weights near t=±1 can be
-    # as small as 1e-90 for dim=768, far below float32's 1e-38 minimum.
-    log_inner_weights = jnp.array(
-        np.log(np.maximum(inner_weights_np, np.finfo(np.float64).tiny)),
-        dtype=jnp.float32,
+    # --- Inner adaptive GL quadrature: t ∈ [-1, 1] ---
+    # The inner integral is ∫_{-1}^{1} (1-t²)^ν · exp(κf + λf²) dt with
+    # ν = (d-4)/2 and f linear in t. The full log-integrand as a function
+    # of t (for fixed h) is:
+    #   g(t) = ν·log(1-t²) + a_eff·t + b_eff·t²  (+ h-dependent const)
+    # where a_eff = S·(κ + 2λ·cos_ψ·h) and b_eff = λ·S² with
+    # S = sin_ψ·√(1-h²). We find the mode of g per outer node, then
+    # concentrate GL nodes around it.
+    nu_inner = (dim - 4) / 2.0
+    S = sin_angle * sqrt_omh  # [N_outer]
+    a_eff = S * (kappa_eff + 2.0 * lambda_eff * cos_angle * h)  # [N_outer]
+    b_eff = lambda_eff * S**2  # [N_outer]
+
+    # Find mode via bisection on g'(t) = -2ν·t/(1-t²) + a_eff + 2·b_eff·t.
+    # g is strictly concave near the peak for dim ≥ 5 (ν ≥ 0.5), and
+    # g'(−1⁺) = +∞, g'(1⁻) = −∞, guaranteeing a unique interior root.
+    # For dim ≤ 4 (ν ≤ 0) the mode may be at a boundary; the bisection
+    # converges to it and the window expands to cover [-1, 1].
+    lo_b = jnp.full_like(h, -1.0 + 1e-6)
+    hi_b = jnp.full_like(h, 1.0 - 1e-6)
+    for _ in range(50):
+        mid_b = (lo_b + hi_b) * 0.5
+        omt2 = 1.0 - mid_b**2
+        fp = -2.0 * nu_inner * mid_b / omt2 + a_eff + 2.0 * b_eff * mid_b
+        lo_b = jnp.where(fp > 0, mid_b, lo_b)
+        hi_b = jnp.where(fp <= 0, mid_b, hi_b)
+    t_mode = (lo_b + hi_b) * 0.5  # [N_outer]
+
+    # Curvature at the mode → window width
+    omt2_mode = 1.0 - t_mode**2
+    gpp = -2.0 * nu_inner * (1.0 + t_mode**2) / omt2_mode**2 + 2.0 * b_eff
+    inner_sigma = 1.0 / jnp.sqrt(jnp.maximum(-gpp, 1.0))  # [N_outer]
+
+    inner_lo = jnp.maximum(t_mode - 6.0 * inner_sigma, -1.0 + 1e-7)
+    inner_hi = jnp.minimum(t_mode + 6.0 * inner_sigma, 1.0 - 1e-7)
+    inner_half = (inner_hi - inner_lo) / 2.0  # [N_outer]
+    inner_mid = (inner_hi + inner_lo) / 2.0  # [N_outer]
+
+    # Map GL nodes to per-h adaptive windows: [N_outer, N_inner]
+    inner_nodes = inner_mid[:, None] + inner_half[:, None] * _GL_HI_NODES[None, :]
+
+    # f(h, t) = cos_ψ·h + sin_ψ·√(1-h²)·t
+    f = cos_angle * h[:, None] + sin_angle * sqrt_omh[:, None] * inner_nodes
+
+    # Full log-integrand: ν·log(1-t²) + κ·f + λ·f² + log(w_GL) + log(Jacobian)
+    log_omt2 = jnp.log(jnp.maximum(1.0 - inner_nodes**2, tiny))
+    log_inner = (
+        nu_inner * log_omt2
+        + kappa_eff * f
+        + lambda_eff * f**2
+        - log_shift
+        + _GL_HI_LOG_WEIGHTS[None, :]
+        + jnp.log(jnp.maximum(inner_half[:, None], tiny))
     )
-
-    # f(h, t) = ẑ·x = cos(ψ)·h + sin(ψ)·√(1-h²)·t
-    f = cos_angle * h[:, None] + sin_angle * sqrt_omh[:, None] * inner_nodes[None, :]
-
-    # Inner log integrand: κ·f + λ·f² (weight already in quadrature)
-    log_inner = kappa_eff * f + lambda_eff * f**2
 
     # Inner integral via logsumexp over t → [N_outer]
-    log_inner_int = jax.scipy.special.logsumexp(
-        log_inner + log_inner_weights[None, :], axis=1
-    )
+    log_inner_int = jax.scipy.special.logsumexp(log_inner, axis=1)
 
     # Outer log integrand: (d-3)/2 · log(1-h²) + log(inner integral)
     log_outer = (dim - 3) / 2.0 * log_omh + log_inner_int
@@ -884,6 +937,92 @@ def _fb_cap_unnorm_log_integral(
     return jax.scipy.special.logsumexp(log_outer + log_gl_w) + jnp.log(
         jnp.maximum(half_range_h, tiny)
     )
+
+
+def _fb_cap_logit_large_lambda(
+    kappa_eff: Array, lambda_eff: Array, cos_angle: Array, d_max: Array, dim: int
+) -> Array:
+    """Large-λ asymptotic for FB cap logits.
+
+    When λ is very large, exp(κu + λu²) concentrates into two narrow Gaussian
+    modes around ±ẑ with tangent-plane precisions 2λ ± κ. Near each pole, the
+    cap boundary is not exactly a flat half-space: in tangent coordinates the
+    sphere curvature subtracts an O(||y||²) term. In high dimensions that
+    curvature cost shifts the effective boundary by the mean transverse energy.
+
+    This approximation is what remains after the exact cap integral is
+    dominated by tiny neighborhoods of the two poles. In that regime the
+    direct quadrature becomes brittle because the inner integrand is bimodal
+    and the exact logit is the difference of two extremely small tail masses.
+    """
+    dtype = jnp.result_type(kappa_eff, lambda_eff, cos_angle, d_max)
+    tiny = jnp.finfo(dtype).tiny
+    boundary_cos = jnp.asarray(1.0 - d_max, dtype=dtype)
+    tangent_dim = jnp.asarray(dim - 1, dtype=dtype)
+
+    sin_angle_sq = jnp.maximum(jnp.asarray(1.0, dtype=dtype) - cos_angle**2, 0.0)
+    sin_angle = jnp.where(
+        sin_angle_sq > 0,
+        jnp.sqrt(jnp.where(sin_angle_sq > 0, sin_angle_sq, 1.0)),
+        0.0,
+    )
+    chi_df = jnp.asarray(dim - 2, dtype=dtype)
+
+    prec_plus = jnp.maximum(2.0 * lambda_eff + kappa_eff - 1.0, tiny)
+    prec_minus = jnp.maximum(2.0 * lambda_eff - kappa_eff - 1.0, tiny)
+
+    log_two_pi = jnp.log(jnp.asarray(2.0 * np.pi, dtype=dtype))
+    log_w_plus = kappa_eff + 0.5 * tangent_dim * (log_two_pi - jnp.log(prec_plus))
+    log_w_minus = -kappa_eff + 0.5 * tangent_dim * (log_two_pi - jnp.log(prec_minus))
+    log_mix_norm = jax.scipy.special.logsumexp(jnp.stack([log_w_plus, log_w_minus]))
+    log_mix_plus = log_w_plus - log_mix_norm
+    log_mix_minus = log_w_minus - log_mix_norm
+
+    def aligned_case(_):
+        plus_in = jnp.where(cos_angle >= boundary_cos, 0.0, -jnp.inf)
+        plus_out = jnp.where(cos_angle >= boundary_cos, -jnp.inf, 0.0)
+        minus_in = jnp.where(-cos_angle >= boundary_cos, 0.0, -jnp.inf)
+        minus_out = jnp.where(-cos_angle >= boundary_cos, -jnp.inf, 0.0)
+        return plus_in, plus_out, minus_in, minus_out
+
+    def general_case(_):
+        sqrt_prec_plus = jnp.sqrt(prec_plus)
+        sqrt_prec_minus = jnp.sqrt(prec_minus)
+
+        # Around each pole, the quadratic cap-boundary term couples the cap-axis
+        # coordinate to the remaining d-2 transverse degrees of freedom. Treating
+        # their aggregate energy by its mean/variance gives a much better
+        # boundary-band approximation than a flat half-space, while staying cheap
+        # and differentiable.
+        curv_plus = cos_angle / (2.0 * sin_angle * sqrt_prec_plus)
+        curv_minus = -cos_angle / (2.0 * sin_angle * sqrt_prec_minus)
+        scale_plus = jnp.sqrt(1.0 + 2.0 * chi_df * curv_plus**2)
+        scale_minus = jnp.sqrt(1.0 + 2.0 * chi_df * curv_minus**2)
+        t_plus = (
+            (cos_angle - boundary_cos) * sqrt_prec_plus / sin_angle - chi_df * curv_plus
+        ) / scale_plus
+        t_minus = (
+            (-cos_angle - boundary_cos) * sqrt_prec_minus / sin_angle
+            - chi_df * curv_minus
+        ) / scale_minus
+        return (
+            jax.scipy.special.log_ndtr(t_plus),
+            jax.scipy.special.log_ndtr(-t_plus),
+            jax.scipy.special.log_ndtr(t_minus),
+            jax.scipy.special.log_ndtr(-t_minus),
+        )
+
+    log_in_plus, log_out_plus, log_in_minus, log_out_minus = jax.lax.cond(
+        sin_angle <= jnp.sqrt(tiny), aligned_case, general_case, operand=None
+    )
+
+    log_p = jax.scipy.special.logsumexp(
+        jnp.stack([log_mix_plus + log_in_plus, log_mix_minus + log_in_minus])
+    )
+    log_one_minus_p = jax.scipy.special.logsumexp(
+        jnp.stack([log_mix_plus + log_out_plus, log_mix_minus + log_out_minus])
+    )
+    return log_p - log_one_minus_p
 
 
 @partial(jax.jit, static_argnames=("dim",))
@@ -907,12 +1046,103 @@ def fb_cap_logit(
     Returns:
         Logit (scalar).
     """
-    log_p = _fb_cap_unnorm_log_integral(kappa_eff, lambda_eff, cos_angle, d_max, dim)
-    log_1_minus_p = _fb_cap_unnorm_log_integral(
-        kappa_eff, lambda_eff, -cos_angle, 2.0 - d_max, dim
+
+    def quadrature_branch(_):
+        # The unnormalized cap and complement integrals both contain the same
+        # dominant Fisher-Bingham factor exp(kappa*u + lambda*u^2). Shifting
+        # both by a shared upper bound avoids catastrophic cancellation in the
+        # moderate high-SNR regime where the quadrature remains accurate.
+        log_shift = lambda_eff + jnp.abs(kappa_eff)
+        log_p = _fb_cap_unnorm_log_integral(
+            kappa_eff, lambda_eff, cos_angle, d_max, dim, log_shift=log_shift
+        )
+        log_1_minus_p = _fb_cap_unnorm_log_integral(
+            kappa_eff,
+            lambda_eff,
+            -cos_angle,
+            2.0 - d_max,
+            dim,
+            log_shift=log_shift,
+        )
+        return log_p - log_1_minus_p
+
+    logit = jax.lax.cond(
+        lambda_eff >= 2e4,
+        lambda _: _fb_cap_logit_large_lambda(
+            kappa_eff, lambda_eff, cos_angle, d_max, dim
+        ),
+        quadrature_branch,
+        operand=None,
     )
-    logit = log_p - log_1_minus_p
     return jnp.where(d_max <= 0.0, -jnp.inf, jnp.where(d_max >= 2.0, jnp.inf, logit))
+
+
+@partial(jax.jit, static_argnames=("dim",))
+def fb_zonal_moments(
+    kappa_eff: Array, lambda_eff: Array, dim: int
+) -> tuple[Array, Array]:
+    """First and second moments of u = ẑ·x under a zonal Fisher-Bingham on S^{d-1}.
+
+    For p(x) ∝ exp(κ ẑ·x + λ (ẑ·x)²) on S^{d-1}, computes E[ẑ·x] and E[(ẑ·x)²].
+
+    Uses adaptive GL quadrature: locates the mode of the log-density via bisection,
+    then concentrates 512 GL nodes on a ±6σ window around it. This avoids the
+    precision loss of Gauss-Jacobi quadrature at high concentration, where GJ nodes
+    cluster near u=0 but the density peaks near u=1.
+
+    Reduces to vMF moments when λ = 0.
+
+    Args:
+        kappa_eff: Linear concentration (scalar).
+        lambda_eff: Quadratic concentration (scalar, >= 0).
+        dim: Ambient space dimension (static int, >= 3).
+
+    Returns:
+        (E[u], E[u²]) where u = ẑ·x.
+    """
+    tiny = jnp.finfo(jnp.float32).tiny
+    nu = (dim - 3) / 2.0
+
+    # --- Find mode via bisection on f'(u) = -2νu/(1-u²) + κ + 2λu ---
+    # f is strictly concave on (-1,1) so f' is monotonically decreasing, with
+    # f'(-1⁺) = +∞ and f'(1⁻) = -∞. Bisection converges unconditionally.
+    lo_b = jnp.float32(-1.0 + 1e-6)
+    hi_b = jnp.float32(1.0 - 1e-6)
+    for _ in range(50):
+        mid_b = (lo_b + hi_b) * 0.5
+        omh = 1.0 - mid_b**2
+        fp = -2.0 * nu * mid_b / omh + kappa_eff + 2.0 * lambda_eff * mid_b
+        lo_b = jnp.where(fp > 0, mid_b, lo_b)
+        hi_b = jnp.where(fp <= 0, mid_b, hi_b)
+    u_mode = (lo_b + hi_b) * 0.5
+
+    # --- Adaptive GL quadrature centered on the mode ---
+    omh_mode = 1.0 - u_mode**2
+    fpp = -2.0 * nu * (1.0 + u_mode**2) / omh_mode**2 + 2.0 * lambda_eff
+    sigma = 1.0 / jnp.sqrt(jnp.maximum(-fpp, 1.0))
+
+    lo = jnp.maximum(u_mode - 6.0 * sigma, -1.0 + 1e-7)
+    hi = jnp.minimum(u_mode + 6.0 * sigma, 1.0 - 1e-7)
+    half_range = (hi - lo) / 2.0
+    mid = (hi + lo) / 2.0
+    nodes = mid + half_range * _GL_HI_NODES  # map [-1,1] GL nodes to [lo, hi]
+
+    # Full log-density at each node (GL weight × Jacobian absorb into log)
+    log_omh = jnp.log(jnp.maximum(1.0 - nodes**2, tiny))
+    log_f = (
+        nu * log_omh
+        + kappa_eff * nodes
+        + lambda_eff * nodes**2
+        + _GL_HI_LOG_WEIGHTS
+        + jnp.log(jnp.maximum(half_range, tiny))
+    )
+
+    # Softmax trick: subtract max, exponentiate, then compute weighted moments
+    w = jnp.exp(log_f - jnp.max(log_f))
+    Z = jnp.sum(w)
+    eu = jnp.sum(nodes * w) / Z
+    eu2 = jnp.sum(nodes**2 * w) / Z
+    return eu, eu2
 
 
 @partial(jax.jit, static_argnames=("dim",))
@@ -1562,45 +1792,77 @@ def test_fb_cap_logit_mc(dim):
 
 
 def _fb_cap_logit_f64_reference(kappa_eff, lambda_eff, cos_angle, d_max, dim):
-    """Compute FB cap logit via high-resolution Gauss-Jacobi quadrature in float64.
+    """Compute FB cap logit via adaptive GL quadrature in float64.
 
-    Uses 256 Gauss-Jacobi inner nodes (max stable for high-alpha scipy)
-    and 256 Gauss-Legendre outer nodes, all in float64.
+    Uses 2048 GL nodes for the inner integral with mode-finding per outer node,
+    and 256 GL outer nodes, all in float64.
     """
-    n_quad = 256
+    n_outer = 256
+    n_inner = 2048
     nu_outer = (dim - 3) / 2.0
+    nu_inner = (dim - 4) / 2.0
     sin_angle = np.sqrt(max(1.0 - cos_angle**2, 0.0))
 
-    # Inner: Gauss-Jacobi with α = (d-4)/2
-    jac_alpha = (dim - 4) / 2.0
-    inner_nodes, inner_weights = sps.roots_jacobi(n_quad, jac_alpha, jac_alpha)
-    log_inner_weights = np.log(np.maximum(inner_weights, 1e-300))
+    # Inner: adaptive GL
+    inner_gl_nodes, inner_gl_weights = np.polynomial.legendre.leggauss(n_inner)
+    log_inner_gl_weights = np.log(inner_gl_weights)
 
     # Outer: Gauss-Legendre
-    outer_nodes, outer_weights = np.polynomial.legendre.leggauss(n_quad)
+    outer_nodes, outer_weights = np.polynomial.legendre.leggauss(n_outer)
     log_outer_weights = np.log(outer_weights)
 
     def _log_integral(h_lo, h_hi):
         """Log of unnormalized FB integral over h ∈ [h_lo, h_hi]."""
         half = (h_hi - h_lo) / 2.0
         mid = (h_hi + h_lo) / 2.0
-        h = mid + half * outer_nodes  # [N]
+        h = mid + half * outer_nodes  # [N_outer]
         u = 1.0 - h
         omh2 = u * (2.0 - u)
         sqrt_omh = np.sqrt(np.maximum(omh2, 0.0))
         log_omh = np.log(np.maximum(u, 1e-300)) + np.log(2.0 - u)
 
-        f = (
-            cos_angle * h[:, None]
-            + sin_angle * sqrt_omh[:, None] * inner_nodes[None, :]
+        # Adaptive inner integral per outer node
+        S = sin_angle * sqrt_omh  # [N_outer]
+        a_eff = S * (kappa_eff + 2.0 * lambda_eff * cos_angle * h)
+        b_eff = lambda_eff * S**2
+
+        # Bisection to find mode of g(t) = nu_inner*log(1-t²) + a*t + b*t²
+        lo_b = np.full_like(h, -1.0 + 1e-12)
+        hi_b = np.full_like(h, 1.0 - 1e-12)
+        for _ in range(80):
+            mid_b = (lo_b + hi_b) * 0.5
+            omt2 = 1.0 - mid_b**2
+            fp = -2.0 * nu_inner * mid_b / omt2 + a_eff + 2.0 * b_eff * mid_b
+            lo_b = np.where(fp > 0, mid_b, lo_b)
+            hi_b = np.where(fp <= 0, mid_b, hi_b)
+        t_mode = (lo_b + hi_b) * 0.5
+
+        omt2_mode = 1.0 - t_mode**2
+        gpp = -2.0 * nu_inner * (1.0 + t_mode**2) / omt2_mode**2 + 2.0 * b_eff
+        sigma = 1.0 / np.sqrt(np.maximum(-gpp, 1.0))
+
+        i_lo = np.maximum(t_mode - 6.0 * sigma, -1.0 + 1e-14)
+        i_hi = np.minimum(t_mode + 6.0 * sigma, 1.0 - 1e-14)
+        i_half = (i_hi - i_lo) / 2.0
+        i_mid = (i_hi + i_lo) / 2.0
+
+        # [N_outer, N_inner]
+        t_nodes = i_mid[:, None] + i_half[:, None] * inner_gl_nodes[None, :]
+
+        f = cos_angle * h[:, None] + sin_angle * sqrt_omh[:, None] * t_nodes
+        log_omt2 = np.log(np.maximum(1.0 - t_nodes**2, 1e-300))
+        log_inner = (
+            nu_inner * log_omt2
+            + kappa_eff * f
+            + lambda_eff * f**2
+            + log_inner_gl_weights[None, :]
+            + np.log(np.maximum(i_half[:, None], 1e-300))
         )
-        log_inner = kappa_eff * f + lambda_eff * f**2
 
         # logsumexp for inner integral
-        log_vals = log_inner + log_inner_weights[None, :]
-        max_vals = np.max(log_vals, axis=1, keepdims=True)
+        max_vals = np.max(log_inner, axis=1, keepdims=True)
         log_inner_int = (
-            np.log(np.sum(np.exp(log_vals - max_vals), axis=1)) + max_vals[:, 0]
+            np.log(np.sum(np.exp(log_inner - max_vals), axis=1)) + max_vals[:, 0]
         )
 
         log_outer_vals = (
@@ -1614,6 +1876,73 @@ def _fb_cap_logit_f64_reference(kappa_eff, lambda_eff, cos_angle, d_max, dim):
     return log_cap - log_comp
 
 
+def _fb_high_snr_params(log_snr, sigma_radial=0.01, z_norm=1.0):
+    """Convert a log-SNR value into the FB parameters used by the uniform baseline."""
+    alpha = np.sqrt(1.0 / (1.0 + np.exp(-log_snr)))
+    sigma = np.sqrt(1.0 / (1.0 + np.exp(log_snr)))
+    denom = alpha**2 * sigma_radial**2 + sigma**2
+    kappa_eff = alpha * z_norm / denom
+    lambda_eff = alpha**2 * sigma_radial**2 * z_norm**2 / (2.0 * sigma**2 * denom)
+    return kappa_eff, lambda_eff
+
+
+def _fb_cap_logit_large_lambda_reference(kappa_eff, lambda_eff, cos_angle, d_max, dim):
+    """Two-mode Laplace reference for the λ >> 1 regime.
+
+    For very large λ the Fisher-Bingham density becomes a mixture of two narrow
+    tangent-plane Gaussians around ±ẑ. Near each pole, the cap boundary has an
+    O(||y||²) curvature term in tangent coordinates, so the one-dimensional
+    Gaussian threshold is shifted by the mean transverse energy and broadened by
+    its variance.
+    """
+    boundary_cos = 1.0 - d_max
+    sin_angle = np.sqrt(max(1.0 - cos_angle**2, 0.0))
+    tangent_dim = dim - 1
+    chi_df = dim - 2
+
+    prec_plus = max(2.0 * lambda_eff + kappa_eff - 1.0, 1e-300)
+    prec_minus = max(2.0 * lambda_eff - kappa_eff - 1.0, 1e-300)
+    log_w_plus = kappa_eff + 0.5 * tangent_dim * (
+        np.log(2.0 * np.pi) - np.log(prec_plus)
+    )
+    log_w_minus = -kappa_eff + 0.5 * tangent_dim * (
+        np.log(2.0 * np.pi) - np.log(prec_minus)
+    )
+    log_mix_norm = sps.logsumexp([log_w_plus, log_w_minus])
+    log_mix_plus = log_w_plus - log_mix_norm
+    log_mix_minus = log_w_minus - log_mix_norm
+
+    if sin_angle < 1e-15:
+        log_in_plus = 0.0 if cos_angle >= boundary_cos else -np.inf
+        log_out_plus = -np.inf if cos_angle >= boundary_cos else 0.0
+        log_in_minus = 0.0 if -cos_angle >= boundary_cos else -np.inf
+        log_out_minus = -np.inf if -cos_angle >= boundary_cos else 0.0
+    else:
+        sqrt_prec_plus = np.sqrt(prec_plus)
+        sqrt_prec_minus = np.sqrt(prec_minus)
+        curv_plus = cos_angle / (2.0 * sin_angle * sqrt_prec_plus)
+        curv_minus = -cos_angle / (2.0 * sin_angle * sqrt_prec_minus)
+        scale_plus = np.sqrt(1.0 + 2.0 * chi_df * curv_plus**2)
+        scale_minus = np.sqrt(1.0 + 2.0 * chi_df * curv_minus**2)
+        t_plus = (
+            (cos_angle - boundary_cos) * sqrt_prec_plus / sin_angle - chi_df * curv_plus
+        ) / scale_plus
+        t_minus = (
+            (-cos_angle - boundary_cos) * sqrt_prec_minus / sin_angle
+            - chi_df * curv_minus
+        ) / scale_minus
+        log_in_plus = sps.log_ndtr(t_plus)
+        log_out_plus = sps.log_ndtr(-t_plus)
+        log_in_minus = sps.log_ndtr(t_minus)
+        log_out_minus = sps.log_ndtr(-t_minus)
+
+    log_p = sps.logsumexp([log_mix_plus + log_in_plus, log_mix_minus + log_in_minus])
+    log_one_minus_p = sps.logsumexp(
+        [log_mix_plus + log_out_plus, log_mix_minus + log_out_minus]
+    )
+    return log_p - log_one_minus_p
+
+
 @pytest.mark.parametrize(
     "dim, kappa_eff, lambda_eff, cos_angle, d_max",
     [
@@ -1625,6 +1954,10 @@ def _fb_cap_logit_f64_reference(kappa_eff, lambda_eff, cos_angle, d_max, dim):
         (64, 6878.0, 7574.0, 0.5, 0.5),
         (768, 2296.0, 342.0, 0.5, 0.5),
         (768, 6878.0, 7574.0, 0.5, 0.5),
+        # Relevant 768D onset-of-failure regime from the zero-residual guidance test
+        (768, 9969.5, 1.63e6, 0.5005, 0.5),
+        (768, 9969.5, 1.63e6, 0.505, 0.5),
+        (768, 9969.5, 1.63e6, 0.51, 0.5),
         # Off-axis cases where the quadratic term shifts the peak
         (768, 2296.0, 342.0, 0.1, 1.0),
         (768, 6878.0, 7574.0, 0.9, 0.5),
@@ -1654,8 +1987,237 @@ def test_fb_cap_logit_scipy_reference(dim, kappa_eff, lambda_eff, cos_angle, d_m
         np.testing.assert_allclose(result, ref, atol=0.5, rtol=0.1)
 
 
+@pytest.mark.parametrize("log_snr", [20.0, 23.5])
+def test_fb_cap_logit_large_lambda_boundary_near_zero(log_snr):
+    """When the dominant pole lies on the cap boundary, the logit should be near zero.
+
+    At very large λ the cap probability is determined by whether the +ẑ Gaussian
+    mode is inside or outside the cap. If the cap boundary passes through +ẑ
+    itself, the in/out probability is asymptotically 1/2 up to an exponentially
+    tiny correction from the suppressed −ẑ mode.
+    """
+    kappa_eff, lambda_eff = _fb_high_snr_params(log_snr)
+    result = float(
+        fb_cap_logit(
+            jnp.float32(kappa_eff),
+            jnp.float32(lambda_eff),
+            jnp.float32(0.5),
+            jnp.float32(0.5),
+            768,
+        )
+    )
+    assert abs(result) < 1.0, f"log_snr={log_snr} gave boundary logit {result:.4f}"
+
+
+@pytest.mark.parametrize(
+    "log_snr, cos_angle",
+    [
+        (15.0, 0.4999),
+        (15.0, 0.5),
+        (15.0, 0.5001),
+        (15.0, 0.5005),
+        (17.5, 0.4999),
+        (17.5, 0.5),
+        (17.5, 0.5001),
+        (17.5, 0.5005),
+        (20.0, 0.5005),
+        (20.0, 0.505),
+        (20.0, 0.51),
+        (20.0, 0.9),
+        (23.5, 0.5005),
+        (23.5, 0.505),
+        (23.5, 0.9),
+    ],
+)
+def test_fb_cap_logit_large_lambda_matches_asymptotic(log_snr, cos_angle):
+    """For λ >> 1, fb_cap_logit should match the two-mode Laplace asymptotic."""
+    kappa_eff, lambda_eff = _fb_high_snr_params(log_snr)
+    ref = _fb_cap_logit_large_lambda_reference(
+        kappa_eff, lambda_eff, cos_angle, 0.5, 768
+    )
+    result = float(
+        fb_cap_logit(
+            jnp.float32(kappa_eff),
+            jnp.float32(lambda_eff),
+            jnp.float32(cos_angle),
+            jnp.float32(0.5),
+            768,
+        )
+    )
+    np.testing.assert_allclose(result, ref, rtol=2e-3, atol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "log_snr, cos_angle",
+    [
+        (15.0, 0.4999),
+        (15.0, 0.5),
+        (15.0, 0.5001),
+        (15.0, 0.5005),
+        (17.5, 0.4999),
+        (17.5, 0.5),
+        (17.5, 0.5001),
+        (17.5, 0.5005),
+    ],
+)
+def test_fb_cap_logit_large_lambda_boundary_band_matches_f64(log_snr, cos_angle):
+    """The large-λ asymptotic should match the exact integral in the boundary band.
+
+    The 768D zero-residual sampler is sensitive to logit errors right around the
+    cap boundary, where the direct float64 integral is still numerically stable
+    for the onset-of-large-λ regime.
+    """
+    kappa_eff, lambda_eff = _fb_high_snr_params(log_snr)
+    ref = _fb_cap_logit_f64_reference(kappa_eff, lambda_eff, cos_angle, 0.5, 768)
+    result = float(
+        fb_cap_logit(
+            jnp.float32(kappa_eff),
+            jnp.float32(lambda_eff),
+            jnp.float32(cos_angle),
+            jnp.float32(0.5),
+            768,
+        )
+    )
+    np.testing.assert_allclose(result, ref, rtol=3e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize(
+    "log_snr, cos_angle",
+    [
+        (11.0, 0.5),
+        (11.0, 0.5005),
+        (12.0, 0.5),
+        (12.0, 0.5005),
+    ],
+)
+def test_fb_cap_logit_large_lambda_early_cutover_matches_f64(log_snr, cos_angle):
+    """The curvature-corrected asymptotic is already accurate before λ reaches 1e6."""
+    kappa_eff, lambda_eff = _fb_high_snr_params(log_snr)
+    assert lambda_eff >= 2e4
+    ref = _fb_cap_logit_f64_reference(kappa_eff, lambda_eff, cos_angle, 0.5, 768)
+    asym = _fb_cap_logit_large_lambda_reference(
+        kappa_eff, lambda_eff, cos_angle, 0.5, 768
+    )
+    np.testing.assert_allclose(asym, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "log_snr, cos_angle",
+    [
+        (20.0, 0.5005),
+        (20.0, 0.505),
+        (23.5, 0.5005),
+    ],
+)
+def test_fb_cap_logit_large_lambda_cos_gradient_positive(log_snr, cos_angle):
+    """Moving the dominant pole deeper into the cap should increase the logit."""
+    kappa_eff, lambda_eff = _fb_high_snr_params(log_snr)
+    grad = float(
+        jax.grad(
+            lambda c: fb_cap_logit(
+                jnp.float32(kappa_eff),
+                jnp.float32(lambda_eff),
+                c,
+                jnp.float32(0.5),
+                768,
+            )
+        )(jnp.float32(cos_angle))
+    )
+    assert grad > 0.0, (
+        f"log_snr={log_snr} cos={cos_angle} should have positive d/dcos, got {grad:.4f}"
+    )
+
+
 def test_fb_cap_logit_edge_cases():
     """Empty and full sphere edge cases."""
     k, le, c = jnp.float32(5.0), jnp.float32(1.0), jnp.float32(0.5)
     assert fb_cap_logit(k, le, c, jnp.float32(0.0), 3) == -jnp.inf
     assert fb_cap_logit(k, le, c, jnp.float32(2.0), 3) == jnp.inf
+
+
+# =============================================================================
+# Tests for Fisher-Bingham zonal moments
+# =============================================================================
+
+
+@pytest.mark.parametrize("dim", [3, 16, 768])
+def test_fb_zonal_moments_uniform(dim):
+    """At κ=0, λ=0 the distribution is uniform on S^{d-1}, so E[u]=0 and E[u²]=1/d."""
+    eu, eu2 = fb_zonal_moments(jnp.float32(0.0), jnp.float32(0.0), dim)
+    np.testing.assert_allclose(float(eu), 0.0, atol=1e-5)
+    np.testing.assert_allclose(float(eu2), 1.0 / dim, rtol=1e-3)
+
+
+@pytest.mark.parametrize("dim", [3, 16, 768])
+@pytest.mark.parametrize("kappa", [1.0, 10.0, 50.0])
+def test_fb_zonal_moments_vmf(dim, kappa):
+    """At λ=0, E[u] should match the vMF mean resultant length A_d(κ)."""
+    eu, eu2 = fb_zonal_moments(jnp.float32(kappa), jnp.float32(0.0), dim)
+    expected_eu = float(mean_resultant_length(jnp.float32(kappa), dim))
+    np.testing.assert_allclose(float(eu), expected_eu, rtol=1e-3)
+    # E[u²] > E[u]² by Jensen's inequality (strict for non-degenerate distribution)
+    assert float(eu2) > float(eu) ** 2 - 1e-6
+
+
+@pytest.mark.parametrize("dim", [3, 16, 768])
+def test_fb_zonal_moments_symmetry(dim):
+    """Negating κ should negate E[u] and leave E[u²] unchanged."""
+    kappa, lam = jnp.float32(5.0), jnp.float32(2.0)
+    eu_pos, eu2_pos = fb_zonal_moments(kappa, lam, dim)
+    eu_neg, eu2_neg = fb_zonal_moments(-kappa, lam, dim)
+    np.testing.assert_allclose(float(eu_pos), -float(eu_neg), atol=1e-5)
+    np.testing.assert_allclose(float(eu2_pos), float(eu2_neg), rtol=1e-5)
+
+
+def fb_zonal_moments_f64_reference(kappa_eff, lambda_eff, dim):
+    """Float64 GL reference for fb_zonal_moments.
+
+    Uses 2048 Gauss-Legendre nodes in float64 with the full log-density computed
+    explicitly, avoiding scipy's roots_jacobi overflow at high alpha.
+    """
+    nu = (dim - 3) / 2.0
+    nodes, weights = np.polynomial.legendre.leggauss(2048)
+    log_omh = np.log(np.maximum(1.0 - nodes**2, 1e-300))
+    log_f = nu * log_omh + kappa_eff * nodes + lambda_eff * nodes**2 + np.log(weights)
+    log_f -= log_f.max()
+    w = np.exp(log_f)
+    Z = w.sum()
+    return (nodes * w).sum() / Z, (nodes**2 * w).sum() / Z
+
+
+@pytest.mark.parametrize(
+    "dim, kappa_eff, lambda_eff",
+    [
+        # Low concentration
+        (3, 5.0, 2.0),
+        (3, 20.0, 10.0),
+        (16, 10.0, 5.0),
+        (64, 50.0, 20.0),
+        # High concentration — the regime where the old GJ code failed.
+        # κ ≈ 5.3e3 and λ ≈ 2.95e3 match γ_max ≈ 9.3 in 16D.
+        (16, 5300.0, 2950.0),
+        (16, 10000.0, 6000.0),
+        (64, 5300.0, 2950.0),
+        (768, 100.0, 50.0),
+    ],
+)
+def test_fb_zonal_moments_scipy_reference(dim, kappa_eff, lambda_eff):
+    """Verify fb_zonal_moments against float64 GL reference at all concentrations."""
+    ref_eu, ref_eu2 = fb_zonal_moments_f64_reference(kappa_eff, lambda_eff, dim)
+
+    eu, eu2 = fb_zonal_moments(jnp.float32(kappa_eff), jnp.float32(lambda_eff), dim)
+    np.testing.assert_allclose(float(eu), ref_eu, rtol=1e-3, atol=1e-6)
+    np.testing.assert_allclose(float(eu2), ref_eu2, rtol=1e-3, atol=1e-6)
+
+
+def test_fb_zonal_moments_gradient_flows():
+    """Verify gradients flow through fb_zonal_moments."""
+
+    def loss(kappa, lam):
+        eu, eu2 = fb_zonal_moments(kappa, lam, 16)
+        return eu + eu2
+
+    grad_fn = jax.grad(loss, argnums=(0, 1))
+    g_k, g_l = grad_fn(jnp.float32(5.0), jnp.float32(2.0))
+    assert jnp.isfinite(g_k) and g_k != 0.0
+    assert jnp.isfinite(g_l) and g_l != 0.0

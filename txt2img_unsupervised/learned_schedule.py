@@ -43,7 +43,16 @@ class LearnedNoiseSchedule(nn.Module):
         hidden_dim: Width of the hidden layer in the rate network.
         n_quadrature_points: Number of grid points for numerical integration.
         init_gamma_min: Initial value for the learned γ_min endpoint.
-        init_gamma_max: Initial value for the learned γ_max endpoint.
+        init_gamma_max: Initial value for the learned γ_max endpoint. Ignored if
+            fixed_gamma_max is set.
+        gamma_max_cap: Optional soft upper bound on the learned γ_max. The
+            effective endpoint becomes cap - softplus(cap - γ_max), which equals
+            γ_max when γ_max << cap and asymptotes to cap from below. Mutually
+            exclusive with fixed_gamma_max.
+        fixed_gamma_max: If set, γ_max is not a learned parameter — it is pinned
+            to this value. Useful when γ_max is determined by an external
+            constraint (e.g. an SDE leak budget) rather than VLB optimization.
+            Mutually exclusive with gamma_max_cap.
     """
 
     hidden_dim: int = 32
@@ -51,34 +60,40 @@ class LearnedNoiseSchedule(nn.Module):
     init_gamma_min: float = -0.693
     init_gamma_max: float = 9.210
     gamma_max_cap: float | None = None
+    fixed_gamma_max: float | None = None
 
     def setup(self):
         assert self.n_quadrature_points >= 2, (
             f"n_quadrature_points must be >= 2, got {self.n_quadrature_points}"
         )
+        if self.fixed_gamma_max is not None and self.gamma_max_cap is not None:
+            raise ValueError("fixed_gamma_max and gamma_max_cap are mutually exclusive")
         self.gamma_min = self.param(
             "gamma_min",
             lambda _: jnp.array(self.init_gamma_min),
         )
-        self.gamma_max = self.param(
-            "gamma_max",
-            lambda _: jnp.array(self.init_gamma_max),
-        )
+        if self.fixed_gamma_max is None:
+            self.gamma_max = self.param(
+                "gamma_max",
+                lambda _: jnp.array(self.init_gamma_max),
+            )
         self.dense0 = nn.Dense(self.hidden_dim)
         self.dense1 = nn.Dense(1)
 
     @property
     def effective_gamma_max(self):
-        """The γ_max value after applying the optional soft cap.
+        """The effective γ_max endpoint.
 
-        Uses cap - softplus(cap - x) which equals x when x << cap and asymptotes
-        to cap from below. Gradients always flow (they shrink but never die),
-        so the optimizer can pull the value back down if needed.
+        If fixed_gamma_max is set, returns that value directly (no learned parameter).
+        Otherwise returns the learned gamma_max, optionally soft-capped.
         """
+        if self.fixed_gamma_max is not None:
+            return self.fixed_gamma_max
+        val = self.gamma_max
         if self.gamma_max_cap is not None:
             cap = self.gamma_max_cap
-            return cap - jax.nn.softplus(cap - self.gamma_max)
-        return self.gamma_max
+            val = cap - jax.nn.softplus(cap - val)
+        return val
 
     def _rate(self, t: Array) -> Array:
         """Compute the positive rate function g(t) = softplus(NN(t)) + 1.0.
