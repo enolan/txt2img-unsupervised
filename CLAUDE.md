@@ -38,6 +38,17 @@ Do your best to write code such that the answers to those questions are "yes", "
 cases where the specific advice is in conflict with the guiding principle, the guiding principle
 overrides.
 
+#### Ordering
+
+Put your declarations in a sensible order. Think of a source file like any other written document -
+it should be ordered in whatever way makes it easiest to understand. In general it should go from
+broad to narrow, while keeping related things together. The high level concept should be first,
+followed by finer details like helper functions. A well written math textbook doesn't *start* with
+pages of derivations of minutiae, even if they're critical, it starts with motivations and
+definitions, then moves on to derivations once the reader has familiarity with why they're there and
+what they mean. Remember that Python does *not* require that callees come before their callers,
+there is little technical constraint on what order you put things in.
+
 #### Be concise
 
 Ceteris paribus, concise code is clearer. If there are two equally effective ways to write
@@ -130,7 +141,6 @@ a bug, we should NOT clamp in the code that takes the parameter. It is correct f
 receives a value from a caller. For example, a function which takes a cosine similarity as a
 parameter should not clamp to [-1.0, 1.0], but a function that computes a cosine similarity should.
 
-
 ## General design
 
 Prefer functional code with minimal state. Small, independent functions that have a clear purpose
@@ -141,8 +151,8 @@ dataclasses where they make sense. Use type hints.
 
 * Follow PEP 8 naming conventions
 * Format code with `ruff format`
-* Import order: external libraries, then local, both in alphabetical order. Always at the top of a
-  source file, after any docstrings. Never put imports inside functions or classes.
+* The formatter will handle import order at the top of files. Never put imports inside functions or
+  classes unless this is necessary to avoid a cycle.
 
 ## Testing
 
@@ -242,7 +252,9 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
   flock /run/user/$UID/claude-gpu-lock uv run pytest -vs ...
   ```
   The lock is held for the duration of the command and released automatically when it finishes.
-  Non-GPU work (reading files, editing code, thinking) does not need the lock.
+  Non-GPU work (reading files, editing code, thinking) does not need the lock. Note that you may be
+  running inside a Docker container, and processes outside your container may be holding the lock.
+  The lock being help by a process you can't see does not necessarily mean anything is wrong.
 - Running code with the `python` interpreter: if you try to use the `python` interpreter directly,
   you won't have access to the dependencies! Always use `uv run`:
   - `uv run python path/to/file.py`
