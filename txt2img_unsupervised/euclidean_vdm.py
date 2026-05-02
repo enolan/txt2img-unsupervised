@@ -34,6 +34,7 @@ Then normalize: x = z / ‖z‖.
 """
 
 import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
@@ -49,7 +50,7 @@ import pytest
 from datasets import Dataset
 from einops import repeat
 from jax import Array
-from scipy import stats
+from scipy import special, stats
 
 from txt2img_unsupervised.cap_sampling import (
     DEFAULT_CAP_FEATURES,
@@ -61,14 +62,19 @@ from txt2img_unsupervised.cap_sampling import (
     sample_negative_cap_center,
     sphere_log_inverse_surface_area,
 )
-from txt2img_unsupervised.config import CapConditioningMode
+from txt2img_unsupervised.config import CapConditioningMode, resolve_log_snr_max
 from txt2img_unsupervised.flow_matching import (
     VectorField,
     sample_sphere,
     stratified_time_sample,
 )
 from txt2img_unsupervised.learned_schedule import LearnedNoiseSchedule
-from txt2img_unsupervised.vmf import fb_cap_logit, vmf_cap_logit
+from txt2img_unsupervised.vmf import (
+    fb_cap_logit,
+    fb_zonal_moments,
+    fb_zonal_moments_f64_reference,
+    vmf_cap_logit,
+)
 from txt2img_unsupervised.vmf import sample as vmf_sample
 
 # =============================================================================
@@ -138,6 +144,48 @@ def _uniform_baseline_logit(z, alpha, sigma, cap_params, domain_dim, sigma_radia
     )
 
 
+def _uniform_baseline_eps(z, alpha, sigma, domain_dim, sigma_radial):
+    """Exact noise prediction ε̂* assuming x₁ ~ Uniform(S^{d-1}).
+
+    The forward process z = α·r·x₁ + σ·ε with r ~ N(1, σ_r²) gives a
+    Fisher-Bingham posterior on x₁:
+
+        p(x₁ | z) ∝ exp(κ_eff (ẑ·x₁) + λ_eff (ẑ·x₁)²)
+
+    Marginalizing over r and using E[r | u, z] = τ²(α‖z‖u/σ² + 1/σ_r²), the
+    optimal noise prediction is:
+
+        ε̂* = (z - α·C·ẑ) / σ
+
+    where C = τ²(α‖z‖/σ² · E_FB[u²] + E_FB[u]/σ_r²) and ẑ = z/‖z‖.
+
+    Args:
+        z: Noisy points [batch_size, domain_dim].
+        alpha: Signal coefficient [batch_size].
+        sigma: Noise coefficient [batch_size].
+        domain_dim: Ambient space dimension (Python int).
+        sigma_radial: Radial augmentation noise std (Python float).
+
+    Returns:
+        Optimal noise prediction [batch_size, domain_dim].
+    """
+    z_norm = jnp.linalg.norm(z, axis=-1)
+    z_hat = z / jnp.maximum(z_norm, 1e-8)[:, None]
+
+    denom = alpha**2 * sigma_radial**2 + sigma**2
+    kappa_eff = alpha * z_norm / denom
+    lambda_eff = alpha**2 * sigma_radial**2 * z_norm**2 / (2.0 * sigma**2 * denom)
+
+    tau_sq = sigma**2 * sigma_radial**2 / denom
+
+    eu, eu2 = jax.vmap(lambda k, le: fb_zonal_moments(k, le, domain_dim))(
+        kappa_eff, lambda_eff
+    )
+
+    C = tau_sq * (alpha * z_norm / sigma**2 * eu2 + eu / sigma_radial**2)
+    return (z - alpha[:, None] * C[:, None] * z_hat) / sigma[:, None]
+
+
 class EuclideanDiffusionModel(nn.Module):
     """Euclidean VDM for data on S^{d-1}, with radial augmentation.
 
@@ -167,15 +215,26 @@ class EuclideanDiffusionModel(nn.Module):
     schedule_hidden_dim: int = 32
     schedule_n_quadrature_points: int = 1024
     init_log_snr_min: float = -10.0
-    init_log_snr_max: float = 10.0
+
+    # γ_max is configured in one of two mutually exclusive ways:
+    # 1. init_log_snr_max: γ_max is a learned parameter, initialized to this value
+    #    and free to move during training. Use when VLB optimization should choose
+    #    the high-SNR endpoint.
+    # 2. sde_max_leak + sde_min_d_max: γ_max is fixed at the value that keeps the
+    #    SDE-sampler leak fraction below sde_max_leak for the smallest cap a
+    #    cap-conditioned model might see (sde_min_d_max). In high dimension the
+    #    uniform-on-cap density concentrates near the boundary at rate
+    #    ≈ (d-2)·cot(θ_b), so leak grows with d; the closed form
+    #        P[leak] ≈ (d-2)·cot(θ_b)·exp(-γ_max/2) / √(2π)
+    #    inverts to a γ_max that depends only on dim and the leak budget. The
+    #    VLB-optimal γ_max is typically lower than what cap conditioning needs,
+    #    so for cap models we usually want this fixed path.
+    init_log_snr_max: float | None = None
+    sde_max_leak: float | None = None
+    sde_min_d_max: float | None = None
 
     # Radial augmentation noise std
     sigma_radial: float = 0.01
-
-    # Hard ceiling on the learned log-SNR maximum. Prevents the schedule from pushing
-    # γ_max to extreme values where float32 precision degrades and the recon term
-    # dominates the VLB without improving actual sample quality.
-    log_snr_max_cap: float | None = None
 
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
     d_max_dist: tuple | None = None
@@ -184,6 +243,12 @@ class EuclideanDiffusionModel(nn.Module):
     cap_features: frozenset[
         Literal["cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"]
     ] = field(default_factory=lambda: DEFAULT_CAP_FEATURES)
+
+    # When True, the neural net predicts a residual δε̂ and the model output is
+    # ε̂*_uniform(z_t, γ) + δε̂, where ε̂*_uniform is the Bayes-optimal noise
+    # prediction for x₁ ~ Uniform(S^{d-1}). The network only needs to learn how
+    # the training distribution differs from uniform.
+    residual_eps: bool = False
 
     @property
     def conditioning_dim(self) -> int:
@@ -228,12 +293,18 @@ class EuclideanDiffusionModel(nn.Module):
                 1, name="classifier_head", kernel_init=nn.initializers.zeros
             )
         self.vector_field = self.mk_vector_field()
+        self._initial_log_snr_max, fixed_gamma_max = resolve_log_snr_max(
+            self.init_log_snr_max,
+            self.sde_max_leak,
+            self.sde_min_d_max,
+            self.domain_dim,
+        )
         self.schedule = LearnedNoiseSchedule(
             hidden_dim=self.schedule_hidden_dim,
             n_quadrature_points=self.schedule_n_quadrature_points,
             init_gamma_min=self.init_log_snr_min,
-            init_gamma_max=self.init_log_snr_max,
-            gamma_max_cap=self.log_snr_max_cap,
+            init_gamma_max=self._initial_log_snr_max,
+            fixed_gamma_max=fixed_gamma_max,
         )
 
     @nn.nowrap
@@ -346,11 +417,17 @@ class EuclideanDiffusionModel(nn.Module):
             raise ValueError(f"Unknown cap conditioning mode: {self.cap_conditioning}")
 
     def _normalize_log_snr(self, log_snr):
-        """Normalize log_snr to [0, 1] at initialization using init endpoints. This intentionally
-        uses the *initial* endpoints rather than the learned ones, so that changes to the endpoints
-        don't change the objective."""
+        """Normalize log_snr to [0, 1] at initialization using init endpoints.
+
+        Uses the *initial* schedule endpoints — the upper one is whatever γ_max was
+        at parameter init, regardless of whether γ_max is learned or fixed by the
+        leak-budget path. This keeps the network's input range stable across the
+        two configuration modes, and (for the learned path) keeps the objective
+        invariant to schedule learning, since γ_max can move during training but
+        the normalization endpoints don't.
+        """
         return (log_snr - self.init_log_snr_min) / (
-            self.init_log_snr_max - self.init_log_snr_min
+            self._initial_log_snr_max - self.init_log_snr_min
         )
 
     def predict_eps(self, z, log_snr, cap_params):
@@ -358,6 +435,9 @@ class EuclideanDiffusionModel(nn.Module):
 
         For CLASSIFIER_GUIDANCE, always uses zeros conditioning (unconditioned noise
         prediction). Cap information only enters through the classifier pass.
+
+        When residual_eps is True, the neural net output is a residual added to the
+        Bayes-optimal noise prediction for a uniform sphere distribution.
 
         Args:
             z: Points in R^d [batch_size, domain_dim]
@@ -373,7 +453,14 @@ class EuclideanDiffusionModel(nn.Module):
         else:
             cond_vecs = self._cap_params_to_cond_vecs(cap_params, z.shape[0], z=z)
         t_normalized = self._normalize_log_snr(log_snr)
-        return self.vector_field(z, t_normalized, cond_vecs)
+        vf_out = self.vector_field(z, t_normalized, cond_vecs)
+        if self.residual_eps:
+            alpha, sigma = _snr_to_alpha_sigma(log_snr)
+            baseline = _uniform_baseline_eps(
+                z, alpha, sigma, self.domain_dim, self.sigma_radial
+            )
+            return baseline + vf_out
+        return vf_out
 
     def gamma_space_velocity(self, z, log_snr, cap_params):
         """Compute the ODE velocity in log-SNR space: ½[σ²z − σε̂].
@@ -475,7 +562,7 @@ class EuclideanDiffusionModel(nn.Module):
         return x_data, z_t, eps, log_snr, alpha, sigma, gamma_prime
 
     def _compute_vlb_components(
-        self, x_data, z_t, eps, log_snr, gamma_prime, cond_vecs
+        self, x_data, z_t, eps, log_snr, gamma_prime, cap_params
     ):
         """Compute VLB loss components from pre-computed forward diffusion state.
 
@@ -485,14 +572,14 @@ class EuclideanDiffusionModel(nn.Module):
             eps: True noise [batch_size, dim]
             log_snr: Log SNR values [batch_size]
             gamma_prime: Schedule derivative [batch_size]
-            cond_vecs: Conditioning vectors for the backbone [batch_size, conditioning_dim]
+            cap_params: None for UNCONDITIONED/CLASSIFIER_GUIDANCE,
+                (cap_centers, d_maxes) for CONDITIONED_SCORE
 
         Returns:
             Dict of VLB loss components.
         """
         dim = self.domain_dim
-        t_normalized = self._normalize_log_snr(log_snr)
-        eps_hat = self.vector_field(z_t, t_normalized, cond_vecs)
+        eps_hat = self.predict_eps(z_t, log_snr, cap_params)
 
         per_sample_sq_err = jnp.sum((eps_hat - eps) ** 2, axis=1)
         diffusion_loss = 0.5 * jnp.mean(gamma_prime * per_sample_sq_err)
@@ -540,13 +627,11 @@ class EuclideanDiffusionModel(nn.Module):
         Returns:
             Tuple of (total_loss, components_dict).
         """
-        batch_size = x_1.shape[0]
         x_data, z_t, eps, log_snr, alpha, sigma, gamma_prime = self._forward_diffusion(
             x_1, t
         )
-        cond_vecs = self._cap_params_to_cond_vecs(cap_params, batch_size, z=z_t)
         components = self._compute_vlb_components(
-            x_data, z_t, eps, log_snr, gamma_prime, cond_vecs
+            x_data, z_t, eps, log_snr, gamma_prime, cap_params
         )
         total_loss = components["vlb_total"] + components["variance"]
         return total_loss, components
@@ -600,15 +685,13 @@ class EuclideanDiffusionModel(nn.Module):
         Returns:
             Tuple of (total_loss, components_dict).
         """
-        batch_size = x_1.shape[0]
         x_data, z_t, eps, log_snr, alpha, sigma, gamma_prime = self._forward_diffusion(
             x_1, t
         )
 
-        # Pass 1: VLB with zeros conditioning (no cap info)
-        zero_cond = jnp.zeros((batch_size, self.conditioning_dim))
+        # Pass 1: VLB, for the unconstrained distribution, no cap information.
         vlb_components = self._compute_vlb_components(
-            x_data, z_t, eps, log_snr, gamma_prime, zero_cond
+            x_data, z_t, eps, log_snr, gamma_prime, None
         )
 
         # Pass 2: classifier with cap conditioning and independent γ-uniform noise.
@@ -1314,8 +1397,155 @@ def _compute_log_probability(
 # =============================================================================
 
 
+def _ks_test_samples(
+    samples: np.ndarray,
+    reference: np.ndarray,
+    n_projections: int = 20,
+    proj_seed: int = 456,
+) -> dict:
+    """Compare two sample sets via KS tests on cosine distance and random projections.
+
+    Returns a dict with KS statistics and Bonferroni-corrected p-values suitable for
+    both exact-correctness assertions and comparative reporting.
+    """
+    n1, dim = samples.shape
+    n2 = reference.shape[0]
+
+    # Random 1D projections
+    proj_rng = np.random.default_rng(proj_seed)
+    directions = proj_rng.standard_normal((n_projections, dim))
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+
+    ks_stats = []
+    p_values = []
+    for direction in directions:
+        stat, p = stats.ks_2samp(samples @ direction, reference @ direction)
+        ks_stats.append(stat)
+        p_values.append(p)
+
+    min_p = min(p_values)
+    # Bonferroni correction: multiply the minimum p-value by the number of tests.
+    # This is conservative (the projections aren't independent) but simple and valid.
+    corrected_p = min(min_p * n_projections, 1.0)
+
+    return {
+        "ks_max": max(ks_stats),
+        "ks_mean": float(np.mean(ks_stats)),
+        "min_p": min_p,
+        "corrected_p": corrected_p,
+        "n_projections": n_projections,
+        "n1": n1,
+        "n2": n2,
+    }
+
+
+def _uniform_cap_cos_distance_cdf(
+    dim: int, d_max: float, cos_dists: np.ndarray
+) -> np.ndarray:
+    """CDF of cosine distance under the uniform distribution on a fixed cap of S^{dim-1}.
+
+    For a cap centered at ``c``, the event ``1 - x·c <= r`` is exactly the cap
+    of radius ``r`` around the same center, so the conditional CDF inside the
+    radius-``d_max`` cap is just the ratio of cap areas.
+    """
+    values = np.asarray(cos_dists, dtype=np.float64)
+    cdf = np.zeros_like(values)
+
+    inside_mask = (values > 0.0) & (values < d_max)
+    if np.any(inside_mask):
+        numerator = _uniform_sphere_cap_mass(dim, values[inside_mask])
+        denominator = float(_uniform_sphere_cap_mass(dim, d_max))
+        cdf[inside_mask] = numerator / denominator
+
+    cdf[values >= d_max] = 1.0
+    return cdf
+
+
+def _uniform_sphere_cap_mass(dim: int, d_max: float | np.ndarray) -> np.ndarray:
+    """Exact cap area fraction for the uniform measure on S^{dim-1}."""
+    values = np.asarray(d_max, dtype=np.float64)
+    mass = np.zeros_like(values)
+
+    interior_mask = (values > 0.0) & (values < 2.0)
+    if np.any(interior_mask):
+        height = 1.0 - values[interior_mask]
+        beta_shape = (dim - 1) / 2.0
+        beta_arg = np.clip(1.0 - height**2, 0.0, 1.0)
+        lower_hemisphere = height >= 0.0
+        mass_interior = np.empty_like(height)
+        mass_interior[lower_hemisphere] = 0.5 * special.betainc(
+            beta_shape, 0.5, beta_arg[lower_hemisphere]
+        )
+        mass_interior[~lower_hemisphere] = 1.0 - 0.5 * special.betainc(
+            beta_shape, 0.5, beta_arg[~lower_hemisphere]
+        )
+        mass[interior_mask] = mass_interior
+
+    mass[values >= 2.0] = 1.0
+    return mass
+
+
+def _cap_cos_distance_quantile(dim: int, d_max: float, q: float) -> float:
+    """Return the cosine-distance quantile of the uniform distribution on a cap of S^{dim-1}."""
+    if not 0.0 < q < 1.0:
+        raise ValueError(f"Quantile must lie in (0, 1), got {q}")
+
+    target_mass = float(_uniform_sphere_cap_mass(dim, d_max)) * q
+    lo = 0.0
+    hi = d_max
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if float(_uniform_sphere_cap_mass(dim, mid)) < target_mass:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def _ks_test_uniform_sphere_projections(
+    samples: np.ndarray,
+    n_projections: int = 20,
+    proj_seed: int = 456,
+) -> dict:
+    """Compare unit-sphere samples to the exact uniform-on-sphere law via projections."""
+    _, dim = samples.shape
+    beta_shape = 0.5 * (dim - 1)
+    beta_dist = stats.beta(beta_shape, beta_shape)
+
+    proj_rng = np.random.default_rng(proj_seed)
+    directions = proj_rng.standard_normal((n_projections, dim))
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+
+    ks_stats = []
+    p_values = []
+    for direction in directions:
+        projected = np.clip(samples @ direction, -1.0, 1.0)
+        transformed = 0.5 * (projected + 1.0)
+        stat, p = stats.ks_1samp(transformed, beta_dist.cdf)
+        ks_stats.append(stat)
+        p_values.append(p)
+
+    min_p = min(p_values)
+    corrected_p = min(min_p * n_projections, 1.0)
+    return {
+        "ks_max": max(ks_stats),
+        "ks_mean": float(np.mean(ks_stats)),
+        "min_p": min_p,
+        "corrected_p": corrected_p,
+        "ks_stats": ks_stats,
+        "p_values": p_values,
+        "n_projections": n_projections,
+    }
+
+
 def _make_model(domain_dim, **kwargs):
-    """Create a EuclideanDiffusionModel with test-friendly defaults."""
+    """Create a EuclideanDiffusionModel with test-friendly defaults.
+
+    γ_max defaults to the learned path with init_log_snr_max=10.0 unless the
+    caller passes init_log_snr_max or sde_max_leak/sde_min_d_max — those are
+    mutually exclusive and exactly one must be set. As an ergonomic shortcut for
+    tests, passing only sde_max_leak fills in sde_min_d_max=0.1 automatically.
+    """
     defaults = dict(
         domain_dim=domain_dim,
         n_layers=2,
@@ -1325,6 +1555,12 @@ def _make_model(domain_dim, **kwargs):
         mlp_dropout_rate=None,
         use_pre_mlp_projection=True,
     )
+    if not any(
+        k in kwargs for k in ("init_log_snr_max", "sde_max_leak", "sde_min_d_max")
+    ):
+        defaults["init_log_snr_max"] = 10.0
+    elif "sde_max_leak" in kwargs and "sde_min_d_max" not in kwargs:
+        defaults["sde_min_d_max"] = 0.1
     defaults.update(kwargs)
     return EuclideanDiffusionModel(**defaults)
 
@@ -1442,7 +1678,7 @@ def test_train_trivial(domain_dim):
     """Train a model where all data is a single fixed point."""
     from txt2img_unsupervised.training_infra import train_for_tests
 
-    model = _make_model(domain_dim, vlb_variance_loss_weight=1e-3, log_snr_max_cap=10.0)
+    model = _make_model(domain_dim, vlb_variance_loss_weight=1e-3, sde_max_leak=0.005)
 
     batch_size = 256
     first_dim_vec = jnp.zeros(domain_dim)
@@ -1637,14 +1873,14 @@ def test_train_distribution(domain_dim, dist_name):
             n_layers=6,
             d_model=512,
             vlb_variance_loss_weight=1e-3,
-            log_snr_max_cap=10.0,
+            sde_max_leak=0.005,
         )
     else:
         model = _make_model(
             domain_dim,
             d_model=256,
             vlb_variance_loss_weight=1e-3,
-            log_snr_max_cap=10.0,
+            sde_max_leak=0.005,
         )
 
     batch_size = 1024
@@ -1769,35 +2005,48 @@ def test_train_distribution(domain_dim, dist_name):
 # Per-config test parameters for test_train_cap_conditioned.
 #
 # These thresholds document approximate performance at matched hyperparameters and
-# ~4 minutes of training time per config. They are NOT pass/fail gates — they record
+# ~1 minute of training time per config. They are NOT pass/fail gates — they record
 # what each configuration achieves so regressions are caught. When the code changes,
-# re-measure and update.
+# re-measure and update. The 1-minute budget is short enough that a regression in
+# learning speed (e.g. an accidentally disabled prior, a broken baseline ε̂*) shows
+# up as a threshold violation rather than being absorbed by convergence — the
+# residual_eps=True prior is what makes 1-minute training feasible at higher
+# dimensions; with residual_eps=False the 64D configs are wildly under-fit at this
+# budget.
 #
 # All configs use the same model architecture (4 layers, 256 d_model) and training set
-# (2M samples). Step counts target ~4 minutes of training time per config. CG gets
-# fewer steps than CS because each CG training step does 2 forward + 2 backward passes
-# (~1.3x slower per step on GPU).
+# (2M samples). CS gets more steps than CG because each CG training step does 2 forward
+# + 2 backward passes (~1.3x slower per step on GPU).
 #
-# Values: (steps, in_cap_threshold, ks_threshold)
+# Values: (steps, leak_budget, ks_threshold)
+# leak_budget: max acceptable true outside-cap fraction (tested via 99.8% binomial CI)
 # fmt: off
 _CAP_CONDITIONED_TEST_CONFIGS: dict[
     tuple[int, str, CapConditioningMode], tuple[int, float, float]
 ] = {
-    #                                                           steps   in_cap   KS
-    (3,  "uniform", CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.96,    0.06),
-    (3,  "uniform", CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.99,    0.04),
-    (3,  "vmf",     CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.96,    0.06),
-    (3,  "vmf",     CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.98,    0.05),
-    (16, "uniform", CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.93,    0.06),
-    (16, "uniform", CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.96,    0.05),
-    (16, "vmf",     CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.93,    0.06),
-    (16, "vmf",     CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.96,    0.05),
-    (64, "uniform", CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.82,    0.09),
-    (64, "uniform", CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.85,    0.09),
-    (64, "vmf",     CapConditioningMode.CONDITIONED_SCORE):    (8500,  0.82,    0.09),
-    (64, "vmf",     CapConditioningMode.CLASSIFIER_GUIDANCE):  (6500,  0.85,    0.09),
+    #                                                           steps   leak     KS
+    (3,  "uniform", CapConditioningMode.CONDITIONED_SCORE):    (2000,  0.02,    0.09),
+    (3,  "uniform", CapConditioningMode.CLASSIFIER_GUIDANCE):  (1500,  0.02,    0.08),
+    (3,  "vmf",     CapConditioningMode.CONDITIONED_SCORE):    (2000,  0.04,    0.12),
+    (3,  "vmf",     CapConditioningMode.CLASSIFIER_GUIDANCE):  (1500,  0.03,    0.12),
+    (16, "uniform", CapConditioningMode.CONDITIONED_SCORE):    (2000,  0.04,    0.11),
+    (16, "uniform", CapConditioningMode.CLASSIFIER_GUIDANCE):  (1500,  0.01,    0.08),
+    (16, "vmf",     CapConditioningMode.CONDITIONED_SCORE):    (2000,  0.04,    0.14),
+    (16, "vmf",     CapConditioningMode.CLASSIFIER_GUIDANCE):  (1500,  0.01,    0.12),
+    (64, "uniform", CapConditioningMode.CONDITIONED_SCORE):    (2000,  0.28,    0.24),
+    (64, "uniform", CapConditioningMode.CLASSIFIER_GUIDANCE):  (1500,  0.01,    0.10),
+    (64, "vmf",     CapConditioningMode.CONDITIONED_SCORE):    (2000,  0.22,    0.38),
+    (64, "vmf",     CapConditioningMode.CLASSIFIER_GUIDANCE):  (1500,  0.01,    0.14),
 }
 # fmt: on
+
+
+# Set CAP_TEST_SEEDS="0,1,2" to run multiple seeds for ablation or threshold calibration.
+# Falls back to a single seed (0) when unset or empty so the parametrize axis always
+# produces at least one test case.
+_CAP_TEST_SEEDS = tuple(
+    int(s) for s in os.environ.get("CAP_TEST_SEEDS", "0").split(",") if s.strip()
+) or (0,)
 
 
 @pytest.mark.usefixtures("starts_with_progressbar")
@@ -1807,28 +2056,32 @@ _CAP_CONDITIONED_TEST_CONFIGS: dict[
     "cap_conditioning",
     [CapConditioningMode.CONDITIONED_SCORE, CapConditioningMode.CLASSIFIER_GUIDANCE],
 )
-def test_train_cap_conditioned(domain_dim, data_distribution, cap_conditioning):
+@pytest.mark.parametrize("seed", _CAP_TEST_SEEDS)
+def test_train_cap_conditioned(domain_dim, data_distribution, cap_conditioning, seed):
     """Train a cap-conditioned model and verify conditioned generation and density.
 
     All configurations use the same model architecture and training set size. Step counts
-    are calibrated so each config trains for approximately 4 minutes. Classifier guidance
-    gets fewer steps (each step is slower due to 2 forward + 2 backward passes) but is
-    expected to hit tighter accuracy thresholds than conditioned score.
+    target approximately 1 minute of training per config (CS=2000, CG=1500). The short
+    training budget is where the uniform-baseline ε̂* prior (residual_eps=True) earns its
+    keep — at 64D it gives roughly 50× lower leak than learning the baseline from scratch.
     """
     jax.config.update("jax_compilation_cache_dir", "/tmp/t2i-u-jax-cache")
     from txt2img_unsupervised.training_infra import train_for_tests
 
-    train_steps, in_cap_threshold, ks_threshold = _CAP_CONDITIONED_TEST_CONFIGS[
+    train_steps, leak_budget, ks_threshold = _CAP_CONDITIONED_TEST_CONFIGS[
         (domain_dim, data_distribution, cap_conditioning)
     ]
 
     d_max_dist = ((0.8, 1.0), (0.2, 2.0))
+    residual_eps = True
     model_kwargs = dict(
         n_layers=4,
         d_model=256,
         cap_conditioning=cap_conditioning,
         d_max_dist=d_max_dist,
         vlb_variance_loss_weight=1e-3,
+        residual_eps=residual_eps,
+        sde_max_leak=0.005,
     )
     model_kwargs["cap_features"] = frozenset(
         {"cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"}
@@ -1842,7 +2095,7 @@ def test_train_cap_conditioned(domain_dim, data_distribution, cap_conditioning):
     n_test_samples = 4096
 
     # Generate training data
-    rng = jax.random.PRNGKey(42)
+    rng = jax.random.PRNGKey(42 + seed * 1000)
     if data_distribution == "uniform":
         points = np.asarray(
             sample_sphere(rng, n_train_samples + n_test_samples, domain_dim)
@@ -1875,6 +2128,7 @@ def test_train_cap_conditioned(domain_dim, data_distribution, cap_conditioning):
         fields=["point_vec"],
         steps=train_steps,
         test_dataset=test_dataset,
+        rng_seed=7357 + seed * 1000,
     )
     eval_params = result.state.get_eval_params()
 
@@ -1883,25 +2137,37 @@ def test_train_cap_conditioned(domain_dim, data_distribution, cap_conditioning):
         f"Learned schedule: γ_min={float(gamma_min):.2f}, γ_max={float(gamma_max):.2f}"
     )
 
-    # --- Distribution verification via SDE samples and KS tests ---
-    # The key property is that the conditioned density inside the cap is proportional to the
-    # unconditioned density — the constraint should not distort the distribution. Boundary sharpness
-    # is secondary, for embedding generation we don't care if the generated embedding is actually
-    # 0.81 away from the prompt embedding instead of <= 0.8, and if we decide we do we can rejection
-    # sample.
+    final_test_loss = result.test_loss if result.test_loss is not None else float("nan")
+    final_aux = result.test_aux or {}
+    aux_str = " ".join(f"{k}={v:.6f}" for k, v in sorted(final_aux.items()))
+    print(
+        f"RESULT_TRAIN dim={domain_dim} dist={data_distribution} "
+        f"mode={cap_conditioning.value} residual_eps={residual_eps} seed={seed} "
+        f"steps={train_steps} test_loss={final_test_loss:.6f} "
+        f"gamma_min={float(gamma_min):.4f} gamma_max={float(gamma_max):.4f} "
+        f"{aux_str}"
+    )
+
+    # --- Distribution verification ---
+    # The conditioned density inside the cap should be proportional to the unconditioned
+    # density. We decompose the check into three independently interpretable parts:
+    # 1. Leak: bounded outside-cap mass via binomial CI
+    # 2. Radial: correct cosine-distance distribution within the cap
+    # 3. Angular: correct tangential direction distribution within radial strata
     cap_center = jnp.zeros(domain_dim).at[0].set(1.0)
     table = LogitsTable(d=domain_dim - 1, n=8192)
     d_max_values = [1.0, 0.5]
     n_gen = 5000
-    n_projections = 20
+    n_radial_strata = 3
+    n_angular_projections = 8
+    leak_alpha = 0.002
 
     for d_max_test in d_max_values:
         print(f"\n--- Distribution check for d_max={d_max_test} ---")
 
-        # Generate conditioned SDE samples
         gen_cap_centers = repeat(cap_center, "d -> n d", n=n_gen)
         gen_d_maxes = jnp.full((n_gen,), d_max_test)
-        gen_rng = jax.random.PRNGKey(int(d_max_test * 1000))
+        gen_rng = jax.random.PRNGKey(int(d_max_test * 1000) + seed * 7919)
 
         samples_np = np.asarray(
             generate_samples_sde(
@@ -1916,36 +2182,81 @@ def test_train_cap_conditioned(domain_dim, data_distribution, cap_conditioning):
 
         sample_cos_dists = 1.0 - samples_np @ np.asarray(cap_center)
 
-        # Sanity check: the model is actually conditioning on the cap (most samples are in or very
-        # near it), not ignoring the constraint.
-        in_cap_frac = float(np.mean(sample_cos_dists <= d_max_test))
-        in_cap_margin = in_cap_frac - in_cap_threshold
-        print(
-            f"  In-cap fraction: {in_cap_frac:.4f} "
-            f"(threshold: {in_cap_threshold:.4f}, margin: {in_cap_margin:+.4f})"
+        # 1. Leak test: binomial CI on outside-cap fraction
+        outside_mask = sample_cos_dists > d_max_test
+        n_outside = int(np.sum(outside_mask))
+        leak_rate = n_outside / n_gen
+        leak_ci = stats.binomtest(n_outside, n_gen).proportion_ci(
+            confidence_level=1.0 - leak_alpha, method="exact"
         )
-        assert in_cap_frac >= in_cap_threshold, (
-            f"In-cap fraction {in_cap_frac:.4f} below threshold {in_cap_threshold:.4f} "
-            f"(d_max={d_max_test}, {cap_conditioning.value})"
+        print(
+            f"  Leak: {leak_rate:.4f} "
+            f"(CI upper: {leak_ci.high:.4f}, budget: {leak_budget:.4f})"
+        )
+        assert leak_ci.high <= leak_budget, (
+            f"Leak CI upper {leak_ci.high:.4f} exceeds budget {leak_budget:.4f} "
+            f"(observed {leak_rate:.4f}, d_max={d_max_test}, {cap_conditioning.value})"
         )
 
-        outside_mask = sample_cos_dists > d_max_test
         if np.any(outside_mask):
             max_overshoot = float(np.max(sample_cos_dists[outside_mask]) - d_max_test)
-            print(f"  Max overshoot past boundary: {max_overshoot:.4f}")
+            print(f"  Max overshoot: {max_overshoot:.4f}")
 
-        # Main assertion: the distribution inside the cap should match the true cap-restricted
-        # distribution. This verifies that conditioning doesn't distort the density.
+        samples_in_cap = samples_np[~outside_mask]
+        cos_dists_in_cap = sample_cos_dists[~outside_mask]
+
         if data_distribution == "uniform":
-            ref_np = np.asarray(
-                sample_from_cap_v(
-                    jax.random.PRNGKey(789), table, cap_center, d_max_test, n_gen
-                )
+            # 2. Radial: 1-sample KS against analytical uniform-on-cap CDF
+            radial_ks = stats.ks_1samp(
+                cos_dists_in_cap,
+                lambda x: _uniform_cap_cos_distance_cdf(domain_dim, d_max_test, x),
             )
+            radial_ks_stat = float(radial_ks.statistic)
+            print(f"  Radial KS: {radial_ks_stat:.4f} (p={radial_ks.pvalue:.4f})")
+            assert radial_ks_stat < ks_threshold, (
+                f"Radial KS {radial_ks_stat:.4f} >= {ks_threshold} "
+                f"for d_max={d_max_test}"
+            )
+
+            # 3. Angular: within radial strata, tangential directions should be
+            # uniform on S^{d-2} (rotational symmetry of uniform measure).
+            stratum_edges = [
+                _cap_cos_distance_quantile(domain_dim, d_max_test, q)
+                for q in np.linspace(1.0 / n_radial_strata, 1.0, n_radial_strata)[:-1]
+            ]
+            stratum_ids = np.digitize(cos_dists_in_cap, stratum_edges, right=True)
+
+            angular_ks_stats = []
+            for stratum_idx in range(n_radial_strata):
+                stratum_samples = samples_in_cap[stratum_ids == stratum_idx]
+                tangent = stratum_samples[:, 1:]
+                tangent_norms = np.linalg.norm(tangent, axis=1)
+                assert np.all(tangent_norms > 1e-8), (
+                    f"Degenerate tangent directions in stratum {stratum_idx} "
+                    f"(d_max={d_max_test}, dim={domain_dim})"
+                )
+                tangent_dirs = tangent / tangent_norms[:, None]
+                ang_result = _ks_test_uniform_sphere_projections(
+                    tangent_dirs,
+                    n_projections=n_angular_projections,
+                    proj_seed=456 + 31 * stratum_idx + int(d_max_test * 1000),
+                )
+                angular_ks_stats.extend(ang_result["ks_stats"])
+                print(
+                    f"  Angular stratum {stratum_idx}: n={len(stratum_samples)}, "
+                    f"max KS={ang_result['ks_max']:.4f}"
+                )
+
+            max_angular_ks = float(max(angular_ks_stats))
+            print(f"  Angular max KS: {max_angular_ks:.4f}")
+            assert max_angular_ks < ks_threshold, (
+                f"Angular KS {max_angular_ks:.4f} >= {ks_threshold} "
+                f"for d_max={d_max_test}"
+            )
+
         elif data_distribution == "vmf":
-            # Sample uniformly from the cap, then resample with vMF density
-            # weights. This works at any dimension and cap size, unlike
-            # rejection sampling which needs ~1/cap_area_frac candidates.
+            # Generate reference samples from vMF restricted to cap via importance
+            # resampling (uniform cap samples reweighted by vMF density).
             vmf_mu = jnp.zeros(domain_dim).at[1].set(1.0)
             vmf_kappa = 5.0
             n_pool = n_gen * 10
@@ -1958,46 +2269,79 @@ def test_train_cap_conditioned(domain_dim, data_distribution, cap_conditioning):
                 resample_rng, n_pool, shape=(n_gen,), p=jnp.exp(log_weights)
             )
             ref_np = np.asarray(pool[indices])
+            ref_cos_dists = 1.0 - ref_np @ np.asarray(cap_center)
+
+            # 2. Radial: 2-sample KS on cosine distances
+            radial_ks_stat, radial_ks_p = stats.ks_2samp(
+                cos_dists_in_cap, ref_cos_dists
+            )
+            radial_ks_stat = float(radial_ks_stat)
+            print(f"  Radial KS: {radial_ks_stat:.4f} (p={radial_ks_p:.4f})")
+            assert radial_ks_stat < ks_threshold, (
+                f"Radial KS {radial_ks_stat:.4f} >= {ks_threshold} "
+                f"for d_max={d_max_test}"
+            )
+
+            # 3. Angular: stratified 2-sample test of tangential directions.
+            # Within a radial stratum at angle θ from cap center, the vMF-restricted
+            # angular distribution is vMF(μ_⊥, κ sin θ) on S^{d-2}. Rather than
+            # testing against this analytical form, we stratify reference samples the
+            # same way and do 2-sample tests — equally sensitive without needing the
+            # Bessel function machinery.
+            ref_quantiles = np.quantile(
+                ref_cos_dists,
+                np.linspace(1.0 / n_radial_strata, 1.0, n_radial_strata)[:-1],
+            )
+            model_stratum_ids = np.digitize(cos_dists_in_cap, ref_quantiles, right=True)
+            ref_stratum_ids = np.digitize(ref_cos_dists, ref_quantiles, right=True)
+
+            angular_ks_stats = []
+            for stratum_idx in range(n_radial_strata):
+                model_stratum = samples_in_cap[model_stratum_ids == stratum_idx]
+                ref_stratum = ref_np[ref_stratum_ids == stratum_idx]
+
+                model_tangent = model_stratum[:, 1:]
+                model_t_norms = np.linalg.norm(model_tangent, axis=1)
+                assert np.all(model_t_norms > 1e-8), (
+                    f"Degenerate tangent directions in stratum {stratum_idx} "
+                    f"(d_max={d_max_test}, dim={domain_dim})"
+                )
+                model_tangent_dirs = model_tangent / model_t_norms[:, None]
+
+                ref_tangent = ref_stratum[:, 1:]
+                ref_t_norms = np.linalg.norm(ref_tangent, axis=1)
+                ref_tangent_dirs = ref_tangent / ref_t_norms[:, None]
+
+                ang_result = _ks_test_samples(
+                    model_tangent_dirs,
+                    ref_tangent_dirs,
+                    n_projections=n_angular_projections,
+                    proj_seed=456 + 31 * stratum_idx + int(d_max_test * 1000),
+                )
+                angular_ks_stats.append(ang_result["ks_max"])
+                print(
+                    f"  Angular stratum {stratum_idx}: "
+                    f"n_model={len(model_stratum)}, n_ref={len(ref_stratum)}, "
+                    f"max KS={ang_result['ks_max']:.4f}"
+                )
+
+            max_angular_ks = float(max(angular_ks_stats))
+            print(f"  Angular max KS: {max_angular_ks:.4f}")
+            assert max_angular_ks < ks_threshold, (
+                f"Angular KS {max_angular_ks:.4f} >= {ks_threshold} "
+                f"for d_max={d_max_test}"
+            )
+
         else:
             raise ValueError(f"Unknown data_distribution: {data_distribution}")
 
-        # Filter model samples to those inside the cap for fair KS comparison
-        samples_in_cap = samples_np[~outside_mask]
-
-        # KS test on cosine distance from cap center — checks the radial distribution within the cap
-        # matches the expected distribution.
-        model_cap_cos_dists = sample_cos_dists[~outside_mask]
-        ref_cap_cos_dists = 1.0 - ref_np @ np.asarray(cap_center)
-        cos_dist_ks, _ = stats.ks_2samp(model_cap_cos_dists, ref_cap_cos_dists)
-        cos_dist_ks_margin = ks_threshold - cos_dist_ks
         print(
-            f"  KS on cosine distance from cap center: {cos_dist_ks:.4f} "
-            f"(threshold: {ks_threshold:.4f}, margin: {cos_dist_ks_margin:+.4f})"
-        )
-        assert cos_dist_ks < ks_threshold, (
-            f"Cosine distance KS statistic {cos_dist_ks:.4f} >= {ks_threshold:.4f} for d_max={d_max_test}"
-        )
-
-        # KS test on random 1D projections
-        proj_rng = np.random.default_rng(456 + int(d_max_test * 1000))
-        directions = proj_rng.standard_normal((n_projections, domain_dim))
-        directions /= np.linalg.norm(directions, axis=1, keepdims=True)
-
-        ks_stats = []
-        for direction in directions:
-            stat, _ = stats.ks_2samp(samples_in_cap @ direction, ref_np @ direction)
-            ks_stats.append(stat)
-
-        max_ks = max(ks_stats)
-        mean_ks = np.mean(ks_stats)
-        proj_ks_margin = ks_threshold - max_ks
-        print(
-            f"  KS stats over {n_projections} projections: "
-            f"max={max_ks:.4f}, mean={mean_ks:.4f} "
-            f"(threshold: {ks_threshold:.4f}, margin: {proj_ks_margin:+.4f})"
-        )
-        assert max_ks < ks_threshold, (
-            f"Max KS statistic {max_ks:.4f} >= {ks_threshold:.4f} for d_max={d_max_test}"
+            f"RESULT_DIST dim={domain_dim} dist={data_distribution} "
+            f"mode={cap_conditioning.value} residual_eps={residual_eps} seed={seed} "
+            f"d_max={d_max_test} leak_rate={leak_rate:.6f} "
+            f"leak_ci_high={leak_ci.high:.6f} leak_budget={leak_budget:.6f} "
+            f"radial_ks={radial_ks_stat:.6f} angular_ks_max={max_angular_ks:.6f} "
+            f"ks_threshold={ks_threshold:.6f}"
         )
 
 
@@ -2044,7 +2388,7 @@ def _train_vmf_mixture_model():
     from txt2img_unsupervised.training_infra import train_for_tests
 
     dim = 3
-    model = _make_model(dim, vlb_variance_loss_weight=1e-3, log_snr_max_cap=10.0)
+    model = _make_model(dim, vlb_variance_loss_weight=1e-3, sde_max_leak=0.005)
 
     mu1 = np.array([1.0, 0.0, 0.0])
     mu2 = np.array([0.0, 1.0, 0.0])
@@ -2397,3 +2741,300 @@ def test_classifier_logit_correction_sign():
         table = LogitsTable(d, 8192)
         assert classifier_logit_correction(table, 0.5) < 0
         assert classifier_logit_correction(table, 1.5) > 0
+
+
+# =============================================================================
+# Tests for uniform baseline eps
+# =============================================================================
+
+
+@pytest.mark.parametrize("domain_dim", [16, 64])
+@pytest.mark.parametrize("log_snr", [-5.0, 0.0, 5.0, 9.0])
+def test_uniform_baseline_eps_direction(domain_dim, log_snr):
+    """The baseline ε̂ must point in the z_t direction (by rotational symmetry)."""
+    rng = jax.random.PRNGKey(42)
+    z = jax.random.normal(rng, (4, domain_dim))
+    alpha, sigma = _snr_to_alpha_sigma(jnp.full(4, log_snr))
+    eps = _uniform_baseline_eps(z, alpha, sigma, domain_dim, 0.01)
+
+    z_hat = z / jnp.linalg.norm(z, axis=-1, keepdims=True)
+    eps_hat = eps / jnp.maximum(jnp.linalg.norm(eps, axis=-1, keepdims=True), 1e-8)
+    cos_sim = jnp.sum(z_hat * eps_hat, axis=-1)
+    np.testing.assert_allclose(np.array(cos_sim), 1.0, atol=1e-4)
+
+
+@pytest.mark.parametrize("domain_dim", [16, 64, 768])
+def test_uniform_baseline_eps_mc(domain_dim):
+    """Monte Carlo test: the baseline should match E[ε | z_t] for uniform x₁.
+
+    Uses moderate SNR (log_snr=0) where importance sampling has sufficient
+    effective sample size. High-SNR precision is tested separately via
+    test_uniform_baseline_eps_high_snr_precision.
+    """
+    sigma_radial = 0.01
+    alpha, sigma = _snr_to_alpha_sigma(jnp.float32(0.0))
+
+    rng = jax.random.PRNGKey(123)
+    n_mc = 200_000
+
+    # Generate one z_t to condition on
+    rng, z_rng = jax.random.split(rng)
+    z = jax.random.normal(z_rng, (1, domain_dim)) * float(
+        jnp.sqrt(alpha**2 + domain_dim * sigma**2)
+    )
+
+    # Monte Carlo: sample many (x₁, r) from prior, weight by p(z_t | x₁, r).
+    # ε is determined by (x₁, r, z) via z = α·r·x₁ + σ·ε.
+    rng, x1_rng, r_rng = jax.random.split(rng, 3)
+    x1 = sample_sphere(x1_rng, n_mc, domain_dim)
+    r = 1.0 + sigma_radial * jax.random.normal(r_rng, (n_mc, 1))
+
+    # Importance weight: p(z | x1, r) = N(z; alpha*r*x1, sigma^2 I)
+    residual = z - float(alpha) * r * x1  # [n_mc, dim]
+    log_w = -0.5 * jnp.sum(residual**2, axis=-1) / float(sigma**2)
+    log_w = log_w - jnp.max(log_w)
+    w = jnp.exp(log_w)
+    w = w / jnp.sum(w)
+
+    # True ε for each sample: (z - α·r·x₁) / σ
+    true_eps = residual / float(sigma)
+    mc_eps = jnp.sum(w[:, None] * true_eps, axis=0)  # [dim]
+
+    baseline = _uniform_baseline_eps(
+        z,
+        jnp.array([float(alpha)]),
+        jnp.array([float(sigma)]),
+        domain_dim,
+        sigma_radial,
+    )[0]
+
+    np.testing.assert_allclose(
+        np.array(baseline), np.array(mc_eps), atol=0.15, rtol=0.05
+    )
+
+
+@pytest.mark.parametrize("domain_dim", [16, 64])
+@pytest.mark.parametrize("log_snr", [5.0, 9.0])
+def test_uniform_baseline_eps_high_snr_precision(domain_dim, log_snr):
+    """At high SNR, verify the float32 baseline matches a float64 reference.
+
+    Computes the FB moments in float64, runs the baseline formula in float64, and
+    checks the float32 implementation agrees. This catches the precision bug where
+    GJ quadrature gave E[u] errors of ~1e-4 that got amplified to ~0.05 in ε̂.
+    """
+    sigma_radial = 0.01
+    log_snr_arr = jnp.float32(log_snr)
+    alpha_j, sigma_j = _snr_to_alpha_sigma(log_snr_arr)
+    alpha, sigma = float(alpha_j), float(sigma_j)
+
+    rng = jax.random.PRNGKey(77 + domain_dim + int(log_snr))
+    z_np = np.array(jax.random.normal(rng, (4, domain_dim)))
+    z_norm = np.linalg.norm(z_np, axis=-1)
+
+    # Float64 reference
+    denom = alpha**2 * sigma_radial**2 + sigma**2
+    kappa_eff = alpha * z_norm / denom
+    lambda_eff = alpha**2 * sigma_radial**2 * z_norm**2 / (2.0 * sigma**2 * denom)
+    tau_sq = sigma**2 * sigma_radial**2 / denom
+
+    ref_eps = np.zeros_like(z_np)
+    for i in range(len(z_np)):
+        eu, eu2 = fb_zonal_moments_f64_reference(
+            kappa_eff[i], lambda_eff[i], domain_dim
+        )
+        C = tau_sq * (alpha * z_norm[i] / sigma**2 * eu2 + eu / sigma_radial**2)
+        z_hat = z_np[i] / z_norm[i]
+        ref_eps[i] = (z_np[i] - alpha * C * z_hat) / sigma
+
+    # Float32 implementation
+    baseline = np.array(
+        _uniform_baseline_eps(
+            jnp.array(z_np, dtype=jnp.float32),
+            jnp.full(4, alpha, dtype=jnp.float32),
+            jnp.full(4, sigma, dtype=jnp.float32),
+            domain_dim,
+            sigma_radial,
+        )
+    )
+
+    np.testing.assert_allclose(baseline, ref_eps, rtol=5e-3, atol=1e-2)
+
+
+@pytest.mark.parametrize("domain_dim", [16, 64, 768])
+@pytest.mark.parametrize("d_max_test", [1.0, 0.5])
+def test_zero_residual_models_uniform(domain_dim, d_max_test):
+    """A residual model with zero network weights should perfectly model a uniform distribution.
+
+    With residual_eps=True the noise prediction is baseline + residual, and the classifier logit
+    is baseline + residual. At initialization, both residuals are zero (out_proj kernel and
+    classifier_head kernel are zero-initialized), so the model should produce the exact Bayes-
+    optimal predictions for x₁ ~ Uniform(S^{d-1}).
+
+    No finite statistical test can prove exact equality of two continuous distributions, so this
+    test checks the strongest decomposition we can make practical in CI:
+    1. The leaked mass outside the cap is tightly bounded.
+    2. The full cosine-distance distribution matches the analytical uniform-on-cap CDF.
+    3. Within several exact radial strata, the tangential direction is uniform on S^{d-2}.
+    """
+    jax.config.update("jax_compilation_cache_dir", "/tmp/t2i-u-jax-cache")
+
+    # The residual heads are zero-initialized, so this test only needs enough backbone to exercise
+    # the initialized-model code path. Keep it tiny, but avoid the one-layer configuration, which
+    # causes the 768D guided sampler to compile to an OOMing XLA program.
+    model = _make_model(
+        domain_dim,
+        n_layers=2,
+        d_model=8,
+        mlp_expansion_factor=1,
+        cap_conditioning=CapConditioningMode.CLASSIFIER_GUIDANCE,
+        residual_eps=True,
+        cap_features=frozenset(
+            {"cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"}
+        ),
+        sde_max_leak=0.005,
+    )
+
+    params = model.init(jax.random.PRNGKey(0), *model.dummy_inputs())
+
+    # Verify that both residual heads are actually zero-initialized: the noise
+    # residual (out_proj) and the classifier residual (classifier_head). The
+    # docstring's "exact Bayes-optimal predictions at init" claim depends on both.
+    vf_params = params["params"]["vector_field"]
+    assert jnp.all(vf_params["out_proj"]["kernel"] == 0), (
+        "out_proj kernel should be zero-initialized"
+    )
+    assert jnp.all(params["params"]["classifier_head"]["kernel"] == 0), (
+        "classifier_head kernel should be zero-initialized"
+    )
+
+    gamma_min, gamma_max = model.apply(params, method=model.gamma_range)
+    print(f"  γ_range=[{float(gamma_min):.1f}, {float(gamma_max):.1f}]")
+
+    cap_center = jnp.zeros(domain_dim).at[0].set(1.0)
+    n_gen = 5000
+    if domain_dim == 768:
+        n_steps = 2500
+    elif domain_dim == 64:
+        n_steps = 1500
+    else:
+        n_steps = 500
+    n_angular_projections = 8
+    n_radial_strata = 3
+    alpha = 0.01
+    leak_alpha = 0.002
+    radial_alpha = 0.002
+    angular_alpha = alpha - leak_alpha - radial_alpha
+    leak_budget = model.sde_max_leak + 0.001
+
+    gen_cap_centers = repeat(cap_center, "d -> n d", n=n_gen)
+    gen_d_maxes = jnp.full((n_gen,), d_max_test)
+    gen_rng = jax.random.PRNGKey(int(d_max_test * 1000))
+
+    samples_np = np.asarray(
+        generate_samples_sde(
+            model,
+            params,
+            gen_rng,
+            cap_params=(gen_cap_centers, gen_d_maxes),
+            n_steps=n_steps,
+            eta=1.0,
+        )
+    )
+
+    sample_cos_dists = 1.0 - samples_np @ np.asarray(cap_center)
+    outside_mask = sample_cos_dists > d_max_test
+    n_outside = int(np.sum(outside_mask))
+    leak_ci = stats.binomtest(n_outside, n_gen).proportion_ci(
+        confidence_level=1.0 - leak_alpha, method="exact"
+    )
+    leak_rate = n_outside / n_gen
+    print(
+        f"  Outside-cap mass: {leak_rate:.4f} "
+        f"(upper {1.0 - leak_alpha:.3f} CI: {leak_ci.high:.4f}, budget: {leak_budget:.4f})"
+    )
+    assert leak_ci.high <= leak_budget, (
+        f"Outside-cap mass upper CI {leak_ci.high:.4f} exceeds budget {leak_budget:.4f} "
+        f"(observed {leak_rate:.4f}, d_max={d_max_test}, dim={domain_dim})"
+    )
+
+    samples_in_cap = samples_np[~outside_mask]
+    cos_dists_in_cap = sample_cos_dists[~outside_mask]
+
+    radial_ks = stats.ks_1samp(
+        cos_dists_in_cap,
+        lambda x: _uniform_cap_cos_distance_cdf(domain_dim, d_max_test, x),
+    )
+    print(f"  KS cosine distance: {radial_ks.statistic:.4f} (p={radial_ks.pvalue:.4f})")
+    assert radial_ks.pvalue > radial_alpha, (
+        f"Cosine distance distribution differs from uniform-on-cap law "
+        f"(KS={radial_ks.statistic:.4f}, p={radial_ks.pvalue:.4f}, "
+        f"d_max={d_max_test}, dim={domain_dim})"
+    )
+
+    stratum_edges = [
+        _cap_cos_distance_quantile(domain_dim, d_max_test, q)
+        for q in np.linspace(1.0 / n_radial_strata, 1.0, n_radial_strata)[:-1]
+    ]
+    stratum_ids = np.digitize(cos_dists_in_cap, stratum_edges, right=True)
+
+    angular_p_values = []
+    angular_ks_stats = []
+    for stratum_idx in range(n_radial_strata):
+        stratum_samples = samples_in_cap[stratum_ids == stratum_idx]
+        tangent = stratum_samples[:, 1:]
+        tangent_norms = np.linalg.norm(tangent, axis=1)
+        assert np.all(tangent_norms > 1e-8), (
+            f"Found {np.sum(tangent_norms <= 1e-8)} samples with undefined tangential direction "
+            f"(d_max={d_max_test}, dim={domain_dim}, stratum={stratum_idx})"
+        )
+        tangent_dirs = tangent / tangent_norms[:, None]
+        result = _ks_test_uniform_sphere_projections(
+            tangent_dirs,
+            n_projections=n_angular_projections,
+            proj_seed=456 + 31 * stratum_idx + int(d_max_test * 1000),
+        )
+        angular_p_values.extend(result["p_values"])
+        angular_ks_stats.extend(result["ks_stats"])
+        print(
+            f"  Angular stratum {stratum_idx}: n={len(stratum_samples)}, "
+            f"max KS={result['ks_max']:.4f}, corrected_p={result['corrected_p']:.4f}"
+        )
+
+    angular_corrected_p = min(min(angular_p_values) * len(angular_p_values), 1.0)
+    print(
+        f"  Angular KS family: max={max(angular_ks_stats):.4f}, "
+        f"mean={float(np.mean(angular_ks_stats)):.4f}, corrected_p={angular_corrected_p:.4f}"
+    )
+    assert angular_corrected_p > angular_alpha, (
+        f"Tangential direction distribution differs from uniform-on-sphere law "
+        f"(max KS={max(angular_ks_stats):.4f}, corrected p={angular_corrected_p:.4f}, "
+        f"d_max={d_max_test}, dim={domain_dim})"
+    )
+
+
+def test_residual_eps_vlb_gradients_flow():
+    """Verify that residual_eps=True produces finite, nonzero gradients through the VLB."""
+    dim = 16
+    model = _make_model(dim, d_model=32, residual_eps=True)
+
+    params_rng, data_rng, noise_rng = jax.random.split(jax.random.PRNGKey(99), 3)
+    params = model.init(params_rng, *model.dummy_inputs())
+
+    x_1 = sample_sphere(data_rng, 32, dim)
+    t = jax.random.uniform(jax.random.PRNGKey(0), (32,))
+
+    def loss_fn(p):
+        loss, _ = model.apply(
+            p,
+            x_1,
+            t,
+            None,
+            rngs={"noise": noise_rng},
+            method=model.compute_vlb_loss,
+        )
+        return loss
+
+    grads = jax.grad(loss_fn)(params)
+    grad_leaves = jax.tree.leaves(grads)
+    assert all(jnp.isfinite(g).all() for g in grad_leaves), "Non-finite gradients found"
+    assert any(jnp.any(g != 0) for g in grad_leaves), "All gradients are zero"

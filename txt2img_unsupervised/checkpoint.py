@@ -470,9 +470,11 @@ class EuclideanVDMTrainState(BaseTrainState):
             d_max_dist=model_cfg.d_max_dist,
             vlb_variance_loss_weight=model_cfg.vlb_variance_loss_weight,
             sigma_radial=model_cfg.sigma_radial,
-            log_snr_max_cap=model_cfg.log_snr_max_cap,
+            sde_max_leak=model_cfg.sde_max_leak,
+            sde_min_d_max=model_cfg.sde_min_d_max,
             classifier_loss_weight=model_cfg.classifier_loss_weight,
             cap_features=model_cfg.cap_features,
+            residual_eps=model_cfg.residual_eps,
         )
 
 

@@ -432,6 +432,53 @@ class FlowMatchingModelConfig(VectorFieldConfig):
             )
 
 
+def resolve_log_snr_max(
+    init_log_snr_max: float | None,
+    sde_max_leak: float | None,
+    sde_min_d_max: float | None,
+    domain_dim: int,
+) -> tuple[float, float | None]:
+    """Validate the γ_max configuration and return (initial_endpoint, fixed_value).
+
+    Exactly one of {init_log_snr_max} or {sde_max_leak AND sde_min_d_max} must be
+    set. When the leak-budget path is chosen, γ_max is computed from the
+    closed-form leak asymptotic and pinned (fixed_value is non-None). Otherwise
+    γ_max is learned starting from init_log_snr_max (fixed_value is None).
+
+    The returned ``initial_endpoint`` is the actual γ_max at parameter init —
+    used by the model to build the schedule and to normalize log-SNR consistently
+    regardless of which path was chosen.
+
+    Lives here (rather than in euclidean_vdm.py) so EuclideanVDMConfig.validate
+    and EuclideanDiffusionModel.setup share one source of truth for the rule and
+    its error messages.
+    """
+    leak_path = sde_max_leak is not None or sde_min_d_max is not None
+    learned_path = init_log_snr_max is not None
+    if leak_path and learned_path:
+        raise ValueError(
+            "init_log_snr_max and sde_max_leak/sde_min_d_max are mutually "
+            "exclusive: pass one to learn γ_max, the other to fix it."
+        )
+    if not leak_path and not learned_path:
+        raise ValueError(
+            "Must set either init_log_snr_max (learned γ_max) or both "
+            "sde_max_leak and sde_min_d_max (fixed γ_max from leak budget)."
+        )
+    if leak_path and (sde_max_leak is None or sde_min_d_max is None):
+        raise ValueError("sde_max_leak and sde_min_d_max must be set together.")
+
+    if learned_path:
+        return float(init_log_snr_max), None
+
+    theta_b = math.acos(max(1.0 - sde_min_d_max, -1.0))
+    cot_b = math.cos(theta_b) / max(math.sin(theta_b), 1e-30)
+    fixed_gamma_max = 2.0 * math.log(
+        max((domain_dim - 2) * cot_b, 1.0) / (sde_max_leak * math.sqrt(2.0 * math.pi))
+    )
+    return fixed_gamma_max, fixed_gamma_max
+
+
 @dataclass
 class EuclideanVDMConfig(VectorFieldConfig):
     """Configuration for Euclidean VDM models.
@@ -442,14 +489,20 @@ class EuclideanVDMConfig(VectorFieldConfig):
     """
 
     init_log_snr_min: float = -10.0
-    init_log_snr_max: float = 10.0
+    # γ_max is configured in one of two mutually exclusive ways. See
+    # EuclideanDiffusionModel for details on the two paths:
+    #   - init_log_snr_max: learned γ_max, initialized to this value.
+    #   - sde_max_leak + sde_min_d_max: γ_max fixed from a closed-form leak budget.
+    init_log_snr_max: float | None = None
     schedule_hidden_dim: int = 32
     schedule_n_quadrature_points: int = 1024
     vlb_variance_loss_weight: float | None = None
 
     sigma_radial: float = 0.01
-    log_snr_max_cap: float | None = None
+    sde_max_leak: float | None = None
+    sde_min_d_max: float | None = None
     classifier_loss_weight: float = 1.0
+    residual_eps: bool = False
 
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
     d_max_dist: tuple[tuple[float, float], ...] | None = None
@@ -516,7 +569,18 @@ class EuclideanVDMConfig(VectorFieldConfig):
         """Validate Euclidean VDM specific configuration."""
         self._validate_vf(self.conditioning_dim)
 
-        if self.init_log_snr_min >= self.init_log_snr_max:
+        # Validates the γ_max path mutual exclusion. Discard the resolved values —
+        # we just need the side-effecting checks here.
+        resolve_log_snr_max(
+            self.init_log_snr_max,
+            self.sde_max_leak,
+            self.sde_min_d_max,
+            self.domain_dim,
+        )
+        if (
+            self.init_log_snr_max is not None
+            and self.init_log_snr_min >= self.init_log_snr_max
+        ):
             raise ValueError("init_log_snr_min must be less than init_log_snr_max")
         if self.schedule_hidden_dim <= 0:
             raise ValueError("schedule_hidden_dim must be positive")
@@ -822,6 +886,7 @@ def test_euclidean_vdm_config_roundtrip_conditioned_score() -> None:
         mlp_expansion_factor=4,
         mlp_dropout_rate=0.1,
         input_dropout_rate=None,
+        init_log_snr_max=10.0,
         cap_conditioning=CapConditioningMode.CONDITIONED_SCORE,
         d_max_dist=((0.95, 1.0), (0.05, 2.0)),
     )
@@ -841,6 +906,7 @@ def test_euclidean_vdm_config_roundtrip_with_cap_features() -> None:
         mlp_expansion_factor=4,
         mlp_dropout_rate=None,
         input_dropout_rate=None,
+        init_log_snr_max=10.0,
         cap_conditioning=CapConditioningMode.CONDITIONED_SCORE,
         d_max_dist=((0.95, 1.0), (0.05, 2.0)),
         cap_features=frozenset({"cap_center", "d_max", "log_cap_odds"}),
@@ -861,6 +927,7 @@ def test_euclidean_vdm_config_validation_unconditioned_rejects_d_max_dist() -> N
             mlp_expansion_factor=2,
             mlp_dropout_rate=None,
             input_dropout_rate=None,
+            init_log_snr_max=10.0,
             d_max_dist=((1.0, 2.0),),
         ).validate()
 
@@ -876,6 +943,7 @@ def test_euclidean_vdm_config_validation_conditioned_requires_d_max_dist() -> No
             mlp_expansion_factor=2,
             mlp_dropout_rate=None,
             input_dropout_rate=None,
+            init_log_snr_max=10.0,
             cap_conditioning=CapConditioningMode.CONDITIONED_SCORE,
         ).validate()
 
@@ -893,6 +961,7 @@ def test_euclidean_vdm_config_validation_classifier_guidance_requires_d_max_dist
             mlp_expansion_factor=2,
             mlp_dropout_rate=None,
             input_dropout_rate=None,
+            init_log_snr_max=10.0,
             cap_conditioning=CapConditioningMode.CLASSIFIER_GUIDANCE,
         ).validate()
     # Should succeed with d_max_dist
@@ -904,9 +973,33 @@ def test_euclidean_vdm_config_validation_classifier_guidance_requires_d_max_dist
         mlp_expansion_factor=2,
         mlp_dropout_rate=None,
         input_dropout_rate=None,
+        init_log_snr_max=10.0,
         cap_conditioning=CapConditioningMode.CLASSIFIER_GUIDANCE,
         d_max_dist=((1.0, 2.0),),
     ).validate()
+
+
+def test_euclidean_vdm_config_validation_gamma_max_paths() -> None:
+    """Exactly one of init_log_snr_max or sde_max_leak/sde_min_d_max must be set."""
+    base = dict(
+        n_layers=2,
+        domain_dim=3,
+        use_pre_mlp_projection=False,
+        d_model=32,
+        mlp_expansion_factor=2,
+        mlp_dropout_rate=None,
+        input_dropout_rate=None,
+    )
+    with pytest.raises(ValueError, match="Must set either init_log_snr_max"):
+        EuclideanVDMConfig(**base).validate()
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        EuclideanVDMConfig(
+            **base, init_log_snr_max=10.0, sde_max_leak=0.005, sde_min_d_max=0.1
+        ).validate()
+    with pytest.raises(ValueError, match="must be set together"):
+        EuclideanVDMConfig(**base, sde_max_leak=0.005).validate()
+    EuclideanVDMConfig(**base, init_log_snr_max=10.0).validate()
+    EuclideanVDMConfig(**base, sde_max_leak=0.005, sde_min_d_max=0.1).validate()
 
 
 class LearningRateSchedule(Enum):
