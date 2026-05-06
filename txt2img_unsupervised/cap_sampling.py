@@ -575,7 +575,7 @@ def test_sample_from_cap():
         assert jnp.all(dists <= max_cos_distances[i])
 
 
-CAP_FEATURES = frozenset({"cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"})
+CAP_FEATURES = frozenset({"cap_center", "d_max", "log_cap_odds", "cos_sim"})
 DEFAULT_CAP_FEATURES = frozenset({"cap_center", "d_max"})
 
 
@@ -603,6 +603,17 @@ def cap_conditioning_dim(
     return (domain_dim if "cap_center" in features else 0) + len(scalar_features)
 
 
+def z_norm_feature(z: jax.Array, domain_dim: int) -> jax.Array:
+    """Normalized ‖z‖ feature: zero-mean, ~unit-variance under z drawn from the
+    forward process at any noise level. Always available regardless of cap
+    conditioning, since it depends only on z.
+
+    Returns shape (batch, 1).
+    """
+    z_norm = jnp.linalg.norm(z, axis=1)
+    return ((z_norm - jnp.sqrt(domain_dim)) * jnp.sqrt(2.0))[:, None]
+
+
 def encode_cap_params(
     cap_center: jax.Array,
     d_max: jax.Array,
@@ -627,8 +638,7 @@ def encode_cap_params(
             "d_max": normalized maximum cosine distance.
             "log_cap_odds": log(cap_area / complement_area), sharp function of d_max.
             "cos_sim": cosine similarity between z and cap_center.
-            "z_norm": Euclidean norm of z.
-        z: Points in R^d, required if "cos_sim" or "z_norm" in features.
+        z: Points in R^d, required if "cos_sim" in features.
         table: LogitsTable, required if "log_cap_odds" in features.
 
     Returns:
@@ -695,12 +705,6 @@ def encode_cap_params(
             jnp.linalg.norm(z, axis=1) * jnp.linalg.norm(cap_center, axis=1)
         )
         parts.append((cos_sim * jnp.sqrt(domain_dim))[:, None])
-
-    if "z_norm" in features:
-        # Norm of z. Concentrates around sqrt(domain_dim) by CLT, with std ≈ 1/sqrt(2).
-        # Subtract the mean and scale to roughly unit variance.
-        z_norm = jnp.linalg.norm(z, axis=1)
-        parts.append(((z_norm - jnp.sqrt(domain_dim)) * jnp.sqrt(2.0))[:, None])
 
     return jnp.concatenate(parts, axis=1)
 

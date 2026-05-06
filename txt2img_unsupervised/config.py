@@ -507,7 +507,7 @@ class EuclideanVDMConfig(VectorFieldConfig):
     cap_conditioning: CapConditioningMode = CapConditioningMode.UNCONDITIONED
     d_max_dist: tuple[tuple[float, float], ...] | None = None
     cap_features: frozenset[
-        Literal["cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"]
+        Literal["cap_center", "d_max", "log_cap_odds", "cos_sim"]
     ] = field(default_factory=lambda: DEFAULT_CAP_FEATURES)
 
     model_type: ClassVar[str] = "euclidean_vdm"
@@ -521,12 +521,15 @@ class EuclideanVDMConfig(VectorFieldConfig):
 
     @property
     def conditioning_dim(self) -> int:
+        # All modes always include z_norm (a feature of z, not the cap).
+        z_norm_dim = 1
         if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
-            return 0
-        elif self.cap_conditioning == CapConditioningMode.CONDITIONED_SCORE:
-            return cap_conditioning_dim(self.domain_dim, self.cap_features)
-        elif self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
-            return cap_conditioning_dim(self.domain_dim, self.cap_features)
+            return z_norm_dim
+        elif self.cap_conditioning in (
+            CapConditioningMode.CONDITIONED_SCORE,
+            CapConditioningMode.CLASSIFIER_GUIDANCE,
+        ):
+            return cap_conditioning_dim(self.domain_dim, self.cap_features) + z_norm_dim
         else:
             raise ValueError(f"Unknown cap conditioning mode: {self.cap_conditioning}")
 

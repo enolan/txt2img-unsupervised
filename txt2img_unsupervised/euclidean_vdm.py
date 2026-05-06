@@ -61,6 +61,7 @@ from txt2img_unsupervised.cap_sampling import (
     sample_from_cap_v,
     sample_negative_cap_center,
     sphere_log_inverse_surface_area,
+    z_norm_feature,
 )
 from txt2img_unsupervised.config import CapConditioningMode, resolve_log_snr_max
 from txt2img_unsupervised.flow_matching import (
@@ -241,7 +242,7 @@ class EuclideanDiffusionModel(nn.Module):
     vlb_variance_loss_weight: float | None = None
     classifier_loss_weight: float = 1.0
     cap_features: frozenset[
-        Literal["cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"]
+        Literal["cap_center", "d_max", "log_cap_odds", "cos_sim"]
     ] = field(default_factory=lambda: DEFAULT_CAP_FEATURES)
 
     # When True, the neural net predicts a residual δε̂ and the model output is
@@ -252,13 +253,15 @@ class EuclideanDiffusionModel(nn.Module):
 
     @property
     def conditioning_dim(self) -> int:
+        # All modes always include z_norm (a feature of z, not the cap).
+        z_norm_dim = 1
         if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
-            return 0
+            return z_norm_dim
         elif self.cap_conditioning in (
             CapConditioningMode.CONDITIONED_SCORE,
             CapConditioningMode.CLASSIFIER_GUIDANCE,
         ):
-            return cap_conditioning_dim(self.domain_dim, self.cap_features)
+            return cap_conditioning_dim(self.domain_dim, self.cap_features) + z_norm_dim
         else:
             raise ValueError(f"Unknown cap conditioning mode: {self.cap_conditioning}")
 
@@ -389,30 +392,43 @@ class EuclideanDiffusionModel(nn.Module):
         else:
             raise ValueError(f"Unknown cap conditioning mode: {self.cap_conditioning}")
 
-    def _cap_params_to_cond_vecs(self, cap_params, batch_size, z=None):
-        """Convert cap_params to conditioning vectors for the vector field.
+    def _make_cond_vec(self, cap_params, z):
+        """Build the backbone conditioning vector.
+
+        z_norm is included for every mode (it's a feature of z, not the cap).
+        For modes that take cap features, ``cap_params`` may be either
+        ``(cap_centers, d_maxes)`` to encode them or ``None`` to fill the
+        cap-feature slots with zeros — used by ``predict_eps`` under
+        CLASSIFIER_GUIDANCE, where ε̂ is unconditional in the cap. UNCONDITIONED
+        accepts only ``cap_params=None``.
 
         Args:
-            cap_params: None or (cap_centers, d_maxes).
-            batch_size: Number of samples.
-            z: Points in R^d, required if cap_features includes cos_sim or z_norm.
+            cap_params: ``(cap_centers, d_maxes)`` or ``None``.
+            z: Points in R^d, [batch_size, domain_dim].
         """
+        z_norm_vec = z_norm_feature(z, self.domain_dim)
         if self.cap_conditioning == CapConditioningMode.UNCONDITIONED:
-            return jnp.zeros((batch_size, 0))
+            assert cap_params is None, "UNCONDITIONED takes no cap_params"
+            return z_norm_vec
         elif self.cap_conditioning in (
             CapConditioningMode.CONDITIONED_SCORE,
             CapConditioningMode.CLASSIFIER_GUIDANCE,
         ):
-            cap_centers, d_maxes = cap_params
-            return encode_cap_params(
-                cap_center=cap_centers,
-                d_max=d_maxes,
-                d_max_dist=self.d_max_dist,
-                domain_dim=self.domain_dim,
-                features=self.cap_features,
-                z=z,
-                table=self.logits_table,
-            )
+            if cap_params is None:
+                cap_dim = cap_conditioning_dim(self.domain_dim, self.cap_features)
+                cap_vec = jnp.zeros((z.shape[0], cap_dim), dtype=z.dtype)
+            else:
+                cap_centers, d_maxes = cap_params
+                cap_vec = encode_cap_params(
+                    cap_center=cap_centers,
+                    d_max=d_maxes,
+                    d_max_dist=self.d_max_dist,
+                    domain_dim=self.domain_dim,
+                    features=self.cap_features,
+                    z=z,
+                    table=self.logits_table,
+                )
+            return jnp.concatenate([cap_vec, z_norm_vec], axis=1)
         else:
             raise ValueError(f"Unknown cap conditioning mode: {self.cap_conditioning}")
 
@@ -433,8 +449,10 @@ class EuclideanDiffusionModel(nn.Module):
     def predict_eps(self, z, log_snr, cap_params):
         """Predict the noise ε̂ at the given log-SNR level.
 
-        For CLASSIFIER_GUIDANCE, always uses zeros conditioning (unconditioned noise
-        prediction). Cap information only enters through the classifier pass.
+        For CLASSIFIER_GUIDANCE, the cap-feature slots in the conditioning vector
+        are zero (ε̂ is unconditional in the cap; cap conditioning enters only via
+        classifier guidance at sampling time). z_norm is always included regardless
+        of mode.
 
         When residual_eps is True, the neural net output is a residual added to the
         Bayes-optimal noise prediction for a uniform sphere distribution.
@@ -442,16 +460,19 @@ class EuclideanDiffusionModel(nn.Module):
         Args:
             z: Points in R^d [batch_size, domain_dim]
             log_snr: Log SNR values [batch_size]
-            cap_params: None for UNCONDITIONED/CLASSIFIER_GUIDANCE,
-                (cap_centers, d_maxes) for CONDITIONED_SCORE
+            cap_params: None for UNCONDITIONED, (cap_centers, d_maxes) for
+                CONDITIONED_SCORE. Ignored for CLASSIFIER_GUIDANCE — ε̂ is always
+                unconditional in the cap.
 
         Returns:
             Predicted noise [batch_size, domain_dim].
         """
-        if self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
-            cond_vecs = jnp.zeros((z.shape[0], self.conditioning_dim))
-        else:
-            cond_vecs = self._cap_params_to_cond_vecs(cap_params, z.shape[0], z=z)
+        backbone_cap_params = (
+            None
+            if self.cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE
+            else cap_params
+        )
+        cond_vecs = self._make_cond_vec(backbone_cap_params, z)
         t_normalized = self._normalize_log_snr(log_snr)
         vf_out = self.vector_field(z, t_normalized, cond_vecs)
         if self.residual_eps:
@@ -523,7 +544,7 @@ class EuclideanDiffusionModel(nn.Module):
         Returns:
             Logits [batch_size] — positive means "x1 likely in cap".
         """
-        cond_vecs = self._cap_params_to_cond_vecs(cap_params, z.shape[0], z=z)
+        cond_vecs = self._make_cond_vec(cap_params, z)
         t_normalized = self._normalize_log_snr(log_snr)
         _, mlp_out = self.vector_field.call_with_intermediates(
             z, t_normalized, cond_vecs
@@ -2084,7 +2105,7 @@ def test_train_cap_conditioned(domain_dim, data_distribution, cap_conditioning, 
         sde_max_leak=0.005,
     )
     model_kwargs["cap_features"] = frozenset(
-        {"cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"}
+        {"cap_center", "d_max", "log_cap_odds", "cos_sim"}
     )
     if cap_conditioning == CapConditioningMode.CLASSIFIER_GUIDANCE:
         model_kwargs["classifier_loss_weight"] = 10.0
@@ -2889,7 +2910,7 @@ def test_zero_residual_models_uniform(domain_dim, d_max_test):
         cap_conditioning=CapConditioningMode.CLASSIFIER_GUIDANCE,
         residual_eps=True,
         cap_features=frozenset(
-            {"cap_center", "d_max", "log_cap_odds", "cos_sim", "z_norm"}
+            {"cap_center", "d_max", "log_cap_odds", "cos_sim"}
         ),
         sde_max_leak=0.005,
     )
