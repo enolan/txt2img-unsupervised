@@ -1,10 +1,14 @@
 FROM nvidia/cuda:13.1.1-runtime-ubuntu24.04
 
+# Without a UTF-8 locale the terminal defaults to POSIX/ASCII, which mangles the Unicode box-drawing
+# Claude Code and friends render. C.UTF-8 is built into glibc, so no locales package is needed.
+ENV LANG=C.UTF-8
+
 # Restore man pages and docs stripped by Ubuntu's minimized image
 RUN yes | unminimize
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl fish git gnupg less lnav man-db htop psmisc \
+        ca-certificates curl fish git gnupg less lnav man-db htop psmisc tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 22 LTS for Codex CLI
