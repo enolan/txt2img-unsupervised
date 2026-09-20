@@ -49,8 +49,8 @@ class ModelFamily:
     # (model, params, batch, rng, capture_intermediates) -> loss, or (loss, intermediates) if
     # capture_intermediates is set, where intermediates is the model's Flax intermediates collection.
     loss_fn: Callable[..., jax.Array | tuple[jax.Array, dict]]
-    # Flax intermediates collection -> {activation name: activations}
-    process_intermediates: Callable[[dict], dict[str, jax.Array]]
+    # (model, Flax intermediates collection) -> {activation name: activations}
+    process_intermediates: Callable[[nn.Module, dict], dict[str, jax.Array]]
     # (activation name, chart title, chart filename) for each activation to chart
     charts: tuple[tuple[str, str, str], ...]
 
@@ -101,7 +101,7 @@ def flow_matching_family(args, example) -> ModelFamily:
         )
         return (loss, aux["intermediates"]) if capture_intermediates else loss
 
-    def process_intermediates(intermediates):
+    def process_intermediates(model, intermediates):
         # FunctionWeightedFlowModel delegates to vector_field, so intermediates are nested
         intermediates = intermediates["vector_field"]
         result = {}
@@ -175,23 +175,41 @@ def flow_matching_family(args, example) -> ModelFamily:
 def transformer_family(args, example) -> ModelFamily:
     """
     Family of cap-conditioned ImageModels of varying width, trained on VQGAN-encoded images with
-    caps around their CLIP embeddings sampled the same way training does. Width is scaled at a
-    fixed head dimension, so the number of heads grows with d_model, and the feedforward width is a
-    fixed multiple of d_model.
+    caps around their CLIP embeddings sampled the same way training does. The feedforward width is
+    a fixed multiple of d_model. Attention is scaled either at a fixed head dimension (--head-dim),
+    so the number of heads grows with d_model, or at a fixed number of heads (--num-heads), so the
+    head dimension grows. The base model's head dimension is set to match, so the muP attention
+    logit scaling is the standard 1/sqrt(head_dim) at the base width either way, or at every width
+    with --standard-attention-scaling.
     """
-    if args.head_dim is None:
-        raise ValueError("--head-dim is required for transformer models")
+    if (args.head_dim is None) == (args.num_heads is None):
+        raise ValueError(
+            "Exactly one of --head-dim and --num-heads is required for transformer models"
+        )
     image_tokens = example["encoded_img"].shape[0]
     cap_logits_table = LogitsTable(767, 16384)
 
     def make_model(d_model):
-        if d_model % args.head_dim != 0:
-            raise ValueError(
-                f"d_model {d_model} isn't a multiple of head_dim {args.head_dim}"
-            )
+        if args.head_dim is not None:
+            if d_model % args.head_dim != 0:
+                raise ValueError(
+                    f"d_model {d_model} isn't a multiple of head_dim {args.head_dim}"
+                )
+            num_heads = d_model // args.head_dim
+            head_dim_base = args.head_dim
+        else:
+            if d_model % args.num_heads != 0:
+                raise ValueError(
+                    f"d_model {d_model} isn't a multiple of num_heads {args.num_heads}"
+                )
+            num_heads = args.num_heads
+            head_dim_base = ImageModel.d_model_base // args.num_heads
+        if args.standard_attention_scaling:
+            head_dim_base = d_model // num_heads
         return ImageModel(
             d_model=d_model,
-            num_heads=d_model // args.head_dim,
+            num_heads=num_heads,
+            head_dim_base=head_dim_base,
             ff_dim=args.mlp_expansion_factor * d_model,
             dropout=None,
             image_dropout=None,
@@ -231,7 +249,7 @@ def transformer_family(args, example) -> ModelFamily:
             capture_intermediates=capture_intermediates,
         )
 
-    def process_intermediates(intermediates):
+    def process_intermediates(model, intermediates):
         result = {
             "token_embedding": intermediates["in_embed"]["__call__"][0],
             "clip_projection": intermediates["clip_proj"]["__call__"][0],
@@ -240,9 +258,15 @@ def transformer_family(args, example) -> ModelFamily:
         # Intermediates from inside the scan over layers have a leading layer axis
         layers = intermediates["transformer_layers"]
         for layer_idx in range(args.n_layers):
-            result[f"layer_{layer_idx}_attention_query"] = layers["mha"]["query"][
-                "__call__"
-            ][0][layer_idx]
+            queries = layers["mha"]["query"]["__call__"][0][layer_idx]
+            keys = layers["mha"]["key"]["__call__"][0][layer_idx]
+            result[f"layer_{layer_idx}_attention_query"] = queries
+            # Pre-softmax attention logits, including the masked-out ones. These are what muP's
+            # 1/head_dim scaling is supposed to keep O(1).
+            result[f"layer_{layer_idx}_attention_logits"] = (
+                jnp.einsum("bqhd,bkhd->bhqk", queries, keys)
+                * model.attention_logit_scale
+            )
             result[f"layer_{layer_idx}_attention_out"] = layers["mha"]["__call__"][0][
                 layer_idx
             ]
@@ -270,6 +294,7 @@ def transformer_family(args, example) -> ModelFamily:
     for layer_idx in range(args.n_layers):
         for key, title in [
             ("attention_query", "Attention Query"),
+            ("attention_logits", "Attention Logit"),
             ("attention_out", "Attention Output"),
             ("ff_up", "Feedforward Up Projection"),
             ("ff_down", "Feedforward Down Projection"),
@@ -339,7 +364,7 @@ def compute_gradients(family, mdl, params, rng, batch):
     (loss, intermediates), grad = grad_fn(params)
     processed_intermediates = jax.tree.map(
         lambda x: jnp.mean(jnp.abs(x)),
-        family.process_intermediates(intermediates),
+        family.process_intermediates(mdl, intermediates),
     )
 
     return loss, processed_intermediates, grad, next_rng
@@ -435,8 +460,21 @@ def main():
         "--head-dim",
         type=int,
         required=False,
-        help="Attention head dimension, held fixed as d_model grows (transformer models only, "
-        "required for them)",
+        help="Attention head dimension, held fixed as d_model grows (transformer models only; "
+        "exactly one of this and --num-heads is required for them)",
+    )
+    parser.add_argument(
+        "--num-heads",
+        type=int,
+        required=False,
+        help="Number of attention heads, held fixed as d_model grows (transformer models only; "
+        "exactly one of this and --head-dim is required for them)",
+    )
+    parser.add_argument(
+        "--standard-attention-scaling",
+        action="store_true",
+        help="Scale attention logits by 1/sqrt(head_dim) at every width instead of muP's "
+        "sqrt(head_dim_base)/head_dim, for comparison (transformer models only)",
     )
     parser.add_argument("--n-layers", type=int, required=True)
     parser.add_argument(
@@ -808,9 +846,13 @@ def generate_activation_charts(d_model_values, activations, charts, args):
         charts: (activation name, chart title, chart filename) for each chart to generate
         args: Command-line arguments to include in the legend
     """
-    # Create a colormap for train steps (only show first 10)
-    num_train_steps = min(len(activations[0]), 10)
-    colors = plt.cm.viridis(np.linspace(0, 1, num_train_steps))
+    # Plot up to 10 training steps, spread evenly over the run and always including the first and
+    # last so the charts show both the initialization and where training ended up.
+    n_train_steps = len(activations[0])
+    plotted_steps = np.unique(
+        np.linspace(0, n_train_steps - 1, min(n_train_steps, 10), dtype=int)
+    )
+    colors = plt.cm.viridis(np.linspace(0, 1, len(plotted_steps)))
 
     def create_chart(key, title, filename):
         """Helper function to create and save a chart for a specific activation type"""
@@ -822,13 +864,13 @@ def generate_activation_charts(d_model_values, activations, charts, args):
         ax2 = plt.subplot(gs[1])
 
         # Plot activation values on the main axis (only first 10 steps)
-        for step in range(num_train_steps):
+        for color, step in zip(colors, plotted_steps):
             values = [model_activations[step][key] for model_activations in activations]
             ax1.plot(
                 d_model_values,
                 values,
                 marker="o",
-                color=colors[step],
+                color=color,
                 label=f"Step {step + 1}",
             )
 
