@@ -117,6 +117,11 @@ class TransformerModelConfig(BaseModelConfig):
     norm_clip_embeddings: bool = False
     image_dropout: float | None = None
     clip_dropout: float | None = None
+    # muP settings, see ImageModel
+    d_model_base: int = 768
+    variance_base: float = 1 / 768
+    alpha_input: float = 1.0
+    alpha_output: float = 1.0
 
     # Class variable to store the model type
     model_type: ClassVar[str] = "transformer"
@@ -698,6 +703,10 @@ def test_transformermodelconfig_roundtrip_from_json() -> None:
         "corrected_cap_projections": true,
         "do_clip_feedforward": false,
         "norm_clip_embeddings": false,
+        "d_model_base": 1024,
+        "variance_base": 0.0009765625,
+        "alpha_input": 0.9,
+        "alpha_output": 1.5,
         "model_type": "transformer"
         }"""
     cfg = TransformerModelConfig.from_json_dict(json.loads(json_str))
@@ -716,6 +725,10 @@ def test_transformermodelconfig_roundtrip_from_object() -> None:
         use_biases=True,
         activations_dtype=jnp.bfloat16,
         activation_function=jax.nn.gelu,
+        d_model_base=1024,
+        variance_base=1 / 1024,
+        alpha_input=0.7,
+        alpha_output=2.0,
     )
     assert (
         TransformerModelConfig.from_json_dict(TransformerModelConfig.to_json_dict(cfg))

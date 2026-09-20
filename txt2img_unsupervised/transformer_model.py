@@ -54,11 +54,87 @@ class ImageModel(nn.Module):
         False  # whether to record attention weights for visualization
     )
 
+    # muP (maximal update parametrization) settings. Hidden layers are initialized and have their
+    # learning rates scaled relative to a model of width d_model_base, so that hyperparameters tuned
+    # at the base width transfer to other widths. See mk_partition_map and scale_lr. Transfer
+    # assumes the width of the attention heads is held fixed as d_model changes (num_heads grows
+    # with d_model), since attention logits are scaled by 1/sqrt(head_dim) rather than the
+    # 1/head_dim muP calls for when head_dim itself grows.
+    d_model_base: int = 768  # Baseline d_model that muP scaling is relative to
+    # Init variance of a hidden kernel with fan-in d_model, at d_model = d_model_base. Hidden kernels
+    # in general get variance_base * d_model_base / fan_in, i.e. fan-in init when this is
+    # 1 / d_model_base.
+    variance_base: float = 1 / 768
+    alpha_input: float = 1.0  # scaling factor for inputs
+    alpha_output: float = 1.0  # scaling factor for outputs
+
+    @property
+    def d_model_scale_factor(self) -> float:
+        "m_d in muP."
+        return self.d_model / self.d_model_base
+
+    @nn.nowrap
+    def scale_lr(self, lr: float) -> float:
+        "Scaled learning rate for hidden layers."
+        return lr / self.d_model_scale_factor
+
+    @nn.nowrap
+    def mk_partition_map(self, use_muon: bool):
+        """
+        Create a partition map for optimizer configuration with muP scaling, suitable for
+        optax.transforms.partition. Parameters are labeled "scaled_lr" if their learning rate should
+        be scaled by scale_lr and "fixed_lr" otherwise.
+
+        Per the muP rules for Adam, kernels of layers whose fan-in grows with d_model (attention,
+        feedforward, and the logits decoder) get scaled learning rates. Input layers (token and
+        positional embeddings, CLIP projections), biases, and layer norms keep the base learning
+        rate.
+
+        Args:
+            use_muon: Must be False. Muon isn't supported for this model.
+        """
+        if use_muon:
+            raise NotImplementedError(
+                "Muon isn't supported for ImageModel. Flax's attention kernels have shape "
+                "(d_model, num_heads, head_dim) and muonize orthogonalizes the trailing two axes, "
+                "which would be the wrong pair."
+            )
+        hidden_dense = {"kernel": "scaled_lr"} | (
+            {"bias": "fixed_lr"} if self.use_biases else {}
+        )
+        params_map = {
+            "in_embed": "fixed_lr",
+            "positional_encoding": "fixed_lr",
+            "transformer_layers": {
+                "mha": {
+                    name: hidden_dense for name in ["query", "key", "value", "out"]
+                },
+                "layer_norm_1": "fixed_lr",
+                "linear_1": hidden_dense,
+                "layer_norm_2": "fixed_lr",
+                "linear_2": hidden_dense,
+            },
+            "logits_decoder": hidden_dense,
+        }
+        if self.clip_conditioning:
+            params_map["clip_proj"] = "fixed_lr"
+        if self.clip_caps:
+            params_map["max_cos_distance_proj"] = "fixed_lr"
+        if self.do_clip_feedforward:
+            params_map["clip_ff_up"] = {"kernel": "scaled_lr", "bias": "fixed_lr"}
+            params_map["clip_ff_down"] = {"kernel": "scaled_lr", "bias": "fixed_lr"}
+            params_map["cond_tokens_layernorm"] = "fixed_lr"
+        if self.pre_norm:
+            params_map["final_layer_norm"] = "fixed_lr"
+        return {"params": params_map}
+
     def setup(self) -> None:
         # Follows PaLM: "PaLM: Scaling Language Modeling with Pathways"
         # https://arxiv.org/abs/2204.02311
-        default_kernel_init = nn.initializers.variance_scaling(
-            scale=1.0, mode="fan_in", distribution="normal"
+        hidden_kernel_init = nn.initializers.variance_scaling(
+            scale=self.variance_base * self.d_model_base,
+            mode="fan_in",
+            distribution="normal",
         )
         self.in_embed = nn.Embed(
             num_embeddings=8192,
@@ -158,13 +234,13 @@ class ImageModel(nn.Module):
         if self.do_clip_feedforward:
             self.clip_ff_up = nn.Dense(
                 features=self.ff_dim,
-                kernel_init=default_kernel_init,
+                kernel_init=hidden_kernel_init,
                 dtype=self.activations_dtype,
                 param_dtype=self.weights_dtype,
             )
             self.clip_ff_down = nn.Dense(
                 features=self.d_model,
-                kernel_init=default_kernel_init,
+                kernel_init=hidden_kernel_init,
                 dtype=self.activations_dtype,
                 param_dtype=self.weights_dtype,
             )
@@ -208,8 +284,7 @@ class ImageModel(nn.Module):
         # optimization in JAX or XLA.
         self.transformer_layers = nn.scan(
             nn.remat(TransformerLayer),
-            variable_axes={"params": 0, "cache": 0}
-            | ({"intermediates": 0} if self.record_attention_weights else {}),
+            variable_axes={"params": 0, "cache": 0, "intermediates": 0},
             variable_broadcast=False,
             split_rngs={"params": True, "dropout": True},
             length=self.n_layers,
@@ -223,8 +298,8 @@ class ImageModel(nn.Module):
             weights_dtype=self.weights_dtype,
             activation_function=self.activation_function,
             pre_norm=self.pre_norm,
-            kernel_init=default_kernel_init,
-            out_proj_kernel_init=default_kernel_init,
+            kernel_init=hidden_kernel_init,
+            out_proj_kernel_init=hidden_kernel_init,
             decode=self.decode,
             attn_method=attn_method,
             record_attention_weights=self.record_attention_weights,
@@ -238,9 +313,11 @@ class ImageModel(nn.Module):
                 param_dtype=jnp.float32,
             )
 
+        # Zero-initialized as in muP: the model starts out predicting a uniform distribution, and
+        # the logits are driven entirely by what the decoder learns rather than by its init.
         self.logits_decoder = nn.Dense(
             features=8192,
-            kernel_init=default_kernel_init,
+            kernel_init=nn.initializers.zeros_init(),
             use_bias=self.use_biases,
             dtype=self.activations_dtype,
             param_dtype=self.weights_dtype,
@@ -391,7 +468,7 @@ class ImageModel(nn.Module):
         img_embeds = self.image_dropout_layer(img_embeds)
         assert img_embeds.shape == (batch_size, self.image_tokens - 1, self.d_model)
 
-        h = jnp.concatenate([cond_embeds, img_embeds], axis=1)
+        h = jnp.concatenate([cond_embeds, img_embeds], axis=1) * self.alpha_input
         assert h.shape == (batch_size, self.seq_len(), self.d_model)
 
         h, _ = self.transformer_layers(h, None)
@@ -399,7 +476,7 @@ class ImageModel(nn.Module):
         if self.pre_norm:
             h = self.final_layer_norm(h)
         h = h[:, self.prepended_tokens() - 1 :]
-        logits = self.logits_decoder(h)
+        logits = self.logits_decoder(h) * self.alpha_output
         assert logits.shape == (batch_size, self.image_tokens, 8192)
         assert logits.dtype == self.activations_dtype
 
@@ -439,6 +516,7 @@ class ImageModel(nn.Module):
         assert cond_tokens.shape == (batch_size, self.prepended_tokens(), self.d_model)
 
         h = cond_tokens + self.positional_encoding(jnp.arange(self.prepended_tokens()))
+        h = h * self.alpha_input
         assert h.shape == (batch_size, self.prepended_tokens(), self.d_model)
 
         for i in range(self.prepended_tokens()):
@@ -451,7 +529,7 @@ class ImageModel(nn.Module):
 
         if self.pre_norm:
             last_toks = self.final_layer_norm(last_toks)
-        logits_out = self.logits_decoder(last_toks)
+        logits_out = self.logits_decoder(last_toks) * self.alpha_output
         assert logits_out.shape == (batch_size, 8192)
         return logits_out
 
@@ -474,14 +552,14 @@ class ImageModel(nn.Module):
         assert embed.shape == (batch_size, self.d_model)
 
         h = embed + self.positional_encoding(idx + self.prepended_tokens())
-        h = self.image_dropout_layer(h)
+        h = self.image_dropout_layer(h) * self.alpha_input
         assert h.shape == (batch_size, self.d_model)
 
         h, _ = self.transformer_layers(h[:, None, :], None)
         assert h.shape == (batch_size, 1, self.d_model)
         if self.pre_norm:
             h = self.final_layer_norm(h)
-        return self.logits_decoder(h[:, 0, :])  # type: ignore[no-any-return]
+        return self.logits_decoder(h[:, 0, :]) * self.alpha_output
 
     def dummy_inputs(self):
         images_dummy = jnp.zeros((1, self.image_tokens), dtype=jnp.int32)
@@ -670,6 +748,123 @@ def test_model_initialization_with_various_configs(config_modifications):
     model.init(rng, *model.dummy_inputs())
 
 
+@pytest.mark.parametrize(
+    "config_modifications",
+    [
+        {},
+        {"use_biases": False},
+        {"pre_norm": True},
+        {"clip_conditioning": True},
+        {"clip_conditioning": True, "clip_caps": True, "clip_cap_count": 4},
+        {
+            "clip_conditioning": True,
+            "clip_caps": True,
+            "clip_cap_count": 1,
+            "do_clip_feedforward": True,
+        },
+    ],
+)
+def test_mk_partition_map_labels_every_param(config_modifications):
+    """Test that the muP partition map covers exactly the model's parameters, with scaled learning
+    rates for the kernels of hidden layers and the logits decoder and fixed learning rates for
+    everything else (embeddings, CLIP projections, biases, and layer norms)."""
+    config = replace(gpt_1_config, **config_modifications)
+    model = ImageModel(**config.__dict__)
+    params = jax.eval_shape(
+        lambda: model.init(jax.random.PRNGKey(0), *model.dummy_inputs())
+    )
+
+    # Broadcast the partition map's labels down to the leaves the same way optax does. This fails
+    # if the map's structure doesn't match the params.
+    leaf_labels = jax.tree_util.tree_map(
+        lambda label, subtree: jax.tree_util.tree_map(lambda _: label, subtree),
+        model.mk_partition_map(use_muon=False),
+        params,
+        is_leaf=lambda x: isinstance(x, str),
+    )
+
+    input_layers = {
+        "in_embed",
+        "positional_encoding",
+        "clip_proj",
+        "max_cos_distance_proj",
+    }
+    for path, label in jax.tree_util.tree_leaves_with_path(leaf_labels):
+        path_keys = [p.key for p in path]
+        if path_keys[-1] != "kernel" or path_keys[1] in input_layers:
+            expected = "fixed_lr"
+        else:
+            expected = "scaled_lr"
+        assert label == expected, f"{path_keys} labeled {label}, expected {expected}"
+
+
+def test_mk_partition_map_rejects_muon():
+    """Test that asking for a Muon partition map fails loudly rather than silently mis-optimizing."""
+    model = ImageModel(**gpt_1_config.__dict__)
+    with pytest.raises(NotImplementedError):
+        model.mk_partition_map(use_muon=True)
+
+
+@pytest.mark.parametrize("d_model_base,variance_base", [(768, 1 / 768), (512, 1 / 256)])
+@pytest.mark.parametrize("d_model", [384, 768, 1536])
+def test_mup_init(d_model, d_model_base, variance_base):
+    """Test that hidden kernels' init variance is variance_base * d_model_base / fan_in at every
+    width (fan-in init with the default settings), the logits decoder starts at zero, and the hidden
+    learning rate scales as 1/m_d."""
+    config = replace(
+        gpt_1_config,
+        d_model=d_model,
+        ff_dim=4 * d_model,
+        num_heads=d_model // 64,
+        n_layers=2,
+        clip_conditioning=True,
+        clip_caps=True,
+        clip_cap_count=1,
+        do_clip_feedforward=True,
+        d_model_base=d_model_base,
+        variance_base=variance_base,
+    )
+    model = ImageModel(**config.__dict__)
+    params = jax.jit(model.init)(jax.random.PRNGKey(0), *model.dummy_inputs())["params"]
+
+    layers = params["transformer_layers"]
+    kernels_and_fan_ins = {
+        "attention query": (layers["mha"]["query"]["kernel"], d_model),
+        "attention out": (layers["mha"]["out"]["kernel"], d_model),
+        "feedforward up": (layers["linear_1"]["kernel"], d_model),
+        "feedforward down": (layers["linear_2"]["kernel"], 4 * d_model),
+        "clip feedforward up": (params["clip_ff_up"]["kernel"], d_model),
+        "clip feedforward down": (params["clip_ff_down"]["kernel"], 4 * d_model),
+    }
+    for name, (kernel, fan_in) in kernels_and_fan_ins.items():
+        np.testing.assert_allclose(
+            jnp.var(kernel),
+            variance_base * d_model_base / fan_in,
+            rtol=0.05,
+            err_msg=name,
+        )
+    assert jnp.all(params["logits_decoder"]["kernel"] == 0)
+
+    assert model.d_model_scale_factor == d_model / d_model_base
+    np.testing.assert_allclose(model.scale_lr(1e-3), 1e-3 * d_model_base / d_model)
+
+
+def test_alpha_output_scales_logits():
+    """Test that alpha_output multiplies the logits and nothing else."""
+    config = replace(gpt_1_config, n_layers=2, d_model=64, num_heads=4, dropout=None)
+    model = ImageModel(**config.__dict__)
+    params = jax.jit(model.init)(jax.random.PRNGKey(0), *model.dummy_inputs())
+    params["params"]["logits_decoder"]["kernel"] = jax.random.normal(
+        jax.random.PRNGKey(1), params["params"]["logits_decoder"]["kernel"].shape
+    )
+    images = jax.random.randint(jax.random.PRNGKey(2), (2, 256), 0, 8192)
+    empty = jnp.zeros((2, 0))
+
+    logits = model.apply(params, images, empty, empty)
+    logits_scaled = model.clone(alpha_output=3.0).apply(params, images, empty, empty)
+    np.testing.assert_allclose(logits_scaled, 3.0 * logits, rtol=1e-5)
+
+
 def _assert_dicts_equal(d1, d2, name) -> None:
     assert isinstance(d1, dict)
     assert isinstance(d2, dict)
@@ -824,11 +1019,15 @@ def _setup_test_sample(
     clip_cap_count: int | None = None,
     pre_norm: bool = False,
     image_tokens: int = 256,
+    alpha_input: float = 1.0,
+    alpha_output: float = 1.0,
 ) -> tuple[ImageModel, ImageModel, dict, jax.Array, jax.Array]:
     """Shared setup code for iterative sampling tests."""
     cfg_nodec = copy(gpt_1_config)
     cfg_nodec.dropout = None
     cfg_nodec.image_tokens = image_tokens
+    cfg_nodec.alpha_input = alpha_input
+    cfg_nodec.alpha_output = alpha_output
     # smaller model makes debug output easier to read
     cfg_nodec.n_layers = 2
     cfg_nodec.d_model = 64
@@ -877,6 +1076,13 @@ def _setup_test_sample(
     )
 
     _assert_dicts_equal(params["params"], params_dec["params"], "params")
+
+    # The logits decoder is zero-initialized, so a freshly initialized model outputs all-zero
+    # logits, which would make the comparisons in these tests vacuous. Give the decoder random
+    # weights so the whole model contributes to the logits.
+    params["params"]["logits_decoder"]["kernel"] = jax.random.normal(
+        jax.random.PRNGKey(7), params["params"]["logits_decoder"]["kernel"].shape
+    ) / jnp.sqrt(cfg_nodec.d_model)
 
     logits_all = mdl_nodec.apply(
         params,
@@ -983,16 +1189,22 @@ def test_sample_tok_1(clip_conditioning: bool, clip_caps: bool, pre_norm: bool) 
 
 @pytest.mark.parametrize("pre_norm", [False, True])
 @pytest.mark.parametrize(
-    "clip_conditioning,clip_caps,image_tokens",
+    "clip_conditioning,clip_caps,image_tokens,alpha_input,alpha_output",
     [
-        (False, False, 256),  # No CLIP
-        (True, False, 256),  # CLIP without caps
-        (True, True, 256),  # CLIP with caps
-        (True, True, 1024),  # Test longer sequence length
+        (False, False, 256, 1.0, 1.0),  # No CLIP
+        (True, False, 256, 1.0, 1.0),  # CLIP without caps
+        (True, True, 256, 1.0, 1.0),  # CLIP with caps
+        (True, True, 1024, 1.0, 1.0),  # Test longer sequence length
+        (True, True, 256, 0.5, 3.0),  # muP input/output multipliers
     ],
 )
 def test_sample_tok_all(
-    clip_conditioning: bool, clip_caps: bool, image_tokens: int, pre_norm: bool
+    clip_conditioning: bool,
+    clip_caps: bool,
+    image_tokens: int,
+    alpha_input: float,
+    alpha_output: float,
+    pre_norm: bool,
 ) -> None:
     """Test that step-by-step decoding is equivalent to all at once for all tokens."""
     (
@@ -1004,7 +1216,15 @@ def test_sample_tok_all(
         clip_embedding,
         max_cos_distance,
         logits_all,
-    ) = _setup_test_sample(clip_conditioning, clip_caps, None, pre_norm, image_tokens)
+    ) = _setup_test_sample(
+        clip_conditioning,
+        clip_caps,
+        None,
+        pre_norm,
+        image_tokens,
+        alpha_input,
+        alpha_output,
+    )
 
     decoded_logits = []
     params = flax.core.copy(params, {"cache": cache})
@@ -1745,8 +1965,10 @@ def loss_batch_tokens(
     batch_imgs: jax.Array,
     batch_clips: jax.Array,
     batch_max_cos_distances: jax.Array,
-) -> jax.Array:
-    """Compute the cross-entropy loss for each token in a batch of examples."""
+    capture_intermediates: bool = False,
+) -> jax.Array | tuple[jax.Array, dict[str, Any]]:
+    """Compute the cross-entropy loss for each token in a batch of examples. If
+    capture_intermediates is set, also return the model's captured intermediates collection."""
     batch_size = batch_imgs.shape[0]
     assert batch_imgs.shape == (
         batch_size,
@@ -1762,13 +1984,15 @@ def loss_batch_tokens(
         assert batch_max_cos_distances.shape == (batch_size, model.clip_cap_count)
     else:
         assert batch_clips.shape == batch_max_cos_distances.shape == (batch_size, 0)
-    logits: jax.Array = model.apply(
+    apply_res = model.apply(
         params,
         rngs={"dropout": dropout_rng},
         images=batch_imgs,
         clip_embeddings=batch_clips,
         max_cos_distances=batch_max_cos_distances,
+        capture_intermediates=capture_intermediates,
     )
+    logits, state = apply_res if capture_intermediates else (apply_res, None)
     per_token_loss = optax.softmax_cross_entropy(
         logits, jax.nn.one_hot(batch_imgs, 8192)
     )
@@ -1776,7 +2000,10 @@ def loss_batch_tokens(
         batch_size,
         model.image_tokens,
     ), f"per_token_loss.shape: {per_token_loss.shape}"
-    return per_token_loss
+    if capture_intermediates:
+        return per_token_loss, state["intermediates"]
+    else:
+        return per_token_loss
 
 
 def loss_batch(
@@ -1786,12 +2013,24 @@ def loss_batch(
     batch_imgs: jax.Array,
     batch_clips: jax.Array,
     batch_max_cos_distances: jax.Array,
-) -> jax.Array:
-    """Compute the average cross-entropy loss for a batch of examples."""
-    per_token_loss = loss_batch_tokens(
-        model, params, dropout_rng, batch_imgs, batch_clips, batch_max_cos_distances
+    capture_intermediates: bool = False,
+) -> jax.Array | tuple[jax.Array, dict[str, Any]]:
+    """Compute the average cross-entropy loss for a batch of examples. If capture_intermediates is
+    set, also return the model's captured intermediates collection."""
+    res = loss_batch_tokens(
+        model,
+        params,
+        dropout_rng,
+        batch_imgs,
+        batch_clips,
+        batch_max_cos_distances,
+        capture_intermediates,
     )
-    return jnp.mean(per_token_loss)
+    if capture_intermediates:
+        per_token_loss, intermediates = res
+        return jnp.mean(per_token_loss), intermediates
+    else:
+        return jnp.mean(res)
 
 
 # Parameters taken from GPT-1, except seq_len is 256 instead of 1024
