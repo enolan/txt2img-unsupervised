@@ -119,6 +119,7 @@ class TransformerModelConfig(BaseModelConfig):
     clip_dropout: float | None = None
     # muP settings, see ImageModel
     d_model_base: int = 768
+    head_dim_base: int = 64
     variance_base: float = 1 / 768
     alpha_input: float = 1.0
     alpha_output: float = 1.0
@@ -704,6 +705,7 @@ def test_transformermodelconfig_roundtrip_from_json() -> None:
         "do_clip_feedforward": false,
         "norm_clip_embeddings": false,
         "d_model_base": 1024,
+        "head_dim_base": 128,
         "variance_base": 0.0009765625,
         "alpha_input": 0.9,
         "alpha_output": 1.5,
@@ -726,6 +728,7 @@ def test_transformermodelconfig_roundtrip_from_object() -> None:
         activations_dtype=jnp.bfloat16,
         activation_function=jax.nn.gelu,
         d_model_base=1024,
+        head_dim_base=32,
         variance_base=1 / 1024,
         alpha_input=0.7,
         alpha_output=2.0,

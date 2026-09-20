@@ -1,3 +1,5 @@
+import functools
+import math
 from collections.abc import Callable
 from copy import copy
 from dataclasses import replace
@@ -56,11 +58,13 @@ class ImageModel(nn.Module):
 
     # muP (maximal update parametrization) settings. Hidden layers are initialized and have their
     # learning rates scaled relative to a model of width d_model_base, so that hyperparameters tuned
-    # at the base width transfer to other widths. See mk_partition_map and scale_lr. Transfer
-    # assumes the width of the attention heads is held fixed as d_model changes (num_heads grows
-    # with d_model), since attention logits are scaled by 1/sqrt(head_dim) rather than the
-    # 1/head_dim muP calls for when head_dim itself grows.
+    # at the base width transfer to other widths. See mk_partition_map and scale_lr.
     d_model_base: int = 768  # Baseline d_model that muP scaling is relative to
+    # Baseline attention head width. muP scales attention logits by 1/head_dim instead of the usual
+    # 1/sqrt(head_dim) so they stay O(1) when head_dim grows; we use sqrt(head_dim_base)/head_dim,
+    # which is the usual scaling when head_dim == head_dim_base. Whether width is scaled by growing
+    # num_heads or head_dim, the base model is unchanged.
+    head_dim_base: int = 64
     # Init variance of a hidden kernel with fan-in d_model, at d_model = d_model_base. Hidden kernels
     # in general get variance_base * d_model_base / fan_in, i.e. fan-in init when this is
     # 1 / d_model_base.
@@ -72,6 +76,16 @@ class ImageModel(nn.Module):
     def d_model_scale_factor(self) -> float:
         "m_d in muP."
         return self.d_model / self.d_model_base
+
+    @property
+    def head_dim(self) -> int:
+        "Width of each attention head."
+        return self.d_model // self.num_heads
+
+    @property
+    def attention_logit_scale(self) -> float:
+        "Factor the query-key dot products are multiplied by before the softmax."
+        return math.sqrt(self.head_dim_base) / self.head_dim
 
     @nn.nowrap
     def scale_lr(self, lr: float) -> float:
@@ -300,6 +314,7 @@ class ImageModel(nn.Module):
             pre_norm=self.pre_norm,
             kernel_init=hidden_kernel_init,
             out_proj_kernel_init=hidden_kernel_init,
+            attention_logit_scale=self.attention_logit_scale,
             decode=self.decode,
             attn_method=attn_method,
             record_attention_weights=self.record_attention_weights,
@@ -863,6 +878,44 @@ def test_alpha_output_scales_logits():
     logits = model.apply(params, images, empty, empty)
     logits_scaled = model.clone(alpha_output=3.0).apply(params, images, empty, empty)
     np.testing.assert_allclose(logits_scaled, 3.0 * logits, rtol=1e-5)
+
+
+@pytest.mark.parametrize("attn_method", [AttnMethod.STANDARD, AttnMethod.FLASH_JAX])
+def test_head_dim_base_scales_attention_logits(attn_method):
+    """Test that attention logits are scaled by sqrt(head_dim_base)/head_dim: a model whose
+    head_dim_base is 4x its head_dim must compute exactly what the standard 1/sqrt(head_dim) model
+    computes with doubled queries."""
+    config = replace(
+        gpt_1_config,
+        n_layers=2,
+        d_model=64,
+        num_heads=4,
+        dropout=None,
+        head_dim_base=64,
+    )
+    model = ImageModel(**config.__dict__, attn_method=attn_method)
+    assert model.head_dim == 16
+    assert model.attention_logit_scale == 8 / 16
+    model_standard = model.clone(head_dim_base=16)
+    assert model_standard.attention_logit_scale == 1 / 4
+
+    params = jax.jit(model.init)(jax.random.PRNGKey(0), *model.dummy_inputs())
+    params["params"]["logits_decoder"]["kernel"] = jax.random.normal(
+        jax.random.PRNGKey(1), params["params"]["logits_decoder"]["kernel"].shape
+    )
+    params_doubled_queries = jax.tree_util.tree_map_with_path(
+        lambda path, x: 2 * x if "query" in jax.tree_util.keystr(path) else x, params
+    )
+    images = jax.random.randint(jax.random.PRNGKey(2), (2, 256), 0, 8192)
+    empty = jnp.zeros((2, 0))
+
+    logits = model.apply(params, images, empty, empty)
+    logits_standard = model_standard.apply(params_doubled_queries, images, empty, empty)
+    np.testing.assert_allclose(logits, logits_standard, rtol=1e-4, atol=1e-4)
+
+    # Sanity check that the scale matters at all
+    logits_unscaled = model_standard.apply(params, images, empty, empty)
+    assert not jnp.allclose(logits, logits_unscaled, rtol=1e-2, atol=1e-2)
 
 
 def _assert_dicts_equal(d1, d2, name) -> None:
@@ -1728,6 +1781,8 @@ class TransformerLayer(nn.Module):
     pre_norm: bool
     kernel_init: Callable[..., jnp.ndarray]
     out_proj_kernel_init: Callable[..., jnp.ndarray]
+    # Factor the query-key dot products are multiplied by before the softmax
+    attention_logit_scale: float
     decode: bool
     attn_method: AttnMethod
     record_attention_weights: bool = False
@@ -1836,6 +1891,18 @@ class TransformerLayer(nn.Module):
         else:
             raise ValueError(f"Invalid attention method: {self.attn_method}")
 
+        # Every attention implementation above scales the logits by 1/sqrt(head_dim) itself, so
+        # scale the queries by whatever's left to reach attention_logit_scale.
+        head_dim = self.d_model // self.num_heads
+        query_scale = self.attention_logit_scale * math.sqrt(head_dim)
+        unscaled_attn_function = attn_function
+
+        # Flax only passes an attention function the keyword arguments (mask etc.) its signature
+        # accepts, so the wrapper must present the wrapped function's signature.
+        @functools.wraps(unscaled_attn_function)
+        def attn_function(q, k, v, *args, **kwargs):
+            return unscaled_attn_function(q * query_scale, k, v, *args, **kwargs)
+
         self.mha = nn.SelfAttention(
             num_heads=self.num_heads,
             qkv_features=self.d_model,
@@ -1938,6 +2005,7 @@ def test_flash_attention_equals_standard(flash_method: AttnMethod) -> None:
         pre_norm=False,
         kernel_init=nn.initializers.normal(stddev=0.02),
         out_proj_kernel_init=nn.initializers.normal(stddev=0.02 / jnp.sqrt(2 * 12)),
+        attention_logit_scale=1 / math.sqrt(768 / 12),
         decode=False,
         attn_method=AttnMethod.STANDARD,
     )
