@@ -8,12 +8,20 @@ ENV LANG=C.UTF-8
 RUN yes | unminimize
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl fish git gnupg less lnav man-db htop psmisc tmux \
+        ca-certificates curl fish git gnupg jq less lnav man-db htop psmisc tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 22 LTS for Codex CLI
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# GitHub CLI, so agents can open pull requests as the repository's GitHub App
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
 # uv
@@ -32,6 +40,10 @@ ENV XDG_RUNTIME_DIR=/run/user/${USER_UID}
 
 USER devuser
 ENV PATH="/home/devuser/.local/bin:${PATH}"
+
+# launch-agent-container.sh mounts a gh shim in here. Create the directory as devuser so the mount
+# doesn't create it as root, which would leave it unwritable for the agent installs below.
+RUN mkdir -p /home/devuser/.local/bin
 
 # Install agents as user so they can be autoupdated.
 # Claude Code

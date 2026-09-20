@@ -262,6 +262,26 @@ This list is incomplete. Remind me to expand it if we're looking at things not l
   - `uv run python -c 'print("Hello, Claude!")'`
 - Code formatting: `uv run ruff format *.py txt2img_unsupervised/*.py`
 
+## Pull requests inside the agent container
+
+If you are inside a sandboxed agent container, you have limited access to GitHub. Specifically, you
+can push branches inside the `agents/` namespace and create PRs. Outside sandboxed containers you
+have access to the user's (almost certainly Echo's) `gh` stuff. Don't use either without explicit
+instructions.
+
+For PRs inside sandboxed containers:
+
+- Push to the `github` remote. `origin` is the read-only host checkout and can't be pushed to.
+- Branch names must begin with `agents/` - use `agents/<container name>/<topic>`. Anything else is
+  refused by a pre-push hook, and by GitHub if you get past the hook.
+- The flow is `git push -u github HEAD:agents/my-topic` then
+  `gh pr create --base master --head agents/my-topic`. Credentials are minted on demand from the
+  app key, so never run `gh auth login`, and don't expect `gh` to work outside the container.
+- You can't merge and shouldn't try - only Echo can write to `master`. Leave the pull request open
+  for review, and say in its description what you tested.
+- Never force-push a branch you didn't create, and don't close, re-target or review anyone else's
+  pull request. Nothing stops you, so it's on you: another agent may be working on it.
+
 ## JAX-specific reminders
 - Pay attention to the special requirements for traced JAX functions:
   - Only certain types of parameters can be passed to traced functions. Any other types must be
