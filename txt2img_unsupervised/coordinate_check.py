@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from distutils.util import strtobool
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import flax.linen as nn
 import jax
@@ -46,6 +47,8 @@ class ModelFamily:
     batch_fields: tuple[str, ...]
     # d_model -> model
     make_model: Callable[[int], nn.Module]
+    # (model, rng key) -> initial params
+    init_params: Callable[[nn.Module, jax.Array], Any]
     # (model, params, batch, rng, capture_intermediates) -> loss, or (loss, intermediates) if
     # capture_intermediates is set, where intermediates is the model's Flax intermediates collection.
     loss_fn: Callable[..., jax.Array | tuple[jax.Array, dict]]
@@ -166,6 +169,7 @@ def flow_matching_family(args, example) -> ModelFamily:
     return ModelFamily(
         batch_fields=(vec_column,),
         make_model=make_model,
+        init_params=lambda model, key: model.init(key, *model.dummy_inputs()),
         loss_fn=loss_fn,
         process_intermediates=process_intermediates,
         charts=tuple(charts),
@@ -178,9 +182,10 @@ def transformer_family(args, example) -> ModelFamily:
     caps around their CLIP embeddings sampled the same way training does. The feedforward width is
     a fixed multiple of d_model. Attention is scaled either at a fixed head dimension (--head-dim),
     so the number of heads grows with d_model, or at a fixed number of heads (--num-heads), so the
-    head dimension grows. The base model's head dimension is set to match, so the muP attention
-    logit scaling is the standard 1/sqrt(head_dim) at the base width either way, or at every width
-    with --standard-attention-scaling.
+    head dimension grows. --parametrization picks between muP (the base model's head dimension is
+    set to match the sweep, so the attention logit scaling is the standard 1/sqrt(head_dim) at the
+    base width either way), muP with the standard 1/sqrt(head_dim) attention scaling at every
+    width, and the pre-muP standard parametrization.
     """
     if (args.head_dim is None) == (args.num_heads is None):
         raise ValueError(
@@ -204,13 +209,28 @@ def transformer_family(args, example) -> ModelFamily:
                 )
             num_heads = args.num_heads
             head_dim_base = ImageModel.d_model_base // args.num_heads
-        if args.standard_attention_scaling:
-            head_dim_base = d_model // num_heads
+        head_dim = d_model // num_heads
+        if args.parametrization == "mup":
+            mup_kwargs = {"head_dim_base": head_dim_base}
+        elif args.parametrization == "mup_sqrt_attention":
+            mup_kwargs = {"head_dim_base": head_dim}
+        elif args.parametrization == "standard":
+            # The transformer as it was before muP: fan-in init for every kernel, one learning rate
+            # for everything (d_model_base = d_model makes the learning rate scaling a no-op), and
+            # 1/sqrt(head_dim) attention. The logits decoder, which the model zero-initializes, is
+            # given fan-in init in init_params.
+            mup_kwargs = {
+                "d_model_base": d_model,
+                "variance_base": 1 / d_model,
+                "head_dim_base": head_dim,
+            }
+        else:
+            raise ValueError(f"Unknown parametrization: {args.parametrization}")
         return ImageModel(
             d_model=d_model,
             num_heads=num_heads,
-            head_dim_base=head_dim_base,
             ff_dim=args.mlp_expansion_factor * d_model,
+            **mup_kwargs,
             dropout=None,
             image_dropout=None,
             clip_dropout=None,
@@ -228,6 +248,18 @@ def transformer_family(args, example) -> ModelFamily:
             weights_dtype=jnp.float32,
             pre_norm=True,
         )
+
+    def init_params(model, key):
+        init_key, decoder_key = jax.random.split(key)
+        params = model.init(init_key, *model.dummy_inputs())
+        if args.parametrization == "standard":
+            kernel = params["params"]["logits_decoder"]["kernel"]
+            params["params"]["logits_decoder"]["kernel"] = (
+                nn.initializers.variance_scaling(1.0, "fan_in", "normal")(
+                    decoder_key, kernel.shape, kernel.dtype
+                )
+            )
+        return params
 
     def loss_fn(model, params, batch, rng, capture_intermediates):
         caps_rng, dropout_rng = jax.random.split(rng)
@@ -312,6 +344,7 @@ def transformer_family(args, example) -> ModelFamily:
     return ModelFamily(
         batch_fields=("encoded_img", "clip_embedding"),
         make_model=make_model,
+        init_params=init_params,
         loss_fn=loss_fn,
         process_intermediates=process_intermediates,
         charts=tuple(charts),
@@ -407,10 +440,10 @@ def train_step(family, mdl, opt, params, opt_state, rng, batch, use_cpu_offload=
     return loss, processed_intermediates, new_params, new_opt_state, next_rng
 
 
-@partial(jax.jit, static_argnames=["model"])
-def init_model_params(model, init_key):
+@partial(jax.jit, static_argnames=["family", "model"])
+def init_model_params(family, model, init_key):
     """JIT-compiled model initialization function."""
-    return model.init(init_key, *model.dummy_inputs())
+    return family.init_params(model, init_key)
 
 
 def main():
@@ -448,8 +481,16 @@ def main():
         default=5,
         help="Number of learning rate points to test between lr-low and lr-high",
     )
-    parser.add_argument("--d-model-low", type=int, required=True)
-    parser.add_argument("--d-model-high", type=int, required=True)
+    parser.add_argument("--d-model-low", type=int, required=False)
+    parser.add_argument("--d-model-high", type=int, required=False)
+    parser.add_argument(
+        "--d-model-values",
+        type=int,
+        nargs="+",
+        required=False,
+        help="Explicit list of d_model values to test, instead of every power of 2 from "
+        "--d-model-low to --d-model-high",
+    )
     parser.add_argument(
         "--use-pre-mlp-projection",
         type=lambda x: bool(strtobool(x)),
@@ -471,10 +512,14 @@ def main():
         "exactly one of this and --head-dim is required for them)",
     )
     parser.add_argument(
-        "--standard-attention-scaling",
-        action="store_true",
-        help="Scale attention logits by 1/sqrt(head_dim) at every width instead of muP's "
-        "sqrt(head_dim_base)/head_dim, for comparison (transformer models only)",
+        "--parametrization",
+        type=str,
+        default="mup",
+        choices=["mup", "mup_sqrt_attention", "standard"],
+        help="Transformer models only. mup: muP with attention logits scaled by "
+        "sqrt(head_dim_base)/head_dim. mup_sqrt_attention: muP with the standard "
+        "1/sqrt(head_dim) attention scaling at every width. standard: the pre-muP standard "
+        "parametrization, fan-in init and one learning rate for everything. (default: mup)",
     )
     parser.add_argument("--n-layers", type=int, required=True)
     parser.add_argument(
@@ -639,17 +684,22 @@ def main():
     if len(lr_combinations) == 0:
         raise ValueError("No learning rate combinations to test!")
 
-    # Generate exponentially spaced d_model values with base 2
-    low_exp = math.log2(args.d_model_low)
-    high_exp = math.log2(args.d_model_high)
-
-    if not (
-        2 ** int(low_exp) == args.d_model_low
-        and 2 ** int(high_exp) == args.d_model_high
-    ):
-        raise ValueError("d-model-low and d-model-high must be powers of 2")
-
-    d_model_values = [2**i for i in range(int(low_exp), int(high_exp) + 1)]
+    if args.d_model_values is not None:
+        d_model_values = args.d_model_values
+    elif args.d_model_low is not None and args.d_model_high is not None:
+        # Every power of 2 from low to high
+        low_exp = math.log2(args.d_model_low)
+        high_exp = math.log2(args.d_model_high)
+        if not (
+            2 ** int(low_exp) == args.d_model_low
+            and 2 ** int(high_exp) == args.d_model_high
+        ):
+            raise ValueError("d-model-low and d-model-high must be powers of 2")
+        d_model_values = [2**i for i in range(int(low_exp), int(high_exp) + 1)]
+    else:
+        raise ValueError(
+            "Either --d-model-values or both --d-model-low and --d-model-high must be provided"
+        )
 
     print(f"Testing d_model values: {d_model_values}")
 
@@ -741,7 +791,7 @@ def main():
                 )
                 with device_ctx:
                     tqdm.write("Initializing parameters")
-                    params = init_model_params(model, init_key)
+                    params = init_model_params(family, model, init_key)
 
                     tqdm.write("Initializing optimizer state")
                     opt_state = init_opt_state(params)
@@ -994,7 +1044,7 @@ def generate_loss_charts(d_model_values, lr_combinations, losses, test_losses, a
         model_test_losses = test_losses[d_idx, :]
 
         # Find the learning rate combination with the lowest test loss
-        min_loss_idx = np.argmin(model_test_losses)
+        min_loss_idx = np.nanargmin(model_test_losses)
         min_loss = model_test_losses[min_loss_idx]
         min_lr_combo = lr_combinations[min_loss_idx]
 
@@ -1196,7 +1246,7 @@ def generate_3d_loss_plots(d_model_values, lr_combinations, test_losses, args):
         )
 
         # Find and highlight the minimum loss point
-        min_loss_idx = np.argmin(losses_flat)
+        min_loss_idx = np.nanargmin(losses_flat)
         min_adam_lr, min_muon_lr = lr_combinations[min_loss_idx]
         min_loss = losses_flat[min_loss_idx]
 
@@ -1290,7 +1340,7 @@ def generate_3d_loss_plots(d_model_values, lr_combinations, test_losses, args):
         )
 
         # Highlight the minimum loss point for this d_model
-        min_loss_idx = np.argmin(losses_flat)
+        min_loss_idx = np.nanargmin(losses_flat)
         min_adam_lr, min_muon_lr = lr_combinations[min_loss_idx]
         min_loss = losses_flat[min_loss_idx]
 
