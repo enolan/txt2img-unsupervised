@@ -624,6 +624,58 @@ class EuclideanVDMConfig(VectorFieldConfig):
             raise ValueError(f"Unknown cap conditioning mode: {self.cap_conditioning}")
 
 
+def migrate_transformer_config_json(cfg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Add the muP fields to a transformer model config saved before they existed, with the values
+    that reproduce how the model behaved without them: the standard parametrization, i.e. fan-in
+    init for every kernel, one learning rate for every parameter, and 1/sqrt(head_dim) attention
+    logits.
+    """
+    mup_fields = {
+        "d_model_base",
+        "head_dim_base",
+        "variance_base",
+        "alpha_input",
+        "alpha_output",
+    }
+    already_present = sorted(mup_fields & cfg.keys())
+    if already_present:
+        raise ValueError(f"Config already has muP fields: {already_present}")
+    return cfg | {
+        "d_model_base": cfg["d_model"],
+        "head_dim_base": cfg["d_model"] // cfg["num_heads"],
+        "variance_base": 1 / cfg["d_model"],
+    }
+
+
+def test_migrate_transformer_config_json() -> None:
+    """Test that migrating a pre-muP config gives a model that behaves the same: no learning rate
+    scaling, fan-in init, and 1/sqrt(head_dim) attention."""
+    old_json = {
+        "d_model": 512,
+        "num_heads": 8,
+        "ff_dim": 2048,
+        "dropout": 0.1,
+        "n_layers": 6,
+        "image_tokens": 256,
+        "use_biases": True,
+        "activation_function": "gelu",
+    }
+    cfg = TransformerModelConfig.from_json_dict(
+        migrate_transformer_config_json(old_json)
+    )
+    ImageModel = importlib.import_module(
+        "txt2img_unsupervised.transformer_model"
+    ).ImageModel
+    model = ImageModel(**cfg.__dict__)
+    assert model.scale_lr(1e-3) == 1e-3
+    assert model.hidden_variance_base * model.d_model_base == 1.0
+    assert model.attention_logit_scale == 1 / math.sqrt(64)
+
+    with pytest.raises(ValueError, match="already has muP fields"):
+        migrate_transformer_config_json(migrate_transformer_config_json(old_json))
+
+
 def invert_dict(d: dict[Any, Any]) -> dict[Any, Any]:
     """Invert a dictionary."""
     return {v: k for k, v in d.items()}

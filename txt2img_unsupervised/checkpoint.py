@@ -3,6 +3,7 @@
 import gc
 import subprocess
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -25,11 +26,12 @@ from .config import (
     LearningRateSchedule,
     TrainingConfig,
     TransformerModelConfig,
+    migrate_transformer_config_json,
 )
 from .euclidean_vdm import EuclideanDiffusionModel
 from .function_weighted_flow_model import FunctionWeightedFlowModel
 from .muon import muon
-from .transformer_model import ImageModel
+from .transformer_model import ImageModel, gpt_1_config
 from .triangle_schedule import triangle_schedule
 
 
@@ -380,6 +382,26 @@ class BaseTrainState(train_state.TrainState):
         if isinstance(opt_state, optax.MultiStepsState):
             opt_state = opt_state.inner_opt_state
 
+        # muP models partition their params into learning rate groups, each with its own copy of
+        # the optimizer
+        if isinstance(opt_state, optax.transforms.PartitionState):
+            partition_states = [
+                masked.inner_state for masked in opt_state.inner_states.values()
+            ]
+            is_schedule_free = [
+                isinstance(s, optax.contrib.ScheduleFreeState) for s in partition_states
+            ]
+            if all(is_schedule_free):
+                return _schedule_free_eval_params_partitioned(
+                    partition_states, self.params
+                )
+            elif any(is_schedule_free):
+                raise ValueError(
+                    "Some partitions use schedule-free optimizers and some don't"
+                )
+            else:
+                return self.params
+
         # Check for schedule-free optimizer
         if isinstance(opt_state, optax.contrib.ScheduleFreeState):
             return optax.contrib.schedule_free_eval_params(opt_state, self.params)
@@ -478,6 +500,156 @@ class EuclideanVDMTrainState(BaseTrainState):
         )
 
 
+def _schedule_free_eval_params_partitioned(partition_states, params):
+    """
+    Eval params for a schedule-free optimizer split up by optax.transforms.partition. Each
+    partition's state holds z only for the params it owns, with MaskedNode everywhere else, so
+    compute each partition's eval params on the params it owns and merge the results.
+    """
+    is_masked = lambda x: isinstance(x, optax.transforms.MaskedNode)
+    eval_params = params
+    for state in partition_states:
+        # A MaskedNode in z stands in for a whole subtree of params the partition doesn't own.
+        # Expand z to the full param structure, using the params themselves as placeholders
+        # there, and mark which leaves the partition owns.
+        owned = jax.tree.map(
+            lambda z, x: jax.tree.map(lambda _: not is_masked(z), x),
+            state.z,
+            params,
+            is_leaf=is_masked,
+        )
+        z_full = jax.tree.map(
+            lambda z, x: x if is_masked(z) else z, state.z, params, is_leaf=is_masked
+        )
+        partition_eval_params = optax.contrib.schedule_free_eval_params(
+            state._replace(z=z_full), params
+        )
+        eval_params = jax.tree.map(
+            lambda current, new, is_owned: new if is_owned else current,
+            eval_params,
+            partition_eval_params,
+            owned,
+        )
+    return eval_params
+
+
+def train_state_class_for_config(model_cfg: BaseModelConfig) -> type[BaseTrainState]:
+    """The train state class for a model config."""
+    if isinstance(model_cfg, TransformerModelConfig):
+        return TransformerTrainState
+    elif isinstance(model_cfg, FlowMatchingModelConfig):
+        return FlowMatchingTrainState
+    elif isinstance(model_cfg, EuclideanVDMConfig):
+        return EuclideanVDMTrainState
+    else:
+        raise ValueError(f"Unknown model config type: {type(model_cfg)}")
+
+
+def partition_opt_state(opt_state, partitioned_template):
+    """
+    Reshape the state of an optimizer into the state of the same optimizer wrapped in
+    optax.transforms.partition, so that a checkpoint saved before its model had a partition map
+    can be resumed. Each partition's state has the structure of the whole optimizer's state with
+    MaskedNode in place of the leaves that belong to other partitions, so every leaf of the
+    partitioned state is the leaf at the same path in the unpartitioned state, once the
+    `.inner_states[label].inner_state` segment is dropped from the path.
+
+    Args:
+        opt_state: The unpartitioned optimizer state.
+        partitioned_template: The partitioned optimizer's state, or a tree of ShapeDtypeStructs
+            with its structure.
+
+    Returns:
+        The partitioned optimizer state, with opt_state's arrays.
+    """
+    unpartitioned_leaves = {
+        jax.tree_util.keystr(path): leaf
+        for path, leaf in jax.tree_util.tree_leaves_with_path(opt_state)
+    }
+
+    def leaf_for(path, template_leaf):
+        keys = list(path)
+        partition_prefix_starts = [
+            i
+            for i, k in enumerate(keys)
+            if isinstance(k, jax.tree_util.GetAttrKey) and k.name == "inner_states"
+        ]
+        if partition_prefix_starts:
+            i = partition_prefix_starts[0]
+            del keys[i : i + 3]
+        leaf = unpartitioned_leaves[jax.tree_util.keystr(keys)]
+        assert leaf.shape == template_leaf.shape, (
+            f"{jax.tree_util.keystr(path)}: {leaf.shape} != {template_leaf.shape}"
+        )
+        return leaf
+
+    return jax.tree_util.tree_map_with_path(leaf_for, partitioned_template)
+
+
+def migrate_transformer_checkpoint_to_mup(
+    src_dir: Path, dst_dir: Path, step: int | None, batches_total: int | None
+) -> None:
+    """
+    Migrate a transformer checkpoint saved before ImageModel supported muP to the current format,
+    so it can be resumed or finetuned from. The model config gets the muP fields with values that
+    reproduce the model's existing behaviour (see migrate_transformer_config_json), and the
+    optimizer state is reshaped into the per-learning-rate-group partitions muP models use. Params
+    and the RNG are copied as they are.
+
+    Args:
+        src_dir: Checkpoint directory to migrate.
+        dst_dir: Directory to write the migrated checkpoint to.
+        step: Which step to migrate, or None for the latest.
+        batches_total: Total batches in the training run, needed for learning rate schedules that
+            depend on it, otherwise None.
+    """
+    src_manager = mk_checkpoint_manager(src_dir)
+    step = src_manager.latest_step() if step is None else step
+    metadata = checkpoint_metadata(src_manager)
+    model_cfg_json = migrate_transformer_config_json(metadata["model_cfg"])
+    model_cfg = TransformerModelConfig.from_json_dict(model_cfg_json)
+    training_cfg = TrainingConfig.from_json_dict(metadata["training_cfg"])
+    mdl = ImageModel(**model_cfg.__dict__)
+
+    params_template = jax.eval_shape(
+        lambda: mdl.init(jax.random.PRNGKey(0), *mdl.dummy_inputs())
+    )
+    rng_template = ocp.utils.to_shape_dtype_struct(jax.random.PRNGKey(0))
+    # A model with no partition map gets an unpartitioned optimizer
+    unpartitioned_opt = setup_optimizer(training_cfg, batches_total, mdl=None)
+    partitioned_opt = setup_optimizer(training_cfg, batches_total, mdl=mdl)
+    unpartitioned_template = jax.eval_shape(unpartitioned_opt.init, params_template)
+    partitioned_template = jax.eval_shape(partitioned_opt.init, params_template)
+
+    print(f"Loading step {step} from {src_dir}")
+    restored = src_manager.restore(
+        step,
+        args=ocp.args.Composite(
+            params=ocp.args.StandardRestore(params_template),
+            opt_state=ocp.args.StandardRestore(unpartitioned_template),
+            rng=ocp.args.ArrayRestore(rng_template),
+        ),
+    )
+    opt_state = partition_opt_state(restored.opt_state, partitioned_template)
+
+    print(f"Saving migrated checkpoint to {dst_dir}")
+    dst_manager = ocp.CheckpointManager(
+        dst_dir.absolute(),
+        options=ocp.CheckpointManagerOptions(enable_async_checkpointing=False),
+        item_names=("params", "opt_state", "rng"),
+        metadata=metadata | {"model_cfg": model_cfg_json},
+    )
+    dst_manager.save(
+        step,
+        args=ocp.args.Composite(
+            params=ocp.args.StandardSave(restored.params),
+            opt_state=ocp.args.StandardSave(opt_state),
+            rng=ocp.args.ArraySave(restored.rng),
+        ),
+    )
+    dst_manager.close()
+
+
 def checkpoint_metadata(checkpoint_manager: ocp.CheckpointManager) -> dict[str, Any]:
     """The metadata dict a checkpoint directory was created with (model and training configs, run
     id, and so on)."""
@@ -505,18 +677,10 @@ def get_model_from_checkpoint(checkpoint_dir: Path):
     Returns:
         A tuple of (model config, model instance)
     """
-    metadata = checkpoint_metadata(mk_checkpoint_manager(checkpoint_dir))
+    metadata = mk_checkpoint_manager(checkpoint_dir).metadata()
     model_cfg = BaseModelConfig.from_json_dict(metadata["model_cfg"])
-
-    # Use the appropriate train state class to create the model based on config type
-    if isinstance(model_cfg, TransformerModelConfig):
-        return model_cfg, TransformerTrainState._create_model_from_config(model_cfg)
-    elif isinstance(model_cfg, FlowMatchingModelConfig):
-        return model_cfg, FlowMatchingTrainState._create_model_from_config(model_cfg)
-    elif isinstance(model_cfg, EuclideanVDMConfig):
-        return model_cfg, EuclideanVDMTrainState._create_model_from_config(model_cfg)
-    else:
-        raise ValueError(f"Unknown model type: {type(model_cfg)}")
+    train_state_class = train_state_class_for_config(model_cfg)
+    return model_cfg, train_state_class._create_model_from_config(model_cfg)
 
 
 def _init_model_with_dummy_inputs(mdl, rng=None):
@@ -644,22 +808,9 @@ def setup_checkpoint_manager_and_initial_state(
         | extra_metadata,
     )
 
-    # Create the appropriate model and initial train state based on model config type
-    if isinstance(model_cfg, TransformerModelConfig):
-        mdl = TransformerTrainState._create_model_from_config(model_cfg)
-        initial_state = TransformerTrainState.new(rng, mdl, training_cfg, batches_total)
-    elif isinstance(model_cfg, FlowMatchingModelConfig):
-        mdl = FlowMatchingTrainState._create_model_from_config(model_cfg)
-        initial_state = FlowMatchingTrainState.new(
-            rng, mdl, training_cfg, batches_total
-        )
-    elif isinstance(model_cfg, EuclideanVDMConfig):
-        mdl = EuclideanVDMTrainState._create_model_from_config(model_cfg)
-        initial_state = EuclideanVDMTrainState.new(
-            rng, mdl, training_cfg, batches_total
-        )
-    else:
-        raise ValueError(f"Unsupported model config type: {type(model_cfg)}")
+    train_state_class = train_state_class_for_config(model_cfg)
+    mdl = train_state_class._create_model_from_config(model_cfg)
+    initial_state = train_state_class.new(rng, mdl, training_cfg, batches_total)
 
     return checkpoint_manager, initial_state
 
@@ -737,3 +888,215 @@ def test_get_eval_params(
     else:
         # scheduleful eval params should be the same
         np.testing.assert_array_equal(eval_params, state.params)
+
+
+_tiny_mup_transformer_cfg = replace(
+    gpt_1_config,
+    n_layers=1,
+    d_model=32,
+    num_heads=2,
+    ff_dim=64,
+    image_tokens=16,
+    dropout=None,
+    pre_norm=True,
+)
+
+
+def _random_grads_like(params, key):
+    """A tree of standard normal arrays with params' structure."""
+    leaves, treedef = jax.tree_util.tree_flatten(params)
+    keys = jax.random.split(key, len(leaves))
+    return treedef.unflatten(
+        [jax.random.normal(k, leaf.shape, leaf.dtype) for k, leaf in zip(keys, leaves)]
+    )
+
+
+def _assert_trees_close(tree_a, tree_b, **kwargs):
+    """Assert two pytrees have the same structure and numerically close leaves."""
+    assert jax.tree_util.tree_structure(tree_a) == jax.tree_util.tree_structure(tree_b)
+    for a, b in zip(
+        jax.tree_util.tree_leaves(tree_a), jax.tree_util.tree_leaves(tree_b)
+    ):
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), **kwargs)
+
+
+@pytest.mark.parametrize("schedule_free", [True, False])
+@pytest.mark.parametrize("gradient_accumulation_steps", [1, 2])
+def test_get_eval_params_partitioned(schedule_free, gradient_accumulation_steps):
+    """Test eval params with a muP model's partitioned optimizer. At its base width every partition
+    gets the same learning rate, so the partitioned optimizer must trace the unpartitioned one
+    exactly, eval params included."""
+    cfg = replace(_tiny_mup_transformer_cfg, d_model_base=32, head_dim_base=16)
+    mdl = ImageModel(**cfg.__dict__)
+    assert mdl.scale_lr(1.0) == 1.0
+    rng = jax.random.PRNGKey(0)
+    params = jax.jit(mdl.init)(rng, *mdl.dummy_inputs())
+    if schedule_free:
+        training_cfg = TrainingConfig(
+            learning_rate_schedule=LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE,
+            schedule_free_beta1=0.9,
+            warmup_steps=5,
+            learning_rate=1e-2,
+            batch_size=1,
+            epochs=1,
+            gradient_clipping=None,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
+    else:
+        training_cfg = TrainingConfig(
+            learning_rate_schedule=LearningRateSchedule.CONSTANT,
+            learning_rate=1e-2,
+            batch_size=1,
+            epochs=1,
+            gradient_clipping=None,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
+
+    states = [
+        TransformerTrainState.create(apply_fn=mdl.apply, params=params, tx=opt, rng=rng)
+        for opt in [
+            setup_optimizer(training_cfg, batches_total=100, mdl=mdl),
+            setup_optimizer(training_cfg, batches_total=100, mdl=None),
+        ]
+    ]
+    partitioned_inner_state = states[0].opt_state.inner_state[-1]
+    if gradient_accumulation_steps > 1:
+        partitioned_inner_state = partitioned_inner_state.inner_opt_state
+    assert isinstance(partitioned_inner_state, optax.transforms.PartitionState)
+    step = jax.jit(lambda state, grads: state.apply_gradients(grads=grads))
+    for grad_key in jax.random.split(
+        jax.random.PRNGKey(1), 10 * gradient_accumulation_steps
+    ):
+        grads = _random_grads_like(params, grad_key)
+        states = [step(state, grads) for state in states]
+
+    partitioned, unpartitioned = states
+    _assert_trees_close(partitioned.params, unpartitioned.params, rtol=1e-6, atol=0)
+    partitioned_eval = partitioned.get_eval_params()
+    _assert_trees_close(
+        partitioned_eval, unpartitioned.get_eval_params(), rtol=1e-6, atol=0
+    )
+    if schedule_free:
+        assert not all(
+            jnp.allclose(a, b)
+            for a, b in zip(
+                jax.tree_util.tree_leaves(partitioned_eval),
+                jax.tree_util.tree_leaves(partitioned.params),
+            )
+        )
+
+
+def test_partition_opt_state():
+    """Test that an unpartitioned optimizer state reshaped into partitions matches the state the
+    partitioned optimizer would have reached itself, when the partitions share a learning rate."""
+    params = {"a": {"kernel": jnp.ones(3), "bias": jnp.ones(2)}, "b": jnp.ones(4)}
+    labels = {"a": {"kernel": "scaled", "bias": "fixed"}, "b": "scaled"}
+    mk_adam = lambda: optax.contrib.schedule_free_adamw(1e-2, warmup_steps=2)
+    unpartitioned = optax.apply_if_finite(optax.chain(optax.identity(), mk_adam()), 20)
+    partitioned = optax.apply_if_finite(
+        optax.chain(
+            optax.identity(),
+            optax.transforms.partition(
+                {"fixed": mk_adam(), "scaled": mk_adam()}, labels
+            ),
+        ),
+        20,
+    )
+    states = [unpartitioned.init(params), partitioned.init(params)]
+    grads = jax.tree.map(lambda p: 0.5 * p, params)
+    for opt, i in [(unpartitioned, 0), (partitioned, 1)]:
+        for _ in range(3):
+            _, states[i] = opt.update(grads, states[i], params)
+
+    migrated = partition_opt_state(states[0], jax.eval_shape(partitioned.init, params))
+    _assert_trees_close(migrated, states[1], rtol=1e-6, atol=0)
+
+
+@pytest.mark.parametrize("schedule_free", [True, False])
+def test_migrate_transformer_checkpoint_to_mup(tmp_path, schedule_free):
+    """Test migrating a transformer checkpoint saved before muP: the result loads as a
+    TransformerTrainState whose model behaves as the old one did, with the old params, eval params,
+    and an optimizer state that continues training identically."""
+    old_cfg_json = _tiny_mup_transformer_cfg.to_json_dict()
+    for mup_field in [
+        "d_model_base",
+        "head_dim_base",
+        "variance_base",
+        "alpha_input",
+        "alpha_output",
+    ]:
+        del old_cfg_json[mup_field]
+    # Params have the same shapes whatever the muP settings, so this model stands in for the old
+    # one when saving.
+    mdl = ImageModel(**_tiny_mup_transformer_cfg.__dict__)
+    if schedule_free:
+        training_cfg = TrainingConfig(
+            learning_rate_schedule=LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE,
+            schedule_free_beta1=0.9,
+            warmup_steps=5,
+            learning_rate=1e-2,
+            batch_size=1,
+            epochs=1,
+            gradient_clipping=None,
+            gradient_accumulation_steps=1,
+        )
+    else:
+        training_cfg = TrainingConfig(
+            learning_rate_schedule=LearningRateSchedule.TRIANGLE,
+            learning_rate=1e-2,
+            batch_size=1,
+            epochs=1,
+            gradient_clipping=None,
+            gradient_accumulation_steps=1,
+        )
+    batches_total = 100
+    rng = jax.random.PRNGKey(0)
+    params = jax.jit(mdl.init)(rng, *mdl.dummy_inputs())
+    old_state = TransformerTrainState.create(
+        apply_fn=mdl.apply,
+        params=params,
+        tx=setup_optimizer(training_cfg, batches_total, mdl=None),
+        rng=rng,
+    )
+    step = jax.jit(lambda state, grads: state.apply_gradients(grads=grads))
+    grad_keys = jax.random.split(jax.random.PRNGKey(1), 4)
+    for grad_key in grad_keys[:3]:
+        old_state = step(old_state, _random_grads_like(params, grad_key))
+
+    src_dir = tmp_path / "src"
+    src_manager = ocp.CheckpointManager(
+        src_dir,
+        options=ocp.CheckpointManagerOptions(enable_async_checkpointing=False),
+        item_names=("params", "opt_state", "rng"),
+        metadata={
+            "model_cfg": old_cfg_json,
+            "training_cfg": training_cfg.to_json_dict(),
+            "run_id": "test",
+            "commit_hash": "test",
+            "data_offset": 0,
+        },
+    )
+    old_state.save_checkpoint(src_manager, 3)
+    src_manager.close()
+
+    dst_dir = tmp_path / "dst"
+    migrate_transformer_checkpoint_to_mup(src_dir, dst_dir, None, batches_total)
+
+    dst_manager = mk_checkpoint_manager(dst_dir)
+    assert checkpoint_metadata(dst_manager)["run_id"] == "test"
+    new_state, new_mdl = TransformerTrainState.load_from_checkpoint(
+        dst_manager, 3, batches_total
+    )
+    assert new_state.step == 3
+    assert new_mdl.scale_lr(1.0) == 1.0
+    assert new_mdl.hidden_variance_base * new_mdl.d_model_base == 1.0
+    assert new_mdl.attention_logit_scale == 1 / np.sqrt(new_mdl.head_dim)
+    _assert_trees_close(new_state.params, old_state.params, rtol=0, atol=0)
+    _assert_trees_close(
+        new_state.get_eval_params(), old_state.get_eval_params(), rtol=1e-6, atol=0
+    )
+
+    grads = _random_grads_like(params, grad_keys[3])
+    _assert_trees_close(
+        step(new_state, grads).params, step(old_state, grads).params, rtol=1e-6, atol=0
+    )
