@@ -31,6 +31,7 @@ from tqdm import tqdm, trange
 import txt2img_unsupervised.config as config
 from txt2img_unsupervised.checkpoint import (
     BaseTrainState,
+    checkpoint_metadata,
     get_model_from_checkpoint,
     mk_checkpoint_manager,
     setup_checkpoint_manager_and_initial_state,
@@ -293,7 +294,7 @@ def init_common_train_state(
         checkpoint_step = checkpoint_manager.latest_step()
         # Start from the next step after the one in the checkpoint
         global_step = checkpoint_step + 1
-        data_offset = checkpoint_manager.metadata().get("data_offset", 0)
+        data_offset = checkpoint_metadata(checkpoint_manager).get("data_offset", 0)
 
         # Use the provided train state class to load the checkpoint
         train_state, mdl = train_state_class.load_from_checkpoint(
@@ -318,15 +319,15 @@ def init_common_train_state(
                 # before we have to.
                 data_offset_examples = (
                     finetune_src_checkpoint_manager.latest_step()
-                    * finetune_src_checkpoint_manager.metadata()["training_cfg"][
-                        "batch_size"
-                    ]
+                    * checkpoint_metadata(finetune_src_checkpoint_manager)[
+                        "training_cfg"
+                    ]["batch_size"]
                 )
                 data_offset = ceil(data_offset_examples / training_cfg.batch_size)
 
             extra_metadata = (
                 "finetune_src_config",
-                finetune_src_checkpoint_manager.metadata(),
+                checkpoint_metadata(finetune_src_checkpoint_manager),
             )
 
         # Set up checkpoint manager and initial state
@@ -370,7 +371,11 @@ def init_common_train_state(
             train_state.save_checkpoint(checkpoint_manager, 0)
             print("Done.")
             wandb.config.update(
-                {"finetune_src_metadata": finetune_src_checkpoint_manager.metadata()}
+                {
+                    "finetune_src_metadata": checkpoint_metadata(
+                        finetune_src_checkpoint_manager
+                    )
+                }
             )
 
         # Initialize the model using the train state class's model creation method
@@ -510,7 +515,7 @@ def init_wandb_training(
             enable_async_checkpointing=False,
         )
         checkpoint_manager = mk_checkpoint_manager(checkpoint_dir, checkpoint_options)
-        metadata = checkpoint_manager.metadata()
+        metadata = checkpoint_metadata(checkpoint_manager)
         model_cfg = BaseModelConfig.from_json_dict(metadata["model_cfg"])
         training_cfg = TrainingConfig.from_json_dict(metadata["training_cfg"])
         run_id = metadata["run_id"]

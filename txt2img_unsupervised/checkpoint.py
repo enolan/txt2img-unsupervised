@@ -308,7 +308,7 @@ class BaseTrainState(train_state.TrainState):
         Returns:
             A tuple of (train_state, model)
         """
-        metadata = checkpoint_manager.metadata()
+        metadata = checkpoint_metadata(checkpoint_manager)
         model_cfg = BaseModelConfig.from_json_dict(metadata["model_cfg"])
         training_cfg = TrainingConfig.from_json_dict(metadata["training_cfg"])
 
@@ -478,6 +478,12 @@ class EuclideanVDMTrainState(BaseTrainState):
         )
 
 
+def checkpoint_metadata(checkpoint_manager: ocp.CheckpointManager) -> dict[str, Any]:
+    """The metadata dict a checkpoint directory was created with (model and training configs, run
+    id, and so on)."""
+    return checkpoint_manager.metadata().custom_metadata
+
+
 def mk_checkpoint_manager(
     checkpoint_dir: Path,
     checkpoint_manager_options: ocp.CheckpointManagerOptions | None = None,
@@ -499,7 +505,7 @@ def get_model_from_checkpoint(checkpoint_dir: Path):
     Returns:
         A tuple of (model config, model instance)
     """
-    metadata = mk_checkpoint_manager(checkpoint_dir).metadata()
+    metadata = checkpoint_metadata(mk_checkpoint_manager(checkpoint_dir))
     model_cfg = BaseModelConfig.from_json_dict(metadata["model_cfg"])
 
     # Use the appropriate train state class to create the model based on config type
