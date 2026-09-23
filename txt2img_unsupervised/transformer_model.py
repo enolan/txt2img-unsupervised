@@ -66,9 +66,9 @@ class ImageModel(nn.Module):
     # num_heads or head_dim, the base model is unchanged.
     head_dim_base: int = 64
     # Init variance of a hidden kernel with fan-in d_model, at d_model = d_model_base. Hidden kernels
-    # in general get variance_base * d_model_base / fan_in, i.e. fan-in init when this is
-    # 1 / d_model_base.
-    variance_base: float = 1 / 768
+    # in general get variance_base * d_model_base / fan_in. None means 1 / d_model_base, i.e.
+    # fan-in init.
+    variance_base: float | None = None
     alpha_input: float = 1.0  # scaling factor for inputs
     alpha_output: float = 1.0  # scaling factor for outputs
 
@@ -76,6 +76,13 @@ class ImageModel(nn.Module):
     def d_model_scale_factor(self) -> float:
         "m_d in muP."
         return self.d_model / self.d_model_base
+
+    @property
+    def hidden_variance_base(self) -> float:
+        "variance_base with its default resolved."
+        return (
+            1 / self.d_model_base if self.variance_base is None else self.variance_base
+        )
 
     @property
     def head_dim(self) -> int:
@@ -146,7 +153,7 @@ class ImageModel(nn.Module):
         # Follows PaLM: "PaLM: Scaling Language Modeling with Pathways"
         # https://arxiv.org/abs/2204.02311
         hidden_kernel_init = nn.initializers.variance_scaling(
-            scale=self.variance_base * self.d_model_base,
+            scale=self.hidden_variance_base * self.d_model_base,
             mode="fan_in",
             distribution="normal",
         )
@@ -666,6 +673,22 @@ class ImageModel(nn.Module):
         return cap_centers, cap_d_maxes
 
 
+cap_logits_table = LogitsTable(767, 16384)
+
+
+@partial(jax.jit, static_argnames=["n_caps", "model"])
+def gen_caps(rng, batch_clips, n_caps, model):
+    """Generate containing spherical caps for a batch of examples, for training."""
+    ex_rngs = jax.random.split(rng, batch_clips.shape[0])
+
+    cap_centers, cap_max_cos_distances = jax.vmap(
+        lambda rng, embedding: model.gen_training_caps(cap_logits_table, rng, embedding)
+    )(ex_rngs, batch_clips)
+    assert cap_centers.shape == (batch_clips.shape[0], n_caps, 768)
+    assert cap_max_cos_distances.shape == (batch_clips.shape[0], n_caps)
+    return cap_centers, cap_max_cos_distances
+
+
 def calculate_discrete_power_law_pmf(n_max, alpha):
     """Calculate the probability mass function (as an array) for a discrete power law distribution
     over the integers 1 through n_max inclusive, with exponent alpha."""
@@ -820,12 +843,15 @@ def test_mk_partition_map_rejects_muon():
         model.mk_partition_map(use_muon=True)
 
 
-@pytest.mark.parametrize("d_model_base,variance_base", [(768, 1 / 768), (512, 1 / 256)])
+@pytest.mark.parametrize(
+    "d_model_base,variance_base", [(768, None), (768, 1 / 768), (512, 1 / 256)]
+)
 @pytest.mark.parametrize("d_model", [384, 768, 1536])
 def test_mup_init(d_model, d_model_base, variance_base):
     """Test that hidden kernels' init variance is variance_base * d_model_base / fan_in at every
-    width (fan-in init with the default settings), the logits decoder starts at zero, and the hidden
-    learning rate scales as 1/m_d."""
+    width (fan-in init with the default settings, where variance_base is None meaning
+    1 / d_model_base), the logits decoder starts at zero, and the hidden learning rate scales as
+    1/m_d."""
     config = replace(
         gpt_1_config,
         d_model=d_model,
@@ -854,10 +880,13 @@ def test_mup_init(d_model, d_model_base, variance_base):
     for name, (kernel, fan_in) in kernels_and_fan_ins.items():
         np.testing.assert_allclose(
             jnp.var(kernel),
-            variance_base * d_model_base / fan_in,
+            model.hidden_variance_base * d_model_base / fan_in,
             rtol=0.05,
             err_msg=name,
         )
+    assert model.hidden_variance_base == (
+        1 / d_model_base if variance_base is None else variance_base
+    )
     assert jnp.all(params["logits_decoder"]["kernel"] == 0)
 
     assert model.d_model_scale_factor == d_model / d_model_base
@@ -1901,6 +1930,7 @@ class TransformerLayer(nn.Module):
         # accepts, so the wrapper must present the wrapped function's signature.
         @functools.wraps(unscaled_attn_function)
         def attn_function(q, k, v, *args, **kwargs):
+            """Attention with the queries scaled so the logits get attention_logit_scale."""
             return unscaled_attn_function(q * query_scale, k, v, *args, **kwargs)
 
         self.mha = nn.SelfAttention(

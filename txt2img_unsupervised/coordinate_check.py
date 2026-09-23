@@ -23,7 +23,6 @@ from tqdm import tqdm, trange
 from tqdm.contrib import tenumerate
 
 from . import flow_matching
-from .cap_sampling import LogitsTable
 from .function_weighted_flow_model import (
     CapIndicatorExtraParams,
     FunctionWeightedFlowModel,
@@ -31,7 +30,7 @@ from .function_weighted_flow_model import (
     WeightingFunction,
 )
 from .muon import muon
-from .transformer_model import ImageModel, loss_batch
+from .transformer_model import ImageModel, gen_caps, loss_batch
 
 
 @dataclass(frozen=True)
@@ -82,6 +81,7 @@ def flow_matching_family(args, example) -> ModelFamily:
     domain_dim = example[vec_column].shape[0]
 
     def make_model(d_model):
+        """Build the model of width d_model."""
         return FunctionWeightedFlowModel(
             domain_dim=domain_dim,
             use_pre_mlp_projection=args.use_pre_mlp_projection,
@@ -95,6 +95,7 @@ def flow_matching_family(args, example) -> ModelFamily:
         )
 
     def loss_fn(model, params, batch, rng, capture_intermediates):
+        """Flow matching loss on a batch of unit vectors."""
         loss, aux = flow_matching.compute_batch_loss(
             model,
             params,
@@ -105,6 +106,7 @@ def flow_matching_family(args, example) -> ModelFamily:
         return (loss, aux["intermediates"]) if capture_intermediates else loss
 
     def process_intermediates(model, intermediates):
+        """Pick out the activations to chart from the captured intermediates."""
         # FunctionWeightedFlowModel delegates to vector_field, so intermediates are nested
         intermediates = intermediates["vector_field"]
         result = {}
@@ -185,16 +187,17 @@ def transformer_family(args, example) -> ModelFamily:
     head dimension grows. --parametrization picks between muP (the base model's head dimension is
     set to match the sweep, so the attention logit scaling is the standard 1/sqrt(head_dim) at the
     base width either way), muP with the standard 1/sqrt(head_dim) attention scaling at every
-    width, and the pre-muP standard parametrization.
+    width, and the standard parametrization (fan-in init, one learning rate, 1/sqrt(head_dim)
+    attention).
     """
     if (args.head_dim is None) == (args.num_heads is None):
         raise ValueError(
             "Exactly one of --head-dim and --num-heads is required for transformer models"
         )
     image_tokens = example["encoded_img"].shape[0]
-    cap_logits_table = LogitsTable(767, 16384)
 
     def make_model(d_model):
+        """Build the model of width d_model in the chosen parametrization."""
         if args.head_dim is not None:
             if d_model % args.head_dim != 0:
                 raise ValueError(
@@ -207,6 +210,11 @@ def transformer_family(args, example) -> ModelFamily:
                 raise ValueError(
                     f"d_model {d_model} isn't a multiple of num_heads {args.num_heads}"
                 )
+            if ImageModel.d_model_base % args.num_heads != 0:
+                raise ValueError(
+                    f"num_heads {args.num_heads} must divide the base width "
+                    f"{ImageModel.d_model_base}"
+                )
             num_heads = args.num_heads
             head_dim_base = ImageModel.d_model_base // args.num_heads
         head_dim = d_model // num_heads
@@ -215,10 +223,9 @@ def transformer_family(args, example) -> ModelFamily:
         elif args.parametrization == "mup_sqrt_attention":
             mup_kwargs = {"head_dim_base": head_dim}
         elif args.parametrization == "standard":
-            # The transformer as it was before muP: fan-in init for every kernel, one learning rate
-            # for everything (d_model_base = d_model makes the learning rate scaling a no-op), and
-            # 1/sqrt(head_dim) attention. The logits decoder, which the model zero-initializes, is
-            # given fan-in init in init_params.
+            # Fan-in init for every kernel, one learning rate for everything (d_model_base =
+            # d_model makes the learning rate scaling a no-op), and 1/sqrt(head_dim) attention. The
+            # logits decoder, which the model zero-initializes, is given fan-in init in init_params.
             mup_kwargs = {
                 "d_model_base": d_model,
                 "variance_base": 1 / d_model,
@@ -250,6 +257,7 @@ def transformer_family(args, example) -> ModelFamily:
         )
 
     def init_params(model, key):
+        """Initialize params, with the logits decoder's init matching the parametrization."""
         init_key, decoder_key = jax.random.split(key)
         params = model.init(init_key, *model.dummy_inputs())
         if args.parametrization == "standard":
@@ -262,14 +270,10 @@ def transformer_family(args, example) -> ModelFamily:
         return params
 
     def loss_fn(model, params, batch, rng, capture_intermediates):
+        """Cross-entropy loss on a batch, conditioned on freshly sampled caps."""
         caps_rng, dropout_rng = jax.random.split(rng)
-        cap_centers, cap_max_cos_distances = jax.vmap(
-            lambda rng, embedding: model.gen_training_caps(
-                cap_logits_table, rng, embedding
-            )
-        )(
-            jax.random.split(caps_rng, batch["clip_embedding"].shape[0]),
-            batch["clip_embedding"],
+        cap_centers, cap_max_cos_distances = gen_caps(
+            caps_rng, batch["clip_embedding"], 1, model
         )
         return loss_batch(
             model,
@@ -282,6 +286,7 @@ def transformer_family(args, example) -> ModelFamily:
         )
 
     def process_intermediates(model, intermediates):
+        """Pick out the activations to chart from the captured intermediates."""
         result = {
             "token_embedding": intermediates["in_embed"]["__call__"][0],
             "clip_projection": intermediates["clip_proj"]["__call__"][0],
@@ -294,9 +299,14 @@ def transformer_family(args, example) -> ModelFamily:
             keys = layers["mha"]["key"]["__call__"][0][layer_idx]
             result[f"layer_{layer_idx}_attention_query"] = queries
             # Pre-softmax attention logits, including the masked-out ones. These are what muP's
-            # 1/head_dim scaling is supposed to keep O(1).
+            # 1/head_dim scaling is supposed to keep O(1). The full logit tensor is quadratic in
+            # the sequence length, so only a spread of query positions is used.
+            seq_len = queries.shape[1]
+            query_positions = jnp.linspace(
+                0, seq_len - 1, min(seq_len, 32), dtype=jnp.int32
+            )
             result[f"layer_{layer_idx}_attention_logits"] = (
-                jnp.einsum("bqhd,bkhd->bhqk", queries, keys)
+                jnp.einsum("bqhd,bkhd->bhqk", queries[:, query_positions], keys)
                 * model.attention_logit_scale
             )
             result[f"layer_{layer_idx}_attention_out"] = layers["mha"]["__call__"][0][
@@ -518,8 +528,9 @@ def main():
         choices=["mup", "mup_sqrt_attention", "standard"],
         help="Transformer models only. mup: muP with attention logits scaled by "
         "sqrt(head_dim_base)/head_dim. mup_sqrt_attention: muP with the standard "
-        "1/sqrt(head_dim) attention scaling at every width. standard: the pre-muP standard "
-        "parametrization, fan-in init and one learning rate for everything. (default: mup)",
+        "1/sqrt(head_dim) attention scaling at every width. standard: the standard "
+        "parametrization, fan-in init, one learning rate for everything, and 1/sqrt(head_dim) "
+        "attention. (default: mup)",
     )
     parser.add_argument("--n-layers", type=int, required=True)
     parser.add_argument(
@@ -1042,6 +1053,11 @@ def generate_loss_charts(d_model_values, lr_combinations, losses, test_losses, a
     # Plot test losses
     for d_idx, d_model in enumerate(d_model_values):
         model_test_losses = test_losses[d_idx, :]
+        if np.all(np.isnan(model_test_losses)):
+            print(
+                f"Every learning rate diverged for d_model={d_model}, not charting it"
+            )
+            continue
 
         # Find the learning rate combination with the lowest test loss
         min_loss_idx = np.nanargmin(model_test_losses)
@@ -1245,6 +1261,13 @@ def generate_3d_loss_plots(d_model_values, lr_combinations, test_losses, args):
             linewidth=0.5,
         )
 
+        if np.all(np.isnan(losses_flat)):
+            print(
+                f"Every learning rate diverged for d_model={d_model}, not charting it"
+            )
+            plt.close()
+            continue
+
         # Find and highlight the minimum loss point
         min_loss_idx = np.nanargmin(losses_flat)
         min_adam_lr, min_muon_lr = lr_combinations[min_loss_idx]
@@ -1338,6 +1361,9 @@ def generate_3d_loss_plots(d_model_values, lr_combinations, test_losses, args):
             edgecolor="black",
             linewidth=0.5,
         )
+
+        if np.all(np.isnan(losses_flat)):
+            continue
 
         # Highlight the minimum loss point for this d_model
         min_loss_idx = np.nanargmin(losses_flat)

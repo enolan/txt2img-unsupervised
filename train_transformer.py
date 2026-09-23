@@ -24,7 +24,6 @@ from jax.sharding import NamedSharding, PartitionSpec
 from omegaconf import OmegaConf
 from tqdm import tqdm, trange
 
-import txt2img_unsupervised.cap_sampling as cap_sampling
 import txt2img_unsupervised.sample as sample
 import txt2img_unsupervised.transformer_model as transformer_model
 from txt2img_unsupervised.checkpoint import TransformerTrainState
@@ -566,8 +565,13 @@ def save_checkpoint_and_log_images(
             "clip_embedding", jnp.zeros((len(visualization_dset), 0))
         )
         if mdl.clip_caps:
-            visualization_embeddings, visualization_max_cos_distances = gen_caps(
-                jax.random.PRNGKey(0), visualization_embeddings, mdl.clip_cap_count, mdl
+            visualization_embeddings, visualization_max_cos_distances = (
+                transformer_model.gen_caps(
+                    jax.random.PRNGKey(0),
+                    visualization_embeddings,
+                    mdl.clip_cap_count,
+                    mdl,
+                )
             )
         else:
             visualization_max_cos_distances = jnp.zeros(
@@ -612,7 +616,7 @@ def loss_fn(params, batch, rng, mdl=None):
 
     # Generate caps if needed
     if mdl.clip_caps:
-        batch_cap_centers, batch_max_cos_distances = gen_caps(
+        batch_cap_centers, batch_max_cos_distances = transformer_model.gen_caps(
             caps_rng, batch_clips, mdl.clip_cap_count, mdl
         )
         assert batch_cap_centers.shape == (
@@ -727,7 +731,7 @@ def post_epoch_hook(state, epoch_idx, global_step):
             "clip_embedding", jnp.zeros((training_cfg.batch_size, 0))
         )
         if mdl.clip_caps:
-            batch_clips, batch_max_cos_distances = gen_caps(
+            batch_clips, batch_max_cos_distances = transformer_model.gen_caps(
                 cap_rng, batch_clips, mdl.clip_cap_count, mdl
             )
         else:
@@ -751,22 +755,6 @@ def post_epoch_hook(state, epoch_idx, global_step):
     test_loss = jnp.mean(jnp.stack(losses))
     wandb.log({"global_step": global_step, "test/loss": test_loss})
     tqdm.write(f"Epoch {epoch_idx} done, test loss {test_loss:.4f}")
-
-
-cap_logits_table = cap_sampling.LogitsTable(767, 16384)
-
-
-@partial(jax.jit, static_argnames=["n_caps", "model"])
-def gen_caps(rng, batch_clips, n_caps, model):
-    """Generate containing spherical caps for a batch of examples."""
-    ex_rngs = jax.random.split(rng, batch_clips.shape[0])
-
-    cap_centers, cap_max_cos_distances = jax.vmap(
-        lambda rng, embedding: model.gen_training_caps(cap_logits_table, rng, embedding)
-    )(ex_rngs, batch_clips)
-    assert cap_centers.shape == (batch_clips.shape[0], n_caps, 768)
-    assert cap_max_cos_distances.shape == (batch_clips.shape[0], n_caps)
-    return cap_centers, cap_max_cos_distances
 
 
 if __name__ == "__main__":

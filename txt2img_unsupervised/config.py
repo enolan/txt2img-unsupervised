@@ -120,7 +120,7 @@ class TransformerModelConfig(BaseModelConfig):
     # muP settings, see ImageModel
     d_model_base: int = 768
     head_dim_base: int = 64
-    variance_base: float = 1 / 768
+    variance_base: float | None = None
     alpha_input: float = 1.0
     alpha_output: float = 1.0
 
