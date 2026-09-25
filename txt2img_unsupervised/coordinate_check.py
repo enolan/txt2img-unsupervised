@@ -1,12 +1,17 @@
-"Coordinate check for flow matching models to check whether muP is working."
+"Coordinate check for flow matching and transformer models to check whether muP is working."
 
 import argparse
 import gc
 import math
+from collections.abc import Callable
 from contextlib import nullcontext
+from dataclasses import dataclass
+from distutils.util import strtobool
 from functools import partial
 from pathlib import Path
+from typing import Any
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -25,81 +30,359 @@ from .function_weighted_flow_model import (
     WeightingFunction,
 )
 from .muon import muon
+from .transformer_model import ImageModel, gen_caps, loss_batch
 
 
-def process_intermediates(intermediates):
+@dataclass(frozen=True)
+class ModelFamily:
     """
-    Convert the raw intermediates dictionary into a more readable format.
-
-    This transforms the nested dictionary structure from captured intermediates
-    into a flattened dictionary with clear names, separating the MLP blocks.
-
-    Args:
-        intermediates: The raw intermediates dictionary from model execution
-
-    Returns:
-        A dictionary with human-readable keys and extracted values
+    Everything the coordinate check needs to know about one kind of model: how to build one of a
+    given width, how to compute its loss on a batch of training data, and which of its activations
+    to chart. Instances are passed to jitted functions as static arguments, so all fields must be
+    hashable.
     """
-    # FunctionWeightedFlowModel delegates to vector_field, so intermediates are nested
-    intermediates = intermediates["vector_field"]
-    result = {}
-    result["model_output"] = intermediates["__call__"][0]
-    result["final_norm_output"] = intermediates["final_norm"]["__call__"][0]
-    result["output_projection"] = intermediates["out_proj"]["__call__"][0]
 
-    if "pre_mlp_proj" in intermediates:
-        result["pre_mlp_projection"] = intermediates["pre_mlp_proj"]["__call__"][0]
+    # Dataset columns that make up a training batch
+    batch_fields: tuple[str, ...]
+    # d_model -> model
+    make_model: Callable[[int], nn.Module]
+    # (model, rng key) -> initial params
+    init_params: Callable[[nn.Module, jax.Array], Any]
+    # (model, params, batch, rng, capture_intermediates) -> loss, or (loss, intermediates) if
+    # capture_intermediates is set, where intermediates is the model's Flax intermediates collection.
+    loss_fn: Callable[..., jax.Array | tuple[jax.Array, dict]]
+    # (model, Flax intermediates collection) -> {activation name: activations}
+    process_intermediates: Callable[[nn.Module, dict], dict[str, jax.Array]]
+    # (activation name, chart title, chart filename) for each activation to chart
+    charts: tuple[tuple[str, str, str], ...]
 
-    # Process each MLP block separately
-    n_layers = intermediates["mlp_blocks"]["__call__"][0][0].shape[0]
-    for layer_idx in range(n_layers):
-        result[f"mlp_block_{layer_idx}_output"] = intermediates["mlp_blocks"][
-            "__call__"
-        ][0][0][layer_idx]
-        result[f"mlp_block_{layer_idx}_gate"] = intermediates["mlp_blocks"][
-            "gate_proj"
-        ]["__call__"][0][layer_idx]
-        result[f"mlp_block_{layer_idx}_norm"] = intermediates["mlp_blocks"]["norm"][
-            "__call__"
-        ][0][layer_idx]
-        result[f"mlp_block_{layer_idx}_out_proj"] = intermediates["mlp_blocks"][
-            "out_proj"
-        ]["__call__"][0][layer_idx]
-        result[f"mlp_block_{layer_idx}_value"] = intermediates["mlp_blocks"][
-            "value_proj"
-        ]["__call__"][0][layer_idx]
 
-    return result
+def flow_matching_family(args, example) -> ModelFamily:
+    """Family of FunctionWeightedFlowModels of varying width, trained on unit vectors."""
+    if args.use_pre_mlp_projection is None:
+        raise ValueError(
+            "--use-pre-mlp-projection is required for flow matching models"
+        )
+
+    if args.weighting_function == "constant":
+        weighting_function = WeightingFunction.CONSTANT
+        weighting_function_extra_params = None
+    elif args.weighting_function == "cap_indicator":
+        weighting_function = WeightingFunction.CAP_INDICATOR
+        weighting_function_extra_params = CapIndicatorExtraParams()
+    elif args.weighting_function == "smoothed_cap_indicator":
+        weighting_function = WeightingFunction.SMOOTHED_CAP_INDICATOR
+        weighting_function_extra_params = SmoothedCapIndicatorExtraParams()
+    else:
+        raise ValueError(f"Unknown weighting function: {args.weighting_function}")
+    print(f"Using weighting function: {weighting_function}")
+
+    vec_column = "clip_embedding" if "clip_embedding" in example else "vec"
+    domain_dim = example[vec_column].shape[0]
+
+    def make_model(d_model):
+        """Build the model of width d_model."""
+        return FunctionWeightedFlowModel(
+            domain_dim=domain_dim,
+            use_pre_mlp_projection=args.use_pre_mlp_projection,
+            n_layers=args.n_layers,
+            d_model=d_model,
+            mlp_expansion_factor=args.mlp_expansion_factor,
+            mlp_dropout_rate=None,
+            input_dropout_rate=None,
+            weighting_function=weighting_function,
+            weighting_function_extra_params=weighting_function_extra_params,
+        )
+
+    def loss_fn(model, params, batch, rng, capture_intermediates):
+        """Flow matching loss on a batch of unit vectors."""
+        loss, aux = flow_matching.compute_batch_loss(
+            model,
+            params,
+            {"point_vec": batch[vec_column]},
+            rng,
+            capture_intermediates=capture_intermediates,
+        )
+        return (loss, aux["intermediates"]) if capture_intermediates else loss
+
+    def process_intermediates(model, intermediates):
+        """Pick out the activations to chart from the captured intermediates."""
+        # FunctionWeightedFlowModel delegates to vector_field, so intermediates are nested
+        intermediates = intermediates["vector_field"]
+        result = {}
+        result["model_output"] = intermediates["__call__"][0]
+        result["final_norm_output"] = intermediates["final_norm"]["__call__"][0]
+        result["output_projection"] = intermediates["out_proj"]["__call__"][0]
+
+        if "pre_mlp_proj" in intermediates:
+            result["pre_mlp_projection"] = intermediates["pre_mlp_proj"]["__call__"][0]
+
+        # Intermediates from inside the scan over MLP blocks have a leading layer axis
+        blocks = intermediates["mlp_blocks"]
+        for layer_idx in range(args.n_layers):
+            result[f"mlp_block_{layer_idx}_output"] = blocks["__call__"][0][0][
+                layer_idx
+            ]
+            result[f"mlp_block_{layer_idx}_gate"] = blocks["gate_proj"]["__call__"][0][
+                layer_idx
+            ]
+            result[f"mlp_block_{layer_idx}_norm"] = blocks["norm"]["__call__"][0][
+                layer_idx
+            ]
+            result[f"mlp_block_{layer_idx}_out_proj"] = blocks["out_proj"]["__call__"][
+                0
+            ][layer_idx]
+            result[f"mlp_block_{layer_idx}_value"] = blocks["value_proj"]["__call__"][
+                0
+            ][layer_idx]
+
+        return result
+
+    charts = []
+    if args.use_pre_mlp_projection:
+        charts.append(
+            (
+                "pre_mlp_projection",
+                "Pre-MLP Projection Activations",
+                "pre_mlp_activation_chart.png",
+            )
+        )
+    for layer_idx in range(args.n_layers):
+        for key, title in [
+            ("out_proj", "Output Projection"),
+            ("gate", "Gate"),
+            ("value", "Value"),
+        ]:
+            charts.append(
+                (
+                    f"mlp_block_{layer_idx}_{key}",
+                    f"MLP Block {layer_idx} {title} Activations",
+                    f"mlp_block_{layer_idx}_{key}_activation_chart.png",
+                )
+            )
+    charts.append(
+        (
+            "output_projection",
+            "Model Output Projection Activations",
+            "model_output_projection_activation_chart.png",
+        )
+    )
+
+    return ModelFamily(
+        batch_fields=(vec_column,),
+        make_model=make_model,
+        init_params=lambda model, key: model.init(key, *model.dummy_inputs()),
+        loss_fn=loss_fn,
+        process_intermediates=process_intermediates,
+        charts=tuple(charts),
+    )
+
+
+def transformer_family(args, example) -> ModelFamily:
+    """
+    Family of cap-conditioned ImageModels of varying width, trained on VQGAN-encoded images with
+    caps around their CLIP embeddings sampled the same way training does. The feedforward width is
+    a fixed multiple of d_model. Attention is scaled either at a fixed head dimension (--head-dim),
+    so the number of heads grows with d_model, or at a fixed number of heads (--num-heads), so the
+    head dimension grows. --parametrization picks between muP (the base model's head dimension is
+    set to match the sweep, so the attention logit scaling is the standard 1/sqrt(head_dim) at the
+    base width either way), muP with the standard 1/sqrt(head_dim) attention scaling at every
+    width, and the standard parametrization (fan-in init, one learning rate, 1/sqrt(head_dim)
+    attention).
+    """
+    if (args.head_dim is None) == (args.num_heads is None):
+        raise ValueError(
+            "Exactly one of --head-dim and --num-heads is required for transformer models"
+        )
+    image_tokens = example["encoded_img"].shape[0]
+
+    def make_model(d_model):
+        """Build the model of width d_model in the chosen parametrization."""
+        if args.head_dim is not None:
+            if d_model % args.head_dim != 0:
+                raise ValueError(
+                    f"d_model {d_model} isn't a multiple of head_dim {args.head_dim}"
+                )
+            num_heads = d_model // args.head_dim
+            head_dim_base = args.head_dim
+        else:
+            if d_model % args.num_heads != 0:
+                raise ValueError(
+                    f"d_model {d_model} isn't a multiple of num_heads {args.num_heads}"
+                )
+            if ImageModel.d_model_base % args.num_heads != 0:
+                raise ValueError(
+                    f"num_heads {args.num_heads} must divide the base width "
+                    f"{ImageModel.d_model_base}"
+                )
+            num_heads = args.num_heads
+            head_dim_base = ImageModel.d_model_base // args.num_heads
+        head_dim = d_model // num_heads
+        if args.parametrization == "mup":
+            mup_kwargs = {"head_dim_base": head_dim_base}
+        elif args.parametrization == "mup_sqrt_attention":
+            mup_kwargs = {"head_dim_base": head_dim}
+        elif args.parametrization == "standard":
+            # Fan-in init for every kernel, one learning rate for everything (d_model_base =
+            # d_model makes the learning rate scaling a no-op), and 1/sqrt(head_dim) attention. The
+            # logits decoder, which the model zero-initializes, is given fan-in init in init_params.
+            mup_kwargs = {
+                "d_model_base": d_model,
+                "variance_base": 1 / d_model,
+                "head_dim_base": head_dim,
+            }
+        else:
+            raise ValueError(f"Unknown parametrization: {args.parametrization}")
+        return ImageModel(
+            d_model=d_model,
+            num_heads=num_heads,
+            ff_dim=args.mlp_expansion_factor * d_model,
+            **mup_kwargs,
+            dropout=None,
+            image_dropout=None,
+            clip_dropout=None,
+            n_layers=args.n_layers,
+            image_tokens=image_tokens,
+            clip_conditioning=True,
+            clip_caps=True,
+            clip_cap_count=1,
+            corrected_cap_projections=True,
+            do_clip_feedforward=False,
+            norm_clip_embeddings=False,
+            use_biases=True,
+            activations_dtype=jnp.float32,
+            activation_function=jax.nn.gelu,
+            weights_dtype=jnp.float32,
+            pre_norm=True,
+        )
+
+    def init_params(model, key):
+        """Initialize params, with the logits decoder's init matching the parametrization."""
+        init_key, decoder_key = jax.random.split(key)
+        params = model.init(init_key, *model.dummy_inputs())
+        if args.parametrization == "standard":
+            kernel = params["params"]["logits_decoder"]["kernel"]
+            params["params"]["logits_decoder"]["kernel"] = (
+                nn.initializers.variance_scaling(1.0, "fan_in", "normal")(
+                    decoder_key, kernel.shape, kernel.dtype
+                )
+            )
+        return params
+
+    def loss_fn(model, params, batch, rng, capture_intermediates):
+        """Cross-entropy loss on a batch, conditioned on freshly sampled caps."""
+        caps_rng, dropout_rng = jax.random.split(rng)
+        cap_centers, cap_max_cos_distances = gen_caps(
+            caps_rng, batch["clip_embedding"], 1, model
+        )
+        return loss_batch(
+            model,
+            params,
+            dropout_rng,
+            batch["encoded_img"],
+            cap_centers,
+            cap_max_cos_distances,
+            capture_intermediates=capture_intermediates,
+        )
+
+    def process_intermediates(model, intermediates):
+        """Pick out the activations to chart from the captured intermediates."""
+        result = {
+            "token_embedding": intermediates["in_embed"]["__call__"][0],
+            "clip_projection": intermediates["clip_proj"]["__call__"][0],
+            "logits": intermediates["logits_decoder"]["__call__"][0],
+        }
+        # Intermediates from inside the scan over layers have a leading layer axis
+        layers = intermediates["transformer_layers"]
+        for layer_idx in range(args.n_layers):
+            queries = layers["mha"]["query"]["__call__"][0][layer_idx]
+            keys = layers["mha"]["key"]["__call__"][0][layer_idx]
+            result[f"layer_{layer_idx}_attention_query"] = queries
+            # Pre-softmax attention logits, including the masked-out ones. These are what muP's
+            # 1/head_dim scaling is supposed to keep O(1). The full logit tensor is quadratic in
+            # the sequence length, so only a spread of query positions is used.
+            seq_len = queries.shape[1]
+            query_positions = jnp.linspace(
+                0, seq_len - 1, min(seq_len, 32), dtype=jnp.int32
+            )
+            result[f"layer_{layer_idx}_attention_logits"] = (
+                jnp.einsum("bqhd,bkhd->bhqk", queries[:, query_positions], keys)
+                * model.attention_logit_scale
+            )
+            result[f"layer_{layer_idx}_attention_out"] = layers["mha"]["__call__"][0][
+                layer_idx
+            ]
+            result[f"layer_{layer_idx}_ff_up"] = layers["linear_1"]["__call__"][0][
+                layer_idx
+            ]
+            result[f"layer_{layer_idx}_ff_down"] = layers["linear_2"]["__call__"][0][
+                layer_idx
+            ]
+            result[f"layer_{layer_idx}_output"] = layers["__call__"][0][0][layer_idx]
+        return result
+
+    charts = [
+        (
+            "token_embedding",
+            "Token Embedding Activations",
+            "token_embedding_activation_chart.png",
+        ),
+        (
+            "clip_projection",
+            "CLIP Projection Activations",
+            "clip_projection_activation_chart.png",
+        ),
+    ]
+    for layer_idx in range(args.n_layers):
+        for key, title in [
+            ("attention_query", "Attention Query"),
+            ("attention_logits", "Attention Logit"),
+            ("attention_out", "Attention Output"),
+            ("ff_up", "Feedforward Up Projection"),
+            ("ff_down", "Feedforward Down Projection"),
+            ("output", "Output"),
+        ]:
+            charts.append(
+                (
+                    f"layer_{layer_idx}_{key}",
+                    f"Layer {layer_idx} {title} Activations",
+                    f"layer_{layer_idx}_{key}_activation_chart.png",
+                )
+            )
+    charts.append(("logits", "Logits", "logits_activation_chart.png"))
+
+    return ModelFamily(
+        batch_fields=("encoded_img", "clip_embedding"),
+        make_model=make_model,
+        init_params=init_params,
+        loss_fn=loss_fn,
+        process_intermediates=process_intermediates,
+        charts=tuple(charts),
+    )
 
 
 @partial(
     jax.jit,
-    static_argnames=["mdl"],
+    static_argnames=["family", "mdl"],
     donate_argnames=["rng"],
 )
-def compute_loss_no_grad(mdl, params, rng, pts):
+def compute_loss_no_grad(family, mdl, params, rng, batch):
     """Compute loss without gradients for test evaluation."""
     rng, next_rng = jax.random.split(rng)
-    loss, _aux = flow_matching.compute_batch_loss(
-        mdl,
-        params,
-        {"point_vec": pts},
-        rng,
-        capture_intermediates=False,
-    )
+    loss = family.loss_fn(mdl, params, batch, rng, capture_intermediates=False)
     return loss, next_rng
 
 
-def compute_test_loss(mdl, params, rng, test_pts, batch_size):
+def compute_test_loss(family, mdl, params, rng, test_data, batch_size):
     """Compute average loss over the test dataset."""
-    n_batches = len(test_pts) // batch_size
+    n_batches = len(test_data[family.batch_fields[0]]) // batch_size
     total_loss = 0.0
 
     for i in trange(n_batches, desc="Evaluating test batches"):
         start_idx = i * batch_size
         end_idx = start_idx + batch_size
-        batch = test_pts[start_idx:end_idx]
-        loss, rng = compute_loss_no_grad(mdl, params, rng, batch)
+        batch = {k: v[start_idx:end_idx] for k, v in test_data.items()}
+        loss, rng = compute_loss_no_grad(family, mdl, params, rng, batch)
         total_loss += loss
 
     return total_loss / n_batches
@@ -107,28 +390,24 @@ def compute_test_loss(mdl, params, rng, test_pts, batch_size):
 
 @partial(
     jax.jit,
-    static_argnames=["mdl"],
+    static_argnames=["family", "mdl"],
     donate_argnames=["rng"],
 )
-def compute_gradients(mdl, params, rng, pts):
+def compute_gradients(family, mdl, params, rng, batch):
     """
     Compute gradients. This is split from apply_updates so we can do this on GPU and
     apply_updates on CPU.
     """
     rng, next_rng = jax.random.split(rng)
 
-    loss_fn = lambda params: flow_matching.compute_batch_loss(
-        mdl,
-        params,
-        {"point_vec": pts},
-        rng,
-        capture_intermediates=True,
+    loss_fn = lambda params: family.loss_fn(
+        mdl, params, batch, rng, capture_intermediates=True
     )
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (loss, intermediates), grad = grad_fn(params)
     processed_intermediates = jax.tree.map(
         lambda x: jnp.mean(jnp.abs(x)),
-        process_intermediates(intermediates["intermediates"]),
+        family.process_intermediates(mdl, intermediates),
     )
 
     return loss, processed_intermediates, grad, next_rng
@@ -149,7 +428,7 @@ def grad_update(opt, grad, opt_state, params):
 str_devices = lambda x: jax.tree.map(lambda y: y.device, x)
 
 
-def train_step(mdl, opt, params, opt_state, rng, pts, use_cpu_offload=False):
+def train_step(family, mdl, opt, params, opt_state, rng, batch, use_cpu_offload=False):
     """Complete training step, optionally with CPU-GPU split."""
     gpu_params = (
         jax.device_put(params, device=jax.devices("gpu")[0])
@@ -157,7 +436,7 @@ def train_step(mdl, opt, params, opt_state, rng, pts, use_cpu_offload=False):
         else params
     )
     loss, processed_intermediates, grad, next_rng = compute_gradients(
-        mdl, gpu_params, rng, pts
+        family, mdl, gpu_params, rng, batch
     )
 
     if use_cpu_offload:
@@ -171,16 +450,27 @@ def train_step(mdl, opt, params, opt_state, rng, pts, use_cpu_offload=False):
     return loss, processed_intermediates, new_params, new_opt_state, next_rng
 
 
-@partial(jax.jit, static_argnames=["model"])
-def init_model_params(model, init_key):
+@partial(jax.jit, static_argnames=["family", "model"])
+def init_model_params(family, model, init_key):
     """JIT-compiled model initialization function."""
-    return model.init(init_key, *model.dummy_inputs())
+    return family.init_params(model, init_key)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--dataset-path", type=Path, required=True, help="Path to a 3D dataset"
+        "--model-type",
+        type=str,
+        default="flow",
+        choices=["flow", "transformer"],
+        help="Which kind of model to check (default: flow)",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=Path,
+        required=True,
+        help="Path to a dataset of unit vectors (flow) or of encoded images with their CLIP "
+        "embeddings (transformer)",
     )
     parser.add_argument(
         "--lr-base",
@@ -201,11 +491,55 @@ def main():
         default=5,
         help="Number of learning rate points to test between lr-low and lr-high",
     )
-    parser.add_argument("--d-model-low", type=int, required=True)
-    parser.add_argument("--d-model-high", type=int, required=True)
-    parser.add_argument("--use-pre-mlp-projection", type=bool, required=True)
+    parser.add_argument("--d-model-low", type=int, required=False)
+    parser.add_argument("--d-model-high", type=int, required=False)
+    parser.add_argument(
+        "--d-model-values",
+        type=int,
+        nargs="+",
+        required=False,
+        help="Explicit list of d_model values to test, instead of every power of 2 from "
+        "--d-model-low to --d-model-high",
+    )
+    parser.add_argument(
+        "--use-pre-mlp-projection",
+        type=lambda x: bool(strtobool(x)),
+        required=False,
+        help="Whether to use a pre-MLP projection (flow models only, required for them)",
+    )
+    parser.add_argument(
+        "--head-dim",
+        type=int,
+        required=False,
+        help="Attention head dimension, held fixed as d_model grows (transformer models only; "
+        "exactly one of this and --num-heads is required for them)",
+    )
+    parser.add_argument(
+        "--num-heads",
+        type=int,
+        required=False,
+        help="Number of attention heads, held fixed as d_model grows (transformer models only; "
+        "exactly one of this and --head-dim is required for them)",
+    )
+    parser.add_argument(
+        "--parametrization",
+        type=str,
+        default="mup",
+        choices=["mup", "mup_sqrt_attention", "standard"],
+        help="Transformer models only. mup: muP with attention logits scaled by "
+        "sqrt(head_dim_base)/head_dim. mup_sqrt_attention: muP with the standard "
+        "1/sqrt(head_dim) attention scaling at every width. standard: the standard "
+        "parametrization, fan-in init, one learning rate for everything, and 1/sqrt(head_dim) "
+        "attention. (default: mup)",
+    )
     parser.add_argument("--n-layers", type=int, required=True)
-    parser.add_argument("--mlp-expansion-factor", type=int, required=False, default=4)
+    parser.add_argument(
+        "--mlp-expansion-factor",
+        type=int,
+        required=False,
+        default=4,
+        help="Width of the MLP/feedforward hidden layer as a multiple of d_model",
+    )
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--n-seeds", type=int, required=False, default=5)
     parser.add_argument(
@@ -286,21 +620,6 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Charts will be saved to: {args.output_dir}")
 
-    # Parse weighting function
-    if args.weighting_function == "constant":
-        weighting_function = WeightingFunction.CONSTANT
-        weighting_function_extra_params = None
-    elif args.weighting_function == "cap_indicator":
-        weighting_function = WeightingFunction.CAP_INDICATOR
-        weighting_function_extra_params = CapIndicatorExtraParams()
-    elif args.weighting_function == "smoothed_cap_indicator":
-        weighting_function = WeightingFunction.SMOOTHED_CAP_INDICATOR
-        weighting_function_extra_params = SmoothedCapIndicatorExtraParams()
-    else:
-        raise ValueError(f"Unknown weighting function: {args.weighting_function}")
-
-    print(f"Using weighting function: {weighting_function}")
-
     dsets = (
         Dataset.from_parquet(str(args.dataset_path))
         .with_format("numpy")
@@ -309,15 +628,18 @@ def main():
     dset_train = dsets["train"]
     dset_test = dsets["test"]
 
-    # Get metadata for model config
-    metadata_example = dset_train[0]
-    vec_column = "clip_embedding" if "clip_embedding" in metadata_example else "vec"
-    domain_dim = metadata_example[vec_column].shape[0]
-
     print(
         f"Dataset loaded with {len(dset_train)} training examples and {len(dset_test)} test examples. First example: {dset_train[0]}"
     )
+    if args.model_type == "flow":
+        family = flow_matching_family(args, dset_train[0])
+    elif args.model_type == "transformer":
+        family = transformer_family(args, dset_train[0])
+    else:
+        raise ValueError(f"Unknown model type: {args.model_type}")
+
     dset_train = dset_train.select(range(args.batch_size * args.n_train_steps))
+    test_data = {field: dset_test[field] for field in family.batch_fields}
 
     doing_lr_sweep = args.lr_low is not None and args.lr_high is not None
     if doing_lr_sweep and args.lr_base is not None:
@@ -373,17 +695,22 @@ def main():
     if len(lr_combinations) == 0:
         raise ValueError("No learning rate combinations to test!")
 
-    # Generate exponentially spaced d_model values with base 2
-    low_exp = math.log2(args.d_model_low)
-    high_exp = math.log2(args.d_model_high)
-
-    if not (
-        2 ** int(low_exp) == args.d_model_low
-        and 2 ** int(high_exp) == args.d_model_high
-    ):
-        raise ValueError("d-model-low and d-model-high must be powers of 2")
-
-    d_model_values = [2**i for i in range(int(low_exp), int(high_exp) + 1)]
+    if args.d_model_values is not None:
+        d_model_values = args.d_model_values
+    elif args.d_model_low is not None and args.d_model_high is not None:
+        # Every power of 2 from low to high
+        low_exp = math.log2(args.d_model_low)
+        high_exp = math.log2(args.d_model_high)
+        if not (
+            2 ** int(low_exp) == args.d_model_low
+            and 2 ** int(high_exp) == args.d_model_high
+        ):
+            raise ValueError("d-model-low and d-model-high must be powers of 2")
+        d_model_values = [2**i for i in range(int(low_exp), int(high_exp) + 1)]
+    else:
+        raise ValueError(
+            "Either --d-model-values or both --d-model-low and --d-model-high must be provided"
+        )
 
     print(f"Testing d_model values: {d_model_values}")
 
@@ -414,17 +741,7 @@ def main():
             key_idx += 1
             seed_keys = jax.random.split(master_key, args.n_seeds)
 
-            model = FunctionWeightedFlowModel(
-                domain_dim=domain_dim,
-                use_pre_mlp_projection=args.use_pre_mlp_projection,
-                n_layers=args.n_layers,
-                d_model=d_model,
-                mlp_expansion_factor=args.mlp_expansion_factor,
-                mlp_dropout_rate=None,
-                input_dropout_rate=None,
-                weighting_function=weighting_function,
-                weighting_function_extra_params=weighting_function_extra_params,
-            )
+            model = family.make_model(d_model)
             tqdm.write(f"Model: {model}")
             tqdm.write(f"m_d = {model.d_model_scale_factor}")
 
@@ -485,7 +802,7 @@ def main():
                 )
                 with device_ctx:
                     tqdm.write("Initializing parameters")
-                    params = init_model_params(model, init_key)
+                    params = init_model_params(family, model, init_key)
 
                     tqdm.write("Initializing optimizer state")
                     opt_state = init_opt_state(params)
@@ -499,29 +816,31 @@ def main():
                     total=args.n_train_steps,
                 ):
                     loss, processed_intermediates, params, opt_state, rng = train_step(
+                        family,
                         model,
                         opt,
                         params,
                         opt_state,
                         rng,
-                        batch[vec_column],
+                        {field: batch[field] for field in family.batch_fields},
                         use_cpu_offload,
                     )
                     activations_this_seed.append(processed_intermediates)
                     # Convert loss to numpy and store
                     seed_losses[seed_idx, i] = np.array(loss)
                     # Only log losses occasionally to avoid flooding the output
-                    log_interval = args.n_train_steps // 10
+                    log_interval = max(1, args.n_train_steps // 10)
                     if i % log_interval == 0 or i == args.n_train_steps - 1:
                         tqdm.write(f"Loss: {loss}, Step {i}/{args.n_train_steps}")
 
                 # After training, evaluate on test set
                 tqdm.write("Evaluating on test set")
                 test_loss = compute_test_loss(
+                    family,
                     model,
                     params,
                     rng,
-                    dset_test[vec_column],
+                    test_data,
                     args.batch_size,
                 )
                 seed_test_losses[seed_idx] = np.array(test_loss)
@@ -566,43 +885,35 @@ def main():
         activations.append(d_model_activations)
 
     # Generate activation charts
-    generate_activation_charts(d_model_values, activations, args.n_layers, args)
+    generate_activation_charts(d_model_values, activations, family.charts, args)
 
     # Generate loss charts if doing a learning rate sweep
     if doing_lr_sweep:
         generate_loss_charts(d_model_values, lr_combinations, losses, test_losses, args)
 
 
-def generate_activation_charts(d_model_values, activations, n_layers, args):
+def format_args(args) -> str:
+    """Format the command-line arguments, one per line, for inclusion in a chart."""
+    return "\n".join(f"{name}: {value}" for name, value in vars(args).items())
+
+
+def generate_activation_charts(d_model_values, activations, charts, args):
     """
     Generate charts showing activation values across different model dimensions.
 
     Args:
         d_model_values: List of d_model values used in training
         activations: List of activation values for each model dimension
-        n_layers: Number of MLP layers in the model
+        charts: (activation name, chart title, chart filename) for each chart to generate
         args: Command-line arguments to include in the legend
     """
-    # Create a colormap for train steps (only show first 10)
-    num_train_steps = min(len(activations[0]), 10)
-    colors = plt.cm.viridis(np.linspace(0, 1, num_train_steps))
-
-    params = {
-        "dataset": args.dataset_path,
-        "lr_base": args.lr_base if args.lr_base is not None else "N/A",
-        "lr_range": f"{args.lr_low}-{args.lr_high}"
-        if args.lr_low is not None
-        else "N/A",
-        "n_lr_points": args.n_lr_points if args.lr_low is not None else "N/A",
-        "d_model_range": f"{args.d_model_low}-{args.d_model_high}",
-        "use_pre_mlp_projection": args.use_pre_mlp_projection,
-        "n_layers": args.n_layers,
-        "mlp_expansion_factor": args.mlp_expansion_factor,
-        "batch_size": args.batch_size,
-        "n_seeds": args.n_seeds,
-        "n_train_steps": args.n_train_steps,
-        "n_test_batches": args.n_test_batches,
-    }
+    # Plot up to 10 training steps, spread evenly over the run and always including the first and
+    # last so the charts show both the initialization and where training ended up.
+    n_train_steps = len(activations[0])
+    plotted_steps = np.unique(
+        np.linspace(0, n_train_steps - 1, min(n_train_steps, 10), dtype=int)
+    )
+    colors = plt.cm.viridis(np.linspace(0, 1, len(plotted_steps)))
 
     def create_chart(key, title, filename):
         """Helper function to create and save a chart for a specific activation type"""
@@ -614,13 +925,13 @@ def generate_activation_charts(d_model_values, activations, n_layers, args):
         ax2 = plt.subplot(gs[1])
 
         # Plot activation values on the main axis (only first 10 steps)
-        for step in range(num_train_steps):
+        for color, step in zip(colors, plotted_steps):
             values = [model_activations[step][key] for model_activations in activations]
             ax1.plot(
                 d_model_values,
                 values,
                 marker="o",
-                color=colors[step],
+                color=color,
                 label=f"Step {step + 1}",
             )
 
@@ -637,48 +948,14 @@ def generate_activation_charts(d_model_values, activations, n_layers, args):
 
         # Create a separate legend for parameters on the second axis
         ax2.axis("off")  # Turn off axis
-        param_labels = [
-            f"{param_name}: {param_value}" for param_name, param_value in params.items()
-        ]
-        ax2.text(0, 0.5, "\n".join(param_labels), va="center", fontsize=10)
+        ax2.text(0, 0.5, format_args(args), va="center", fontsize=10)
 
         plt.tight_layout()
         plt.savefig(args.output_dir / filename, bbox_inches="tight", dpi=300)
+        plt.close()
 
-    # Chart for pre_mlp_projection
-    if "pre_mlp_projection" in activations[0][0]:
-        create_chart(
-            "pre_mlp_projection",
-            "Pre-MLP Projection Activations",
-            "pre_mlp_activation_chart.png",
-        )
-
-    # Charts for each MLP block's output projection, gate, and value
-    for layer_idx in range(n_layers):
-        create_chart(
-            f"mlp_block_{layer_idx}_out_proj",
-            f"MLP Block {layer_idx} Output Projection Activations",
-            f"mlp_block_{layer_idx}_out_proj_activation_chart.png",
-        )
-
-        create_chart(
-            f"mlp_block_{layer_idx}_gate",
-            f"MLP Block {layer_idx} Gate Activations",
-            f"mlp_block_{layer_idx}_gate_activation_chart.png",
-        )
-
-        create_chart(
-            f"mlp_block_{layer_idx}_value",
-            f"MLP Block {layer_idx} Value Activations",
-            f"mlp_block_{layer_idx}_value_activation_chart.png",
-        )
-
-    # Chart for model's output projection
-    create_chart(
-        "output_projection",
-        "Model Output Projection Activations",
-        "model_output_projection_activation_chart.png",
-    )
+    for key, title, filename in charts:
+        create_chart(key, title, filename)
 
     print("Charts generated successfully!")
 
@@ -754,31 +1031,7 @@ def generate_loss_charts(d_model_values, lr_combinations, losses, test_losses, a
         plt.grid(True, which="both", linestyle="--", alpha=0.6)
         plt.legend()
 
-        # Add parameter information as text
-        param_info = (
-            f"Dataset: {args.dataset_path}\n"
-            f"d_model range: {args.d_model_low}-{args.d_model_high}\n"
-        )
-        if args.use_muon:
-            param_info += (
-                f"Adam LR range: {args.lr_low}-{args.lr_high}, n_points={args.n_lr_points}\n"
-                f"Muon LR range: {args.muon_lr_low}-{args.muon_lr_high}, n_points={args.n_muon_lr_points}\n"
-                f"Muon beta: {args.muon_beta}\n"
-            )
-        else:
-            param_info += (
-                f"LR range: {args.lr_low}-{args.lr_high}, n_points={args.n_lr_points}\n"
-            )
-
-        param_info += (
-            f"pre_mlp_projection: {args.use_pre_mlp_projection}\n"
-            f"n_layers: {args.n_layers}\n"
-            f"mlp_expansion_factor: {args.mlp_expansion_factor}\n"
-            f"batch_size: {args.batch_size}\n"
-            f"n_seeds: {args.n_seeds}\n"
-            f"n_test_batches: {args.n_test_batches}\n"
-        )
-        plt.figtext(0.01, 0.01, param_info, fontsize=8, va="bottom")
+        plt.figtext(0.01, 0.01, format_args(args), fontsize=8, va="bottom")
 
         plt.tight_layout()
         plt.savefig(
@@ -800,9 +1053,14 @@ def generate_loss_charts(d_model_values, lr_combinations, losses, test_losses, a
     # Plot test losses
     for d_idx, d_model in enumerate(d_model_values):
         model_test_losses = test_losses[d_idx, :]
+        if np.all(np.isnan(model_test_losses)):
+            print(
+                f"Every learning rate diverged for d_model={d_model}, not charting it"
+            )
+            continue
 
         # Find the learning rate combination with the lowest test loss
-        min_loss_idx = np.argmin(model_test_losses)
+        min_loss_idx = np.nanargmin(model_test_losses)
         min_loss = model_test_losses[min_loss_idx]
         min_lr_combo = lr_combinations[min_loss_idx]
 
@@ -928,31 +1186,7 @@ def generate_loss_charts(d_model_values, lr_combinations, losses, test_losses, a
     plt.grid(True, which="both", linestyle="--", alpha=0.6)
     plt.legend()
 
-    # Add parameter information as text
-    param_info = (
-        f"Dataset: {args.dataset_path}\n"
-        f"d_model range: {args.d_model_low}-{args.d_model_high}\n"
-    )
-    if args.use_muon:
-        param_info += (
-            f"Adam LR range: {args.lr_low}-{args.lr_high}, n_points={args.n_lr_points}\n"
-            f"Muon LR range: {args.muon_lr_low}-{args.muon_lr_high}, n_points={args.n_muon_lr_points}\n"
-            f"Muon beta: {args.muon_beta}\n"
-        )
-    else:
-        param_info += (
-            f"LR range: {args.lr_low}-{args.lr_high}, n_points={args.n_lr_points}\n"
-        )
-
-    param_info += (
-        f"pre_mlp_projection: {args.use_pre_mlp_projection}\n"
-        f"n_layers: {args.n_layers}\n"
-        f"mlp_expansion_factor: {args.mlp_expansion_factor}\n"
-        f"batch_size: {args.batch_size}\n"
-        f"n_seeds: {args.n_seeds}\n"
-        f"n_test_batches: {args.n_test_batches}\n"
-    )
-    plt.figtext(0.01, 0.01, param_info, fontsize=8, va="bottom")
+    plt.figtext(0.01, 0.01, format_args(args), fontsize=8, va="bottom")
 
     plt.tight_layout()
     plt.savefig(args.output_dir / "final_loss_vs_lr.png", bbox_inches="tight", dpi=300)
@@ -1027,8 +1261,15 @@ def generate_3d_loss_plots(d_model_values, lr_combinations, test_losses, args):
             linewidth=0.5,
         )
 
+        if np.all(np.isnan(losses_flat)):
+            print(
+                f"Every learning rate diverged for d_model={d_model}, not charting it"
+            )
+            plt.close()
+            continue
+
         # Find and highlight the minimum loss point
-        min_loss_idx = np.argmin(losses_flat)
+        min_loss_idx = np.nanargmin(losses_flat)
         min_adam_lr, min_muon_lr = lr_combinations[min_loss_idx]
         min_loss = losses_flat[min_loss_idx]
 
@@ -1121,8 +1362,11 @@ def generate_3d_loss_plots(d_model_values, lr_combinations, test_losses, args):
             linewidth=0.5,
         )
 
+        if np.all(np.isnan(losses_flat)):
+            continue
+
         # Highlight the minimum loss point for this d_model
-        min_loss_idx = np.argmin(losses_flat)
+        min_loss_idx = np.nanargmin(losses_flat)
         min_adam_lr, min_muon_lr = lr_combinations[min_loss_idx]
         min_loss = losses_flat[min_loss_idx]
 
