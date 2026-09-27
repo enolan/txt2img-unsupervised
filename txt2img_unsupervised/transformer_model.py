@@ -1928,7 +1928,7 @@ def test_learn_zeros(pre_norm: bool, weights_dtype: jnp.dtype) -> None:
     dset = Dataset.from_dict({"encoded_img": np.array(data)}).with_format("np")
 
     def loss_fn(params, batch, rng):
-        return loss_batch(
+        loss = loss_batch(
             mdl,
             params,
             rng,
@@ -1936,6 +1936,7 @@ def test_learn_zeros(pre_norm: bool, weights_dtype: jnp.dtype) -> None:
             batch_clips=jnp.zeros((batch["encoded_img"].shape[0], 0)),
             batch_max_cos_distances=jnp.zeros((batch["encoded_img"].shape[0], 0)),
         )
+        return loss, {}
 
     result = train_for_tests(
         mdl,
@@ -1952,7 +1953,7 @@ def test_learn_zeros(pre_norm: bool, weights_dtype: jnp.dtype) -> None:
     )
     eval_params = result.state.get_eval_params()
 
-    test_loss = loss_fn(eval_params, {"encoded_img": data}, jax.random.PRNGKey(0))
+    test_loss, _ = loss_fn(eval_params, {"encoded_img": data}, jax.random.PRNGKey(0))
     assert test_loss < 1e-6
 
     sampled_arr = sample(
@@ -2002,7 +2003,7 @@ def test_learn_sequential(
     batch_size = 64
 
     def loss_fn(params, batch, rng):
-        return loss_batch(
+        loss = loss_batch(
             mdl,
             params,
             rng,
@@ -2014,6 +2015,7 @@ def test_learn_sequential(
                 (batch["encoded_img"].shape[0], 0), dtype=jnp.float32
             ),
         )
+        return loss, {}
 
     result = train_for_tests(
         mdl,
