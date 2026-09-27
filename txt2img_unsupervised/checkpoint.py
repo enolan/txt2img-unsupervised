@@ -3,6 +3,7 @@
 import gc
 import subprocess
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -29,7 +30,7 @@ from .config import (
 from .euclidean_vdm import EuclideanDiffusionModel
 from .function_weighted_flow_model import FunctionWeightedFlowModel
 from .muon import muon
-from .transformer_model import ImageModel
+from .transformer_model import ImageModel, gpt_1_config
 from .triangle_schedule import triangle_schedule
 
 
@@ -380,6 +381,26 @@ class BaseTrainState(train_state.TrainState):
         if isinstance(opt_state, optax.MultiStepsState):
             opt_state = opt_state.inner_opt_state
 
+        # muP models partition their params into learning rate groups, each with its own copy of
+        # the optimizer
+        if isinstance(opt_state, optax.transforms.PartitionState):
+            partition_states = [
+                masked.inner_state for masked in opt_state.inner_states.values()
+            ]
+            is_schedule_free = [
+                isinstance(s, optax.contrib.ScheduleFreeState) for s in partition_states
+            ]
+            if all(is_schedule_free):
+                return _schedule_free_eval_params_partitioned(
+                    partition_states, self.params
+                )
+            elif any(is_schedule_free):
+                raise ValueError(
+                    "Some partitions use schedule-free optimizers and some don't"
+                )
+            else:
+                return self.params
+
         # Check for schedule-free optimizer
         if isinstance(opt_state, optax.contrib.ScheduleFreeState):
             return optax.contrib.schedule_free_eval_params(opt_state, self.params)
@@ -476,6 +497,39 @@ class EuclideanVDMTrainState(BaseTrainState):
             cap_features=model_cfg.cap_features,
             residual_eps=model_cfg.residual_eps,
         )
+
+
+def _schedule_free_eval_params_partitioned(partition_states, params):
+    """
+    Eval params for a schedule-free optimizer split up by optax.transforms.partition. Each
+    partition's state holds z only for the params it owns, with MaskedNode everywhere else, so
+    compute each partition's eval params on the params it owns and merge the results.
+    """
+    is_masked = lambda x: isinstance(x, optax.transforms.MaskedNode)
+    eval_params = params
+    for state in partition_states:
+        # A MaskedNode in z stands in for a whole subtree of params the partition doesn't own.
+        # Expand z to the full param structure, using the params themselves as placeholders
+        # there, and mark which leaves the partition owns.
+        owned = jax.tree.map(
+            lambda z, x: jax.tree.map(lambda _: not is_masked(z), x),
+            state.z,
+            params,
+            is_leaf=is_masked,
+        )
+        z_full = jax.tree.map(
+            lambda z, x: x if is_masked(z) else z, state.z, params, is_leaf=is_masked
+        )
+        partition_eval_params = optax.contrib.schedule_free_eval_params(
+            state._replace(z=z_full), params
+        )
+        eval_params = jax.tree.map(
+            lambda current, new, is_owned: new if is_owned else current,
+            eval_params,
+            partition_eval_params,
+            owned,
+        )
+    return eval_params
 
 
 def checkpoint_metadata(checkpoint_manager: ocp.CheckpointManager) -> dict[str, Any]:
@@ -737,3 +791,99 @@ def test_get_eval_params(
     else:
         # scheduleful eval params should be the same
         np.testing.assert_array_equal(eval_params, state.params)
+
+
+_tiny_mup_transformer_cfg = replace(
+    gpt_1_config,
+    n_layers=1,
+    d_model=32,
+    num_heads=2,
+    ff_dim=64,
+    image_tokens=16,
+    dropout=None,
+    pre_norm=True,
+)
+
+
+def _random_grads_like(params, key):
+    """A tree of standard normal arrays with params' structure."""
+    leaves, treedef = jax.tree_util.tree_flatten(params)
+    keys = jax.random.split(key, len(leaves))
+    return treedef.unflatten(
+        [jax.random.normal(k, leaf.shape, leaf.dtype) for k, leaf in zip(keys, leaves)]
+    )
+
+
+def _assert_trees_close(tree_a, tree_b, **kwargs):
+    """Assert two pytrees have the same structure and numerically close leaves."""
+    assert jax.tree_util.tree_structure(tree_a) == jax.tree_util.tree_structure(tree_b)
+    for a, b in zip(
+        jax.tree_util.tree_leaves(tree_a), jax.tree_util.tree_leaves(tree_b)
+    ):
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), **kwargs)
+
+
+@pytest.mark.parametrize("schedule_free", [True, False])
+@pytest.mark.parametrize("gradient_accumulation_steps", [1, 2])
+def test_get_eval_params_partitioned(schedule_free, gradient_accumulation_steps):
+    """Test eval params with a muP model's partitioned optimizer. At its base width every partition
+    gets the same learning rate, so the partitioned optimizer must trace the unpartitioned one
+    exactly, eval params included."""
+    cfg = replace(_tiny_mup_transformer_cfg, d_model_base=32, head_dim_base=16)
+    mdl = ImageModel(**cfg.__dict__)
+    assert mdl.scale_lr(1.0) == 1.0
+    rng = jax.random.PRNGKey(0)
+    params = jax.jit(mdl.init)(rng, *mdl.dummy_inputs())
+    if schedule_free:
+        training_cfg = TrainingConfig(
+            learning_rate_schedule=LearningRateSchedule.WARMUP_PLUS_SCHEDULE_FREE,
+            schedule_free_beta1=0.9,
+            warmup_steps=5,
+            learning_rate=1e-2,
+            batch_size=1,
+            epochs=1,
+            gradient_clipping=None,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
+    else:
+        training_cfg = TrainingConfig(
+            learning_rate_schedule=LearningRateSchedule.CONSTANT,
+            learning_rate=1e-2,
+            batch_size=1,
+            epochs=1,
+            gradient_clipping=None,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
+
+    states = [
+        TransformerTrainState.create(apply_fn=mdl.apply, params=params, tx=opt, rng=rng)
+        for opt in [
+            setup_optimizer(training_cfg, batches_total=100, mdl=mdl),
+            setup_optimizer(training_cfg, batches_total=100, mdl=None),
+        ]
+    ]
+    partitioned_inner_state = states[0].opt_state.inner_state[-1]
+    if gradient_accumulation_steps > 1:
+        partitioned_inner_state = partitioned_inner_state.inner_opt_state
+    assert isinstance(partitioned_inner_state, optax.transforms.PartitionState)
+    step = jax.jit(lambda state, grads: state.apply_gradients(grads=grads))
+    for grad_key in jax.random.split(
+        jax.random.PRNGKey(1), 10 * gradient_accumulation_steps
+    ):
+        grads = _random_grads_like(params, grad_key)
+        states = [step(state, grads) for state in states]
+
+    partitioned, unpartitioned = states
+    _assert_trees_close(partitioned.params, unpartitioned.params, rtol=1e-6, atol=0)
+    partitioned_eval = partitioned.get_eval_params()
+    _assert_trees_close(
+        partitioned_eval, unpartitioned.get_eval_params(), rtol=1e-6, atol=0
+    )
+    if schedule_free:
+        assert not all(
+            jnp.allclose(a, b)
+            for a, b in zip(
+                jax.tree_util.tree_leaves(partitioned_eval),
+                jax.tree_util.tree_leaves(partitioned.params),
+            )
+        )
