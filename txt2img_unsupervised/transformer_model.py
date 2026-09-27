@@ -673,6 +673,22 @@ class ImageModel(nn.Module):
         return cap_centers, cap_d_maxes
 
 
+cap_logits_table = LogitsTable(767, 16384)
+
+
+@partial(jax.jit, static_argnames=["n_caps", "model"])
+def gen_caps(rng, batch_clips, n_caps, model):
+    """Generate containing spherical caps for a batch of examples, for training."""
+    ex_rngs = jax.random.split(rng, batch_clips.shape[0])
+
+    cap_centers, cap_max_cos_distances = jax.vmap(
+        lambda rng, embedding: model.gen_training_caps(cap_logits_table, rng, embedding)
+    )(ex_rngs, batch_clips)
+    assert cap_centers.shape == (batch_clips.shape[0], n_caps, 768)
+    assert cap_max_cos_distances.shape == (batch_clips.shape[0], n_caps)
+    return cap_centers, cap_max_cos_distances
+
+
 def calculate_discrete_power_law_pmf(n_max, alpha):
     """Calculate the probability mass function (as an array) for a discrete power law distribution
     over the integers 1 through n_max inclusive, with exponent alpha."""
